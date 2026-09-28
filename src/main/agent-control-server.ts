@@ -43,7 +43,10 @@ export interface ControlEndpointFile {
 
 const OWNER_KEY = '\0owner'
 const MAX_IN_FLIGHT_PER_SESSION = 8
-const BUSY = `This session already has ${MAX_IN_FLIGHT_PER_SESSION} control requests in progress`
+const BUSY = `This session already has ${MAX_IN_FLIGHT_PER_SESSION} control requests in progress; wait for one of them to answer. Do not resend a mutation that timed out: check agents.list or git.ship.status first`
+/** A credential the server does not know (G22). */
+export const UNAUTHORIZED_CONTROL = 'This app-control credential is not (or no longer) valid, for example because the conversation moved workspace or Conductor restarted; nothing was done. Use the conductor MCP tools if you have them; otherwise say so in your final message and the owner restarts this conversation.'
+const NO_METHOD = 'Provide a method and args object, e.g. {"method":"tools.list","args":{"brief":true}}'
 /** Conversations whose credential is remembered across launches; the oldest go first. */
 const MAX_KEPT_CREDENTIALS = 2000
 
@@ -222,7 +225,7 @@ export class AgentControlServer {
     const authorization = request.headers.authorization
     const credential = [...this.credentials.values()].find(credential => authorization === 'Bearer ' + credential.token)
     const owner = Boolean(this.ownerToken) && authorization === 'Bearer ' + this.ownerToken
-    if (!credential && !owner) { reply(401, { error: 'Unauthorized control session' }); request.resume(); return }
+    if (!credential && !owner) { reply(401, { error: UNAUTHORIZED_CONTROL }); request.resume(); return }
     // Reads and waits may overlap a caller's mutation. Mutations keep their order per session and
     // method family (control-method-classes.ts), so a long git.ship never holds up tabs.open,
     // while the bounded request count prevents one credential from monopolising the server.
@@ -237,7 +240,7 @@ export class AgentControlServer {
         chunks.push(Buffer.from(chunk))
       }
       const input = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { method?: unknown; args?: unknown; scope?: unknown }
-      if (!input || typeof input.method !== 'string' || input.method.length > 100) throw new Error('Provide a method and args object')
+      if (!input || typeof input.method !== 'string' || input.method.length > 100) throw new Error(NO_METHOD)
       // The owner names the project and workspace per call; a conversation's scope is fixed
       // when its credential is issued and nothing in the body can move it.
       const scope = owner ? this.control.ownerScope(input.scope) : credential!.scope
@@ -251,7 +254,7 @@ export class AgentControlServer {
    *  tool calls this (permission-grants/control-mcp.ts), so moving a call off the shell changes
    *  nothing about what it may do; a refusal throws the text HTTP answers as `{error}`. */
   async invoke(scope: AgentControlScope, method: string, args: unknown = {}): Promise<unknown> {
-    if (typeof method !== 'string' || !method || method.length > 100) throw new Error('Provide a method and args object')
+    if (typeof method !== 'string' || !method || method.length > 100) throw new Error(NO_METHOD)
     const key = scope.owner ? OWNER_KEY : scope.agentSessionId
     if (!this.enter(key)) throw new Error(BUSY)
     try { return await this.run(key, scope, method, args) } finally { this.leave(key) }
@@ -274,7 +277,7 @@ export class AgentControlServer {
     // Every answered call is shown in the timelines it concerns (control-activity.ts), on the
     // Conductor side only: nothing is added to any prompt.
     const call = async (): Promise<unknown> => {
-      this.control.authorize(scope)
+      this.control.authorize(scope, method)
       // Resolved before the call: a close leaves no tab to name afterwards.
       const prepared = this.control.prepareActivity?.(scope, method, args)
       try {

@@ -120,9 +120,6 @@ export function grantStatusOf(data: { type: string; payload?: unknown }): GrantS
 /** A native rule entry as `rules()` hands it to the adapter. */
 export interface GrantRule { rule: string; once: boolean }
 
-/** A decision a wizard tab may make for its owner: only local, reversible actions. */
-export const wizardMayDecide = (request: Pick<PermissionGrantRequest, 'class' | 'rule'>): boolean => request.class === 'local' && Boolean(request.rule)
-
 /** Production and external actions reach the owner's phone even while the turn goes on. */
 export const grantNeedsPhone = (request: Pick<PermissionGrantRequest, 'class'>): boolean => request.class === 'external' || request.class === 'shared' || request.class === 'destructive'
 

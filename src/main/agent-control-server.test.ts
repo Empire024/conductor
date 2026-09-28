@@ -18,7 +18,7 @@ const deferred = <T = void>() => {
 
 async function fixture(call: (method: string) => Promise<unknown>) {
   const control = {
-    authorize: vi.fn(() => spec),
+    authorize: vi.fn((_scope: unknown, _method?: string) => spec),
     ownerScope: vi.fn(() => ({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: 'owner', owner: true })),
     call: vi.fn((_scope: unknown, method: string) => call(method))
   }
@@ -33,8 +33,20 @@ async function fixture(call: (method: string) => Promise<unknown>) {
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ method, args: {} })
   })
-  return { control, request }
+  return { control, request, endpoint, token }
 }
+
+describe('transport refusals say what to do next', () => {
+  it('answers an unknown credential and a body without a method with the next step', async () => {
+    const f = await fixture(async () => null)
+    const endpoint = f.endpoint
+    const stranger = await fetch(endpoint, { method: 'POST', headers: { Authorization: 'Bearer ' + '0'.repeat(64), 'Content-Type': 'application/json' }, body: JSON.stringify({ method: 'tools.list', args: {} }) })
+    expect(stranger.status).toBe(401)
+    expect((await stranger.json() as { error: string }).error).toMatch(/not \(or no longer\) valid.*Use the conductor MCP tools if you have them; otherwise say so in your final message/)
+    const empty = await fetch(endpoint, { method: 'POST', headers: { Authorization: 'Bearer ' + f.token, 'Content-Type': 'application/json' }, body: JSON.stringify({ args: {} }) })
+    expect(await empty.json()).toEqual({ error: 'Provide a method and args object, e.g. {"method":"tools.list","args":{"brief":true}}' })
+  })
+})
 
 describe('agent-control request concurrency', () => {
   it('lets a read complete while a mutation from the same session is in flight', async () => {
@@ -132,7 +144,7 @@ describe('agent-control request concurrency', () => {
     await allStarted.promise
     const refused = await f.request('agents.status')
     expect(refused.status).toBe(429)
-    expect(await refused.json()).toEqual({ error: 'This session already has 8 control requests in progress' })
+    expect(await refused.json()).toEqual({ error: 'This session already has 8 control requests in progress; wait for one of them to answer. Do not resend a mutation that timed out: check agents.list or git.ship.status first' })
     release.resolve()
     expect((await Promise.all(requests)).every(response => response.status === 200)).toBe(true)
   })

@@ -76,6 +76,51 @@ describe('coworker auto-close', () => {
       expect([...f.live]).toEqual(['running', 'background'])
     })
 
+    it('says how to wait instead of polling when it is refused', async () => {
+      const f = fixture()
+      f.add('running', {}, { phase: 'running' })
+      await expect(f.service.finish(f.tabs.get('running')!)).rejects.toThrow(/Retry with agents.finish\(\{agentSessionId:"running",waitSeconds:60\}\).*or agents.interrupt it first/)
+    })
+
+    it('with waitMs, finishes a coworker that settles within the wait', async () => {
+      const f = fixture()
+      f.add('busy', {}, { phase: 'running' })
+      const finishing = f.service.finish(f.tabs.get('busy')!, { waitMs: 5_000 })
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(f.closed).toEqual([])
+      f.states.set('busy', { ...f.states.get('busy')!, phase: 'completed' })
+      await vi.advanceTimersByTimeAsync(500)
+      expect(await finishing).toMatchObject({ finished: true, agentSessionId: 'busy' })
+      expect(f.closed).toEqual(['busy'])
+      expect(f.live.has('busy')).toBe(false)
+    })
+
+    it('with waitMs, refuses naming the blocker when it does not settle in time', async () => {
+      const f = fixture()
+      f.add('stuck', {}, { phase: 'waiting_approval' })
+      const refused = expect(f.service.finish(f.tabs.get('stuck')!, { waitMs: 3_000 })).rejects.toThrow(/cannot be finished yet: it is waiting on an approval after 3 s of waiting/)
+      await vi.advanceTimersByTimeAsync(3_500)
+      await refused
+      expect(f.closed).toEqual([])
+    })
+
+    it('with waitMs, does not close a tab that closed or turned into a wizard meanwhile', async () => {
+      const f = fixture()
+      f.add('gone', {}, { phase: 'running' })
+      const finishing = expect(f.service.finish(f.tabs.get('gone')!, { waitMs: 5_000 })).rejects.toThrow(/closed while Conductor waited/)
+      f.tabs.delete('gone')
+      f.states.set('gone', { ...f.states.get('gone')!, phase: 'completed' })
+      await vi.advanceTimersByTimeAsync(500)
+      await finishing
+      f.add('wand', {}, { phase: 'running' })
+      const wand = expect(f.service.finish(f.tabs.get('wand')!, { waitMs: 5_000 })).rejects.toThrow(/wizard tab/)
+      f.tabs.set('wand', { ...f.tabs.get('wand')!, wizard: true })
+      f.states.set('wand', { ...f.states.get('wand')!, phase: 'completed' })
+      await vi.advanceTimersByTimeAsync(500)
+      await wand
+      expect(f.closed).toEqual([])
+    })
+
     it('closes a settled coworker at once and releases its runtime', async () => {
       const f = fixture()
       f.add('done')
@@ -108,7 +153,7 @@ describe('coworker auto-close', () => {
     it('waits for its own turn to settle, then closes and releases', async () => {
       const f = fixture()
       f.add('self', {}, { phase: 'running' })
-      expect(f.service.requestSelfFinish(f.tabs.get('self')!)).toMatchObject({ finished: false })
+      expect(await f.service.requestSelfFinish(f.tabs.get('self')!)).toMatchObject({ finished: false })
       await vi.advanceTimersByTimeAsync(10_000)
       expect(f.closed).toEqual([])
       f.states.set('self', { ...f.states.get('self')!, phase: 'completed' })
@@ -121,27 +166,53 @@ describe('coworker auto-close', () => {
       const f = fixture()
       f.settings.set(COWORKER_AUTOCLOSE_SETTING, '0')
       f.add('self')
-      f.service.requestSelfFinish(f.tabs.get('self')!)
+      await f.service.requestSelfFinish(f.tabs.get('self')!)
       await vi.advanceTimersByTimeAsync(2_500)
       expect(f.closed).toEqual(['self'])
     })
 
-    it('is refused for the owner’s own tab, a wizard, a controller with coworkers and pending background tasks', () => {
+    it('is refused for the owner’s own tab, a wizard, a controller with coworkers and pending background tasks', async () => {
       const f = fixture()
       f.add('owner', { controller: null, opened: false })
       f.add('wizard', { wizard: true })
       f.add('boss', { controlsLiveCoworkers: true })
       f.add('background', {}, { phase: 'running', backgroundTasks: 1 })
-      expect(() => f.service.requestSelfFinish(f.tabs.get('owner')!)).toThrow(/owner’s own tab/)
-      expect(() => f.service.requestSelfFinish(f.tabs.get('wizard')!)).toThrow(/wizard/)
-      expect(() => f.service.requestSelfFinish(f.tabs.get('boss')!)).toThrow(/controls open coworkers/)
-      expect(() => f.service.requestSelfFinish(f.tabs.get('background')!)).toThrow(/background task/)
+      await expect(f.service.requestSelfFinish(f.tabs.get('owner')!)).rejects.toThrow(/owner’s own tab/)
+      await expect(f.service.requestSelfFinish(f.tabs.get('wizard')!)).rejects.toThrow(/wizard/)
+      await expect(f.service.requestSelfFinish(f.tabs.get('boss')!)).rejects.toThrow(/controls open coworkers/)
+      await expect(f.service.requestSelfFinish(f.tabs.get('background')!)).rejects.toThrow(/1 background task still running.*force:true.*waitSeconds/)
+    })
+
+    it('with force, closes once the turn settles although background tasks run, and releases the CLI', async () => {
+      const f = fixture()
+      f.add('self', {}, { phase: 'running', backgroundTasks: 2 })
+      expect(await f.service.requestSelfFinish(f.tabs.get('self')!, { force: true })).toMatchObject({ finished: false, note: expect.stringMatching(/background task stops with it/) })
+      await vi.advanceTimersByTimeAsync(2_500)
+      expect(f.closed).toEqual([])
+      f.states.set('self', { ...f.states.get('self')!, phase: 'completed' })
+      await vi.advanceTimersByTimeAsync(2_500)
+      expect(f.closed).toEqual(['self'])
+      expect(f.live.has('self')).toBe(false)
+    })
+
+    it('with waitSeconds, waits for its background tasks before accepting', async () => {
+      const f = fixture()
+      f.add('self', {}, { phase: 'running', backgroundTasks: 1 })
+      const request = f.service.requestSelfFinish(f.tabs.get('self')!, { waitMs: 5_000 })
+      await vi.advanceTimersByTimeAsync(1_000)
+      f.states.set('self', { ...f.states.get('self')!, backgroundTasks: 0 })
+      await vi.advanceTimersByTimeAsync(500)
+      expect(await request).toMatchObject({ finished: false })
+      f.add('stuck', {}, { phase: 'running', backgroundTasks: 1 })
+      const refused = expect(f.service.requestSelfFinish(f.tabs.get('stuck')!, { waitMs: 2_000 })).rejects.toThrow(/1 background task still running after 2 s of waiting/)
+      await vi.advanceTimersByTimeAsync(2_500)
+      await refused
     })
 
     it('tells the tab when a draft kept it open', async () => {
       const f = fixture()
       f.add('self'); f.refuse('it has an unsent draft')
-      f.service.requestSelfFinish(f.tabs.get('self')!)
+      await f.service.requestSelfFinish(f.tabs.get('self')!)
       await vi.advanceTimersByTimeAsync(2_500)
       expect(f.closed).toEqual([])
       expect(f.notices).toEqual([['self', expect.stringMatching(/kept .* open after agents.finish: it has an unsent draft/)]])

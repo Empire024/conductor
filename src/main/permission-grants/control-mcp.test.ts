@@ -49,6 +49,7 @@ describe('the conductor MCP server for Codex (H14)', () => {
     expect(refused.result).toMatchObject({ isError: true })
     expect(refused.result!.content![0]!.text).toContain('its own approval card')
     expect(refused.result!.content![0]!.text).toContain('Tools here: control, send_message')
+    expect((await rpc('codex', { method: 'tools/call', params: { name: 'send_mesage', arguments: {} } })).error!.message).toBe('Unknown Conductor tool "send_mesage"; the tools here are control, send_message, submit_task, report, handoff. control({method,args}) calls any app-control method.')
     expect(calls).toEqual([])
 
     await rpc('codex', { method: 'tools/call', params: { name: 'report', arguments: { text: 'done' } } })

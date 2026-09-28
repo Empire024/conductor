@@ -31,6 +31,10 @@ export const COWORKER_DELIVERED_PREFIX = 'coworkerDelivered:'
 
 const SWEEP_MS = 60_000
 const SELF_FINISH_POLL_MS = 2_000
+const WAIT_POLL_MS = 250
+/** agents.finish({waitSeconds}) waits at most this long. The conductor MCP tool gives a call 180 s
+ *  (CONDUCTOR_TOOL_TIMEOUT_SEC), so a wait never outlives the tool call that asked for it. */
+export const FINISH_WAIT_MAX_SECONDS = 150
 
 type Settings = { getSetting(key: string): string | null; setSetting(key: string, value: string): void; removeSetting(key: string): void }
 
@@ -63,8 +67,9 @@ export interface FinishTarget {
   remote: boolean
 }
 
-/** Why this conversation is not settled, in words for a refusal; null when it is. */
-export function unsettledReason(state: SessionProjection | null | undefined): string | null {
+/** Why this conversation is not settled, in words for a refusal; null when it is. A forced
+ *  self-finish ignores background tasks: they stop with the CLI it releases. */
+export function unsettledReason(state: SessionProjection | null | undefined, options: { ignoreBackground?: boolean } = {}): string | null {
   if (!state) return 'it has no conversation state here'
   if (state.phase === 'running' || state.phase === 'interrupting') return 'its turn is still running'
   if (state.phase === 'waiting_approval') return 'it is waiting on an approval'
@@ -72,8 +77,14 @@ export function unsettledReason(state: SessionProjection | null | undefined): st
   if (state.limitResumeAt) return 'it waits out a usage limit and continues at the reset'
   if (state.queued || state.queuedPrompts?.length) return 'it has queued messages'
   if (state.pendingSteering?.some(input => input.status === 'sending' || input.status === 'accepted')) return 'a message is being steered into it'
+  if (options.ignoreBackground) return null
   if ((state.backgroundTasks ?? 0) > 0) return `it has ${state.backgroundTasks} background task${state.backgroundTasks === 1 ? '' : 's'} still running`
   return hasSessionWork(state) ? 'it has background tasks still running' : null
+}
+
+const backgroundReason = (state: SessionProjection | null): string | null => {
+  const count = state?.backgroundTasks ?? 0
+  return count > 0 ? `it has ${count} background task${count === 1 ? '' : 's'} still running` : null
 }
 
 /** What makes a tab one Conductor never closes on its own or at a coworker's own request. */
@@ -110,7 +121,7 @@ export interface CoworkerAutoCloseDependencies {
 export class CoworkerAutoClose {
   /** When each settled conversation was first seen settled at its current sequence. */
   private readonly idle = new Map<string, { sequence: number; since: number }>()
-  private readonly selfFinish = new Map<string, FinishTarget>()
+  private readonly selfFinish = new Map<string, { target: FinishTarget; force: boolean }>
   private sweepTimer?: ReturnType<typeof setInterval>
   private pollTimer?: ReturnType<typeof setTimeout>
   private sweeping?: Promise<void>
@@ -150,27 +161,47 @@ export class CoworkerAutoClose {
 
   delivered(id: string): boolean { return this.deps.settings.getSetting(COWORKER_DELIVERED_PREFIX + id) !== null }
 
-  /** agents.finish({agentSessionId}) from its controller: close now, or refuse naming why. */
-  async finish(target: FinishTarget): Promise<FinishResult> {
-    const refused = protectedReason(target)
-    if (refused) throw new Error(`Conductor will not finish “${target.title}”: ${refused}`)
-    const busy = unsettledReason(this.deps.snapshot(target.agentSessionId))
-    if (busy) throw new Error(`“${target.title}” cannot be finished yet: ${busy}. Finish it once agents.status shows it settled with no background tasks`)
-    await this.closeAndRelease(target)
-    return { agentSessionId: target.agentSessionId, tabId: target.tabId, finished: true, note: `“${target.title}” is closed with its history kept (reopen it from the closed tabs) and its CLI process is released.` }
+  /** Polls until `reason` answers null or `waitMs` passes; returns the reason still standing. A
+   *  controller that would otherwise loop on agents.status and a refused finish (H10: 26 refusals
+   *  in a week) waits here in one call instead. */
+  private async waitUntil(reason: () => string | null, waitMs: number): Promise<string | null> {
+    const deadline = this.now() + waitMs
+    for (let current = reason(); ; current = reason()) {
+      if (!current || this.now() >= deadline || this.disposed) return current
+      await new Promise(resolve => setTimeout(resolve, Math.min(WAIT_POLL_MS, Math.max(1, deadline - this.now()))))
+    }
   }
 
-  /** agents.finish({}) from the coworker itself, in its last turn: closes once that turn settles. */
-  requestSelfFinish(target: FinishTarget): FinishResult {
+  /** agents.finish({agentSessionId, waitSeconds?}) from its controller: close now, or once it
+   *  settles within waitMs, or refuse naming what still stands in the way. */
+  async finish(target: FinishTarget, options: { waitMs?: number } = {}): Promise<FinishResult> {
+    const refused = protectedReason(target)
+    if (refused) throw new Error(`Conductor will not finish “${target.title}”: ${refused}`)
+    const id = target.agentSessionId, waitMs = options.waitMs ?? 0
+    const busy = await this.waitUntil(() => unsettledReason(this.deps.snapshot(id)), waitMs)
+    if (busy) throw new Error(`“${target.title}” cannot be finished yet: ${busy}${waitMs ? ` after ${Math.round(waitMs / 1000)} s of waiting` : ''}. Retry with agents.finish({agentSessionId:"${id}",waitSeconds:${Math.min(FINISH_WAIT_MAX_SECONDS, 60)}}), which waits for it to settle and then finishes it, or agents.interrupt it first.`)
+    // Waiting gave the tab time to change: close what is there now, under the same rules.
+    const current = waitMs ? this.deps.targets().find(candidate => candidate.agentSessionId === id) : target
+    if (!current) throw new Error(`“${target.title}” closed while Conductor waited for it to settle; nothing is left to finish`)
+    const now = protectedReason(current)
+    if (now) throw new Error(`Conductor will not finish “${current.title}”: ${now}`)
+    await this.closeAndRelease(current)
+    return { agentSessionId: id, tabId: current.tabId, finished: true, note: `“${current.title}” is closed with its history kept (reopen it from the closed tabs) and its CLI process is released.` }
+  }
+
+  /** agents.finish({}) from the coworker itself, in its last turn: closes once that turn settles.
+   *  Background tasks wake the conversation when they end, so they are waited for (waitMs) or
+   *  cut off with the CLI (force); neither given, the call says so instead of closing mid-work. */
+  async requestSelfFinish(target: FinishTarget, options: { waitMs?: number; force?: boolean } = {}): Promise<FinishResult> {
     if (!target.controller && !target.opened) throw new Error('This is the owner’s own tab, not a coworker a controller opened; only a coworker finishes itself')
     const refused = protectedReason(target)
     if (refused) throw new Error(`Conductor will not finish this tab: ${refused}`)
-    const state = this.deps.snapshot(target.agentSessionId)
-    const background = state?.backgroundTasks ?? 0
-    if (background > 0) throw new Error(`This tab cannot finish yet: it has ${background} background task${background === 1 ? '' : 's'} still running. Finish once they are done`)
-    this.selfFinish.set(target.agentSessionId, target)
+    const force = options.force === true
+    const background = force ? null : await this.waitUntil(() => backgroundReason(this.deps.snapshot(target.agentSessionId)), options.waitMs ?? 0)
+    if (background) throw new Error(`This tab cannot finish yet: ${background}${options.waitMs ? ` after ${Math.round(options.waitMs / 1000)} s of waiting` : ''}, and they wake this conversation when they end. Call agents.finish({force:true}) to finish anyway (they stop with this tab's CLI), or agents.finish({waitSeconds:60}) to wait for them first.`)
+    this.selfFinish.set(target.agentSessionId, { target, force })
     this.schedulePoll()
-    return { agentSessionId: target.agentSessionId, tabId: target.tabId, finished: false, note: 'Conductor closes this tab (history kept) and releases its CLI as soon as this turn settles. End your turn now; do not start more work.' }
+    return { agentSessionId: target.agentSessionId, tabId: target.tabId, finished: false, note: `Conductor closes this tab (history kept) and releases its CLI as soon as this turn settles${force ? ', and any background task stops with it' : ''}. End your turn now; do not start more work.` }
   }
 
   private schedulePoll(): void {
@@ -184,10 +215,10 @@ export class CoworkerAutoClose {
     for (const [id, requested] of [...this.selfFinish]) {
       const target = open.get(id)
       if (!target) { this.selfFinish.delete(id); continue }
-      if (unsettledReason(this.deps.snapshot(id))) continue
+      if (unsettledReason(this.deps.snapshot(id), { ignoreBackground: requested.force })) continue
       this.selfFinish.delete(id)
-      try { await this.closeAndRelease(target) }
-      catch (error) { this.deps.notice?.(id, `Conductor kept “${requested.title}” open after agents.finish: ${reason(error)}.`) }
+      try { await this.closeAndRelease(target, requested.force) }
+      catch (error) { this.deps.notice?.(id, `Conductor kept “${requested.target.title}” open after agents.finish: ${reason(error)}.`) }
     }
     this.schedulePoll()
   }
@@ -231,11 +262,11 @@ export class CoworkerAutoClose {
    *  asked to close, or the finished-tab sweep chose, closes and releases exactly as a coworker does. */
   closeSettled(target: FinishTarget): Promise<void> { return this.closeAndRelease(target) }
 
-  private async closeAndRelease(target: FinishTarget): Promise<void> {
+  private async closeAndRelease(target: FinishTarget, force = false): Promise<void> {
     const id = target.agentSessionId
     await this.deps.close(target)
     // Closed means done: a runtime that settled is stopped now rather than after the idle timeout.
-    this.deps.release(spec => spec.id === id && !unsettledReason(this.deps.snapshot(id)))
+    this.deps.release(spec => spec.id === id && !unsettledReason(this.deps.snapshot(id), { ignoreBackground: force }))
     this.deps.settings.removeSetting(COWORKER_DELIVERED_PREFIX + id)
     // Reopened from history it is the owner's tab again, never closed on a timer.
     this.deps.settings.removeSetting(COWORKER_OPENED_PREFIX + id)

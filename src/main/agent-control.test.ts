@@ -327,7 +327,7 @@ locked: [budget]
     expect(await f.control.call(childScope, 'agents.status', { agentSessionId: f.scope.agentSessionId })).toMatchObject({ agentSessionId: f.scope.agentSessionId })
     const stranger = agentIn(f, f.project.id, f.workspace.id, 'stranger')
     expect(await f.control.call(stranger, 'agents.status', { agentSessionId: child.resourceId })).toMatchObject({ agentSessionId: child.resourceId })
-    await expect(f.control.call(stranger, 'agents.steer', { agentSessionId: child.resourceId, prompt: 'Mine now' })).rejects.toThrow(/Another agent already controls/)
+    await expect(f.control.call(stranger, 'agents.steer', { agentSessionId: child.resourceId, prompt: 'Mine now' })).rejects.toThrow(new RegExp(`Another agent already controls this tab: ".*" is controlled by ".*" \\(${f.scope.agentSessionId}\\); send_message that controller, or ask it to agents.release the tab`))
     // A grandchild reaches the root too.
     const grandchild = await f.control.call(childScope, 'tabs.open', { title: 'Grandchild' }) as AgentControlTab
     expect(await f.control.call({ ...f.scope, agentSessionId: grandchild.resourceId! }, 'agents.steer', { agentSessionId: f.scope.agentSessionId, prompt: 'From below' })).toMatchObject({ reportedTo: 'ancestor', agentSessionId: f.scope.agentSessionId })
@@ -587,8 +587,8 @@ locked: [budget]
 
   it('rejects an explicit tabs.open permission that is not a real mode, or one this provider does not offer', async () => {
     const f = fixture()
-    await expect(f.control.call(f.scope, 'tabs.open', { provider: 'claude', permission: 'plan' })).rejects.toThrow('Invalid permission mode')
-    await expect(f.control.call(f.scope, 'tabs.open', { provider: 'claude', permission: 'auto' })).rejects.toThrow('supported by this provider')
+    await expect(f.control.call(f.scope, 'tabs.open', { provider: 'claude', permission: 'plan' })).rejects.toThrow('tabs.open: permission must be one of read-only, default, accept-edits, auto (models.list says which each provider offers); not "plan"')
+    await expect(f.control.call(f.scope, 'tabs.open', { provider: 'claude', permission: 'auto' })).rejects.toThrow(/claude does not offer permission "auto"; it offers /)
   })
 
   it('never lets a Claude-only remembered mode leak into a new Codex tab', async () => {
@@ -781,7 +781,9 @@ describe('Project task handoff through native router dispatch', () => {
     const f = fixture()
     writeFileSync(join(f.root, 'project', 'feature-list.md'), '- [~] Mine <!-- conductor-task:mine agent=controller -->\n- [~] Other <!-- conductor-task:other agent=coworker -->\n- [x] Done <!-- conductor-task:done -->\n')
     const worker = { title: 'Worker', prompt: 'Selected work', provider: 'claude', model: 'claude-synthetic', effort: 'low' }
-    for (const id of ['absent', 'other', 'done']) await expect(f.control.call(f.scope, 'router.dispatch', { tasks: [{ ...worker, projectTaskIds: [id] }] })).rejects.toThrow('missing, finished, or owned')
+    await expect(f.control.call(f.scope, 'router.dispatch', { tasks: [{ ...worker, projectTaskIds: ['absent'] }] })).rejects.toThrow('Project task absent is not in feature-list.md; tasks.list returns the current ids')
+    await expect(f.control.call(f.scope, 'router.dispatch', { tasks: [{ ...worker, projectTaskIds: ['other'] }] })).rejects.toThrow('Project task other is claimed by coworker; drop it from projectTaskIds, or send_message that agent')
+    await expect(f.control.call(f.scope, 'router.dispatch', { tasks: [{ ...worker, projectTaskIds: ['done'] }] })).rejects.toThrow('Project task done is already done; drop it from projectTaskIds')
     await expect(f.control.call(f.scope, 'router.dispatch', { tasks: [{ ...worker, projectTaskIds: ['mine'] }, { ...worker, projectTaskIds: ['mine'] }] })).rejects.toThrow('distinct')
     expect(f.control.tabs(f.scope)).toHaveLength(1)
     expect(f.submissions).toHaveLength(0)
@@ -2541,7 +2543,8 @@ describe('agents.finish', () => {
     f.sessions.ensure({ ...f.spec, id: 'owners-own', title: 'Owner tab' })
     openAgentTab(f, 'owners-own', 'owners-own-tab')
     await expect(f.control.call(f.scope, 'agents.finish', { agentSessionId: 'owners-own' })).rejects.toThrow(/Finish only a coworker this agent controls/)
-    await expect(f.control.call(f.scope, 'agents.finish', { agentSessionId: 'owners-own', force: true })).rejects.toThrow(/accepts only agentSessionId/)
+    await expect(f.control.call(f.scope, 'agents.finish', { agentSessionId: 'owners-own', bogus: true })).rejects.toThrow(/accepts only agentSessionId, waitSeconds, force/)
+    await expect(f.control.call(f.scope, 'agents.finish', { agentSessionId: 'owners-own', force: true })).rejects.toThrow(/force applies only to agents.finish\(\{\}\) on your own tab/)
     expect(closes(f)).toHaveLength(0)
   })
 
@@ -2554,6 +2557,34 @@ describe('agents.finish', () => {
     await new Promise(resolve => setTimeout(resolve, 2_300))
     expect(closes(f)).toHaveLength(0)
     settle(f, child.resourceId!, 'completed')
+    await vi.waitFor(() => expect(closes(f)).toHaveLength(1), { timeout: 5_000 })
+    expect(released).toEqual([child.resourceId])
+  })
+
+  it('waits with waitSeconds for a coworker to settle, then finishes it; refuses naming the blocker when it does not', async () => {
+    const f = fixture(); closer(f)
+    const child = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab
+    settle(f, child.resourceId!, 'running')
+    const finishing = f.control.call(f.scope, 'agents.finish', { agentSessionId: child.resourceId, waitSeconds: 5 })
+    await new Promise(resolve => setTimeout(resolve, 400))
+    expect(closes(f)).toHaveLength(0)
+    settle(f, child.resourceId!, 'completed')
+    expect(await finishing).toMatchObject({ finished: true, agentSessionId: child.resourceId })
+    expect(closes(f)).toHaveLength(1)
+    const stuck = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab
+    settle(f, stuck.resourceId!, 'running')
+    await expect(f.control.call(f.scope, 'agents.finish', { agentSessionId: stuck.resourceId, waitSeconds: 0.5 })).rejects.toThrow(/its turn is still running after 1 s of waiting\. Retry with agents.finish\(\{agentSessionId:"[^"]+",waitSeconds:60\}\).*or agents.interrupt it first/)
+    await expect(f.control.call(f.scope, 'agents.finish', { agentSessionId: stuck.resourceId, waitSeconds: 'soon' })).rejects.toThrow(/waitSeconds must be a number of seconds from 0 to 150/)
+  })
+
+  it('lets a coworker with background tasks finish itself with force:true, and says how otherwise', async () => {
+    const f = fixture(), released = closer(f)
+    const child = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab
+    const self = { ...f.scope, agentSessionId: child.resourceId! }
+    settle(f, child.resourceId!, 'running', { backgroundTasks: 1 })
+    await expect(f.control.call(self, 'agents.finish', {})).rejects.toThrow(/1 background task still running, and they wake this conversation when they end\. Call agents.finish\(\{force:true\}\)/)
+    expect(await f.control.call(self, 'agents.finish', { force: true })).toMatchObject({ finished: false })
+    settle(f, child.resourceId!, 'completed', { backgroundTasks: 1 })
     await vi.waitFor(() => expect(closes(f)).toHaveLength(1), { timeout: 5_000 })
     expect(released).toEqual([child.resourceId])
   })
@@ -2803,5 +2834,101 @@ describe('harness gaps H05, H08, H09, H11: arguments, aliases and reports', () =
     expect(raw.map(event => event.sequence)).toEqual([...raw.map(event => event.sequence)].sort((a, b) => a - b))
     await expect(f.control.call(f.scope, 'agents.history', { agentSessionId: id, limit: 0 })).rejects.toThrow('agents.history: limit must be a whole number from 1 to 100')
     await expect(f.control.call(f.scope, 'agents.history', { agentSessionId: id, before: 5, afterSequence: 1 })).rejects.toThrow(/not both/)
+  })
+})
+
+describe('H15 error texts and agents.interrupt expedite', () => {
+  const dropTab = (f: ReturnType<typeof fixture>, tabId: string) => {
+    const current = f.database.getSession(f.workspace.id)!
+    if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+    current.layout.root.tabs = current.layout.root.tabs.filter(tab => tab.id !== tabId)
+    f.database.saveSession(f.workspace.id, current.layout, null, [])
+  }
+  const phase = (f: ReturnType<typeof fixture>, id: string, value: SessionProjection['phase']) =>
+    f.database.structured.append({ schemaVersion: 1, id: 'h15-' + value + '-' + Math.random(), sequence: f.database.structured.snapshot(id)!.sequence + 1, sessionId: id, runtimeId: 'h15-runtime', provider: 'codex', projectId: f.project.id, workspaceId: f.workspace.id, cwd: f.project.path, timestamp: new Date().toISOString(), data: { type: 'session', phase: value } as AgentEventData })
+
+  it('tells a conversation whose tab closed mid-turn where its work goes, and still lets it report to its controller', async () => {
+    const f = fixture()
+    const child = await f.control.call(f.scope, 'tabs.open', { title: 'Closed worker' }) as AgentControlTab
+    const childScope = { ...f.scope, agentSessionId: child.resourceId! }
+    dropTab(f, child.id)
+    await expect(f.control.call(childScope, 'git.ship', { message: 'Stranded' })).rejects.toThrow(/tab was closed while its turn was running.*End this turn with your result as your final message: the paths you changed, the commit message you meant to ship/)
+    await expect(f.control.call(childScope, 'agents.list', {})).rejects.toThrow(/final message/)
+    expect(() => f.control.authorize(childScope, 'agents.report')).not.toThrow()
+    const before = f.submissions.length
+    expect(await f.control.call(childScope, 'agents.report', { text: 'Changed a.ts; meant to ship "Fix a"; tests pass.' })).toMatchObject({ agentSessionId: f.scope.agentSessionId })
+    await vi.waitFor(() => expect(f.submissions.length).toBe(before + 1))
+    // Without a controller nothing is let through.
+    const loner = agentIn(f, f.project.id, f.workspace.id, 'loner')
+    dropTab(f, 'tab-loner')
+    await expect(f.control.call(loner, 'agents.report', { text: 'Anyone?' })).rejects.toThrow(/tab was closed while its turn was running/)
+  })
+
+  it('echoes an unknown method with the likeliest one, its family and the build', async () => {
+    const f = fixture()
+    await expect(f.control.call(f.scope, 'agents.message', { agentSessionId: 'x', prompt: 'hi' })).rejects.toThrow('Unknown control method "agents.message" in this build. Did you mean agents.steer? tools.list({prefix:"agents."}) lists that family; if the method is newer than this build, app.update installs the checkout\'s build.')
+    await expect(f.control.call(f.scope, 'git.push', {})).rejects.toThrow(/Did you mean git.ship\?/)
+    await expect(f.control.call(f.scope, 'local.serverz', {})).rejects.toThrow(/Did you mean local.servers\?/)
+    await expect(f.control.call(f.scope, 'zzzz', {})).rejects.toThrow(/Unknown control method "zzzz" in this build\. tools.list\(\{brief:true\}\) names every method/)
+    const versioned = new AgentControl({ ...f.deps, host: { version: '9.9.9', pid: 1, relaunch: async () => {} } })
+    await expect(versioned.call(f.scope, 'loops.explode', {})).rejects.toThrow(/in build 9\.9\.9\. Did you mean loops\.propose\?|in build 9\.9\.9\. .*tools.list\(\{prefix:"loops\."\}\)/)
+  })
+
+  it('names the refused method and the way out of read-only or planning', async () => {
+    const f = fixture()
+    const state = f.database.structured.snapshot(f.spec.id)!
+    f.database.structured.update(f.spec.id, { settings: { ...state.settings, permission: 'read-only' } })
+    await expect(f.control.call(f.scope, 'git.ship', { message: 'Read only' })).rejects.toThrow('This conversation is read-only or planning, so git.ship was refused. The owner can switch this tab out of plan/read-only in its composer; otherwise hand the change to a writable coworker (tabs.open) or report what should be done (agents.report).')
+  })
+
+  it('names the agent that owns a task, and a missing task id', async () => {
+    const f = fixture()
+    writeFileSync(join(f.root, 'project', 'feature-list.md'), '- [~] Other <!-- conductor-task:other agent=coworker -->\n- [ ] Free <!-- conductor-task:free -->\n')
+    openAgentTab(f, 'coworker', 'coworker-tab')
+    const board = await f.control.call(f.scope, 'tasks.list', {}) as { revision: string }
+    await expect(f.control.call(f.scope, 'tasks.update', { revision: board.revision, id: 'other', status: 'done' })).rejects.toThrow(/Another agent owns this task: coworker is working on it; send_message it, or pick another task from tasks.list/)
+    await expect(f.control.call(f.scope, 'tasks.update', { revision: board.revision, id: 'nope', status: 'done' })).rejects.toThrow('No task nope in feature-list.md; tasks.list returns the current ids and revision')
+    await expect(f.control.call(f.scope, 'tasks.update', { revision: board.revision, id: 'free', status: 'finished' })).rejects.toThrow('tasks.update: status is todo, doing or done; not "finished"')
+  })
+
+  it('names the holder, path and expiry of an edit lease', async () => {
+    const f = fixture()
+    const holder = agentIn(f, f.project.id, f.workspace.id, 'holder')
+    writeFileSync(join(f.root, 'project', 'leased.txt'), 'before')
+    f.collaboration.announcePresence({ ...holder, path: 'leased.txt', intent: 'edit', ttlSeconds: 90 })
+    await expect(f.control.call(f.scope, 'files.write', { path: 'leased.txt', content: 'after', expectedContent: 'before' })).rejects.toThrow(/"holder" \(holder\) holds an edit lease on leased.txt until .+; wait for it to expire, or coordinate with send_message/)
+  })
+
+  it('names a cross-project controller', async () => {
+    const f = fixture()
+    const other = sibling(f)
+    const handed = await f.control.call(f.scope, 'tabs.open', { projectId: other.project.id, direct: true, provider: 'codex' }) as AgentControlTab
+    const stranger = agentIn(f, f.project.id, f.workspace.id, 'stranger')
+    await expect(f.control.call(stranger, 'agents.snapshot', { agentSessionId: handed.resourceId })).rejects.toThrow(new RegExp(`Another agent controls that tab in Theme: ".*" \\(${f.scope.agentSessionId}\\); only it can read or steer that tab, so send_message it instead`))
+  })
+
+  it('agents.interrupt expedite:true sends the waiting queue straight after the stop, as Esc does', async () => {
+    const f = fixture()
+    const child = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab
+    const interrupt = vi.spyOn(f.sessions, 'interrupt')
+    phase(f, child.resourceId!, 'running')
+    expect(await f.control.call(f.scope, 'agents.interrupt', { agentSessionId: child.resourceId, expedite: true })).toMatchObject({ interrupted: true, expedited: 0 })
+    expect(interrupt).toHaveBeenLastCalledWith(child.resourceId, true)
+    phase(f, child.resourceId!, 'running')
+    await f.control.call(f.scope, 'agents.interrupt', { agentSessionId: child.resourceId })
+    expect(interrupt).toHaveBeenLastCalledWith(child.resourceId, false)
+    await expect(f.control.call(f.scope, 'agents.interrupt', { agentSessionId: child.resourceId, expedite: 'yes' })).rejects.toThrow('agents.interrupt: expedite must be true or false')
+    await expect(f.control.call(f.scope, 'agents.interrupt', { agentSessionId: child.resourceId, now: true })).rejects.toThrow(/agents.interrupt accepts only agentSessionId, expedite/)
+  })
+
+  it('suffixes the small refusals with the next step', async () => {
+    const f = fixture()
+    await expect(f.control.call(f.scope, 'tabs.open', { kind: 'editor' })).rejects.toThrow(/kind "editor" is not a tab kind; kinds are agent, terminal/)
+    await expect(f.control.call(f.scope, 'memory.remember', { gist: 'x', kind: 'wrong' })).rejects.toThrow(/memory.remember: kind is one of /)
+    const terminal = await f.control.call(f.scope, 'tabs.open', { kind: 'terminal' }) as AgentControlTab
+    await expect(f.control.call(f.scope, 'tabs.split', { tabId: terminal.id, direction: 'diagonal' })).rejects.toThrow('tabs.split: direction must be "horizontal" or "vertical"; not "diagonal"')
+    await expect(f.control.call(f.scope, 'router.dispatch', { tasks: [] })).rejects.toThrow(/tasks must hold one to four bounded tasks; split a larger batch/)
+    await expect(f.control.call(f.scope, 'app.state', { sessionId: 'elsewhere' })).rejects.toThrow(/omit sessionId: a conversation's scope is fixed/)
+    await expect(f.control.call(f.scope, 'tools.list', [] as never)).rejects.toThrow(/args must be a JSON object/)
   })
 })

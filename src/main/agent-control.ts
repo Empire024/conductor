@@ -10,7 +10,7 @@ import { relative } from 'node:path'
 import type { AgentControlLink, AgentControlScope, AgentControlTab, AgentControlUiRequest, AgentFileChange } from '../shared/agent-control'
 import { conductorUri } from '../shared/agent-control'
 import { hasSessionWork } from './close-confirmation'
-import { COWORKER_OPENED_PREFIX, type CoworkerAutoClose, type FinishTarget } from './coworker-autoclose'
+import { COWORKER_OPENED_PREFIX, FINISH_WAIT_MAX_SECONDS, type CoworkerAutoClose, type FinishTarget } from './coworker-autoclose'
 import { agentConfirmFailure } from './agent-confirm-broker'
 import type { AgentConfirmOutcome } from '../shared/agent-confirm'
 import { isMemoryKind, MEMORY_KINDS, makeId, type AgentProviderInfo, type AgentSpec, type AppUpdateState, type LayoutNode, type PaneKind, type PaneTab, type ProjectRecord } from '../shared/models'
@@ -57,7 +57,7 @@ import { callPermissions, PERMISSION_METHOD_SIGNATURES, PERMISSION_METHODS, PERM
 import { callWizardApprovals, WIZARD_APPROVAL_METHODS, WIZARD_APPROVAL_SIGNATURES, type AnswerableConversation, type WizardApprovalScope } from './wizard-approvals'
 import type { PermissionGrants } from './permission-grants/service'
 import { isControlActivityNotice, type AppControlEntry, type ControlTarget } from '../shared/control-activity'
-import { ArgumentError, modelError, pickModel, resolveModel, validateArgs } from './control-args'
+import { ArgumentError, modelError, pickModel, resolveModel, unknownMethodError, validateArgs } from './control-args'
 import { readHistory } from './agent-history'
 import type { ApprovalReviewRouting } from './approval-review-gate'
 import type { ModelKey, RegistryRecord, RouteDecision, TaskFeatures } from '../shared/model-routing'
@@ -71,6 +71,12 @@ type Args = Record<string, unknown>
 const FINISHED_LINK_PREFIX = 'agentControlFinished:'
 const FINISHED_BY_PREFIX = 'agentControlFinishedBy:'
 const restricted = (settings?: SessionSettings): boolean => settings?.permission === 'read-only' || settings?.sandbox === 'read-only' || settings?.plan === true
+/** A conversation whose tab closed mid-turn. Nothing it asks for can run, so the text says where
+ *  its finished work goes instead: stranded work was the cost of the old dead-end "The caller no
+ *  longer has an open tab". agents.report is the one exception (authorize). */
+const TAB_CLOSED = 'This conversation\'s tab was closed while its turn was running, so Conductor accepts no control calls from it (send_message and git.ship included; agents.report only while a controller is linked) and nothing was done. End this turn with your result as your final message: the paths you changed, the commit message you meant to ship and what you verified; your controller or the owner reads it with agents.history.'
+/** The one refusal for a write from a read-only or planning conversation, naming the way out. */
+const readOnly = (method: string): string => `This conversation is read-only or planning, so ${method} was refused. The owner can switch this tab out of plan/read-only in its composer; otherwise hand the change to a writable coworker (tabs.open) or report what should be done (agents.report).`
 const permissionOrder: SessionSettings['permission'][] = ['read-only', 'default', 'accept-edits', 'auto']
 /** A controlled tab inherits its controller autonomy, never more, and only what the target provider
  *  offers. `requested` names a different starting point than the controller's own permission — an
@@ -106,7 +112,7 @@ const text = (args: Args, key: string, maximum = 20000): string => {
 /** The refusal for an effort the chosen model does not take, naming the ones it does. */
 const effortError = (model: { id: string; effort?: string[] }, effort: string): string => `Effort "${effort}" is not offered for ${model.id}; choose one of: ${model.effort?.length ? model.effort.join(', ') : 'none (omit effort)'}.`
 const object = (value: unknown): Args => {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Expected an object')
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('args must be a JSON object of the method\'s arguments, e.g. {"agentSessionId":"agent_..."}; tools.list({methods:["<method>"]}) gives its signature')
   return value as Args
 }
 /** The top-level argument names out of a tools.list signature string ('({a?,b?}) — ...'), read
@@ -198,13 +204,13 @@ const toolSignatures = {
   'agents.grant': '({agentSessionId,repository?,research?}) — switch a local-model coworker’s per-conversation grants: repository (the sandbox may commit and branch, and a plain git push runs for it on the host) and research (web_search plus a larger tool-round budget). These are the conversation’s durable settings, the same toggles as its composer, so its own buttons show the change and it applies from its next turn. Only a non-local coworker may grant, only to a provider-local tab it already controls on this machine, never to itself or an ancestor; an omitted field is left alone, false revokes; returns what is now on and off',
   'agents.submit': '({agentSessionId,prompt}) — dispatch to a visible native tab with its existing permission settings; a coworker this caller dispatched whose tab closed as finished (or, for the owner or a wizard, any closed conversation of its own workspace) is reopened in the background first (reopened:true)',
   'agents.steer': '({agentSessionId,prompt}) — what the user composer does with a message: while a turn is running (or waiting on an approval or a question) it steers the message into that turn where the provider can, else queues it behind the turn; while the conversation is idle, finished, failed, disconnected or interrupted it starts a turn with it exactly as agents.submit does (one turn, same settings, same control link); while a turn is still stopping it is refused, so send it again once it has stopped. A coworker this caller dispatched that finished and closed its tab (or, for the owner or a wizard, any closed conversation of its own workspace) is reopened in the background first (reopened:true). The result says which: delivery "started" for a new turn, "queued" for a message steered into or queued behind the running one',
-  'agents.interrupt': '({agentSessionId}) — stops the running turn, including one waiting on an approval; queued messages stay held above its composer, as after the owner’s Stop. Interrupting does not take control, here or in a sibling project',
+  'agents.interrupt': '({agentSessionId,expedite?}) — stops the running turn, including one waiting on an approval; queued messages stay held above its composer, as after the owner’s Stop. expedite:true is the owner’s Esc instead: what waits in its queue (an approved retry, a steered message) is sent straight after the stop, which is how a wizard releases an approved retry by hand. Interrupting does not take control, here or in a sibling project',
   'agents.resume': '({agentSessionId}) — reopen a live orphan in this workspace without restarting its turn, or reconnect an idle/disconnected native conversation with its existing settings; outside this workspace only a coworker this caller controls. Resuming a failed, interrupted or disconnected one is a recovery: three per conversation in six hours (the owner is not counted), never while it waits on a request, never once it is superseded',
   'agents.supersede': '({agentSessionId,by,reason}) - mark a stopped coworker whose work another conversation (by) took over and delivered, so it reads as superseded rather than unfinished work and is not resumed again; reason up to 300 characters, e.g. what accepted the replacement',
   'agents.fork': '({agentSessionId,title?}) — fork supported idle native history into a visible linked tab, opened in the workspace that holds the original; outside this workspace only a coworker this caller controls',
   'agents.release': '({agentSessionId}) — release this controller relationship, wherever the coworker lives',
   'agents.report': '({text}) — deliver a report to the conversation that opened this tab (its controller, whoever that is; a controller that handed itself on is reached through its successor), as agents.steer does: steered into a running turn where the provider can, else queued or starting one. Never refused for length: the first 2000 characters (cut at a line break) are delivered with a pointer, and the whole text is kept as an artifact the controller reads with agents.artifact; the result says {delivered,total,artifactId}. Takes no agentSessionId: it always reports to the caller\'s own controller, never any other target. For a local model this is the way to reach its controller directly instead of the controller polling agents.status',
-  'agents.finish': '({agentSessionId?}) — close a finished coworker: its tab closes with history kept (reopenable from the closed tabs) and its CLI process is released. With agentSessionId, a controller finishes a coworker it controls whose turn has settled with no background tasks, at once and without an owner dialog; refused, naming the reason, while it is running, has background tasks, waits on an approval, has an unsent draft, is a wizard tab or still controls open coworkers. With {} a coworker finishes itself as its last act: Conductor closes it once this turn settles, so call it after your work is delivered and reported, then end the turn',
+  'agents.finish': '({agentSessionId?,waitSeconds?,force?}) — close a finished coworker: its tab closes with history kept (reopenable from the closed tabs) and its CLI process is released. With agentSessionId, a controller finishes a coworker it controls whose turn has settled with no background tasks, at once and without an owner dialog; waitSeconds (max ' + FINISH_WAIT_MAX_SECONDS + ') first waits that long for it to settle, so there is no agents.status loop; refused, naming the reason, while it is (still) running, has background tasks, waits on an approval, has an unsent draft, is a wizard tab or still controls open coworkers. With {} a coworker finishes itself as its last act: Conductor closes it once this turn settles, so call it after your work is delivered and reported, then end the turn; background tasks of your own are waited for with waitSeconds, or stopped with your CLI with force:true',
   'agents.handoff': `({handoff,title?,successor?,provider?,model?,effort?}) — hand your own remaining work to a fresh tab when this conversation's context has grown expensive. Takes no agentSessionId: it always hands off the caller. handoff is ${HANDOFF_MINIMUM}-${HANDOFF_MAXIMUM} characters holding the six sections of docs/token-thrift-policy.md on their own lines, in order (${handoffSections.join(', ')}); reference long output by repository path rather than pasting it. The new tab opens in this workspace with your provider, model, effort and mode, and receives the handoff as its first prompt; provider, model and effort from models.list continue you elsewhere (another provider must name its model; your mode is kept, never widened). Your tab stays open and steerable: finish the step you are in, report it, and stop. successor:true is for a main brain (a wizard tab, or a controller with live coworkers): the new tab is you continued, not your coworker. It opens as a root (under your own controller, if you have one), inherits wizard mode and limit continuation, takes over every coworker you control (their agents.report, approvals and steering go to it) and any pending restart that would bring you back (a wizard's successor must be a model that can hold the wand, else nothing opens); you lose wizard mode, are marked superseded, and your tab shows “Continued in <tab>”`,
   'files.list': '({query?,projectId?}) — indexed project search, at most 100 matches with stable URIs',
   'files.read': '({path,projectId?}) — UTF-8 text up to 1 MiB; projectId reads a sibling project from projects.list',
@@ -319,6 +325,9 @@ const jobKeys: Record<string, string[]> = {
   'jobs.cancel': ['jobId', 'reason'],
   'jobs.report': ['jobId']
 }
+/** Every method some caller of this build can reach, for the unknown-method refusal: a method
+ *  that is merely unavailable here (no job controller, not the owner) keeps its own refusal. */
+const KNOWN_METHODS = new Set<string>([...Object.keys(toolSignatures), ...Object.keys(ownerSignatures), ...Object.keys(jobSignatures), ...Object.keys(nodeSignatures), ...Object.keys(cloudSignatures), ...Object.keys(scheduleSignatures), ...Object.keys(ideaSignatures), ...Object.keys(ideaRunSignatures), ...Object.keys(modelSignatures), ...modelMethods, ...PERMISSION_METHODS, ...WIZARD_APPROVAL_METHODS])
 const strings = (value: unknown, key: string, count: number, length: number): string[] => {
   if (!Array.isArray(value) || value.length > count || value.some(item => typeof item !== 'string' || !item.trim() || item.length > length || item.includes('\0'))) throw new Error(`${key} must be a list of at most ${count} non-empty strings of up to ${length} characters`)
   return value as string[]
@@ -443,7 +452,10 @@ export class AgentControl {
     return { projectId, sessionId, agentSessionId: OWNER_AGENT_ID, owner: true }
   }
 
-  authorize(scope: AgentControlScope): AgentSpec {
+  /** The caller's own spec, or a refusal. `method` lets exactly one call through for a
+   *  conversation whose tab closed mid-turn: agents.report while a control link (live, or the one
+   *  kept when it finished) still names its controller, so its finished work is not stranded. */
+  authorize(scope: AgentControlScope, method?: string): AgentSpec {
     const { database } = this.deps
     if (scope.owner) {
       // The owner's own credential: as much authority as the window, addressed at one project
@@ -451,15 +463,27 @@ export class AgentControl {
       // caps a coworker at its controller's mode lets the owner open coworkers on Auto.
       if (!scope.projectId && !scope.sessionId) return { id: OWNER_AGENT_ID, projectId: '', sessionId: '', provider: 'claude', title: 'Owner control', cwd: '' }
       const project = database.getProject(scope.projectId), workspace = database.getSession(scope.sessionId)
-      if (!project || workspace?.projectId !== scope.projectId) throw new Error('Control scope is no longer active')
+      if (!project || workspace?.projectId !== scope.projectId) throw new Error('Control scope is no longer active: this conversation\'s project or workspace was closed or moved, so nothing was done. Put your result in your final message; the owner reopens it')
       return { id: OWNER_AGENT_ID, projectId: scope.projectId, sessionId: scope.sessionId, provider: 'claude', title: 'Owner control', cwd: project.path }
     }
     if (this.deps.sessions.isApprovalReviewer(scope.agentSessionId)) throw new Error('Approval reviewers have no app-control or delegation authority')
     const spec = database.structured.spec<AgentSpec>(scope.agentSessionId)
     const workspace = database.getSession(scope.sessionId)
-    if (!spec || spec.projectId !== scope.projectId || spec.sessionId !== scope.sessionId || workspace?.projectId !== scope.projectId || !database.listSessions(scope.projectId).some(item => item.id === scope.sessionId)) throw new Error('Control scope is no longer active')
-    if (!this.tabs(scope).some(tab => tab.resourceId === scope.agentSessionId)) throw new Error('The caller no longer has an open tab')
+    if (!spec || spec.projectId !== scope.projectId || spec.sessionId !== scope.sessionId || workspace?.projectId !== scope.projectId || !database.listSessions(scope.projectId).some(item => item.id === scope.sessionId)) throw new Error('Control scope is no longer active: this conversation\'s project or workspace was closed or moved, so nothing was done. Put your result in your final message; the owner reopens it')
+    if (!this.tabs(scope).some(tab => tab.resourceId === scope.agentSessionId) && !(method === 'agents.report' && this.reportLink(scope.agentSessionId))) throw new Error(TAB_CLOSED)
     return spec
+  }
+
+  /** Whom agents.report reaches: the live control link, else (for a tab that closed) the link its
+   *  controller kept when it finished. */
+  private reportLink(agentSessionId: string): AgentControlLink | null {
+    return this.linkFor(agentSessionId) ?? (this.tabHolding(agentSessionId) ? null : this.finishedLink(agentSessionId))
+  }
+
+  /** Whether any workspace of the conversation's project shows its tab. */
+  private tabHolding(agentSessionId: string): boolean {
+    const spec = this.deps.database.structured.spec<AgentSpec>(agentSessionId)
+    return Boolean(spec && this.tabs({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId }).some(tab => tab.resourceId === agentSessionId))
   }
 
   tabs(scope: AgentControlScope): AgentControlTab[] {
@@ -490,7 +514,7 @@ export class AgentControl {
 
   private tab(scope: AgentControlScope, id: string): AgentControlTab {
     const tab = this.tabs(scope).find(tab => tab.id === id)
-    if (!tab) throw new Error('Tab is outside this workspace or closed')
+    if (!tab) throw new Error('Tab is outside this workspace or closed; tabs.list shows this workspace\'s tabs, agents.list every agent tab you may name')
     return tab
   }
 
@@ -503,7 +527,7 @@ export class AgentControl {
     const own = this.tabs(scope).find(tab => tab.id === id)
     const found = own ? { tab: own, scope } : this.reachableElsewhere(scope).find(entry => entry.yours && entry.tab.id === id)
     if (!found) throw new Error('Tab is outside this workspace or closed; outside it, name an agent tab this agent controls (agents.list controlled:true)')
-    if (args.projectId !== undefined && args.projectId !== found.scope.projectId || args.workspaceId !== undefined && args.workspaceId !== found.scope.sessionId) throw new Error('That tab is not open in the requested project or workspace')
+    if (args.projectId !== undefined && args.projectId !== found.scope.projectId || args.workspaceId !== undefined && args.workspaceId !== found.scope.sessionId) throw new Error(`That tab is not open in the requested project or workspace; it is in project ${found.scope.projectId}, workspace ${found.scope.sessionId}: pass those, or omit projectId/workspaceId`)
     return { tab: found.tab, scope: found.scope }
   }
 
@@ -545,6 +569,12 @@ export class AgentControl {
     }
   }
 
+  /** "<title>" (<id>) of another conversation, for a refusal that names the other party. */
+  private agentLabel(agentSessionId: string): string {
+    const title = this.deps.database.structured.snapshot(agentSessionId)?.title || this.deps.database.structured.spec<AgentSpec>(agentSessionId)?.title
+    return title ? `"${title}" (${agentSessionId})` : agentSessionId
+  }
+
   /** Where a message to this conversation belongs now: a controller that handed itself on
    *  (agents.handoff successor:true, or agents.supersede) keeps its tab open and still answers,
    *  but its work, and the reports about it, are its successor's. Followed to the newest open one. */
@@ -563,7 +593,7 @@ export class AgentControl {
    *  A superseded addressee's successor receives it instead (forwardedFrom names the old one). */
   private async reportTo(scope: AgentControlScope, addressee: string, body: string): Promise<unknown> {
     const { database, sessions } = this.deps
-    if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+    if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly('send_message (agents.steer) to your controller'))
     const toAgentSessionId = this.successorOf(database.structured.spec<AgentSpec>(addressee)?.projectId ?? scope.projectId, addressee)
     const state = database.structured.snapshot(toAgentSessionId)
     if (!state) throw new Error('That controlling conversation is no longer open')
@@ -664,7 +694,7 @@ export class AgentControl {
     if (spec.projectId !== scope.projectId && this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)?.state?.remotePeerId) throw new Error('This conversation is driven by a paired machine and stays inside the project shared with it')
     if (sideways && !reach) throw link ? missing : new Error('That tab is outside this workspace and this agent does not control it. agents.submit or agents.steer takes control of an uncontrolled tab in a sibling project; after that it answers every agents.* and tabs.* method')
     if (sideways) {
-      if (link) throw new Error(`Another agent controls that tab in ${this.deps.database.getProject(spec.projectId)?.name ?? 'the other project'}; only its controller can read or steer it`)
+      if (link) throw new Error(`Another agent controls that tab in ${this.deps.database.getProject(spec.projectId)?.name ?? 'the other project'}: ${this.agentLabel(link.controllerAgentSessionId)}; only it can read or steer that tab, so send_message it instead`)
       if (reach === 'steer' && this.deps.database.structured.spec<AgentSpec>(scope.agentSessionId)?.provider === 'local') throw new Error('A sandboxed local conversation cannot steer a tab in another project; a non-local coworker or the owner can')
     }
     const target = elsewhere ? { projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: scope.agentSessionId } : scope
@@ -688,7 +718,7 @@ export class AgentControl {
       }
       if (ancestors.has(id)) throw new Error('An agent cannot control itself or an ancestor; use send_message or report to reach it')
       // The owner drives any tab in the window, a coworker's included, exactly as from the UI.
-      if (link && link.controllerAgentSessionId !== scope.agentSessionId && !sovereign(scope)) throw new Error('Another agent already controls this tab; its controller must release it first')
+      if (link && link.controllerAgentSessionId !== scope.agentSessionId && !sovereign(scope)) throw new Error(`Another agent already controls this tab: "${tab.title}" is controlled by ${this.agentLabel(link.controllerAgentSessionId)}; send_message that controller, or ask it to agents.release the tab`)
     }
     return { tab, scope: target }
   }
@@ -697,7 +727,7 @@ export class AgentControl {
    * altered after this caller went away. Only a relationship the caller already owns qualifies. */
   private configuredTarget(scope: AgentControlScope, id: string): { tab: AgentControlTab; scope: AgentControlScope } {
     const target = this.target(scope, id, true)
-    if (this.linkFor(id)?.controllerAgentSessionId !== scope.agentSessionId) throw new Error('Configure only a coworker this agent already controls')
+    if (this.linkFor(id)?.controllerAgentSessionId !== scope.agentSessionId) throw new Error('Configure only a coworker this agent already controls; agents.list marks yours controlled:true. To work on another model, open a new coworker with tabs.open({provider,model,effort})')
     const spec = this.deps.database.structured.spec<AgentSpec>(id)
     // The durable spec is the execution owner. Old layouts may predate the machine badge, so
     // accepting a missing/local-looking tab stamp would turn a remote configuration into a local
@@ -708,11 +738,11 @@ export class AgentControl {
 
   private configurableSettings(id: string, provider: StructuredProvider, args: Args): { previous: SessionSettings; next: SessionSettings; model: string; effort?: string; resolvedFrom?: string } {
     const state = this.deps.database.structured.snapshot(id)
-    if (!state) throw new Error('Agent session is no longer available')
+    if (!state) throw new Error('Agent session is no longer available; agents.list shows what is, and agents.resume reopens one listed as orphaned')
     if (['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'].includes(state.phase) || state.queued || state.queuedPrompts?.length || state.pendingSteering?.length) {
-      throw new Error('Wait until the coworker is idle and has no queued or pending input before changing its model and effort')
+      throw new Error('Wait until the coworker is idle and has no queued or pending input before changing its model and effort: poll agents.status({agentSessionId}) until its phase is idle or completed with nothing queued, then retry agents.configure')
     }
-    if (state.capabilities?.provider !== provider) throw new Error('The visible tab provider does not match the native conversation')
+    if (state.capabilities?.provider !== provider) throw new Error('The visible tab provider does not match the native conversation; close it (tabs.close) and open a new coworker with tabs.open')
     const requested = text(args, 'model', 160)
     const resolved = resolveModel(state.capabilities.models, requested)
     if (!resolved) throw new ArgumentError(modelError([{ provider, available: true, models: state.capabilities.models }], provider, requested) + ' agents.configure never changes the provider.')
@@ -721,7 +751,7 @@ export class AgentControl {
     if (choice.effort?.length) {
       effort = text(args, 'effort', 40)
       if (!choice.effort.includes(effort)) throw new ArgumentError(effortError(choice, effort))
-    } else if (args.effort !== undefined) throw new Error('This model does not accept an effort setting')
+    } else if (args.effort !== undefined) throw new ArgumentError(`${choice.id} takes no effort setting; omit effort`)
     return { previous: structuredClone(state.settings), next: { ...state.settings, model, effort }, model, effort, ...(resolved.resolvedFrom ? { resolvedFrom: resolved.resolvedFrom } : {}) }
   }
 
@@ -748,7 +778,7 @@ export class AgentControl {
    */
   private grantAuthority(scope: AgentControlScope, source: AgentSpec): void {
     if (source.provider === 'local') throw new Error('A sandboxed local conversation cannot grant repository writes or research, to itself or to any other conversation. A non-local coworker grants them with agents.grant, or the owner toggles them in that tab’s composer.')
-    if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+    if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly('a repository or research grant'))
     if (this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)?.state?.remotePeerId) throw new Error('This conversation is driven by a paired machine and cannot widen a local model')
   }
 
@@ -768,7 +798,7 @@ export class AgentControl {
     this.grantAuthority(scope, source)
     const { tab, scope: target } = this.configuredTarget(scope, id)
     if (tab.state?.remotePeerId) throw new Error('That conversation is driven by a paired machine; its grants belong to that machine')
-    if (this.deps.database.structured.spec<AgentSpec>(id)?.provider !== 'local' || tab.state?.provider !== 'local') throw new Error('Repository and research grants apply to local models only')
+    if (this.deps.database.structured.spec<AgentSpec>(id)?.provider !== 'local' || tab.state?.provider !== 'local') throw new Error('Repository and research grants apply to local models only; a native coworker already runs with its provider\'s own permissions, so omit repository/research')
     const requested = this.grantArguments(args)
     const changing = Object.keys(requested).length > 0
     if (changing) this.deps.sessions.saveSettings(id, { ...this.deps.database.structured.snapshot(id)!.settings, ...requested })
@@ -1004,7 +1034,7 @@ export class AgentControl {
     const spec = database.structured.spec<AgentSpec>(id)!, state = database.structured.snapshot(id)
     if (this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)?.state?.remotePeerId) throw new Error('This conversation is driven by a paired machine and stays inside the project shared with it')
     const tab = this.tabs({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: scope.agentSessionId }).find(candidate => candidate.kind === 'agent' && candidate.resourceId === id)
-    if (!tab || !state) throw new Error('That conversation has no open tab in its project any more')
+    if (!tab || !state) throw new Error('That conversation has no open tab in its project any more; send to the project instead with send_message({projectId,text}), and its wizard gets it')
     if (tab.state?.remotePeerId) throw new Error('That conversation is driven by a paired machine; only that machine steers it')
     const wizard = this.wizardsOf(spec.projectId).find(candidate => candidate.agentSessionId === id)
     if (wizard) return { ...await this.deliverToWizard(scope, wizard, prompt), agentSessionId: id, projectId: spec.projectId, workspaceId: spec.sessionId }
@@ -1116,7 +1146,7 @@ export class AgentControl {
   private async open(scope: AgentControlScope, args: Args, approvalReviewer = false, root = false): Promise<AgentControlTab & { projectId: string; workspaceId: string; grants?: { repository: boolean; research: boolean }; modelResolvedFrom?: string }> {
     const kind = (args.kind ?? 'agent') as PaneKind
     const allowed: PaneKind[] = ['agent', 'terminal', 'file-tree', 'browser', 'tasks', 'memory', 'routine', 'logs', 'job']
-    if (!allowed.includes(kind)) throw new Error('Unsupported tab kind; use files.open for editors')
+    if (!allowed.includes(kind)) throw new ArgumentError(`kind ${JSON.stringify(kind)} is not a tab kind; kinds are ${allowed.join(', ')}. Open an editor with files.open`)
     if (kind === 'job') return this.openJobTab(scope, args)
     if (kind === 'agent' && args.provider === 'cloud') return this.cloud(scope, this.authorize(scope), 'cloud.start', cloudStart(args)) as never
     // Where the tab is going. Only the caller's own scope is ever authorized; the target only
@@ -1136,7 +1166,7 @@ export class AgentControl {
       if (resolvedFrom) modelResolvedFrom = resolvedFrom
       const effort = args.effort === undefined ? model.defaultEffort : text(args, 'effort', 40)
       if (effort && !model.effort?.includes(effort)) throw new ArgumentError(effortError(model, effort))
-      if (args.permission !== undefined && !isSessionPermission(args.permission)) throw new Error('Invalid permission mode')
+      if (args.permission !== undefined && !isSessionPermission(args.permission)) throw new ArgumentError(`permission must be one of read-only, default, accept-edits, auto (models.list says which each provider offers); not ${JSON.stringify(args.permission)}`)
       if (args.exactPermission !== undefined && typeof args.exactPermission !== 'boolean') throw new Error('exactPermission must be true or false')
       const explicitPermission = args.permission as SessionSettings['permission'] | undefined
       // Grants are checked before the session exists, so a refused ask leaves no orphaned
@@ -1144,7 +1174,7 @@ export class AgentControl {
       const requestedGrants = this.grantArguments(args)
       if (Object.keys(requestedGrants).length) {
         this.grantAuthority(scope, source)
-        if (provider !== 'local') throw new Error('Repository and research grants apply to local models only')
+        if (provider !== 'local') throw new Error('Repository and research grants apply to local models only; a native coworker already runs with its provider\'s own permissions, so omit repository/research')
       }
       // A contract narrows what the worker may do rather than widening it, so any caller that may
       // open a tab may set one; it only means something to the local runtime.
@@ -1172,12 +1202,12 @@ export class AgentControl {
       // A coworker of the owner or of a wizard waits out usage limits and continues, like the wizard itself.
       const spec: AgentSpec = { id: tab.resourceId, projectId: target.projectId, sessionId: target.sessionId, provider, model: model.id, title: tab.title, cwd, ...(sovereign(scope) ? { continueOnLimit: true } : {}), ...(anonymous ? { anonymous: true } : {}) }
       const result = this.deps.sessions.ensure(spec)
-      if (!result.available) throw new Error(result.message || 'Provider unavailable')
+      if (!result.available) throw new Error(result.message || `Provider "${provider}" is unavailable here now; models.list shows which providers are`)
       const created = this.deps.database.structured.snapshot(spec.id)!
       // Claude and Grok have no read-only permission; their read-only is plan mode, where the model
       // reads and searches but changes nothing and asks for nothing a stronger-model review answers.
       const planReadOnly = explicitPermission === 'read-only' && (provider === 'claude' || provider === 'grok') && !created.capabilities?.permissions?.includes('read-only')
-      if (explicitPermission && !planReadOnly && !created.capabilities?.permissions?.includes(explicitPermission)) throw new Error('Choose a permission mode supported by this provider')
+      if (explicitPermission && !planReadOnly && !created.capabilities?.permissions?.includes(explicitPermission)) throw new ArgumentError(`${provider} does not offer permission "${explicitPermission}"; it offers ${created.capabilities?.permissions?.join(', ') || 'none'}`)
       const sourceSettings: SessionSettings = sovereign(scope) ? { permission: 'auto', plan: false } : settingsForRuntime(this.deps.database.structured.snapshot(scope.agentSessionId)!.settings)
       // A native coworker opens on Auto (see dispatchPermission). Only with exactPermission does
       // an explicit ask, else the owner's remembered mode for this provider (permission-memory.ts
@@ -1241,7 +1271,7 @@ export class AgentControl {
   private async openLocalCoworker(scope: AgentControlScope, args: Args): Promise<unknown> {
     const { database, sessions } = this.deps
     const own = database.structured.snapshot(scope.agentSessionId)
-    if (!own) throw new Error('The caller no longer has an open tab')
+    if (!own) throw new Error(TAB_CLOSED)
     const parent = this.linkFor(scope.agentSessionId)
     const coworkers = this.tabs(scope).filter(tab => tab.kind === 'agent' && tab.resourceId && tab.state?.provider === 'local' && this.linkFor(tab.resourceId)?.controllerAgentSessionId === scope.agentSessionId)
     const plan = planLocalCoworker({
@@ -1305,7 +1335,7 @@ export class AgentControl {
     // The identity that has to match is the project the tab is for, not the caller's own.
     const placement = machineRunsProject(machine, target.projectId)
     if (!placement.ok) throw new Error(placement.message)
-    if (!this.deps.openRemote) throw new Error('Remote machine placement is unavailable in this window')
+    if (!this.deps.openRemote) throw new Error('Remote machine placement is unavailable in this window; omit machineId to open the tab on this machine')
     if (args.kind !== undefined && args.kind !== 'agent') throw new Error('Only agent tabs can be opened on another machine')
     // The grants are settings of the conversation where it runs; silently dropping them here
     // would hand that machine a job the tab cannot finish.
@@ -1321,6 +1351,8 @@ export class AgentControl {
     return { machineId, machineName: created.machineName, remote: true, tabId: created.tabId, agentSessionId: created.agentSessionId, projectId: target.projectId, workspaceId: target.sessionId,
       note: `This tab runs on ${created.machineName}. Steer it with agents.* through that machine; it is not a local tab.` }
   }
+
+  private unknownMethod(method: string): string { return unknownMethodError(method, KNOWN_METHODS, this.deps.host?.version) }
 
   /** Every control call. An argument refusal is named after the method it came from
    *  (`agents.report: text is required`), so the caller knows which call to fix. */
@@ -1351,14 +1383,15 @@ export class AgentControl {
   }
 
   private async invoke(scope: AgentControlScope, method: string, rawArgs: unknown): Promise<unknown> {
-    const source = this.authorize(scope), { database, sessions, backlogs, orchestration } = this.deps
+    const source = this.authorize(scope, method), { database, sessions, backlogs, orchestration } = this.deps
+    if (!KNOWN_METHODS.has(method)) throw new Error(this.unknownMethod(method))
     const args = AGENT_TARGET_METHODS.has(method) ? this.agentTarget(scope, method, object(rawArgs)) : object(rawArgs)
     if (process.env.CONDUCTOR_LIVE_TESTS === '1') throw new Error('App control is disabled during isolated live acceptance tests')
     // A wizard conversation (the wand toggle on a frontier model, not read-only or planning)
     // carries the owner's authority in its own tab: decided here from its durable settings on
     // every call, never from anything the caller sends.
     if (!scope.owner && wizardActive(database.structured.snapshot(scope.agentSessionId)?.settings, source.provider)) scope = { ...scope, wizard: true }
-    if (args.sessionId !== undefined && args.sessionId !== scope.sessionId) throw new Error('Requested scope differs from the authorized session')
+    if (args.sessionId !== undefined && args.sessionId !== scope.sessionId) throw new Error('Requested scope differs from the authorized session; omit sessionId: a conversation\'s scope is fixed, and the methods that reach another project take projectId (and workspaceId)')
     // A message to another project (its wizard), or one between a wizard and a conversation that
     // handed it work, is delivered without taking control (handIn, messagesAcross).
     if ((method === 'agents.steer' || method === 'agents.submit') && source.provider !== 'local') {
@@ -1420,7 +1453,7 @@ export class AgentControl {
       const { tab, scope: target } = this.tabTarget(scope, args)
       if (method !== 'tabs.focus' && tab.kind === 'agent') this.target(scope, tab.resourceId!, true)
       if (method === 'tabs.rename') text(args, 'title', 120)
-      if (method === 'tabs.split' && !['horizontal', 'vertical'].includes(String(args.direction))) throw new Error('Invalid split direction')
+      if (method === 'tabs.split' && !['horizontal', 'vertical'].includes(String(args.direction))) throw new ArgumentError(`direction must be "horizontal" or "vertical"; not ${JSON.stringify(args.direction)}`)
       const closingState = method === 'tabs.close' && tab.kind === 'agent' ? database.structured.snapshot(tab.resourceId!) : undefined
       const where = target.projectId === scope.projectId ? '' : ` in ${database.getProject(target.projectId)?.name ?? 'another project'}`
       if (method === 'tabs.close' && (!closingState || hasSessionWork(closingState))) await this.ask(scope, `${source.title} wants to close the tab “${tab.title}”${where}.`, 'close this tab')
@@ -1477,19 +1510,19 @@ export class AgentControl {
     if (method === 'agents.report') {
       // Takes no addressee, but one naming the caller's own controller is harmless and accepted.
       const reportArgs = validateArgs(method, args, ['text'], { aliases: { message: 'text', report: 'text', summary: 'text', content: 'text' }, ignore: ['agentSessionId'], hint: 'agents.report always goes to your own controller; put everything in text.' })
-      if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+      if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly(method))
       const reportText = text(reportArgs, 'text', Number.MAX_SAFE_INTEGER)
       // The only reachable target is whoever opened this tab (AgentControl.linkFor), never a
       // caller-named agentSessionId: a coworker reports to its controller, not to anyone it picks.
       // A controller that handed itself on is reached through its successor.
-      const link = this.linkFor(scope.agentSessionId)
+      const link = this.reportLink(scope.agentSessionId)
       const controllerId = link ? this.successorOf(link.controllerProjectId ?? link.projectId, link.controllerAgentSessionId) : undefined
       const controllerState = controllerId ? database.structured.snapshot(controllerId) : null
-      if (!link || !controllerId || !controllerState) throw new Error('No controlling conversation is open for this tab')
+      if (!link || !controllerId || !controllerState) throw new Error('No controlling conversation is open for this tab: nobody opened it, or its controller closed. Put your result in your final message; the owner reads it here')
       if (reportArgs.agentSessionId !== undefined && reportArgs.agentSessionId !== link.controllerAgentSessionId && reportArgs.agentSessionId !== controllerId) throw new ArgumentError(`agents.report takes no agentSessionId: it always goes to your controller (${controllerId}). To message another tab use send_message (agents.steer)`)
       if (anonymousConversations.has(scope.agentSessionId) && !anonymousConversations.has(controllerId)) throw new Error('This conversation is anonymous and its controller keeps a history, so nothing of it may be reported there; the owner reads it in its tab')
       const reporter = this.tabs(scope).find(candidate => candidate.resourceId === scope.agentSessionId)
-      const origin: PromptOrigin = { agentSessionId: scope.agentSessionId, label: reporter?.title || 'Local coworker' }
+      const origin: PromptOrigin = { agentSessionId: scope.agentSessionId, label: reporter?.title || source.title || 'Local coworker' }
       const { body, ...length } = this.reportBody(scope.agentSessionId, reportText)
       const delivery = await sessions.steerOrStart(controllerId, body, controllerState.settings, [], origin)
       return { agentSessionId: controllerId, delivery, ...length, ...(controllerId !== link.controllerAgentSessionId ? { forwardedFrom: link.controllerAgentSessionId } : {}) }
@@ -1532,9 +1565,9 @@ export class AgentControl {
       if (method === 'agents.configure') {
         validateArgs(method, args, ['agentSessionId', 'model', 'effort'], { hint: 'Provider and permissions never change.' })
         const spec = database.structured.spec<AgentSpec>(id)
-        if (!spec || !['codex', 'claude', 'grok', 'local'].includes(spec.provider)) throw new Error('This native provider does not support structured model configuration')
+        if (!spec || !['codex', 'claude', 'grok', 'local'].includes(spec.provider)) throw new Error('This native provider does not support structured model configuration; open a new coworker on the model you want with tabs.open')
         const provider = spec.provider as StructuredProvider
-        if (provider !== tab.state?.provider) throw new Error('The visible tab provider does not match the native conversation')
+        if (provider !== tab.state?.provider) throw new Error('The visible tab provider does not match the native conversation; close it (tabs.close) and open a new coworker with tabs.open')
         const configured = this.configuredTarget(scope, id)
         const desired = this.configurableSettings(id, provider, args)
         const visibleBefore = { provider, model: String(configured.tab.state?.model ?? desired.previous.model ?? ''), ...(configured.tab.state?.effort === undefined ? {} : { effort: String(configured.tab.state.effort) }) }
@@ -1542,9 +1575,9 @@ export class AgentControl {
         try {
           this.authorize(scope)
           const current = this.configuredTarget(scope, id)
-          if (current.tab.id !== configured.tab.id) throw new Error('The controlled tab changed while its settings were being applied')
+          if (current.tab.id !== configured.tab.id) throw new Error('The controlled tab changed while its settings were being applied; read agents.status and retry agents.configure once')
           const fresh = this.configurableSettings(id, provider, args)
-          if (JSON.stringify(fresh.previous) !== JSON.stringify(desired.previous)) throw new Error('The coworker settings changed while its model and effort were being applied')
+          if (JSON.stringify(fresh.previous) !== JSON.stringify(desired.previous)) throw new Error('The coworker settings changed while its model and effort were being applied; read agents.status and retry agents.configure once')
           sessions.saveSettings(id, desired.next)
         } catch (error) {
           // Compensation is compare-and-set too. A relationship release can race this renderer
@@ -1584,7 +1617,15 @@ export class AgentControl {
         return { ...opened, projectId: target.projectId, workspaceId: target.sessionId }
       }
       if (method === 'agents.release') { this.relationship(scope, target, tab, 'detached'); return { released: true } }
-      if (method === 'agents.interrupt') { await sessions.interrupt(id); return { interrupted: true } }
+      if (method === 'agents.interrupt') {
+        const { expedite } = validateArgs(method, args, ['agentSessionId', 'expedite'], { aliases: { expediteSubmittedInput: 'expedite' }, ignore: ['projectId', 'workspaceId'] })
+        if (expedite !== undefined && typeof expedite !== 'boolean') throw new ArgumentError('expedite must be true or false')
+        // expedite is the owner's Esc: what waits in the queue (an approved retry, a steered
+        // message) is sent straight after the stop instead of being held above the composer.
+        const queued = (state.queuedPrompts?.length ?? 0) + (state.pendingSteering?.filter(input => input.status === 'sending' || input.status === 'accepted').length ?? 0)
+        await sessions.interrupt(id, expedite === true)
+        return { interrupted: true, ...(expedite === true ? { expedited: queued } : queued ? { held: queued, note: 'Its queued messages stay held above its composer; agents.interrupt with expedite:true would have sent them straight after the stop' } : {}) }
+      }
       if (method === 'agents.submit' || method === 'agents.steer') {
         const prompt = text(args, 'prompt', MAX_PROMPT_CHARS)
         if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings) && !restricted(state.settings)) throw new Error('A read-only controller cannot dispatch to a writable conversation')
@@ -1626,31 +1667,34 @@ export class AgentControl {
       // Same guard the editor uses: an agent asking for a binary file gets a
       // clear refusal rather than a megabyte of mojibake it will act on.
       if (method === 'files.read') return { path: relativePath, projectId: target.projectId, content: readTextFile(path), uri: conductorUri(target.projectId, 'file', relativePath) }
-      if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+      if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly(method))
       if (typeof args.content !== 'string' || Buffer.byteLength(args.content) > 1024 * 1024 || !(args.expectedContent === null || typeof args.expectedContent === 'string' && Buffer.byteLength(args.expectedContent) <= 1024 * 1024)) throw new Error('Provide content and the exact expectedContent (null for a new file), up to 1 MiB')
       const lease = this.deps.collaboration.announcePresence({ ...scope, path: relativePath, intent: args.expectedContent === null ? 'create' : 'edit', ttlSeconds: 90 })
-      if (!lease.granted) throw new Error('Another agent holds an active edit lease for this file')
+      if (!lease.granted) {
+        const holder = lease.conflicts.find(conflict => conflict.severity === 'blocking')?.presence
+        throw new Error(holder ? `${this.agentLabel(holder.agentSessionId)} holds an edit lease on ${relativePath} until ${holder.expiresAt}; wait for it to expire, or coordinate with send_message` : `Another agent holds an active edit lease on ${relativePath}; wait a minute and retry, or coordinate with send_message`)
+      }
       const saved = writeEditorFile(path, args.content, args.expectedContent)
       if (saved.status === 'saved') { invalidateProjectFiles(source.cwd); this.deps.fileChanged({ ...scope, path: relativePath }) }
       return saved
     }
     if (method === 'tasks.list') return backlogs.get(this.sibling(scope, args).projectId)
     if (method === 'tasks.update') {
-      if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+      if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly(method))
       const board = await backlogs.get(scope.projectId), id = text(args, 'id', 160), task = board.tasks.find(task => task.id === id)
-      if (!task) throw new Error('Task not found')
-      if (task.agentId && task.agentId !== scope.agentSessionId && task.status === 'doing' && this.claimHolderIsOpen(scope.projectId, task.agentId)) throw new Error('Another agent owns this task')
+      if (!task) throw new Error(`No task ${id} in feature-list.md; tasks.list returns the current ids and revision`)
+      if (task.agentId && task.agentId !== scope.agentSessionId && task.status === 'doing' && this.claimHolderIsOpen(scope.projectId, task.agentId)) throw new Error(`Another agent owns this task: ${this.agentLabel(task.agentId)} is working on it; send_message it, or pick another task from tasks.list`)
       const status = args.status === undefined ? task.status : args.status
-      if (!['todo', 'doing', 'done'].includes(String(status))) throw new Error('Invalid task status')
+      if (!['todo', 'doing', 'done'].includes(String(status))) throw new ArgumentError(`status is todo, doing or done; not ${JSON.stringify(status)}`)
       // parsePriority would quietly degrade a typo to 'normal'; an agent deserves to hear that its edit did nothing.
-      if (args.priority !== undefined && !projectTaskPriorities.includes(args.priority as ProjectTaskPriority)) throw new Error('Invalid task priority')
+      if (args.priority !== undefined && !projectTaskPriorities.includes(args.priority as ProjectTaskPriority)) throw new ArgumentError(`priority is one of ${projectTaskPriorities.join(', ')}; not ${JSON.stringify(args.priority)}`)
       const updated = await backlogs.edit(scope.projectId, text(args, 'revision', 100), { type: 'update', id, status: status as 'todo' | 'doing' | 'done', ...(args.title === undefined ? {} : { title: text(args, 'title', PROJECT_TASK_MAX_LENGTH) }), ...(args.priority === undefined ? {} : { priority: args.priority as ProjectTaskPriority }), agentId: scope.agentSessionId }, { actor: 'agent', agentId: scope.agentSessionId, sessionId: scope.sessionId })
       this.deps.fileChanged({ ...scope, path: 'feature-list.md' })
       return updated
     }
     if (method.startsWith('loops.')) {
       const project = database.getProject(scope.projectId)
-      if (!project) throw new Error('This project is no longer open')
+      if (!project) throw new Error('This project is no longer open; projects.list names the open ones')
       const loops = new LogicLoops(project.path, scope.projectId, database, { usage: () => sessions.usageLimits() })
       if (method === 'loops.list') {
         if (Object.keys(args).length) throw new Error('loops.list takes no arguments')
@@ -1662,22 +1706,22 @@ export class AgentControl {
         return method === 'loops.get' ? loops.get(id) : loops.history(id)
       }
       if (method === 'loops.run') {
-        if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+        if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly(method))
         validateArgs(method, args, ['id', 'inputs'])
         return loops.run(text(args, 'id', 80), args.inputs)
       }
       if (method === 'loops.record') {
-        if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+        if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly(method))
         if (Object.keys(args).some(key => !['runId', 'stepId', 'model', 'startedAt', 'finishedAt', 'outcome', 'tokens', 'note'].includes(key))) throw new Error('loops.record received an unknown argument')
         return loops.record(args as unknown as LoopRecordInput)
       }
       if (method === 'loops.propose') {
-        if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+        if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly(method))
         validateArgs(method, args, ['id', 'change', 'evidence', 'metric'])
         return loops.propose(args as unknown as { id: string; change: string; evidence: string; metric?: string })
       }
       if (method === 'loops.apply' || method === 'loops.reject') {
-        if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+        if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly(method))
         validateArgs(method, args, ['proposalId'])
         const proposalId = text(args, 'proposalId', 200)
         return method === 'loops.reject' ? loops.reject(proposalId) : loops.apply(proposalId, sovereign(scope), scope.owner ? 'owner' : scope.wizard ? 'wizard' : 'agent')
@@ -1686,13 +1730,13 @@ export class AgentControl {
         validateArgs(method, args, ['id'])
         return loops.listProposals(args.id === undefined ? undefined : text(args, 'id', 80))
       }
-      throw new Error('Unknown loops method; use tools.list')
+      throw new Error(this.unknownMethod(method))
     }
     if (method === 'memory.recall') return database.recall(scope.projectId, typeof args.query === 'string' ? args.query.slice(0, 4000) : '', undefined, 12)
     if (method === 'memory.remember') {
       const kind = args.kind ?? 'semantic'
-      if (!isMemoryKind(kind)) throw new Error('Invalid memory kind')
-      if (args.cues !== undefined && (!Array.isArray(args.cues) || args.cues.length > 20 || args.cues.some(cue => typeof cue !== 'string' || cue.length > 160))) throw new Error('Invalid memory cues')
+      if (!isMemoryKind(kind)) throw new ArgumentError(`kind is one of ${MEMORY_KINDS.join(', ')}; not ${JSON.stringify(kind)}`)
+      if (args.cues !== undefined && (!Array.isArray(args.cues) || args.cues.length > 20 || args.cues.some(cue => typeof cue !== 'string' || cue.length > 160))) throw new ArgumentError('cues is a list of up to 20 strings of up to 160 characters each')
       return database.remember({
         projectId: scope.projectId, kind, source: 'agent',
         // Attribution comes from the authorized scope, never from the caller's arguments.
@@ -1720,7 +1764,7 @@ export class AgentControl {
       return orchestration.updateTask(id, changes as UpdateOrchestrationTaskInput)
     }
     if (method === 'orchestration.routines.save') {
-      if (!Array.isArray(args.steps) || args.steps.length > 100) throw new Error('Invalid routine steps')
+      if (!Array.isArray(args.steps) || args.steps.length > 100) throw new ArgumentError('steps must be a list of up to 100 steps, each {title,instructions?,assignedAgentId?}')
       return orchestration.saveRoutine({ ...args, projectId: scope.projectId, name: text(args, 'name', 200) } as unknown as SaveRoutineInput)
     }
     if (method.startsWith('app.update')) return this.localUpdate(scope, source, method, args)
@@ -1735,7 +1779,7 @@ export class AgentControl {
     if (ideaMethods.has(method)) return this.ideasMethod(scope, source, method, args)
     if (ideaRunMethods.has(method)) return this.ideaRunsMethod(scope, source, method, args)
     if (modelMethods.has(method)) return this.modelsMethod(scope, source, method, args)
-    throw new Error('Unknown control method; use tools.list')
+    throw new Error(this.unknownMethod(method))
   }
 
   /** Plugs in model intelligence once it is constructed (src/main/index.ts); it also becomes the
@@ -1866,7 +1910,7 @@ export class AgentControl {
   async evaluationTurn(key: ModelKey, prompt: { system: string; user: string }, signal: AbortSignal, options: { maxTokens?: number } = {}): Promise<{ answer: string; tokens: number | null; costUsd: number | null; durationMs: number; effort: string | null; inputTokens: number | null }> {
     const scope = this.ownerScope(undefined)
     const model = this.catalog(scope).find(entry => entry.provider === key.provider && entry.available)?.models.find(entry => entry.id === key.model)
-    if (!model) throw new Error(`${key.provider}/${key.model} is not offered on this machine now`)
+    if (!model) throw new Error(`${key.provider}/${key.model} is not offered on this machine now; models.list shows what is, or omit route and name provider and model`)
     const effort = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'].find(level => model.effort?.includes(level)) ?? null
     const started = Date.now()
     const tab = await this.open(scope, { kind: 'agent', provider: key.provider, model: key.model, ...(effort ? { effort } : {}), title: `Evaluation: ${key.model}`.slice(0, 120), permission: 'read-only', focus: false })
@@ -2011,7 +2055,7 @@ export class AgentControl {
     const project = this.deps.database.getProject(scope.projectId)
     const refusal = sovereign(scope) ? null
       : source.provider === 'local' ? 'A sandboxed local conversation cannot start or steer cloud sessions; the owner, a wizard tab or a non-local coworker can'
-        : restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings) ? 'This conversation is read-only or planning' : null
+        : restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings) ? readOnly(method) : null
     return callCloudMethod(runs, {
       projectId: scope.projectId, workspaceId: scope.sessionId, projectPath: project && !project.remote ? project.path : null,
       startedBy: scope.owner ? 'owner' : scope.agentSessionId, refusal,
@@ -2032,7 +2076,7 @@ export class AgentControl {
     const project = this.deps.database.getProject(scope.projectId)
     const refusal = sovereign(scope) ? null
       : source.provider === 'local' ? 'A sandboxed local conversation cannot run commands on another machine; the owner, a wizard tab or a non-local coworker can'
-        : restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings) ? 'This conversation is read-only or planning' : null
+        : restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings) ? readOnly(method) : null
     return callNodeMethod(service, { projectId: scope.projectId, projectPath: project && !project.remote ? project.path : null, agentSessionId: scope.agentSessionId, owner: sovereign(scope), refusal }, method, args)
   }
 
@@ -2053,7 +2097,7 @@ export class AgentControl {
   private mayChangeJob(scope: AgentControlScope, source: AgentSpec, service: DurableJobsService, jobId: string): void {
     if (sovereign(scope)) return
     if (source.provider === 'local') throw new Error('A sandboxed local conversation cannot change a durable job; the owner, a wizard tab or the conversation that created the job can')
-    if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+    if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly('changing a durable job'))
     if (service.get(jobId).createdBy?.agentSessionId !== scope.agentSessionId) throw new Error('Only the owner, a wizard tab or the conversation that created this job may pause, resume or cancel it')
   }
 
@@ -2093,7 +2137,7 @@ export class AgentControl {
   private async createJob(scope: AgentControlScope, source: AgentSpec, service: DurableJobsService, args: Args): Promise<DurableJobSummary> {
     if (!sovereign(scope)) {
       if (source.provider === 'local') throw new Error('A sandboxed local conversation cannot start a durable job; the owner, a wizard tab or a non-local coworker can')
-      if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+      if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly('jobs.create'))
     }
     const objective = text(args, 'objective', 20000)
     const requested = text(args, 'model', 200)
@@ -2177,11 +2221,11 @@ export class AgentControl {
       const settled = await settle(run)
       return settled ? view(settled, note) : { state: 'idle', note: 'No delivery has run for this project since Conductor started.' }
     }
-    if (method !== 'git.ship') throw new Error('Unknown control method; use tools.list')
+    if (method !== 'git.ship') throw new Error(this.unknownMethod(method))
     args = validateArgs(method, args, ['message', 'paths', 'publish', 'mac', 'waitSeconds'], { aliases: { commitMessage: 'message', files: 'paths', wait: 'waitSeconds' } })
     if (args.publish !== undefined && typeof args.publish !== 'boolean') throw new Error('publish must be true or false')
     if (args.mac !== undefined && typeof args.mac !== 'boolean') throw new Error('mac must be true or false')
-    if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+    if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly(method))
     const message = text(args, 'message', 5000)
     let paths: string[] | undefined
     if (args.paths !== undefined) {
@@ -2256,7 +2300,7 @@ export class AgentControl {
       later('app.update.install', () => scope.owner ? host.updates!.install(force) : host.updates!.install(force, { agentSessionId: scope.agentSessionId, method: 'app.update.install' }))
       return { installing: true, version: state.availableVersion ?? null, force, note: 'Conductor quits, installs and relaunches. Wait for a new control-owner.json (new pid) before calling again.' }
     }
-    throw new Error('Unknown control method; use tools.list')
+    throw new Error(this.unknownMethod(method))
   }
 
   /** local.servers / local.stop: the one llama.cpp server this machine holds, found and stopped
@@ -2279,7 +2323,7 @@ export class AgentControl {
     if (args.force !== undefined && typeof args.force !== 'boolean') throw new Error('force must be true or false')
     if (!sovereign(scope)) {
       if (source.provider === 'local') throw new Error('A sandboxed local conversation cannot stop a model server; its controller, a wizard tab or the owner can')
-      if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+      if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly(method))
     }
     const request: LocalStopRequest = { ...(args.model === undefined ? {} : { model: text(args, 'model', 200) }), ...(args.pid === undefined ? {} : { pid: args.pid as number }) }
     try { return await local.stop(request) }
@@ -2305,7 +2349,7 @@ export class AgentControl {
     if (!builder) throw new Error('Local update builds are unavailable in this Conductor')
     if (method === 'app.update.status') return builder.status()
     if (method === 'app.update.authorize') {
-      if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+      if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly(method))
       if (source.provider === 'local') throw new Error('A sandboxed local conversation cannot authorize app.update. The owner confirms it, or a non-local coworker grants it.')
       const id = text(args, 'agentSessionId', 160)
       validateArgs('app.update.authorize', args, ['agentSessionId', 'allowed'])
@@ -2316,8 +2360,8 @@ export class AgentControl {
       this.updateGrants.set(id, { controllerAgentSessionId: scope.agentSessionId, projectId: scope.projectId, grantedAt: new Date().toISOString() })
       return { agentSessionId: id, authorized: true, grantedBy: scope.agentSessionId, note: 'That conversation can now run app.update without the owner dialog while this tab stays open and Conductor keeps running.' }
     }
-    if (method !== 'app.update') throw new Error('Unknown control method; use tools.list')
-    if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+    if (method !== 'app.update') throw new Error(this.unknownMethod(method))
+    if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly(method))
     const unsupported = builder.unsupported(source.cwd)
     if (unsupported) throw new Error(unsupported)
     const running = builder.status()
@@ -2377,7 +2421,7 @@ export class AgentControl {
   }
 
   private async dispatchRouter(scope: AgentControlScope, args: Args): Promise<unknown> {
-    if (!Array.isArray(args.tasks) || !args.tasks.length || args.tasks.length > 4) throw new Error('Route one to four bounded tasks per call')
+    if (!Array.isArray(args.tasks) || !args.tasks.length || args.tasks.length > 4) throw new ArgumentError('tasks must hold one to four bounded tasks; split a larger batch into several router.dispatch calls')
     const seen = new Set<string>()
     const requests: Array<Args & { projectTaskIds: string[] }> = args.tasks.map(value => {
       const request = object(value); text(request, 'title', 120); text(request, 'prompt', MAX_PROMPT_CHARS)
@@ -2393,7 +2437,11 @@ export class AgentControl {
     const board = seen.size ? await this.deps.backlogs.get(scope.projectId) : undefined
     const selected = new Map((board?.tasks ?? []).filter(task => seen.has(task.id)).map(task => [task.id, task]))
     const claimable = (task: NonNullable<typeof board>['tasks'][number] | undefined): boolean => Boolean(task && task.status !== 'done' && (task.agentId === scope.agentSessionId || task.status === 'todo'))
-    for (const id of seen) if (!claimable(selected.get(id))) throw new Error('A selected project task is missing, finished, or owned by another active agent')
+    for (const id of seen) {
+      const task = selected.get(id)
+      if (claimable(task)) continue
+      throw new Error(!task ? `Project task ${id} is not in feature-list.md; tasks.list returns the current ids` : task.status === 'done' ? `Project task ${id} is already done; drop it from projectTaskIds` : `Project task ${id} is claimed by ${task.agentId ? this.agentLabel(task.agentId) : 'another agent'}; drop it from projectTaskIds, or send_message that agent`)
+    }
     // Every task's provider, model, effort and permission are checked before any tab opens: a bad
     // second task used to reject the call after the first had opened and started, and the retry
     // duplicated it.
@@ -2553,19 +2601,24 @@ export class AgentControl {
   private async finish(scope: AgentControlScope, args: Args): Promise<unknown> {
     const service = this.deps.coworkerAutoClose
     if (!service) throw new Error('agents.finish is unavailable in this window')
-    validateArgs('agents.finish', args, ['agentSessionId'])
+    validateArgs('agents.finish', args, ['agentSessionId', 'waitSeconds', 'force'], { aliases: { wait: 'waitSeconds' } })
+    if (args.waitSeconds !== undefined && (typeof args.waitSeconds !== 'number' || !Number.isFinite(args.waitSeconds) || args.waitSeconds < 0)) throw new ArgumentError(`waitSeconds must be a number of seconds from 0 to ${FINISH_WAIT_MAX_SECONDS}`)
+    if (args.force !== undefined && typeof args.force !== 'boolean') throw new ArgumentError('force must be true or false')
+    const waitMs = Math.min(FINISH_WAIT_MAX_SECONDS, (args.waitSeconds as number | undefined) ?? 0) * 1000
     if (args.agentSessionId === undefined) {
       if (scope.owner) throw new Error('The owner credential has no tab of its own to finish; name the coworker with agentSessionId')
       const self = this.finishTargets().find(target => target.agentSessionId === scope.agentSessionId)
-      if (!self) throw new Error('The caller no longer has an open tab')
-      return service.requestSelfFinish(self)
+      if (!self) throw new Error(TAB_CLOSED)
+      return service.requestSelfFinish(self, { waitMs, force: args.force === true })
     }
+    // A controller's finish closes a settled coworker; force only cuts off a caller's own tasks.
+    if (args.force !== undefined) throw new ArgumentError('force applies only to agents.finish({}) on your own tab, whose background tasks stop with its CLI; a coworker is finished once it settles: pass waitSeconds, or agents.interrupt it first')
     const id = text(args, 'agentSessionId', 160)
     this.target(scope, id, true)
     const target = this.finishTargets().find(candidate => candidate.agentSessionId === id)
     if (!target) throw new Error('Agent is outside this workspace or has no visible tab; agents.list returns every agentSessionId this caller may name')
     if (target.controller !== scope.agentSessionId && !sovereign(scope)) throw new Error('Finish only a coworker this agent controls; agents.list shows them as its coworkers')
-    return service.finish(target)
+    return service.finish(target, { waitMs })
   }
 
   /** Every agent tab in the workspaces open in this window, as the finish rules see it. */

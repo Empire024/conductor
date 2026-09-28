@@ -66,6 +66,32 @@ export function validateArgs(method: string, args: Args, allowed: readonly strin
   return result
 }
 
+/** Method names agents reach for that Conductor calls something else. Only suggested, never run:
+ *  git.push is not what git.ship does unless publish:true is passed. */
+const METHOD_ALIASES: Record<string, string> = {
+  'agents.send': 'agents.steer', 'agents.message': 'agents.steer', 'agents.reply': 'agents.steer', 'agents.prompt': 'agents.steer',
+  'git.commit': 'git.ship', 'git.push': 'git.ship', 'git.deliver': 'git.ship',
+  'tabs.create': 'tabs.open', 'agents.open': 'tabs.open', 'agents.start': 'tabs.open', 'agents.create': 'tabs.open', 'agents.dispatch': 'router.dispatch',
+  'agents.close': 'agents.finish', 'agents.done': 'agents.finish', 'agents.stop': 'agents.interrupt', 'agents.cancel': 'agents.interrupt',
+  'agents.get': 'agents.status', 'agents.state': 'agents.status', 'tabs.state': 'app.state', 'files.search': 'files.list'
+}
+
+/**
+ * The refusal for a method this build does not have: the name echoed, the likeliest intended
+ * method, the family's listing, and the build, because a method the docs name but this build lacks
+ * (local.servers, 2026-09-28: 10 refusals in 7 tabs) is fixed by app.update, not by guessing.
+ */
+export function unknownMethodError(method: string, known: Iterable<string>, version?: string): string {
+  const methods = [...new Set(known)]
+  const aliased = METHOD_ALIASES[method] ?? METHOD_ALIASES[method.toLowerCase()]
+  const lower = method.toLowerCase()
+  const ranked = methods.map(candidate => ({ candidate, cost: distance(lower, candidate.toLowerCase()) })).sort((a, b) => a.cost - b.cost)
+  const guess = aliased && methods.includes(aliased) ? aliased : ranked[0] && ranked[0].cost <= 3 ? ranked[0].candidate : undefined
+  const family = method.includes('.') ? method.slice(0, method.indexOf('.') + 1) : ''
+  const listing = family && methods.some(candidate => candidate.startsWith(family)) ? `tools.list({prefix:"${family}"}) lists that family` : 'tools.list({brief:true}) names every method'
+  return `Unknown control method "${method}" in ${version ? `build ${version}` : 'this build'}.${guess ? ` Did you mean ${guess}?` : ''} ${listing}; if the method is newer than this build, app.update installs the checkout's build.`
+}
+
 /** A model as models.list offers it. */
 export interface OfferedModel { id: string; label: string }
 export interface OfferedProvider<M extends OfferedModel = OfferedModel> { provider: string; available: boolean; models: M[] }

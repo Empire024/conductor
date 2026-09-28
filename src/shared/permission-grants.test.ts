@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { callMatchesRule, commandHost, describeGrantRequest, escapeRuleContent, grantStatusOf, permissionGrantOf, posixPath, wizardMayDecide } from './permission-grants'
+import { callMatchesRule, commandHost, describeGrantRequest, escapeRuleContent, grantStatusOf, permissionGrantOf, posixPath } from './permission-grants'
 
 const cwd = 'C:\\Users\\owner\\site\\theme'
 
@@ -58,12 +58,6 @@ describe('the narrowest rule for one call', () => {
     expect(callMatchesRule(rule, 'PowerShell', { command: 'ssh root@192.0.2.10 uptime' }, cwd)).toBe(false)
     const file = describeGrantRequest({ tool: 'Write', input: { file_path: 'a.sh' }, cwd }).rule!
     expect(callMatchesRule(file, 'Edit', { file_path: 'C:\\Users\\owner\\site\\theme\\a.sh' }, cwd)).toBe(true)
-  })
-
-  it('lets a wizard answer only local requests that have a rule', () => {
-    expect(wizardMayDecide({ class: 'local', rule: 'Bash(npm test)' })).toBe(true)
-    for (const kind of ['shared', 'destructive', 'external'] as const) expect(wizardMayDecide({ class: kind, rule: 'Bash(x)' })).toBe(false)
-    expect(wizardMayDecide({ class: 'local' })).toBe(false)
   })
 
   it('reads an agent request card and a denial card\'s answer back from a notice', () => {

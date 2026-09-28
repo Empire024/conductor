@@ -164,7 +164,7 @@ export class ConductorMcpServer {
     if (Number(request.headers['content-length']) > MAX_BODY) { reply(413, { error: 'Request too large' }); request.resume(); return }
     const offered = /^Bearer (.+)$/.exec(request.headers.authorization ?? '')?.[1] ?? ''
     const credential = offered ? [...this.credentials.values()].find(candidate => sameToken(offered, candidate.token)) : undefined
-    if (!credential) { reply(401, { error: 'Unauthorized session' }); request.resume(); return }
+    if (!credential) { reply(401, { error: 'This app-control credential is not (or no longer) valid, for example because the conversation moved workspace or Conductor restarted; nothing was done. Use the conductor MCP tools if you have them; otherwise say so in your final message and the owner restarts this conversation.' }); request.resume(); return }
     if (request.method === 'DELETE') { reply(200, {}); request.resume(); return }
     let message: { id?: string | number | null; method?: string; params?: Record<string, unknown> }
     try {
@@ -198,20 +198,20 @@ export class ConductorMcpServer {
     if (message.method === 'tools/call') {
       const name = typeof params.name === 'string' ? params.name : ''
       const tool = CONDUCTOR_MCP_TOOLS.find(candidate => candidate.name === name)
-      if (!tool) return { ...envelope, error: { code: -32602, message: `Unknown Conductor tool: ${name || '(none)'}` } }
+      if (!tool) return { ...envelope, error: { code: -32602, message: `Unknown Conductor tool "${name || '(none)'}"; the tools here are ${offered(credential.provider).map(candidate => candidate.name).join(', ')}. control({method,args}) calls any app-control method.` } }
       if (tool.claudeOnly && credential.provider !== 'claude') return { ...envelope, result: { isError: true, content: [{ type: 'text', text: `${name} is for Claude conversations, whose auto-mode classifier refuses calls; a ${credential.provider} command that needs the owner raises its own approval card in this tab, so run the call itself. Tools here: ${offered(credential.provider).map(candidate => candidate.name).join(', ')}.` }] } }
       const input = params.arguments && typeof params.arguments === 'object' && !Array.isArray(params.arguments) ? params.arguments as Record<string, unknown> : {}
       try {
         const result = tool.generic
           ? await this.call(credential.scope, controlMethod(input), tool.args(input), { generic: true })
           : await this.call(credential.scope, tool.method, tool.args(input))
-        if (this.credentials.get(credential.scope.agentSessionId) !== credential) throw new Error('Conductor access was revoked while the tool was running')
+        if (this.credentials.get(credential.scope.agentSessionId) !== credential) throw new Error('Conductor access was revoked while the tool was running; the call may already have taken effect, so check (agents.list, git.ship.status or list_permissions) before repeating it')
         // Any method's result as its JSON text alone: a tools.list is tens of KB, so it is not
         // sent a second time as structuredContent.
         if (tool.generic) return { ...envelope, result: { content: [{ type: 'text', text: JSON.stringify(result ?? null) }] } }
         const structured = result && typeof result === 'object' && !Array.isArray(result) ? result as Record<string, unknown> : { result }
         return { ...envelope, result: { content: [{ type: 'text', text: JSON.stringify(structured) }], structuredContent: structured } }
-      } catch (error) { return { ...envelope, result: { isError: true, content: [{ type: 'text', text: error instanceof Error ? error.message : 'Conductor tool failed' }] } } }
+      } catch (error) { return { ...envelope, result: { isError: true, content: [{ type: 'text', text: error instanceof Error ? error.message : 'Conductor tool failed; the call may not have run: check with agents.list or list_permissions before repeating it' }] } } }
     }
     return { ...envelope, error: { code: -32601, message: `Method not found: ${message.method ?? '(none)'}` } }
   }
