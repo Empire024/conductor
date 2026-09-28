@@ -60,19 +60,30 @@ const watchLoops = new Map()
 // SYNTHETIC CLASSIFIER (scripts/smoke-permission-grant.mjs): replays the auto-mode classifier
 // denial recorded in the haftheme session on 2026-09-25 (haftheme-denial-2026-09-25.json) for
 // stand-in calls, and lets a sensitive call through only when the flag settings layer (--settings at
-// launch, apply_flag_settings while running) holds its exact rule. Whether the real CLI lets such a
-// rule decide before its classifier is UNCONFIRMED (docs/permissions-classifier.md): this fixture
-// exercises Conductor's side of the path only. No command is ever executed.
+// launch, apply_flag_settings while running) holds its exact rule. No command is ever executed.
+// CONDUCTOR_TEST_CLASSIFIER=approval-turn is what claude 2.1.282 showed live on 2026-09-28
+// (docs/permissions-classifier.md, Evidence): the rule alone does not decide; the call also has to
+// come in a turn that the owner's "[Conductor] approved: <rule>" started as a user message. The
+// same approval steered into a running turn is folded in as a queued command and does not count.
+// Without it, the rule alone decides: the handoff and restart smokes test Conductor's bookkeeping.
 const recordedDenial = JSON.parse(readFileSync(new URL('./haftheme-denial-2026-09-25.json', import.meta.url), 'utf8'))
 const settingsArgument = process.argv.indexOf('--settings')
 let flagAllow = new Set(settingsArgument >= 0 ? JSON.parse(readFileSync(process.argv[settingsArgument + 1], 'utf8')).permissions?.allow ?? [] : [])
 const flagLog = entry => { if (process.env.CONDUCTOR_TEST_FLAG_SETTINGS_LOG) writeFileSync(process.env.CONDUCTOR_TEST_FLAG_SETTINGS_LOG, JSON.stringify({ at: Date.now(), pid: process.pid, ...entry }) + '\n', { flag: 'a' }) }
 flagLog({ launch: [...flagAllow] })
 let deniedHookRegistered = false
+const approvalTurnClassifier = process.env.CONDUCTOR_TEST_CLASSIFIER === 'approval-turn'
+// The "[Conductor] approved:" message that started the current turn as a user message, if any.
+let approvalTurn
+// SYNTHETIC CLASSIFIER BUSY <call>: after the refusal the turn keeps working for a while, as the live
+// agent did, so an approval given meanwhile meets a running turn.
+let busyTurn
 const classifierCalls = {
   WRITE: () => ({ tool: 'Write', input: { file_path: resolve(recordedDenial.standInPath), content: '#!/usr/bin/env bash\n# Stand-in for the pool fix script: prints one line and touches nothing.\necho "pool fix stand-in"\n' } }),
   OTHER: () => ({ tool: 'Bash', input: { command: "ssh -o BatchMode=yes -o ConnectTimeout=3 root@192.0.2.10 'lswsctrl restart'" } }),
-  LOCAL: () => ({ tool: 'Write', input: { file_path: resolve('notes/todo.md'), content: '- tidy the README\n' }, local: true })
+  LOCAL: () => ({ tool: 'Write', input: { file_path: resolve('notes/todo.md'), content: '- tidy the README\n' }, local: true }),
+  // The live call of 2026-09-28, with a documentation address: a read-only check over ssh.
+  PROBE: () => ({ tool: 'Bash', input: { command: "ssh -o BatchMode=yes root@192.0.2.20 'bash -s -- --check' < prod/fix-pool.sh 2>&1 | tail -40" } })
 }
 const escapeRule = content => content.replaceAll('\\', '\\\\').replaceAll('(', '\\(').replaceAll(')', '\\)')
 const posixPath = path => { const drive = /^([A-Za-z]):[/\\]/.exec(path); return drive ? '/' + drive[1].toLowerCase() + path.slice(2).replaceAll('\\', '/') : path.replaceAll('\\', '/') }
@@ -83,17 +94,21 @@ let classifierCount = 0, classified, lastRefused
 let holdRetry = false
 // CONDUCTOR_TEST_UNIQUE_TOOL_IDS: ids unique across processes, as the real CLI's toolu_ ids are; by
 // default a successor's first denial repeats its predecessor's id (smoke-verify-vr9b-handoff.mjs).
-const classify = call => {
+const classify = (call, busy = false) => {
   const id = process.env.CONDUCTOR_TEST_UNIQUE_TOOL_IDS ? `toolu_classified_${process.pid}_${++classifierCount}` : `classified-${++classifierCount}`
   classified = { id, call }
   declare(id, call.tool, call.input)
-  if (call.local || flagAllow.has(ruleFor(call))) { pending = `${id}-pre`; hook(pending, 'conductor_before', id, call.tool, call.input); return }
+  if (call.local || flagAllow.has(ruleFor(call)) && (!approvalTurnClassifier || approvalTurn?.includes(ruleFor(call)))) { pending = `${id}-pre`; hook(pending, 'conductor_before', id, call.tool, call.input); return }
   lastRefused = call
   const refuse = () => {
     result(id, recordedDenial.toolResult, true)
     text(`SYNTHETIC classifier refused ${call.tool} (${recordedDenial.reason}); nothing ran.`)
-    emit({ type: 'result', subtype: 'success', is_error: false, usage: {}, permission_denials: [{ tool_name: call.tool, tool_input: call.input, tool_use_id: id }] })
     pending = undefined; classified = undefined
+    const end = () => { busyTurn = undefined; emit({ type: 'result', subtype: 'success', is_error: false, usage: {}, permission_denials: [{ tool_name: call.tool, tool_input: call.input, tool_use_id: id }] }) }
+    if (!busy) { end(); return }
+    text('SYNTHETIC: carrying on with other work in this turn.')
+    busyTurn = setTimeout(() => { steeringTimers.delete(busyTurn); end() }, Number(process.env.CONDUCTOR_TEST_BUSY_MS ?? 6000))
+    steeringTimers.add(busyTurn)
   }
   if (!deniedHookRegistered) { refuse(); return }
   pending = `${id}-denied`
@@ -152,7 +167,7 @@ for await (const line of input) {
     } else if (kind === 'interrupt') {
       if (pending) send({ type: 'control_cancel_request', request_id: pending })
       const cancelled = [...steeringHeld.keys()]
-      steeringHeld.clear(); for (const timer of steeringTimers) clearTimeout(timer); steeringTimers.clear()
+      steeringHeld.clear(); for (const timer of steeringTimers) clearTimeout(timer); steeringTimers.clear(); busyTurn = undefined
       pending = undefined; success(message.request_id, { cancelled, still_queued: [] }); emit({ type: 'result', subtype: 'error_during_execution', is_error: true, result: '[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use', usage: {} })
     } else if (kind === 'set_permission_mode') {
       if (permissionScenario === 'REJECT' && message.request.mode === 'auto') send({ type: 'control_response', response: { subtype: 'error', request_id: message.request_id, error: 'Synthetic managed policy disables auto-mode' } })
@@ -181,6 +196,7 @@ for await (const line of input) {
     if (!initialized) throw new Error('User message before initialization')
     const blocks = message.message.content
     const prompt = Array.isArray(blocks) ? blocks.filter(item => item.type === 'text').map(item => item.text).join('') : blocks
+    if (message.priority !== 'next') approvalTurn = typeof prompt === 'string' && prompt.startsWith('[Conductor] approved:') ? prompt : undefined
     if (process.env.CONDUCTOR_TEST_CONTROL_CAPTURE && typeof prompt === 'string') writeFileSync(process.env.CONDUCTOR_TEST_CONTROL_CAPTURE, process.env.CONDUCTOR_TEST_CONTROL_CAPTURE_APPEND ? prompt + '\n\u0000\n' : prompt, process.env.CONDUCTOR_TEST_CONTROL_CAPTURE_APPEND ? { flag: 'a' } : undefined)
     if (typeof prompt === 'string' && prompt.startsWith('SYNTHETIC IMAGES')) {
       const images = blocks.filter(item => item.type === 'image')
@@ -200,6 +216,14 @@ for await (const line of input) {
     }
     // Conductor's own answer to a permission grant (src/main/permission-grants): retry exactly the
     // refused call, or stand down.
+    // Steered into a turn that is still working: folded in as a queued command, and the agent
+    // retries at once in the same turn, as the live agent did on 2026-09-28.
+    if (typeof prompt === 'string' && prompt.startsWith('[Conductor] approved:') && message.priority === 'next' && busyTurn) {
+      clearTimeout(busyTurn); steeringTimers.delete(busyTurn); busyTurn = undefined
+      emit({ type: 'command_lifecycle', command_uuid: message.uuid, state: 'queued' })
+      emit({ type: 'command_lifecycle', command_uuid: message.uuid, state: 'started' })
+      classify(lastRefused); continue
+    }
     if (typeof prompt === 'string' && prompt.startsWith('[Conductor] approved:') && holdRetry) {
       emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263', permissionMode })
       text('SYNTHETIC: approval noted; the retry waits.'); finish(); continue
@@ -225,11 +249,11 @@ for await (const line of input) {
       text(`SYNTHETIC: planned ${planned}; nothing tried yet.`); finish(); continue
     }
     if (prompt.startsWith('SYNTHETIC CLASSIFIER ')) {
-      const scenario = /^SYNTHETIC CLASSIFIER (WRITE|OTHER|LOCAL|RETRY)\b/.exec(prompt)?.[1]
+      const [, busy, scenario] = /^SYNTHETIC CLASSIFIER (BUSY )?(WRITE|OTHER|LOCAL|PROBE|RETRY)\b/.exec(prompt) ?? []
       if (!scenario) throw new Error('Unknown synthetic classifier scenario')
       if (scenario === 'RETRY' && !lastRefused) throw new Error('Synthetic fixture has no refused call to retry')
       emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263', permissionMode })
-      classify(scenario === 'RETRY' ? lastRefused : classifierCalls[scenario]()); continue
+      classify(scenario === 'RETRY' ? lastRefused : classifierCalls[scenario](), Boolean(busy)); continue
     }
     // An idea run's prompts (src/main/idea-runs/briefs.ts), answered from the scenario file a smoke
     // names: keys are the prompt's first line ("PLAN", "STAGE research", "OCCURRENCE post 1"),

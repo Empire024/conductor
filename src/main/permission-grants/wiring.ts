@@ -16,15 +16,19 @@ export interface GrantSessions {
   applyPermissionRules(id: string): Promise<'applied' | 'unsupported' | 'offline'>
   resume(id: string): Promise<void>
   steerOrStart(id: string, text: string, settings: SessionSettings): Promise<unknown>
+  /** Queues a message as the next turn of its own, behind a turn under way (never steered). */
+  queue(id: string, text: string, settings: SessionSettings): Promise<void>
   setPermissionGrants(grants: PermissionGrants): void
   setConductorMcp(server: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }): void
 }
 export interface GrantStore {
   spec<T>(id: string): T | null | undefined
-  snapshot(id: string): Pick<SessionProjection, 'items' | 'phase' | 'settings'> | null | undefined
+  snapshot(id: string): Pick<SessionProjection, 'items' | 'phase' | 'settings' | 'queuedPrompts'> | null | undefined
 }
 
 export const permissionGrantsIpcChannels = ['permission-grants:state', 'permission-grants:decide', 'permission-grants:revoke'] as const
+/** Phases in which a message can only follow the turn (StructuredSessions.queue) or be steered into it. */
+const TURN_UNDER_WAY = new Set(['starting', 'running', 'waiting_input', 'waiting_approval'])
 
 /** Starts the grant service and the `conductor` MCP server and hands both to the structured
  *  sessions. index.ts calls this once, before any conversation launches. */
@@ -66,6 +70,15 @@ export async function startPermissionGrants(deps: {
       if (!state) throw new Error('The conversation is not registered')
       await deps.sessions.steerOrStart(id, text, state.settings)
     },
+    // A steered approval reaches the CLI as a mid-turn queued command, which its classifier did not
+    // take as the owner's approval (docs/permissions-classifier.md, Evidence 2026-09-28).
+    retry: async (id, text) => {
+      const state = deps.store.snapshot(id)
+      if (!state) throw new Error('The conversation is not registered')
+      if (TURN_UNDER_WAY.has(state.phase)) await deps.sessions.queue(id, text, state.settings)
+      else await deps.sessions.steerOrStart(id, text, state.settings)
+    },
+    retryQueued: (id, text) => Boolean(deps.store.snapshot(id)?.queuedPrompts?.some(prompt => prompt.text === text)),
     phone: (id, title, body) => { void deps.announce?.({ id: randomUUID(), kind: 'attention', sessionId: id, title, body, at: new Date().toISOString(), url: `/#/session/${encodeURIComponent(id)}` }) },
     changed: (state: PermissionGrantsState) => deps.publish('permission-grants:changed', state),
     ...(deps.workspaces ? { tabOpen: (id: string) => tabOpen(deps.workspaces!, spec(id), id) } : {})

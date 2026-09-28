@@ -7,8 +7,10 @@
 //   this session -> the grant is gone when the tab closes.
 // Real Electron main/preload/renderer; only the Claude process is the synthetic fixture
 // (scripts/fixtures/fake-claude.mjs, SYNTHETIC CLASSIFIER), so no inference happens and nothing is
-// executed. What it cannot show is whether the real CLI lets the rule decide before its classifier:
-// that stays UNCONFIRMED in docs/permissions-classifier.md. CONDUCTOR_TEST_USER_DATA parks the window.
+// executed. The fixture runs with CONDUCTOR_TEST_CLASSIFIER=approval-turn, the precedence claude
+// 2.1.282 showed live on 2026-09-28 (docs/permissions-classifier.md, Evidence): a granted call runs
+// only in a turn the approval started as a user message, never after the approval was steered into
+// a turn still under way. CONDUCTOR_TEST_USER_DATA parks the window.
 //   node scripts/smoke-lock.mjs -- node scripts/smoke-permission-grant.mjs
 import { _electron as electron, expect } from '@playwright/test'
 import { mkdtemp, mkdir, readFile, writeFile, stat } from 'node:fs/promises'
@@ -21,7 +23,7 @@ const output = resolve('artifacts/fx32/permission-grant')
 await mkdir(output, { recursive: true })
 const flagLog = join(root, 'flag-settings.log')
 const env = {
-  ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_EMPTY_HISTORY: '1', CONDUCTOR_TEST_FLAG_SETTINGS_LOG: flagLog,
+  ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_EMPTY_HISTORY: '1', CONDUCTOR_TEST_FLAG_SETTINGS_LOG: flagLog, CONDUCTOR_TEST_CLASSIFIER: 'approval-turn',
   CONDUCTOR_TEST_NODE_EXECUTABLE: process.execPath, CONDUCTOR_TEST_USER_DATA: join(root, 'profile'), CONDUCTOR_PROJECTS_ROOT: join(root, 'projects')
 }
 delete env.ELECTRON_RUN_AS_NODE; delete env.CONDUCTOR_LIVE_TESTS; delete env.CONDUCTOR_BACKGROUND_WINDOWS
@@ -100,6 +102,26 @@ try {
   await expect.poll(async () => (await grantsState()).requests.find(entry => entry.id === writeDenial.nativeItemId)?.status).toBe('used')
   await expect(writeCard).toContainText('Approved once, and used')
   check('Approve once handed the live tab exactly that rule, the tab retried and wrote the script, and the grant was spent and withdrawn')
+
+  // 3b. The live case of 2026-09-28: the refused turn keeps working, and the owner approves for this
+  // session meanwhile. The approval waits as a turn of its own (a steer would be folded into the
+  // running turn, where the classifier refuses the retry again), then the call runs in that turn.
+  await submit(id, 'SYNTHETIC CLASSIFIER BUSY PROBE read the pool config')
+  await expect.poll(async () => (await denials(id)).length).toBe(2)
+  const probeDenial = (await denials(id)).at(-1)
+  const probeRule = probeDenial.data.payload.autoModeDenial.request.rule
+  assert.equal((await snapshot(id)).phase, 'running', 'The refused turn is still working when the owner approves')
+  await card(probeDenial.nativeItemId).getByRole('button', { name: 'Approve for this session' }).click()
+  await expect.poll(async () => (await snapshot(id)).queuedPrompts?.some(prompt => prompt.text.startsWith('[Conductor] approved: ' + probeRule) && !prompt.steer)).toBe(true)
+  assert.equal((await snapshot(id)).phase, 'running')
+  assert.ok(!(await snapshot(id)).pendingSteering?.some(prompt => prompt.text.startsWith('[Conductor] approved:')), 'The approval is not steered into the running turn')
+  await expect.poll(async () => (await snapshot(id)).items.some(item => item.data.type === 'text' && item.data.role === 'assistant' && item.data.text === 'SYNTHETIC classified call ran: ' + probeRule), { timeout: 20000 }).toBe(true)
+  await settled(id)
+  assert.ok(!(await snapshot(id)).items.some(item => item.data.type === 'notice' && item.data.payload?.permissionGrantIneffective), 'No grant was declared ineffective')
+  assert.equal((await grantsState()).grants.filter(grant => grant.agentSessionId === id && grant.rule === probeRule && grant.scope === 'session').length, 1)
+  await card(probeDenial.nativeItemId).getByRole('button', { name: 'Revoke' }).click()
+  await expect.poll(async () => (await grantsState()).grants.filter(grant => grant.agentSessionId === id).length).toBe(0)
+  check('An approval given while the refused turn kept working waited as a turn of its own (not steered), and the call ran in that turn')
 
   // 4. A different sensitive action is still refused; Deny keeps it blocked.
   await submit(id, 'SYNTHETIC CLASSIFIER OTHER restart the web server')

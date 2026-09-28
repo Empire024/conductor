@@ -14,6 +14,8 @@ function harness(overrides: Partial<PermissionGrantPorts> = {}) {
   const denials = new Map<string, AutoModeDenial>()
   const notices: Array<{ id: string; message: string; payload: Json; itemId: string }> = []
   const told: Array<{ id: string; text: string }> = []
+  // Approval turns still waiting in the conversation's queue (retryQueued).
+  const queued = new Set<string>()
   let phase = 'running'
   const ports: PermissionGrantPorts = {
     now: () => '2026-09-25T22:00:00.000Z',
@@ -25,6 +27,8 @@ function harness(overrides: Partial<PermissionGrantPorts> = {}) {
     phase: () => phase,
     restart: vi.fn(async () => undefined),
     tell: vi.fn(async (id: string, text: string) => { told.push({ id, text }) }),
+    retry: vi.fn(async (id: string, text: string) => { told.push({ id, text }) }),
+    retryQueued: (_id, text) => queued.has(text),
     phone: vi.fn(),
     changed: vi.fn(),
     idlePollMs: 1,
@@ -39,7 +43,7 @@ function harness(overrides: Partial<PermissionGrantPorts> = {}) {
     if (shown) grants.adapterPort(tab).denied(autoModeDenialItemId(toolUseId), denial.request)
     return autoModeDenialItemId(toolUseId)
   }
-  return { grants, ports, notices, told, deny, setPhase: (value: string) => { phase = value } }
+  return { grants, ports, notices, told, queued, deny, setPhase: (value: string) => { phase = value } }
 }
 
 describe('one narrow owner approval per refused call', () => {
@@ -59,6 +63,55 @@ describe('one narrow owner approval per refused call', () => {
     expect(h.grants.rules(tab)).toEqual([])
     expect(h.grants.list(tab).requests[0]!.status).toBe('used')
     expect(h.ports.apply).toHaveBeenCalledTimes(2)
+  })
+
+  // Live case 2026-09-28 (docs/permissions-classifier.md, Evidence): two session approvals steered
+  // into the running turn were refused again and declared ineffective; the once approval that
+  // arrived as a turn of its own ran. Both scopes now arrive the same way.
+  it.each(['approve-once', 'approve-session'] as const)('%s: the approval reaches a busy conversation as a turn of its own, and a refusal before that turn keeps the grant', async decision => {
+    const h = harness()
+    const item = h.deny('toolu_r', 'Bash', { command: ssh }, 'Production Reads')
+    const result = await h.grants.decide(tab, item, decision, 'owner')
+    expect(result.message).toMatch(/in a message of its own once its current turn ends/)
+    expect(h.ports.retry).toHaveBeenCalledWith(tab, expect.stringMatching(/^\[Conductor\] approved: Bash\(/))
+    expect(h.ports.tell).not.toHaveBeenCalled()
+    const rule = result.grant!.rule
+    // The agent retries on its own while its approval turn still waits: nothing is judged yet.
+    h.queued.add(h.told[0]!.text)
+    h.grants.adapterPort(tab).refused(rule)
+    const early = h.deny('toolu_r2', 'Bash', { command: ssh }, 'Production Reads', true)
+    expect(h.grants.rules(tab)).toEqual([{ rule, once: decision === 'approve-once' }])
+    expect(h.notices.some(entry => entry.itemId.startsWith('grant-ineffective:'))).toBe(false)
+    expect(h.grants.list(tab).requests.filter(request => request.status === 'pending')).toEqual([])
+    expect(h.notices.at(-1)).toMatchObject({ itemId: early, message: expect.stringContaining('already asked about'), payload: { permissionGrant: { id: item, status: decision === 'approve-once' ? 'approved-once' : 'approved-session' } } })
+    await expect(h.grants.decide(tab, early, 'approve-session', 'owner')).rejects.toThrow('already answered')
+    // Its approval turn ran and the call ran: an approve-once grant is spent.
+    h.queued.clear()
+    if (decision === 'approve-once') {
+      h.grants.adapterPort(tab).used(rule)
+      expect(h.grants.list(tab).requests.find(request => request.id === item)!.status).toBe('used')
+    } else expect(h.grants.rules(tab)).toHaveLength(1)
+  })
+
+  it('declares a grant ineffective only when the call is refused after its approval turn started', async () => {
+    const h = harness()
+    const { grant } = await h.grants.decide(tab, h.deny('toolu_i', 'Bash', { command: ssh }, 'Production Reads'), 'approve-session', 'owner')
+    h.grants.adapterPort(tab).refused(grant!.rule)
+    expect(h.grants.rules(tab)).toEqual([])
+    expect(h.notices.at(-1)).toMatchObject({ itemId: `grant-ineffective:${grant!.id}`, message: expect.stringMatching(/in a message of its own, but the claude CLI's classifier still refused the call/) })
+  })
+
+  it('tells an idle conversation to retry at once, and a restarted one after its restart', async () => {
+    const h = harness()
+    h.setPhase('idle')
+    const idle = await h.grants.decide(tab, h.deny('toolu_idle', 'Write', { file_path: 'notes/idle.md' }, 'Self-Modification'), 'approve-once', 'owner')
+    expect(idle.message).toMatch(/The conversation was told to retry it\.$/)
+    const restarting = harness({ apply: vi.fn(async () => 'unsupported' as const) })
+    restarting.setPhase('idle')
+    await restarting.grants.decide(tab, restarting.deny('toolu_rs', 'Write', { file_path: 'notes/restart.md' }, 'Self-Modification'), 'approve-once', 'owner')
+    await vi.waitFor(() => expect(restarting.ports.retry).toHaveBeenCalledTimes(1))
+    expect(restarting.ports.restart).toHaveBeenCalledWith(tab)
+    expect(restarting.ports.tell).not.toHaveBeenCalled()
   })
 
   it('keeps a denied request blocked and tells the conversation not to route around it', async () => {

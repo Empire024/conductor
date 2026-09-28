@@ -1348,8 +1348,8 @@ describe('owner permission grants (src/main/permission-grants)', () => {
 
   it('spends an approve-once grant only after its exact call ran, and reports a granted call the classifier still refused', async () => {
     const command = 'ssh -i key root@192.0.2.10 bash -s < app/prod/fix-pool.sh'
-    const used = vi.fn(), refused = vi.fn()
-    const f = fixture({ permissionGrants: { rules: () => [{ rule: `Bash(${command})`, once: true }], used, refused } })
+    const used = vi.fn(), refused = vi.fn(), denied = vi.fn()
+    const f = fixture({ permissionGrants: { rules: () => [{ rule: `Bash(${command})`, once: true }], used, refused, denied } })
     await f.adapter.start(); await f.adapter.submit('Synthetic', settings)
     f.transport.receive(toolUse('other', 'Bash', { command: 'git status' }))
     f.transport.receive(hook('after-other', 'conductor_after', 'other', 'Bash', { command: 'git status' }, { stdout: '', exitCode: 0 }))
@@ -1364,5 +1364,9 @@ describe('owner permission grants (src/main/permission-grants)', () => {
     f.transport.receive(deniedHook('denied-again', 'again', 'Bash', { command }, '[External System Write]'))
     await flush()
     expect(refused).toHaveBeenCalledWith(`Bash(${command})`)
+    // The service decides whether the grant stands (its approval turn may still be queued) before
+    // it files the card, which then joins the approved request instead of asking again.
+    expect(denied).toHaveBeenCalledWith('auto-denial:again',expect.objectContaining({ tool: 'Bash', rule: `Bash(${command})` }))
+    expect(refused.mock.invocationCallOrder[0]).toBeLessThan(denied.mock.invocationCallOrder[0]!)
   })
 })

@@ -14,7 +14,9 @@ import type { Json } from '../../shared/structured-agent'
  * tries. The owner answers in the card; a wizard tab may answer
  * only for local, reversible actions. An approval becomes exactly one native allow rule for that
  * one conversation, handed to the running CLI (apply_flag_settings) or, where the CLI cannot take
- * it live, through --settings on its next start. Waiting requests and unspent grants survive an
+ * it live, through --settings on its next start, and the conversation is told to retry in a user
+ * turn of its own (retry), which is what the classifier honours. Waiting requests and unspent
+ * grants survive an
  * app restart (snapshot/restore, permission-grants.json in userData); they end with the tab, when
  * the owner revokes them, or (approve once) when their call has run.
  * A tab that hands itself on (agents.handoff successor) hands its waiting requests and unspent
@@ -41,6 +43,14 @@ export interface PermissionGrantPorts {
   restart(agentSessionId: string): Promise<void>
   /** Delivers a Conductor message: steered into a running turn, or starting one. */
   tell(agentSessionId: string, text: string): Promise<void>
+  /** Delivers an approval's "retry it now" as a user turn of its own: queued behind a turn that is
+   *  under way, never steered into it, and started at once when the conversation is idle. The
+   *  classifier let an approved call through only when the approval arrived that way
+   *  (docs/permissions-classifier.md, Evidence 2026-09-28). */
+  retry(agentSessionId: string, text: string): Promise<void>
+  /** Whether that turn is still waiting in the conversation's queue. A refusal before it starts is
+   *  the agent retrying on its own, which says nothing yet about the grant. */
+  retryQueued?(agentSessionId: string, text: string): boolean
   /** Phone push for external, shared and destructive requests. */
   phone?(agentSessionId: string, title: string, body: string): void
   changed?(state: PermissionGrantsState): void
@@ -99,6 +109,8 @@ export class PermissionGrants {
   private readonly aliases = new Map<string, Map<string, string>>()
   /** Answers a previous run gave (restore): a request answered before the restart stays answered. */
   private readonly settled = new Map<string, Map<string, GrantStatus>>()
+  /** A grant -> the approval turn it was announced with (retry), until the grant ends. */
+  private readonly retries = new Map<string, string>()
   /** The app is quitting (freeze): runtimes stopping now are not conversations ending. */
   private stopping = false
   constructor(private readonly ports: PermissionGrantPorts) {}
@@ -246,6 +258,8 @@ export class PermissionGrants {
     const same = aliased ? this.lookup(agentSessionId, aliased)
       : [...(this.requests.get(agentSessionId)?.values() ?? [])].find(entry => entry.status === 'pending' && !outageCard(entry) && sameCall(entry))
         ?? [...(this.movedOut.get(agentSessionId) ?? [])].map(id => this.lookup(agentSessionId, id)).find(sameCall)
+        // Refused while its approval turn still waits (refused kept the grant): the approved request.
+        ?? (this.grants.get(agentSessionId) ?? []).filter(grant => this.retryWaiting(agentSessionId, grant.id)).map(grant => this.lookup(agentSessionId, grant.requestId)).find(sameCall)
     if (same) {
       const views = this.aliases.get(agentSessionId) ?? new Map<string, string>()
       this.aliases.set(agentSessionId, views.set(itemId, same.id))
@@ -323,16 +337,19 @@ export class PermissionGrants {
     this.grants.set(agentSessionId, [...(this.grants.get(agentSessionId) ?? []).filter(entry => entry.rule !== grant.rule), grant])
     this.settle(agentSessionId, request, { status: DECIDED[decision], decidedAt, decidedBy: actor })
     const applied = await this.ports.apply(agentSessionId).catch(error => { this.drop(agentSessionId, grant.id); throw error })
+    const text = grantApprovedMessage(grant.rule, scope)
+    this.retries.set(grant.id, text)
     if (applied === 'unsupported') {
       grant.delivery = 'restart'
       this.changed()
-      void this.restartThenTell(agentSessionId, grantApprovedMessage(grant.rule, scope))
+      void this.restartThenRetry(agentSessionId, text)
       return { status: DECIDED[decision], grant, message: 'Approved. This CLI cannot take a rule while it runs, so the conversation restarts with it once its turn ends, then retries.' }
     }
     grant.delivery = applied === 'applied' ? 'live' : 'pending'
     this.changed()
-    await this.ports.tell(agentSessionId, grantApprovedMessage(grant.rule, scope))
-    return { status: DECIDED[decision], grant, message: `Approved: ${grant.rule}. The conversation was told to retry it.` }
+    const busy = ACTIVE_PHASES.has(this.ports.phase(agentSessionId) ?? '')
+    await this.ports.retry(agentSessionId, text)
+    return { status: DECIDED[decision], grant, message: `Approved: ${grant.rule}. ${busy ? 'The conversation retries it in a message of its own once its current turn ends.' : 'The conversation was told to retry it.'}` }
   }
 
   /** Revoking only narrows: the conversation's own grant, or any grant for the owner or a wizard. */
@@ -360,15 +377,18 @@ export class PermissionGrants {
     void this.ports.apply(agentSessionId).catch(error => console.warn('A spent grant could not be removed from the live conversation; it ends with the runtime', error))
   }
 
-  /** The classifier refused a call the owner had granted: the rule did not take effect in this CLI
-   *  (docs/permissions-classifier.md, precedence UNCONFIRMED). It is withdrawn and the owner told how
-   *  to get a one-off approval instead. */
+  /** The classifier refused a call the owner had granted. The allow rule alone does not decide a
+   *  call in Auto (docs/permissions-classifier.md, Evidence 2026-09-28); the approval turn does. A
+   *  refusal while that turn still waits in the queue is the agent retrying on its own, so the grant
+   *  stands and the turn still comes. A refusal after it means the classifier refused even the
+   *  owner's approval: the grant is withdrawn and the owner told how to approve it another way. */
   refused(agentSessionId: string, rule: string): void {
     const grant = (this.grants.get(agentSessionId) ?? []).find(entry => entry.rule === rule)
     if (!grant) return
+    if (this.retryWaiting(agentSessionId, grant.id)) return
     this.drop(agentSessionId, grant.id)
     this.statusOf(agentSessionId, grant.requestId, 'ineffective')
-    this.ports.notice(agentSessionId, `Conductor handed this conversation ${rule}, but the claude CLI's classifier still refused the call, so this CLI does not let an allow rule decide it. Switch the conversation to Edit mode: the next attempt then asks you with an ordinary Allow card.`, { permissionGrantIneffective: { rule } }, `grant-ineffective:${grant.id}`)
+    this.ports.notice(agentSessionId, `Conductor handed this conversation ${rule} and told it to retry in a message of its own, but the claude CLI's classifier still refused the call. Switch the conversation to Edit mode: the next attempt then asks you with an ordinary Allow card.`, { permissionGrantIneffective: { rule } }, `grant-ineffective:${grant.id}`)
     void this.ports.apply(agentSessionId).catch(() => undefined)
   }
 
@@ -421,8 +441,9 @@ export class PermissionGrants {
       for (const grant of granted) grant.delivery = applied === 'applied' ? 'live' : applied === 'unsupported' ? 'restart' : 'pending'
       this.changed()
       const text = granted.map(grant => grantApprovedMessage(grant.rule, grant.scope)).join('\n')
-      if (applied === 'unsupported') void this.restartThenTell(toId, text)
-      else await this.ports.tell(toId, text).catch(error => console.warn('The successor could not be told about the grants it now holds', error))
+      for (const grant of granted) this.retries.set(grant.id, text)
+      if (applied === 'unsupported') void this.restartThenRetry(toId, text)
+      else await this.ports.retry(toId, text).catch(error => console.warn('The successor could not be told about the grants it now holds', error))
     }
     return { requests: pending.length, grants: granted.length }
   }
@@ -439,6 +460,7 @@ export class PermissionGrants {
     this.withdraw(agentSessionId)
     this.aliases.delete(agentSessionId)
     this.settled.delete(agentSessionId)
+    for (const grant of this.grants.get(agentSessionId) ?? []) this.retries.delete(grant.id)
     if (!this.requests.delete(agentSessionId) && !this.grants.delete(agentSessionId)) return
     this.grants.delete(agentSessionId)
     this.changed()
@@ -456,7 +478,7 @@ export class PermissionGrants {
       this.missing.delete(agentSessionId)
       const granted = this.grants.get(agentSessionId) ?? []
       this.grants.delete(agentSessionId)
-      for (const grant of granted) this.statusOf(agentSessionId, grant.requestId, 'expired')
+      for (const grant of granted) { this.retries.delete(grant.id); this.statusOf(agentSessionId, grant.requestId, 'expired') }
       this.withdraw(agentSessionId)
       this.requests.delete(agentSessionId)
       this.aliases.delete(agentSessionId)
@@ -491,6 +513,12 @@ export class PermissionGrants {
       request.status = 'expired'
       this.card(agentSessionId, request)
     }
+  }
+
+  /** Whether the grant's approval turn (retry) still waits in the conversation's queue. */
+  private retryWaiting(agentSessionId: string, grantId: string): boolean {
+    const told = this.retries.get(grantId)
+    return Boolean(told && this.ports.retryQueued?.(agentSessionId, told))
   }
 
   /** Who holds a request now: the named conversation, or the successor a handoff moved it to. */
@@ -541,6 +569,7 @@ export class PermissionGrants {
   }
 
   private drop(agentSessionId: string, grantId: string): void {
+    this.retries.delete(grantId)
     const remaining = (this.grants.get(agentSessionId) ?? []).filter(entry => entry.id !== grantId)
     if (remaining.length) this.grants.set(agentSessionId, remaining)
     else this.grants.delete(agentSessionId)
@@ -579,14 +608,14 @@ export class PermissionGrants {
     this.ports.notice(agentSessionId, `Auto mode refused this call again; it is the one already asked about: ${grantRequestSummary(request)}`, { permissionGrant: request as unknown as Json }, itemId)
   }
 
-  private async restartThenTell(agentSessionId: string, text: string): Promise<void> {
+  private async restartThenRetry(agentSessionId: string, text: string): Promise<void> {
     const deadline = Date.now() + (this.ports.idleWaitMs ?? 10 * 60_000)
     while (ACTIVE_PHASES.has(this.ports.phase(agentSessionId) ?? '') && Date.now() < deadline) await new Promise(done => setTimeout(done, this.ports.idlePollMs ?? 2000))
     if (!this.grants.get(agentSessionId)?.length) return
     try {
       if (ACTIVE_PHASES.has(this.ports.phase(agentSessionId) ?? '')) throw new Error('the conversation did not settle')
       await this.ports.restart(agentSessionId)
-      await this.ports.tell(agentSessionId, text)
+      await this.ports.retry(agentSessionId, text)
     } catch (error) {
       this.ports.notice(agentSessionId, `The approved rule could not be handed to this conversation (${error instanceof Error ? error.message : 'restart failed'}). It still applies the next time the conversation starts.`, { permissionGrantDelivery: 'failed' }, `grant-delivery:${agentSessionId}`)
     }
