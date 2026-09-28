@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { RecoveryReport } from './recovery/protocol'
-import { coworkerResumeMessage, encodeRestartIntent, restartLine, mayInstallOnQuit, parseRestartIntent, RESTART_INTENT_MAX_AGE_MS, resumePlan, restartReason, watchChanged, wizardResumeMessage, workingSet, type RestartIntent, type RestartKind } from './restart-resume'
+import { coworkerResumeMessage, encodeRestartIntent, restartLine, mayInstallOnQuit, resumeAction, parseRestartIntent, RESTART_INTENT_MAX_AGE_MS, resumePlan, restartReason, watchChanged, wizardResumeMessage, workingSet, type RestartIntent, type RestartKind } from './restart-resume'
 
 /* resume-after-any-restart: every restart kind brings back the wizards that were working or waiting
    on their coworkers, tells each "Conductor restarted (<reason>, <old> -> <new>); continue." and
@@ -160,5 +160,34 @@ describe('install on quit', () => {
     expect(mayInstallOnQuit({ updateReady: true, unkeptWork: false, ownerAnswered: false })).toBe(true)
     expect(mayInstallOnQuit({ updateReady: true, unkeptWork: true, ownerAnswered: true })).toBe(true)
     expect(mayInstallOnQuit({ updateReady: false, unkeptWork: true, ownerAnswered: false })).toBe(true)
+  })
+})
+
+describe('resume action', () => {
+  const target = { open: true, resumable: true, wizard: true, wizardActive: true, reattached: false, working: false, live: false }
+  it('leaves a reattached conversation whose kept turn was briefed while it ran to that steer', () => {
+    expect(resumeAction({ ...target, reattached: true, brief: 'steered', working: true, live: true })).toBe('none')
+    expect(resumeAction({ ...target, reattached: true, brief: 'steered', working: false, live: true })).toBe('none')
+  })
+  it('sends the resume message to the kept runtime of a reattached conversation whose turn ended during the restart', () => {
+    expect(resumeAction({ ...target, reattached: true, live: true })).toBe('submit')
+    expect(resumeAction({ ...target, wizard: false, wizardActive: false, reattached: true, live: true })).toBe('submit')
+  })
+  it('resumes a reattached conversation whose kept runtime is gone again', () => {
+    expect(resumeAction({ ...target, reattached: true, live: false })).toBe('resume-and-submit')
+  })
+  it('waits for a still-running turn the brief did not reach, then resumes it', () => {
+    expect(resumeAction({ ...target, reattached: true, brief: 'failed', working: true, live: true })).toBe('wait')
+    expect(resumeAction({ ...target, reattached: true, brief: 'failed', working: false, live: true })).toBe('submit')
+  })
+  it('keeps the existing rule for a conversation that was not reattached', () => {
+    expect(resumeAction(target)).toBe('resume-and-submit')
+    expect(resumeAction({ ...target, working: true, live: true })).toBe('none')
+    expect(resumeAction({ ...target, open: false })).toBe('none')
+    expect(resumeAction({ ...target, resumable: false })).toBe('none')
+  })
+  it('brings back no wizard whose wizard mode is off', () => {
+    expect(resumeAction({ ...target, wizardActive: false })).toBe('none')
+    expect(resumeAction({ ...target, wizardActive: false, reattached: true, live: true })).toBe('none')
   })
 })

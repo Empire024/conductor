@@ -111,10 +111,15 @@ the attached adapter restates what is still live: running tools, pending interac
 phase. Buffered frames then arrive and are handled exactly as if live. A record whose runtime is
 gone is dropped and the conversation marked `disconnected` (native resume as before).
 
-A reattached turn is sent one short steering message saying the app restarted. App control keeps
-its endpoint and credential across restarts (below), so the message carries a new briefing only when
-it could not. A reattached wizard is not resumed a second time by
-the restart-initiator logic. Reattached conversations without an open tab appear in `agents.list`
+A reattached turn that is still running is sent one short steering message saying the app
+restarted. App control keeps its endpoint and credential across restarts (below), so the message
+carries a new briefing only when it could not. A conversation that steer reached is not resumed a
+second time by the restart plan. One whose kept turn ended while no app ran (the wizard that ran
+`app.update.install` finishes its turn in the gap) is not steered; the restart plan brings it back
+with the usual resume message, submitted to the runtime it already holds so no second process
+starts. If the steer is refused, the resume message follows once the turn settles
+(`resumeAction` in `src/main/restart-resume.ts`; `scripts/smoke-restart-gap-resume.mjs`).
+Reattached conversations without an open tab appear in `agents.list`
 as orphans. After reattaching, main starts (or joins) the host for new runtimes and closes any
 host runtime nobody owns: its app crashed, so no adapter state exists to continue it.
 

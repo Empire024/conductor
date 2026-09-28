@@ -112,6 +112,44 @@ export function resumePlan(intent: RestartIntent | null, initiator: RestartIniti
   return { reason: restartReason(intent, initiator, crash && recovery !== null && recovery.outcome !== 'down'), ...(intent ? { fromVersion: intent.fromVersion } : {}), wizards, coworkers, ...(crash ? { crash } : {}), ...(note ? { recovery: note } : {}) }
 }
 
+/** What the reattach brief did for a conversation this launch reattached: `steered` delivered the
+ *  restart into its kept turn (or queued it behind that turn); `failed` was refused or not
+ *  confirmed. Absent when it was not briefed because its turn had already settled. */
+export type ReattachBrief = 'steered' | 'failed'
+
+/** One conversation of the resume plan, as the launch finds it. */
+export interface ResumeTarget {
+  open: boolean
+  /** It has a spec and, for a native provider, a native conversation to resume. */
+  resumable: boolean
+  /** Brought back as a wizard: only while it still is one. */
+  wizard: boolean
+  wizardActive: boolean
+  /** This launch reattached it to the turn the previous process kept running in the runtime host. */
+  reattached: boolean
+  brief?: ReattachBrief
+  /** Its turn or queue is still under way (hasSessionWork). */
+  working: boolean
+  /** It has a runtime in this process: a reattached one still holds its kept provider process. */
+  live: boolean
+}
+
+/** `wait`: the brief did not reach a turn that is still running, so the resume message follows once
+ *  it settles. `submit` sends it to the runtime the conversation already holds; resuming there would
+ *  replace the kept process with a new one. */
+export type ResumeAction = 'none' | 'wait' | 'submit' | 'resume-and-submit'
+
+/** How a launch brings back one conversation of its resume plan. A reattached conversation whose
+ *  kept turn ended while no app ran (2026-09-28: the wizard that installed an update) was never
+ *  told on reattach, so it is brought back like any other. */
+export function resumeAction(target: ResumeTarget): ResumeAction {
+  if (!target.open || !target.resumable) return 'none'
+  if (target.wizard && !target.wizardActive) return 'none'
+  if (target.reattached && target.brief === 'steered') return 'none'
+  if (target.working) return target.reattached && target.brief === 'failed' ? 'wait' : 'none'
+  return target.reattached && target.live ? 'submit' : 'resume-and-submit'
+}
+
 /** The one line every brought-back conversation starts from. The old version is only ever the
  *  one the previous process recorded; without it the line names the running version alone rather
  *  than claiming `new -> new` across an update. */

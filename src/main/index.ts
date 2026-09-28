@@ -1,5 +1,5 @@
 import { encodeRestartInitiator, encodeRestartRequest, launchRestartInitiator, parseRestartRequest, RESTART_INITIATOR_KEY, RESTART_REQUEST_KEY, type RestartInitiator, type RestartRequest } from './restart-initiator'
-import { coworkerResumeMessage, encodeRestartIntent, mayInstallOnQuit, parseRestartIntent, RESTART_INTENT_KEY, restartLine, restartReason, resumePlan, watchChanged, wizardResumeMessage, workingSet, type RestartIntent, type RestartKind, type ResumeCandidate, type ResumePlan } from './restart-resume'
+import { coworkerResumeMessage, encodeRestartIntent, mayInstallOnQuit, parseRestartIntent, RESTART_INTENT_KEY, restartLine, restartReason, resumeAction, resumePlan, watchChanged, wizardResumeMessage, workingSet, type RestartIntent, type ReattachBrief, type RestartKind, type ResumeAction, type ResumeCandidate, type ResumePlan } from './restart-resume'
 import { StopConfirmations, type StopDecision } from './stop-confirmation'
 import { connectRuntimeHost } from './runtime-host/launcher'
 import { createRecovery, findCheckout, type RecoveryController } from './recovery/controller'
@@ -64,7 +64,7 @@ import type {
 } from '../shared/models'
 import { AGENT_SOUND_PROFILES, isMemoryKind, THEME_IDS, THEME_VARIANTS } from '../shared/models'
 import type { LayoutNode, RestorePoint, RestoreScope } from '../shared/models'
-import { wizardActive } from '../shared/structured-agent'
+import { wizardActive, type SessionSettings } from '../shared/structured-agent'
 import type { AgentConfirmResponse } from '../shared/agent-confirm'
 import { AgentConfirmBroker } from './agent-confirm-broker'
 import { ConductorDatabase } from './database'
@@ -816,24 +816,49 @@ const takeRestartIntent = (): RestartIntent | null => {
 
 /** Brings back the wizards and coworkers a restart left behind, and tells each why and to continue.
  *  Coworkers go first, so a wizard's agents.list already shows them running again. A conversation
- *  whose turn was kept running in the runtime host was told on reattach instead. */
+ *  whose kept turn was still running when it reattached was told then instead; one whose kept turn
+ *  ended while no app ran is brought back here like any other (restart-resume.ts resumeAction). */
 const resumeAfterRestart = async (plan: ResumePlan): Promise<void> => {
   const open = new Set(openAgentTabs().map(tab => tab.resourceId))
   const version = updates.getState().currentVersion
-  const bringBack = async (id: string, message: string, wizard: boolean): Promise<boolean> => {
-    if (!open.has(id) || reattachedRuntimes.has(id)) return false
+  const target = (id: string, wizard: boolean, brief?: ReattachBrief): { action: ResumeAction; settings?: SessionSettings } => {
     const state = database.structured.snapshot(id), spec = database.structured.spec<AgentSpec>(id)
-    if (!state || !spec || spec.provider !== 'local' && !state.nativeSessionId) return false
-    if (wizard && (spec.provider === 'local' || !wizardActive(state.settings, spec.provider))) return false
-    // Something already started it again.
-    if (hasSessionWork(state, agents.structured.hasRuntime(id))) return false
+    const live = agents.structured.hasRuntime(id)
+    const action = resumeAction({
+      open: open.has(id), resumable: Boolean(state && spec && (spec.provider === 'local' || state.nativeSessionId)),
+      wizard, wizardActive: Boolean(spec && state && spec.provider !== 'local' && wizardActive(state.settings, spec.provider)),
+      reattached: reattachedRuntimes.has(id), ...(brief ? { brief } : {}),
+      working: Boolean(state && hasSessionWork(state, live)), live
+    })
+    return { action, ...(state ? { settings: state.settings } : {}) }
+  }
+  const bringBack = async (id: string, message: string, wizard: boolean): Promise<boolean> => {
     const label = wizard ? 'Wizard tab' : 'Coworker'
-    try {
-      await agents.structured.resume(id, state.settings)
-      await agents.structured.submit(id, message, state.settings, [], { agentSessionId: 'owner', label: 'Conductor' })
-      console.log(`${label} ${id} resumed after the restart (${plan.reason})`)
-      return true
-    } catch (error) { console.warn(`${label} ${id} could not be resumed after the restart`, error); return false }
+    const { action, settings } = target(id, wizard, await reattachBriefs.get(id))
+    const send = async (resume: boolean, settings: SessionSettings): Promise<boolean> => {
+      try {
+        if (resume) await agents.structured.resume(id, settings)
+        await agents.structured.submit(id, message, settings, [], { agentSessionId: 'owner', label: 'Conductor' })
+        console.log(`${label} ${id} resumed after the restart (${plan.reason})`)
+        return true
+      } catch (error) { console.warn(`${label} ${id} could not be resumed after the restart`, error); return false }
+    }
+    if (action === 'wait') {
+      // The brief did not reach its still-running kept turn: the resume message follows once that
+      // turn settles, without holding up the rest of the plan.
+      void (async () => {
+        for (const deadline = Date.now() + 6 * 60 * 60_000; Date.now() < deadline;) {
+          await new Promise(resolve => setTimeout(resolve, 2000))
+          const next = target(id, wizard, 'failed')
+          if (next.action === 'wait') continue
+          if (next.action !== 'none' && next.settings) await send(next.action === 'resume-and-submit', next.settings)
+          return
+        }
+      })()
+      return false
+    }
+    if (action === 'none' || !settings) return false
+    return send(action === 'resume-and-submit', settings)
   }
   const resumed: string[] = []
   // A crashed process's orphaned host runtimes are stopped first, so no native resume races them.
@@ -902,6 +927,8 @@ const installRuntimeHost = (client: RuntimeHostClient): void => {
 }
 /** Conversations this launch reattached to a turn the previous process kept running. */
 const reattachedRuntimes = new Set<string>()
+/** What briefReattachedRuntimes did for each reattached conversation whose kept turn still ran. */
+const reattachBriefs = new Map<string, Promise<ReattachBrief>>()
 /** Rebinds every conversation whose turn the previous process kept running in the host, before
  *  any window asks for it; a record whose runtime is gone becomes an ordinary disconnect. */
 const reattachKeptRuntimes = async (): Promise<void> => {
@@ -931,12 +958,15 @@ const reattachKeptRuntimes = async (): Promise<void> => {
 const briefReattachedRuntimes = (restarted: string): void => {
   for (const id of reattachedRuntimes) {
     const spec = database.structured.spec<AgentSpec>(id), state = database.structured.snapshot(id)
+    // A kept turn that already ended is not briefed: the restart plan brings it back instead.
     if (!spec || spec.provider === 'local' || !state || !agentControlServer || !['running', 'waiting_approval', 'waiting_input'].includes(state.phase)) continue
     const control = agentControlServer.endpointChanged
       ? ` App control moved to a new endpoint and credential; use these from now on.\n\n${agentControlServer.briefing(spec)}`
       : ' App control keeps the same endpoint and credential.'
-    void agents.structured.steer(id, `[Conductor] ${restarted} while this turn kept running; continue.${control}`, state.settings, [], { agentSessionId: 'owner', label: 'Conductor' })
-      .catch(error => console.warn(`Reattached conversation ${id} could not be briefed`, error))
+    const steered = agents.structured.steer(id, `[Conductor] ${restarted} while this turn kept running; continue.${control}`, state.settings, [], { agentSessionId: 'owner', label: 'Conductor' })
+      .then((): ReattachBrief => 'steered', (error): ReattachBrief => { console.warn(`Reattached conversation ${id} could not be briefed`, error); return 'failed' })
+    // A steer that has not answered in a minute may still land: it is not sent a second time.
+    reattachBriefs.set(id, Promise.race([steered, new Promise<ReattachBrief>(resolve => setTimeout(() => resolve('steered'), 60_000).unref())]))
   }
 }
 /** The new app's control server asks the runtime host for the port it held while no app ran. */
