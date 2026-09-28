@@ -70,6 +70,9 @@ const HOSTED_HOOK_TIMEOUT_SEC = 900
 /** A CLI started by this app waits a little longer than Conductor's own budget, so a late answer
  *  is Conductor's refusal (and is counted as one) rather than the CLI's "host client may be unreachable". */
 const HOOK_TIMEOUT_SEC = HOOK_ANSWER_MS / 1000 + 5
+/** The launch of a CLI that only answers text: no settings layers (so no settings hooks, CLAUDE.md or
+ *  auto-memory), no skills, no tools and no MCP servers. Used by approval reviewers and evaluation turns. */
+export const CLAUDE_ISOLATED_ARGS: readonly string[] = ['--setting-sources', '', '--disable-slash-commands', '--tools', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}']
 /** A hook answer slower than this is logged: every tool call of the turn waits on it. */
 const HOOK_SLOW_MS = 2_000
 /** How long a hook failure keeps app.state's claudeHooks.unreachable set. */
@@ -270,20 +273,25 @@ export class ClaudeAdapter implements ProviderAdapter {
       // Not --bare: since 2.1.28x it reads only ANTHROPIC_API_KEY, never the owner's OAuth login,
       // so every review answered "Not logged in" and fell back to the owner. No bypass flags.
       if (this.nativeSessionId) throw new Error('Approval reviewers must start a fresh isolated native session')
-      args.push('--setting-sources', '', '--disable-slash-commands', '--tools', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}')
+      args.push(...CLAUDE_ISOLATED_ARGS)
+    } else if (this.options.profile === 'evaluation') {
+      // A cloud evaluation turn (models.evaluate) answers one prompt from its text alone, so it is
+      // launched like the reviewer: no settings layers or their hooks, skills, tools or MCP servers
+      // (the host's own tool hooks stay registered below). The host starts it in an empty directory.
+      args.push(...CLAUDE_ISOLATED_ARGS)
     }
     // Conductor's own MCP servers (currently the browser view) are attached at launch so the
     // tools are simply present: there is no way to hand a running conversation a new server, and
     // the owner should never have to restart one to get them. --mcp-config is additive, so the
     // owner's own MCP configuration is untouched; --strict-mcp-config is deliberately not sent.
     // One variadic flag carries both servers; a repeated flag is not something the CLI promises to merge.
-    const mcpConfigs = await this.relayMcp(this.options.approvalReviewer ? [] : [this.options.mcpConfig, this.options.localAssistMcpConfig, this.options.conductorMcpConfig].filter((config): config is string => Boolean(config)))
+    const mcpConfigs = await this.relayMcp(this.options.approvalReviewer || this.options.profile === 'evaluation' ? [] : [this.options.mcpConfig, this.options.localAssistMcpConfig, this.options.conductorMcpConfig].filter((config): config is string => Boolean(config)))
     if (mcpConfigs.length) args.push('--mcp-config', ...mcpConfigs)
     if (this.nativeSessionId) args.push(this.options.newNativeSession ? '--session-id' : '--resume', this.nativeSessionId)
     // Rules the owner granted this conversation (src/main/permission-grants) ride in the flag
     // settings layer, the same layer apply_flag_settings changes while it runs. Nothing else is
     // ever put there, so a launch without grants passes no --settings at all.
-    const grantRules = this.options.approvalReviewer ? [] : this.options.permissionGrants?.rules() ?? []
+    const grantRules = this.options.approvalReviewer || this.options.profile === 'evaluation' ? [] : this.options.permissionGrants?.rules() ?? []
     if (grantRules.length) {
       this.grantSettingsFile = privateConfigFile(JSON.stringify({ permissions: { allow: grantRules.map(entry => entry.rule) } }), `claude-grants-${this.options.runtimeId}`)
       this.relayFiles.push(this.grantSettingsFile)
@@ -589,7 +597,8 @@ export class ClaudeAdapter implements ProviderAdapter {
   /** The configured mode, always. "Review coworkers" on the controller never lowers a worker to
    *  manual: a worker the owner put on Auto runs on Auto, and the review only sees the requests
    *  the runtime raises on its own. Only the isolated reviewer itself is pinned to manual. */
-  private permissionMode(settings: SessionSettings): string { return settings.plan ? 'plan' : this.options.approvalReviewer ? 'manual' : settings.permission === 'accept-edits' ? 'acceptEdits' : settings.permission === 'auto' ? 'auto' : 'manual' }
+  // An evaluation turn has no tools, so plan mode would only add its instructions to the prompt.
+  private permissionMode(settings: SessionSettings): string { return this.options.profile === 'evaluation' ? 'manual' : settings.plan ? 'plan' : this.options.approvalReviewer ? 'manual' : settings.permission === 'accept-edits' ? 'acceptEdits' : settings.permission === 'auto' ? 'auto' : 'manual' }
   private async imageInput(attachment: ContextAttachment): Promise<Json> {
     if (!attachment.path) throw new Error('Claude image attachment requires a local workspace path')
     const path = await workspacePath(this.options.cwd, attachment.path)

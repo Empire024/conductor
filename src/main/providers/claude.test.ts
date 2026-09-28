@@ -75,6 +75,25 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     await expect(fixture({ approvalReviewer: true, nativeSessionId: 'old-native' }).adapter.start()).rejects.toThrow('fresh isolated')
   })
 
+  it('launches an evaluation turn lean: no settings, skills, tools, MCP servers, grants or plan mode, Conductor hooks kept', async () => {
+    const f = fixture({ profile: 'evaluation', settings: { permission: 'default', plan: true }, mcpConfig: 'browser.json', localAssistMcpConfig: 'local.json', conductorMcpConfig: 'conductor.json', permissionGrants: { rules: () => [{ rule: 'Bash(git status)', once: false }], used: vi.fn() } })
+    await f.adapter.start()
+    const args = f.transport.options.args
+    expect(args).not.toContain('--bare')
+    expect(args[args.indexOf('--setting-sources') + 1]).toBe('')
+    expect(args).toContain('--disable-slash-commands')
+    expect(args).toContain('--strict-mcp-config')
+    expect(args[args.indexOf('--tools') + 1]).toBe('')
+    expect(args.filter(arg => arg === '--mcp-config')).toHaveLength(1)
+    expect(args[args.indexOf('--mcp-config') + 1]).toBe('{"mcpServers":{}}')
+    expect(args).not.toContain('--settings')
+    expect(args[args.indexOf('--permission-mode') + 1]).toBe('manual')
+    for (const config of ['browser.json', 'local.json', 'conductor.json']) expect(args).not.toContain(config)
+    const initialize = f.transport.sent.find(message => (message as { request?: { subtype?: string } }).request?.subtype === 'initialize') as { request: { hooks: Record<string, unknown> } }
+    expect(Object.keys(initialize.request.hooks)).toEqual(expect.arrayContaining(['PreToolUse', 'PostToolUse']))
+    expect(f.adapter.capabilities.approvalRouting).not.toBe('isolated-reviewer')
+  })
+
   it('passes the browser and conductor-local configs in one --mcp-config, and neither to a reviewer', async () => {
     const both = fixture({ mcpConfig: 'browser.json', localAssistMcpConfig: 'local.json' })
     await both.adapter.start()

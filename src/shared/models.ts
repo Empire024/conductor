@@ -452,7 +452,13 @@ export interface AgentSpec {
   /** Local models only, set when the tab opens: the conversation lives in memory and is gone for
    *  good when its tab closes (src/main/local-models/anonymous.ts). */
   anonymous?: boolean
+  /** How the provider runtime is launched. 'evaluation' (AgentControl.evaluationTurn only) is the lean
+   *  one-prompt profile: no Conductor briefing or MCP servers, no settings/skills/tools, an empty working
+   *  directory. Absent for every other conversation. */
+  profile?: AgentLaunchProfile
 }
+
+export type AgentLaunchProfile = 'evaluation'
 
 export interface AgentProviderInfo {
   id: AgentProviderId

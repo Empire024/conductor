@@ -6,7 +6,7 @@ import { join, dirname } from 'node:path'
 import { claudeHistoryPath } from './native-history'
 import { ConductorDatabase } from './database'
 import { StructuredAgentStore } from './structured-store'
-import { StructuredSessions } from './structured-sessions'
+import { evaluationCwd, StructuredSessions } from './structured-sessions'
 import type { AgentSpec } from '../shared/models'
 import type { StructuredProvider } from '../shared/structured-agent'
 import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './providers/adapter'
@@ -189,6 +189,32 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     expect(localAssist.configure).toHaveBeenCalledWith(f.spec)
     f.manager.killWhere(() => true)
     expect(localAssist.release).toHaveBeenCalledWith(f.spec.id)
+  })
+
+  it.each(['claude', 'codex'] as const)('launches a %s evaluation turn lean: no briefing, no Conductor MCP servers or grants, an empty directory', async provider => {
+    const f = fixture(provider, true)
+    const mcp = { configure: vi.fn(() => 'server.json'), release: vi.fn() }
+    const context = vi.fn(() => 'BRIEFING')
+    const manager = new StructuredSessions(f.database, () => 'synthetic-executable', vi.fn(), f.factory, context, undefined, mcp); managers.push(manager)
+    manager.setLocalAssist(mcp); manager.setConductorMcp(mcp)
+    const lean: AgentSpec = { ...f.spec, id: 'evaluation-session', title: 'Evaluation: model', profile: 'evaluation' }
+    manager.ensure(lean)
+    await manager.submit(lean.id, 'Answer: 42?', settings)
+    const options = f.current.options
+    expect(options.profile).toBe('evaluation')
+    expect([options.mcpConfig, options.localAssistMcpConfig, options.conductorMcpConfig ?? '']).toEqual(['', '', ''])
+    expect(options.permissionGrants).toBeUndefined()
+    expect(options.cwd).toBe(evaluationCwd())
+    expect(options.cwd).not.toBe(f.workspace)
+    expect(f.database.structured.spec<AgentSpec>(lean.id)!.cwd).toBe(f.workspace)
+    expect(f.current.submissions.at(-1)!.text).toBe('Answer: 42?')
+    expect(context).not.toHaveBeenCalled()
+    // Every other conversation keeps its briefing, servers and project folder.
+    await manager.submit(f.spec.id, 'Normal turn', settings)
+    expect(f.current.options.profile).toBeUndefined()
+    expect(f.current.options.cwd).toBe(f.workspace)
+    expect(f.current.options.localAssistMcpConfig).toBe('server.json')
+    expect(f.current.submissions.at(-1)!.text).toBe('Normal turn\n\nBRIEFING')
   })
 
   it.each(['claude', 'codex'] as const)('reconnects the same idle native %s conversation when browser tools change', async provider => {

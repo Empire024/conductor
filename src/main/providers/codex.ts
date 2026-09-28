@@ -145,10 +145,19 @@ export function codexMcpToolApproval(params: unknown): { serverName: string; too
 
 const LIVE_DISABLED_FEATURES = ['hooks', 'plugins', 'apps', 'multi_agent', 'multi_agent_v2', 'browser_use', 'browser_use_external', 'computer_use', 'memories', 'unbounded_connection_retries'] as const
 
+/** What a lean evaluation turn (AgentSpec.profile) switches off: optional features that only add tools
+ *  or context to a one-prompt text answer. Hooks stay on: Codex keeps its tools, and a hook may be a guard. */
+export const EVALUATION_DISABLED_FEATURES = ['plugins', 'apps', 'multi_agent', 'multi_agent_v2', 'browser_use', 'browser_use_external', 'computer_use', 'memories'] as const
+
 /** Process-local CLI overrides; never writes the user's configuration or changes authentication. */
-export function codexLaunchArguments(environment: NodeJS.ProcessEnv): string[] {
+export function codexLaunchArguments(environment: NodeJS.ProcessEnv, profile?: AdapterOptions['profile']): string[] {
   const args = ['app-server', '--listen', 'stdio://']
-  if (environment.CONDUCTOR_LIVE_TESTS !== '1') return args
+  if (environment.CONDUCTOR_LIVE_TESTS !== '1') {
+    if (profile !== 'evaluation') return args
+    for (const feature of EVALUATION_DISABLED_FEATURES) args.push('--disable', feature)
+    args.push('-c', 'web_search="disabled"', '-c', 'memories.generate_memories=false', '-c', 'memories.use_memories=false')
+    return args
+  }
   if (!environment.CONDUCTOR_LIVE_MODEL_CODEX || !['cli', 'api'].includes(environment.CONDUCTOR_LIVE_AUTH_CODEX ?? '')) throw new Error('Codex live tests require an explicit approved model and authentication mode')
   const servers: unknown = JSON.parse(environment.CONDUCTOR_LIVE_OPTIONAL_MCP ?? '[]')
   if (!Array.isArray(servers) || servers.length > 128 || servers.some(server => typeof server !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(server))) throw new Error('Live optional MCP names must be an explicit bounded list of simple names without dots or quotes')
@@ -197,6 +206,31 @@ export function codexLiveSkillOverrides(discovered: SkillsListResponse, config: 
   if (overrides.size > 2048) throw new Error('Live skill inventory exceeded the bounded preflight limit')
   return { 'skills.config': [...overrides.values()] }
 }
+
+/** The thread config of a lean evaluation turn: every MCP server the owner's configuration enables and
+ *  every optional (user, repo, system) skill switched off for this one thread, as dotted overrides like
+ *  the verified `-c mcp_servers.<name>.enabled=false`. Best effort: what could not be read stays as it is,
+ *  and a name the dotted-key parser cannot carry is left alone. Undefined when there is nothing to turn off. */
+export function codexEvaluationThreadConfig(config: ConfigReadResponse | null, skills: SkillsListResponse | null): Json | undefined {
+  const overrides: Record<string, Json> = {}
+  const servers = config && record(config.config.mcp_servers) ? config.config.mcp_servers : {}
+  for (const [name, server] of Object.entries(servers)) {
+    if (/^[a-zA-Z0-9_-]{1,128}$/.test(name) && !(record(server) && server.enabled === false)) overrides[`mcp_servers.${name}.enabled`] = false
+  }
+  const optional = (skills?.data ?? []).flatMap(entry => Array.isArray(entry.skills) ? entry.skills : [])
+    .filter(skill => skill.enabled && skill.scope !== 'admin' && typeof skill.path === 'string' && skill.path.length > 0 && skill.path.length <= 4096)
+  if (optional.length) {
+    const inherited = config && record(config.config.skills) && Array.isArray(config.config.skills.config) ? config.config.skills.config : []
+    const entries = new Map<string, Json>()
+    for (const entry of inherited) if (record(entry) && typeof entry.path === 'string' && typeof entry.enabled === 'boolean') entries.set(entry.path, { path: entry.path, enabled: entry.enabled })
+    for (const skill of optional.slice(0, 2048)) entries.set(skill.path, { path: skill.path, enabled: false })
+    overrides['skills.config'] = [...entries.values()]
+  }
+  return Object.keys(overrides).length ? overrides : undefined
+}
+
+const mergeEvaluationConfig = (base: Json | undefined, lean: Json | undefined): Json | undefined =>
+  record(base) && record(lean) ? { ...base, ...lean } : lean ?? base
 
 /** Reads only the exact loopback browser configuration minted by BrowserMcpServer. This is a
  * thread config, never a process argument, so the per-session bearer token stays out of argv. */
@@ -332,7 +366,7 @@ export class CodexAdapter implements ProviderAdapter {
   private createTransport(attach?: HostedRuntimeHandle): WireTransport {
     const factory = this.dependencies.transport ?? (options => new JsonLineTransport(options))
     return factory({
-      executable: this.options.executable, args: codexLaunchArguments(this.options.environment ?? process.env),
+      executable: this.options.executable, args: codexLaunchArguments(this.options.environment ?? process.env, this.options.profile),
       cwd: this.options.cwd, environment: this.options.environment, ...(attach ? { attach } : {}),
       onMessage: message => this.receive(message),
       onStderr: output => this.emit({ data: { type: 'notice', message: 'Codex process diagnostic (stderr)', payload: output }, native: { method: 'process/stderr' } }),
@@ -421,6 +455,8 @@ export class CodexAdapter implements ProviderAdapter {
         if (!catalog.data.some(model => model.model === liveEnvironment.CONDUCTOR_LIVE_MODEL_CODEX && model.supportedReasoningEfforts.some(effort => effort.reasoningEffort === 'low'))) throw new Error('The approved Codex live model with low effort is unavailable; no substitution is allowed')
         this.emit({ data: { type: 'notice', message: 'Codex live fixture isolation verified before thread creation', payload: { authentication: expectedType, model: liveEnvironment.CONDUCTOR_LIVE_MODEL_CODEX!, disabledOptionalFeatures: [...LIVE_DISABLED_FEATURES] } } })
       }
+      // A lean evaluation turn (AgentSpec.profile) also leaves the owner's own MCP servers and optional skills off.
+      if (this.options.profile === 'evaluation' && liveEnvironment.CONDUCTOR_LIVE_TESTS !== '1') threadConfig = mergeEvaluationConfig(threadConfig, await this.evaluationThreadConfig())
       const method = this.options.nativeSessionId ? 'thread/resume' : 'thread/start'
       const params = this.options.nativeSessionId
         ? { threadId: this.options.nativeSessionId, cwd: this.options.cwd, excludeTurns: true, ...(threadConfig ? { config: threadConfig } : {}) }
@@ -465,6 +501,20 @@ export class CodexAdapter implements ProviderAdapter {
       this.transport?.close()
       throw error
     }
+  }
+
+  /** Reads what the owner's configuration would add to a lean evaluation thread (codexEvaluationThreadConfig).
+   *  A read that fails leaves that part as configured and says so; the evaluation still runs. */
+  private async evaluationThreadConfig(): Promise<Json | undefined> {
+    const read = async <T>(method: ClientRequest['method'], params: Json): Promise<T | null> => {
+      try { return await this.request<T>(method, params) } catch (error) {
+        this.emit({ data: { type: 'notice', message: `Evaluation profile: ${method} failed, so its part of the owner's Codex configuration stays on: ${error instanceof Error ? error.message : String(error)}` } })
+        return null
+      }
+    }
+    const config = await read<ConfigReadResponse>('config/read', { cwd: this.options.cwd, includeLayers: false })
+    const skills = await read<SkillsListResponse>('skills/list', { cwds: [this.options.cwd], forceReload: false })
+    return codexEvaluationThreadConfig(config, skills)
   }
 
   async submit(text: string, settings: SessionSettings, attachments?: ContextAttachment[]): Promise<void> {

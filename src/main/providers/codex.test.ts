@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { CodexAdapter, CODEX_PROTOCOL_BASELINE, codexChanges, codexDiffCounts, codexInput, codexLaunchArguments, validateCodexLiveConfiguration, codexLiveSkillOverrides } from './codex'
+import { CodexAdapter, CODEX_PROTOCOL_BASELINE, codexChanges, codexDiffCounts, codexInput, codexEvaluationThreadConfig, codexLaunchArguments, validateCodexLiveConfiguration, codexLiveSkillOverrides } from './codex'
 import { JsonLineTransport } from './transport'
 import { SteeringUnavailableError, type AdapterOptions } from './adapter'
 import type { AdapterEvent, AgentEvent, Json, SessionSettings } from '../../shared/structured-agent'
@@ -375,6 +375,48 @@ describe('Codex deterministic mapping', () => {
     expect(() => codexLaunchArguments({ ...env, CONDUCTOR_LIVE_OPTIONAL_MCP: '["unsafe\\nkey"]' })).toThrow('bounded list')
     expect(() => codexLaunchArguments({ ...env, CONDUCTOR_LIVE_OPTIONAL_MCP: '["server.with.dots"]' })).toThrow('without dots or quotes')
     expect(() => codexLaunchArguments({ ...env, CONDUCTOR_LIVE_OPTIONAL_MCP: JSON.stringify(['"quoted"']) })).toThrow('without dots or quotes')
+  })
+
+  it('launches an evaluation turn lean: optional features and web search off, hooks kept, the owner\'s MCP servers and skills off for the thread', async () => {
+    const args = codexLaunchArguments({}, 'evaluation')
+    expect(args.slice(0, 3)).toEqual(['app-server', '--listen', 'stdio://'])
+    for (const feature of ['plugins', 'apps', 'multi_agent', 'browser_use', 'computer_use', 'memories']) expect(args[args.indexOf(feature) - 1]).toBe('--disable')
+    expect(args).not.toContain('hooks')
+    expect(args).toContain('web_search="disabled"')
+    expect(args).toContain('memories.use_memories=false')
+    // Live isolation keeps its own, stricter arguments.
+    expect(codexLaunchArguments({ CONDUCTOR_LIVE_TESTS: '1', CONDUCTOR_LIVE_MODEL_CODEX: 'approved-model', CONDUCTOR_LIVE_AUTH_CODEX: 'cli' }, 'evaluation')).toContain('hooks')
+
+    const { adapter, sent, events } = create({}, undefined, 3000, { permission: 'read-only', plan: false }, undefined, { profile: 'evaluation' })
+    await adapter.start()
+    const methods = sent.map(message => (message as { method: string }).method)
+    expect(methods.slice(0, 5)).toEqual(['initialize', 'initialized', 'config/read', 'skills/list', 'thread/start'])
+    const start = sent.find(message => (message as { method: string }).method === 'thread/start') as { params: { config?: Json } }
+    // fixture-disabled is already off; the two enabled servers are switched off for this thread only.
+    expect(start.params.config).toEqual({ 'mcp_servers.fixture-tools.enabled': false, 'mcp_servers.fixture-prompting.enabled': false })
+    expect(events.some(event => event.data.type === 'notice' && /Evaluation profile/.test(event.data.message))).toBe(false)
+
+    const normal = create()
+    await normal.adapter.start()
+    expect(normal.sent.map(message => (message as { method: string }).method)).not.toContain('config/read')
+  })
+
+  it('keeps a lean evaluation thread running when the owner\'s configuration cannot be read', async () => {
+    const { adapter, sent, events } = create({ CONDUCTOR_TEST_CONFIG_READ_UNAVAILABLE: '1' }, undefined, 3000, settings, undefined, { profile: 'evaluation' })
+    await adapter.start()
+    const start = sent.find(message => (message as { method: string }).method === 'thread/start') as { params: { config?: Json } }
+    expect(start.params.config).toBeUndefined()
+    expect(events.some(event => event.data.type === 'notice' && /Evaluation profile: config\/read failed/.test(event.data.message))).toBe(true)
+  })
+
+  it('builds the evaluation thread config from what the owner configured, keeping inherited skill entries', () => {
+    const config = { config: { mcp_servers: { on: { enabled: true }, unset: {}, off: { enabled: false }, 'has.dot': {} }, skills: { config: [{ path: 'C:/kept/SKILL.md', enabled: true }] } }, layers: [], origins: {} } as unknown as ConfigReadResponse
+    const skills = { data: [{ cwd: 'C:/x', errors: [], skills: [{ path: 'C:/user/SKILL.md', scope: 'user', enabled: true }, { path: 'C:/admin/SKILL.md', scope: 'admin', enabled: true }, { path: 'C:/idle/SKILL.md', scope: 'repo', enabled: false }] }] } as unknown as SkillsListResponse
+    expect(codexEvaluationThreadConfig(config, skills)).toEqual({
+      'mcp_servers.on.enabled': false, 'mcp_servers.unset.enabled': false,
+      'skills.config': [{ path: 'C:/kept/SKILL.md', enabled: true }, { path: 'C:/user/SKILL.md', enabled: false }]
+    })
+    expect(codexEvaluationThreadConfig(null, null)).toBeUndefined()
   })
 
   it('refuses live isolation when optional integrations remain enabled or managed policy would be suppressed', () => {

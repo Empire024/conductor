@@ -37,6 +37,9 @@ export interface AdapterOptions {
   permissionGrants?: { rules(): Array<{ rule: string; once: boolean }>; used(rule: string): void; refused?(rule: string): void; denied?(itemId: string, request: DenialGrantRequest): void }
   /** Host-only reviewer isolation; never accepted from worker settings or app-control input. */
   approvalReviewer?: boolean
+  /** Host-only lean launch of a cloud evaluation turn (AgentSpec.profile): the adapter drops what the
+   *  one prompt does not need (settings sources, skills, tools, optional features) before any turn. */
+  profile?: import('../../shared/models').AgentLaunchProfile
   /** Delegated native approval events must pass the host reviewer gate, including Auto mode. */
   reviewApprovals?: boolean
   /** Host denial fence, including tools which native remembered rules would otherwise allow. */

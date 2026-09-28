@@ -9,11 +9,11 @@ import type { ReviewAction } from '../approval-review'
 import type { LocalModelRequest } from '../local-assist/contract'
 import { outcome as outcomeRow } from './capture/common'
 import { batchJobTokens, type EvaluationSuite } from './evaluation'
-import { EvaluationRefused } from './evaluation-ports'
+import { DEFAULT_FIXED_OVERHEAD_TOKENS, EvaluationRefused } from './evaluation-ports'
 import { softmax } from './deciders/scorer'
 import {
   CALLER_DECIDER_ID, callerFrontier, chosenOnTop, closeCandidates, createModelIntelligence, DEFAULT_EVALUATION_CAPS, DEFAULT_EXCLUDED_MODELS, EVALUATION_CAPS_SETTING, EXCLUDED_MODELS_SETTING,
-  EVALUATION_OVERHEAD_SETTING, excludedMatcher, LOCAL_DECIDER_UNAVAILABLE, routeUsage, usageVerdict, weeklyUsage, WEEKLY_STOP_SETTING, type ModelIntelligenceOptions
+  EVALUATION_OVERHEAD_PROFILE, EVALUATION_OVERHEAD_SETTING, excludedMatcher, LOCAL_DECIDER_UNAVAILABLE, routeUsage, usageVerdict, weeklyUsage, WEEKLY_STOP_SETTING, type ModelIntelligenceOptions
 } from './index'
 
 const dirs: string[] = []
@@ -259,7 +259,7 @@ describe('cloud evaluation under the owner caps (gap 8)', () => {
   it('never lets a learned overhead lock a provider out, and refuses a run that cannot fit before it counts (N14)', async () => {
     const smallest = batchJobTokens({ id: 'answer', category: 'simple-coding', complexity: 1, prompt: 'Say 42', grader: { kind: 'exact', expected: '42' } })
     // A multi-call turn learned 500k as the "overhead" under the old code: read back, it is bounded so a full run still holds one job.
-    const locked = cloud(10, values => values.set(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ claude: { tokens: 500_000, at: NOW.toISOString() } })))
+    const locked = cloud(10, values => values.set(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ claude: { tokens: 500_000, at: NOW.toISOString(), profile: EVALUATION_OVERHEAD_PROFILE } })))
     expect(locked.s.fixedOverheadTokens('claude')).toBe(60_000)
     locked.runCloud.mockImplementation(async () => ({ answer: '42', tokens: 41_000, costUsd: null, durationMs: 1, overheadTokens: 39_000 }))
     const full = await locked.s.startEvaluation(OPUS, 'mini')
@@ -272,7 +272,7 @@ describe('cloud evaluation under the owner caps (gap 8)', () => {
     huge.runCloud.mockImplementation(async () => ({ answer: '42', tokens: 41_000, costUsd: null, durationMs: 1, overheadTokens: 250_000 }))
     const run = await huge.s.startEvaluation(OPUS, 'mini')
     await vi.waitFor(() => expect(huge.s.evaluation(run.runId)!.state).not.toBe('running'))
-    expect(JSON.parse(huge.s.decisions['ports'].settings.getSetting(EVALUATION_OVERHEAD_SETTING)!)).toEqual({ claude: { tokens: 60_000 - smallest, measured: 250_000, at: NOW.toISOString() } })
+    expect(JSON.parse(huge.s.decisions['ports'].settings.getSetting(EVALUATION_OVERHEAD_SETTING)!)).toEqual({ claude: { tokens: 60_000 - smallest, measured: 250_000, at: NOW.toISOString(), profile: EVALUATION_OVERHEAD_PROFILE } })
     // What is left of the day cannot hold that overhead plus a job: refused before the run is counted, the runner never called.
     huge.runCloud.mockClear()
     huge.s.store.recordEvaluationSpend({ runId: 'earlier', key: OPUS, at: NOW.toISOString(), tokens: 60_000, jobs: 1, gradedJobs: 1, stoppedBy: null })
@@ -281,14 +281,14 @@ describe('cloud evaluation under the owner caps (gap 8)', () => {
     expect(huge.s.store.evaluationSpend('2026-09-27T12:00:00Z')).toEqual(before)
     expect(huge.runCloud).not.toHaveBeenCalled()
     // And a small learned value is raised to the band's floor.
-    const tiny = cloud(10, values => values.set(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ claude: { tokens: 12, at: NOW.toISOString() } })))
+    const tiny = cloud(10, values => values.set(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ claude: { tokens: 12, at: NOW.toISOString(), profile: EVALUATION_OVERHEAD_PROFILE } })))
     expect(tiny.s.fixedOverheadTokens('claude')).toBe(5_000)
   })
   it('admits on the recent raw measurement: a cap below the real overhead refuses instead of starting a doomed turn (N19)', async () => {
     const smallest = batchJobTokens(suite.jobs[0]!), measuredAt = (hoursAgo: number) => new Date(NOW.getTime() - hoursAgo * 3_600_000).toISOString()
     const capped = (hoursAgo: number) => cloud(10, values => {
       values.set(EVALUATION_CAPS_SETTING, JSON.stringify({ perRunTokens: 30_000 }))
-      values.set(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ claude: { tokens: 30_000 - smallest, measured: 39_115, at: measuredAt(hoursAgo) } }))
+      values.set(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ claude: { tokens: 30_000 - smallest, measured: 39_115, at: measuredAt(hoursAgo), profile: EVALUATION_OVERHEAD_PROFILE } }))
     })
     // reverify4: measured 39,115 two hours ago, the run cap 30k. Refused with the reason; nothing runs or counts.
     const recent = capped(2)
@@ -305,8 +305,26 @@ describe('cloud evaluation under the owner caps (gap 8)', () => {
     await expect(stale.s.startEvaluation(OPUS, 'mini')).rejects.toThrow(/cannot hold a claude turn's 39115 fixed tokens \(measured 2026-/)
     expect(stale.runCloud).toHaveBeenCalledTimes(1)
     // A measurement that fits is admitted as before (a legacy entry without `measured` never refuses: the N14 test above).
-    const fits = cloud(10, values => values.set(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ claude: { tokens: 39_115, measured: 39_115, at: measuredAt(1) } })))
+    const fits = cloud(10, values => values.set(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ claude: { tokens: 39_115, measured: 39_115, at: measuredAt(1), profile: EVALUATION_OVERHEAD_PROFILE } })))
     expect((await fits.s.startEvaluation(OPUS, 'mini')).maxTokens).toBe(60_000)
+  })
+  it('ignores an overhead measured before the lean evaluation profile and measures it again (B5-H)', async () => {
+    const smallest = batchJobTokens(suite.jobs[0]!)
+    // reverify: a full native tab measured 51,491 an hour ago; a 30k cap would refuse on it, but that preamble is gone.
+    const old = cloud(10, values => {
+      values.set(EVALUATION_CAPS_SETTING, JSON.stringify({ perRunTokens: 30_000 }))
+      values.set(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ claude: { tokens: 30_000 - smallest, measured: 51_491, at: new Date(NOW.getTime() - 3_600_000).toISOString() }, codex: { tokens: 45_000, measured: 45_000, at: NOW.toISOString(), profile: 'full-0' } }))
+    })
+    // Both read as unmeasured: the 40k default, bounded by the 30k run cap.
+    expect(DEFAULT_FIXED_OVERHEAD_TOKENS).toBeGreaterThan(30_000)
+    expect(old.s.fixedOverheadTokens('claude')).toBe(30_000)
+    expect(old.s.fixedOverheadTokens('codex')).toBe(30_000)
+    old.runCloud.mockImplementation(async () => ({ answer: '42', tokens: 13_000, costUsd: null, durationMs: 1, overheadTokens: 12_345 }))
+    const run = await old.s.startEvaluation(OPUS, 'mini')
+    expect(run.maxTokens).toBe(30_000)
+    await vi.waitFor(() => expect(old.s.evaluation(run.runId)!.state).not.toBe('running'))
+    expect(old.s.fixedOverheadTokens('claude')).toBe(12_345)
+    expect(JSON.parse(old.s.decisions['ports'].settings.getSetting(EVALUATION_OVERHEAD_SETTING)!)).toEqual({ claude: { tokens: 12_345, measured: 12_345, at: NOW.toISOString(), profile: EVALUATION_OVERHEAD_PROFILE } })
   })
   it('refuses a cloud run of a suite whose jobs all need a command runner', async () => {
     const onlyCommands: EvaluationSuite = { name: 'commands', jobs: [{ id: 'check', category: 'simple-coding', complexity: 1, prompt: 'Write add.js', grader: { kind: 'command', cmd: 'node', args: ['test.mjs'], expectExit: 0, timeoutSec: 10 } }] }
@@ -331,7 +349,7 @@ describe('cloud evaluation under the owner caps (gap 8)', () => {
     const runCloud = vi.fn(async (..._args: unknown[]) => ({ answer: '42', tokens: (_args[3] as { maxTokens: number }).maxTokens, costUsd: null, durationMs: 1 }))
     const store = settings()
     // The smallest overhead the band allows, and a floor that lets the day's 30k remainder run.
-    store.values.set(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ claude: { tokens: 0, at: NOW.toISOString() } }))
+    store.values.set(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ claude: { tokens: 0, at: NOW.toISOString(), profile: EVALUATION_OVERHEAD_PROFILE } }))
     store.values.set(EVALUATION_CAPS_SETTING, JSON.stringify({ minRunTokens: 20_000 }))
     const s = createModelIntelligence({ dbPath: ':memory:', settings: store, timers: noTimers, clock: () => NOW, log: () => {}, evaluation: { runCloud, usage: () => 10, suites: () => ({ big }) } })
     register(s, [[OPUS, 'Opus']])
@@ -354,7 +372,7 @@ describe('cloud evaluation under the owner caps (gap 8)', () => {
     await vi.waitFor(() => expect(s.evaluation(handle.runId)!.state).not.toBe('running'))
     expect(s.fixedOverheadTokens('claude')).toBe(38_500)
     expect(s.fixedOverheadTokens('codex')).toBe(40_000)
-    expect(JSON.parse(s.decisions['ports'].settings.getSetting(EVALUATION_OVERHEAD_SETTING)!)).toEqual({ claude: { tokens: 38_500, measured: 38_500, at: NOW.toISOString() } })
+    expect(JSON.parse(s.decisions['ports'].settings.getSetting(EVALUATION_OVERHEAD_SETTING)!)).toEqual({ claude: { tokens: 38_500, measured: 38_500, at: NOW.toISOString(), profile: EVALUATION_OVERHEAD_PROFILE } })
     // A failed turn that reported its input still teaches the overhead.
     runCloud.mockImplementation(async () => { throw Object.assign(new Error('the evaluation turn ended failed'), { tokens: 6_000, overheadTokens: 41_000 }) })
     const next = await s.startEvaluation(OPUS, 'mini')

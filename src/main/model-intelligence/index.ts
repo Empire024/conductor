@@ -42,8 +42,12 @@ const HOUR_MS = 3_600_000
 const DAILY_MS = 24 * HOUR_MS
 const LAST_DAILY_SETTING = 'model-intelligence:last-daily-refresh'
 export const EVALUATION_CAPS_SETTING = 'model-intelligence:evaluation-caps'
-/** The last measured fixed input overhead of a cloud evaluation turn, per provider: {provider: {tokens, at}}. */
+/** The last measured fixed input overhead of a cloud evaluation turn, per provider: {provider: {tokens, measured, at, profile}}. */
 export const EVALUATION_OVERHEAD_SETTING = 'model-intelligence:evaluation-overhead'
+/** The launch profile evaluation turns run on (AgentSpec.profile 'evaluation', version 1: no Conductor briefing,
+ *  MCP servers, settings, skills or tools, an empty working directory). A stored overhead measured under any
+ *  other preamble (an entry without it was a full native tab, ~51k) is stale: ignored until one run measures again. */
+export const EVALUATION_OVERHEAD_PROFILE = 'lean-1'
 const STARTUP_SOURCES: IngestionSourceName[] = ['configured', 'runtime']
 const DAILY_SOURCES: IngestionSourceName[] = ['configured', 'runtime', 'openrouter', 'latest-models', 'benchmarks']
 const SETTLED: ReadonlySet<SessionPhase> = new Set(['completed', 'failed', 'interrupted'])
@@ -326,11 +330,14 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
     } catch { return { ...DEFAULT_EVALUATION_CAPS, weeklyStop: weeklyStops() } }
   }
   /** Each provider's last measured fixed overhead of a cloud evaluation turn (N9): what a native turn
-   *  reads before the job itself. Kept in settings so it survives a restart; DEFAULT_FIXED_OVERHEAD_TOKENS until measured. */
-  const overheads = (): Record<string, { tokens: number; measured?: number; at: string }> => {
+   *  reads before the job itself. Kept in settings so it survives a restart; DEFAULT_FIXED_OVERHEAD_TOKENS until measured.
+   *  Only entries measured on the current launch profile (EVALUATION_OVERHEAD_PROFILE) count. */
+  type OverheadEntry = { tokens: number; measured?: number; at: string; profile?: string }
+  const overheads = (): Record<string, OverheadEntry> => {
     try {
       const stored: unknown = JSON.parse(options.settings.getSetting(EVALUATION_OVERHEAD_SETTING) ?? '{}')
-      return stored && typeof stored === 'object' && !Array.isArray(stored) ? stored as Record<string, { tokens: number; measured?: number; at: string }> : {}
+      if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return {}
+      return Object.fromEntries(Object.entries(stored as Record<string, OverheadEntry>).filter(([, entry]) => entry && typeof entry === 'object' && entry.profile === EVALUATION_OVERHEAD_PROFILE))
     } catch { return {} }
   }
   /** The raw measurement while it is recent (OVERHEAD_TRUST_MS): what admission charges (N19). An entry
@@ -352,7 +359,7 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
    *  job prompt), bounded; the raw measurement is kept beside it for audit. */
   const recordOverhead = (provider: string, tokens: unknown, smallestJob = 0): void => {
     if (typeof tokens !== 'number' || !Number.isFinite(tokens) || tokens < 0) return
-    try { options.settings.setSetting(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ ...overheads(), [provider]: { tokens: clampOverhead(tokens, smallestJob), measured: Math.round(tokens), at: clock().toISOString() } })) }
+    try { options.settings.setSetting(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ ...overheads(), [provider]: { tokens: clampOverhead(tokens, smallestJob), measured: Math.round(tokens), at: clock().toISOString(), profile: EVALUATION_OVERHEAD_PROFILE } })) }
     catch (error) { log('evaluation overhead not saved', error) }
   }
   /** The owner's exclusion patterns; an unreadable setting keeps the defaults, an empty array excludes nothing. */

@@ -3,7 +3,9 @@ import { sessionCheckpoint } from './local-models/session-checkpoint'
 import { deriveConversationTitle } from '../shared/conversation-title'
 import { readClaudeHistory, hasClaudeHistory, readGrokHistory, hasGrokHistory, historyEvent } from './native-history'
 import { randomUUID } from 'node:crypto'
-import { realpathSync } from 'node:fs'
+import { mkdirSync, realpathSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { AgentActivityPhase, AgentSpec, LayoutNode, RuntimeEnsureResult } from '../shared/models'
 import { isFrontierModel, MAX_PROMPT_CHARS, PROVIDER_SAFEGUARD_REFUSAL, settingsForRuntime, WIZARD_MODEL_HINT, wizardActive } from '../shared/structured-agent'
 import type { ActivityStatus, AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, Json, PendingSteering, PromptDispatchAuthority, PromptOrigin, QueuedPrompt, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
@@ -149,6 +151,15 @@ const fallbackAfterRefusal = (provider: StructuredProvider, model: string): { mo
 
 /** Only a public, renderer-understood error code crosses the adapter boundary. Provider errors
  *  can carry arbitrary fields, so never project an unrecognised value into durable history. */
+/** Where a lean evaluation runtime (AgentSpec.profile 'evaluation') runs: an empty directory outside
+ *  every project, so the CLI reads no AGENTS.md/CLAUDE.md, project settings or auto-memory. The spec
+ *  keeps the project's folder; only the provider process is started here. */
+export function evaluationCwd(): string {
+  const directory = join(tmpdir(), 'conductor-evaluation')
+  mkdirSync(directory, { recursive: true })
+  return directory
+}
+
 const safeErrorCode = (error: unknown): string | undefined =>
   error instanceof Error && 'code' in error && error.code === LOCAL_MODEL_SETUP_ERROR_CODE
     ? LOCAL_MODEL_SETUP_ERROR_CODE
@@ -349,17 +360,21 @@ export class StructuredSessions {
   }
   private options(live: LiveSession, runtimeId: string): AdapterOptions {
     const id = live.spec.id, state = this.database.structured.snapshot(id)!
+    // A lean evaluation turn, like an approval reviewer, gets none of Conductor's MCP servers or grants.
+    const lean = live.spec.profile === 'evaluation' && live.spec.provider !== 'local'
+    const isolated = this.isApprovalReviewer(id) || lean
     return {
-      executable: live.executable, cwd: live.spec.cwd, runtimeId, nativeSessionId: state.nativeSessionId,
+      executable: live.executable, cwd: lean ? evaluationCwd() : live.spec.cwd, runtimeId, nativeSessionId: state.nativeSessionId,
       settings: settingsForRuntime(state.settings, runtimeId),
-      mcpConfig: this.isApprovalReviewer(id) || live.spec.provider === 'local' || !state.settings.browserMcp ? '' : this.mcp?.configure(live.spec) ?? '',
-      localAssistMcpConfig: this.isApprovalReviewer(id) ? '' : this.localAssist?.configure(live.spec) ?? '',
+      mcpConfig: isolated || live.spec.provider === 'local' || !state.settings.browserMcp ? '' : this.mcp?.configure(live.spec) ?? '',
+      localAssistMcpConfig: isolated ? '' : this.localAssist?.configure(live.spec) ?? '',
       // Codex gets the conductor tools too (control, send_message, report, ...); permission grants stay Claude's.
-      ...(live.spec.provider === 'codex' && !this.isApprovalReviewer(id) ? { conductorMcpConfig: this.conductorMcp?.configure(live.spec) ?? '' } : {}),
-      ...(live.spec.provider === 'claude' && !this.isApprovalReviewer(id) ? {
+      ...(live.spec.provider === 'codex' && !isolated ? { conductorMcpConfig: this.conductorMcp?.configure(live.spec) ?? '' } : {}),
+      ...(live.spec.provider === 'claude' && !isolated ? {
         conductorMcpConfig: this.conductorMcp?.configure(live.spec) ?? '',
         ...(this.permissionGrants ? { permissionGrants: this.permissionGrants.adapterPort(id) } : {})
       } : {}),
+      ...(lean ? { profile: 'evaluation' as const } : {}),
       approvalReviewer: this.isApprovalReviewer(id),
       reviewApprovals: Boolean(this.reviewRouting?.enabled(live.spec)),
       authorizeTool: (name, input) => this.approvalGate.guardTool(live.spec, name, input),
@@ -965,7 +980,8 @@ export class StructuredSessions {
           nudged: state.items.some(item => item.data.type === 'notice' && typeof item.data.payload === 'object' && item.data.payload !== null && !Array.isArray(item.data.payload) && item.data.payload[SUCCESSION_NUDGE] === true),
           notice: message => this.emit(live, { data: { type: 'notice', message, payload: { [SUCCESSION_NUDGE]: true } } }) }
         : share ? { percent: share.percent } : undefined
-      const recalled = process.env.CONDUCTOR_LIVE_TESTS === '1' || this.isApprovalReviewer(id) ? '' : this.context?.(live.spec, text, userItemId, live.adapter ? live.runtimeId : '', briefing) ?? ''
+      // An evaluation turn (AgentSpec.profile) is graded on its prompt alone: no briefing or recalled memory.
+      const recalled = process.env.CONDUCTOR_LIVE_TESTS === '1' || this.isApprovalReviewer(id) || live.spec.profile === 'evaluation' ? '' : this.context?.(live.spec, text, userItemId, live.adapter ? live.runtimeId : '', briefing) ?? ''
       // A local model reads recalled background before the owner's words, fenced as reference, so
       // the owner's instruction is the last thing it reads; native providers keep it after.
       const submitted = live.spec.provider === 'local'

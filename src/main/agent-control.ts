@@ -1317,7 +1317,7 @@ export class AgentControl {
       // the folder of whoever asked for it.
       const cwd = target.projectId === scope.projectId ? source.cwd : this.deps.database.getProject(target.projectId)!.path
       // A coworker of the owner or of a wizard waits out usage limits and continues, like the wizard itself.
-      const spec: AgentSpec = { id: tab.resourceId, projectId: target.projectId, sessionId: target.sessionId, provider, model: model.id, title: tab.title, cwd, ...(sovereign(scope) ? { continueOnLimit: true } : {}), ...(anonymous ? { anonymous: true } : {}) }
+      const spec: AgentSpec = { id: tab.resourceId, projectId: target.projectId, sessionId: target.sessionId, provider, model: model.id, title: tab.title, cwd, ...(sovereign(scope) ? { continueOnLimit: true } : {}), ...(anonymous ? { anonymous: true } : {}), ...(args.profile === 'evaluation' ? { profile: 'evaluation' as const } : {}) }
       const result = this.deps.sessions.ensure(spec)
       if (!result.available) throw new Error(result.message || `Provider "${provider}" is unavailable here now; models.list shows which providers are`)
       const created = this.deps.database.structured.snapshot(spec.id)!
@@ -2040,7 +2040,7 @@ export class AgentControl {
     if (!model) throw new Error(`${key.provider}/${key.model} is not offered on this machine now; models.list shows what is, or omit route and name provider and model`)
     const effort = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'].find(level => model.effort?.includes(level)) ?? null
     const started = Date.now()
-    const tab = await this.open(scope, { kind: 'agent', provider: key.provider, model: key.model, ...(effort ? { effort } : {}), title: `Evaluation: ${key.model}`.slice(0, 120), permission: 'read-only', focus: false })
+    const tab = await this.open(scope, { kind: 'agent', provider: key.provider, model: key.model, ...(effort ? { effort } : {}), title: `Evaluation: ${key.model}`.slice(0, 120), permission: 'read-only', focus: false, profile: 'evaluation' })
     const id = tab.resourceId!
     const budget = options.maxTokens !== undefined && Number.isFinite(options.maxTokens) && options.maxTokens > 0 ? options.maxTokens : null
     const spentOf = (items: SessionProjection['items'] | undefined): number | null => items ? evaluationTokens(summarizeUsage(items).tokens) : null
