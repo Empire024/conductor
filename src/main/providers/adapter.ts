@@ -1,6 +1,8 @@
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, ProviderCapabilities, SessionSettings, StructuredProvider } from '../../shared/structured-agent'
 import type { HostedRuntimeHandle } from './transport'
 import type { DenialGrantRequest } from '../../shared/auto-mode-denial'
+import type { PermissionGrantRequest } from '../../shared/permission-grants'
+import type { NativeGrantCall } from '../permission-grants/identity'
 
 /** What an adapter hands the next app process so it can continue a provider process the
  *  runtime host kept running (docs/runtime-host.md): its own protocol state and the process. */
@@ -34,9 +36,14 @@ export interface AdapterOptions {
    *  read at launch and whenever applyPermissionRules runs; used() when an approve-once rule's
    *  call has run, refused() when the classifier refused a call a rule was granted for. */
   /** denied: a classifier denial's card (its notice item) was shown, so it is a pending owner request from now on. */
-  permissionGrants?: { rules(): Array<{ rule: string; once: boolean }>; used(rule: string): void; refused?(rule: string): void; denied?(itemId: string, request: DenialGrantRequest): void }
+  permissionGrants?: { rules(): Array<{ rule: string; once: boolean }>; used(rule: string): void; refused?(rule: string): void; denied?(itemId: string, request: DenialGrantRequest): void;
+    nativePending?(call: NativeGrantCall): PermissionGrantRequest | undefined;
+    executionStarted?(call: NativeGrantCall, evidence: 'tool-progress'): void;
+    executionFinished?(call: NativeGrantCall, outcome: 'succeeded' | 'failed' | 'blocked' | 'cancelled' | 'unknown'): void }
   /** Host-only reviewer isolation; never accepted from worker settings or app-control input. */
   approvalReviewer?: boolean
+  /** Trusted host policy, read at the moment a Claude permission transition is requested. */
+  claudeFullAutoAuthorized?: () => boolean
   /** Host-only lean launch of a cloud evaluation turn (AgentSpec.profile): the adapter drops what the
    *  one prompt does not need (settings sources, skills, tools, optional features) before any turn. */
   profile?: import('../../shared/models').AgentLaunchProfile
@@ -76,6 +83,9 @@ export interface ProviderAdapter {
   /** Hand the running provider its current owner-granted rules (options.permissionGrants).
    *  'unsupported' when it cannot take them live; they then apply from its next start. */
   applyPermissionRules?(): Promise<'applied' | 'unsupported'>
+  /** Reconcile a changed host policy with a live Claude process. A process launched without the
+   *  bypass capability reports restart-pending so its manager can resume it at a safe boundary. */
+  refreshClaudeFullAutoPolicy?(settings?: SessionSettings): Promise<{ status: 'confirmed' | 'restart-pending' | 'blocked' | 'unchanged'; error?: string }>
   /** Fold the runtime's own transcript into its durable task state, keeping the same logical
    *  conversation (the local runtime; native CLIs compact themselves). Null when there is
    *  nothing to fold. */

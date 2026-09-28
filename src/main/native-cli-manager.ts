@@ -6,7 +6,7 @@ import type { SessionSettings, StructuredProvider } from '../shared/structured-a
 import type { StructuredSessions } from './structured-sessions'
 import type { ConductorDatabase } from './database'
 
-export function nativeCliArgs(provider: StructuredProvider, nativeId: string, settings: SessionSettings, fresh = false): string[] {
+export function nativeCliArgs(provider: StructuredProvider, nativeId: string, settings: SessionSettings, fresh = false, claudeFullAutoAuthorized = false): string[] {
   if (!/^[a-zA-Z0-9_-]{1,160}$/.test(nativeId)) throw new Error('Invalid native conversation ID')
   const model = settings.model && settings.model !== 'default' ? ['--model', settings.model] : []
   if (provider === 'codex') return [
@@ -21,7 +21,8 @@ export function nativeCliArgs(provider: StructuredProvider, nativeId: string, se
     '--permission-mode', settings.plan ? 'plan' : settings.permission === 'accept-edits' ? 'acceptEdits' : settings.permission === 'read-only' ? 'dontAsk' : settings.permission === 'auto' ? 'auto' : 'default']
   return [fresh ? '--session-id' : '--resume', nativeId, ...model,
     ...(settings.effort && settings.effort !== 'auto' ? ['--effort', settings.effort] : []),
-    '--permission-mode', settings.plan ? 'plan' : settings.permission === 'accept-edits' ? 'acceptEdits' : settings.permission === 'read-only' ? 'plan' : settings.permission === 'auto' ? 'auto' : 'manual']
+    '--permission-mode', settings.plan ? 'plan' : settings.permission === 'accept-edits' ? 'acceptEdits' : settings.permission === 'read-only' ? 'plan' : settings.permission === 'auto' ? (claudeFullAutoAuthorized && !settings.claudeGuardedAuto ? 'bypassPermissions' : 'auto') : 'manual',
+    ...(claudeFullAutoAuthorized && settings.permission === 'auto' && !settings.plan && !settings.claudeGuardedAuto ? ['--allow-dangerously-skip-permissions'] : [])]
 }
 export interface NativeCliInputState { draft: string; submitted: boolean }
 
@@ -44,11 +45,34 @@ export function trackNativeCliInput(state: NativeCliInputState, data: string): N
   return { draft, submitted }
 }
 
-interface LiveCli { spec: AgentSpec; process: IPty; exited: boolean; transcript: string; sequence: number; input: NativeCliInputState; stopped: Promise<void>; resolveStopped(): void }
+interface LiveCli { spec: AgentSpec; process: IPty; exited: boolean; transcript: string; sequence: number; input: NativeCliInputState; stopped: Promise<void>; resolveStopped(): void; launchedFullAuto?: boolean; policyBlocked?: boolean }
 export class NativeCliManager {
   private live = new Map<string, LiveCli>()
   private returning = new Map<string, Promise<void>>()
   private switching = new Map<string, Promise<RuntimeEnsureResult & { sequence: number }>>()
+  private claudeFullAutoPolicy: () => boolean = () => false
+  setClaudeFullAutoPolicy(policy: () => boolean): void { this.claudeFullAutoPolicy = policy }
+  /** The interactive TUI has no acknowledged permission setter. Idle handoffs return to the
+   * structured runtime safely; an in-flight command stays alive and is reported as blocked. */
+  async refreshClaudeFullAutoPolicy(): Promise<Array<{ agentSessionId: string; status: 'confirmed' | 'blocked'; error?: string }>> {
+    const results: Array<{ agentSessionId: string; status: 'confirmed' | 'blocked'; error?: string }> = []
+    for (const [id, live] of this.live) {
+      if (live.exited || live.spec.provider !== 'claude') continue
+      const settings = this.database.structured.snapshot(id)?.settings
+      const requested = live.spec.profile !== 'evaluation' && !this.sessions.isApprovalReviewer?.(id) && this.claudeFullAutoPolicy() && settings?.permission === 'auto' && !settings.plan && !settings.claudeGuardedAuto
+      if (Boolean(live.launchedFullAuto) === Boolean(requested)) { live.policyBlocked = false; continue }
+      if (live.input.submitted) {
+        const error = 'The interactive Claude CLI has submitted work and no acknowledged permission-mode control. That work is preserved; additional terminal input is blocked until it can return to Chat safely.'
+        if (!live.policyBlocked) this.broadcast('native-cli:data', { id, data: `\r\n[Conductor] ${error}\r\n`, sequence: ++live.sequence })
+        live.policyBlocked = true
+        results.push({ agentSessionId: id, status: 'blocked', error })
+      } else {
+        try { await this.switchToChat(id); results.push({ agentSessionId: id, status: 'confirmed' }) }
+        catch (error) { results.push({ agentSessionId: id, status: 'blocked', error: error instanceof Error ? error.message : String(error) }) }
+      }
+    }
+    return results
+  }
   constructor(private sessions: StructuredSessions, private database: ConductorDatabase, private executable: (provider: StructuredProvider) => string | null, private broadcast: (channel: string, payload: unknown) => void) {}
   ensure(id: string): Promise<RuntimeEnsureResult & { sequence: number }> {
     if (this.returning.has(id)) return Promise.reject(new Error('This conversation is switching to Chat.'))
@@ -67,14 +91,15 @@ export class NativeCliManager {
     if (this.database.structured.snapshot(id)?.settings.plan && spec.provider === 'codex') throw new Error('Turn off Plan mode before switching to the Codex CLI.')
     const handoff = await this.sessions.prepareCli(id)
     try {
-      const args = nativeCliArgs(handoff.spec.provider as StructuredProvider, handoff.nativeSessionId, handoff.settings, handoff.fresh)
+      const authorized = handoff.spec.provider === 'claude' && handoff.spec.profile !== 'evaluation' && !this.sessions.isApprovalReviewer?.(id) && this.claudeFullAutoPolicy()
+      const args = nativeCliArgs(handoff.spec.provider as StructuredProvider, handoff.nativeSessionId, handoff.settings, handoff.fresh, authorized)
       const child = pty.spawn(executable, offline ? [join(process.cwd(), 'scripts/fixtures/native-cli.cjs'), handoff.nativeSessionId] : args, {
         name: 'xterm-256color', cols: 100, rows: 30, cwd: handoff.spec.cwd, useConptyDll: process.platform === 'win32',
         env: { ...process.env, CONDUCTOR_AGENT_ID: id, CONDUCTOR_TASK_FILE: 'feature-list.md', ...(offline ? { ELECTRON_RUN_AS_NODE: '1' } : {}), TERM: 'xterm-256color', COLORTERM: 'truecolor' } as Record<string, string>
       })
       let resolveStopped!: () => void
       const stopped = new Promise<void>((resolve) => { resolveStopped = resolve })
-      const live: LiveCli = { spec: handoff.spec, process: child, exited: false, transcript: '', sequence: 0, input: { draft: '', submitted: false }, stopped, resolveStopped }
+      const live: LiveCli = { spec: handoff.spec, process: child, exited: false, transcript: '', sequence: 0, input: { draft: '', submitted: false }, stopped, resolveStopped, launchedFullAuto: authorized && args.includes('bypassPermissions') }
       this.live.set(id, live)
       child.onData((data) => {
         if (this.live.get(id) !== live) return
@@ -95,8 +120,11 @@ export class NativeCliManager {
   write(id: string, data: string): void {
     const live = this.live.get(id)
     if (!live || live.exited || typeof data !== 'string' || data.length > 1000000) return
+    // Stop remains available; new submissions cannot use a mode whose policy was revoked.
+    if (live.policyBlocked && data !== '\x03') return
     live.input = trackNativeCliInput(live.input, data)
     live.process.write(data)
+    if (live.policyBlocked && data === '\x03') void this.switchToChat(id).catch(error => this.broadcast('native-cli:data', { id, data: `\r\n[Conductor] ${String(error)}\r\n`, sequence: ++live.sequence }))
   }
   hasSubmittedInput(id?: string): boolean {
     if (id) { const live = this.live.get(id); return Boolean(live && !live.exited && live.input.submitted) }

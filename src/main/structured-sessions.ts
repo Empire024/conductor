@@ -57,6 +57,9 @@ interface LiveSession {
   nativeAcceptance?: Map<string, { timer: NodeJS.Timeout; resolve(): void; reject(reason: Error): void }>
   /** The current provider process was launched with the previous browser-MCP preference. */
   browserConfigStale?: boolean
+  /** A Claude CLI without the bypass launch capability must be resumed at an idle checkpoint. */
+  claudePolicyRestartPending?: boolean
+  claudePolicyRefresh?: Promise<ClaudeFullAutoRefreshResult>
   budget?: LiveRuntimeBudget
   /** Snapshot failure reasons already reported in this conversation, so an unactionable
    *  reason is stated once instead of on every tool call that hits it. */
@@ -79,6 +82,7 @@ interface LiveSession {
   refusalFallback?: { text: string; settings: SessionSettings; attachments: ContextAttachment[]; origin?: PromptOrigin; model: string; notice: string }
 }
 type Factory = (provider: StructuredProvider, options: AdapterOptions) => ProviderAdapter
+export interface ClaudeFullAutoRefreshResult { agentSessionId: string; status: 'confirmed' | 'restart-pending' | 'blocked' | 'unchanged'; error?: string }
 /** Settings key of the conversations whose provider processes the runtime host kept running
  *  while this app restarted, by agent session id (docs/runtime-host.md). */
 export const DETACHED_RUNTIMES_KEY = 'runtimeHost:detached'
@@ -183,6 +187,52 @@ export class StructuredSessions {
   setConductorMcp(server: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }): void { this.conductorMcp = server }
   private permissionGrants?: PermissionGrants
   setPermissionGrants(grants: PermissionGrants): void { this.permissionGrants = grants }
+  private claudeFullAutoPolicy: () => boolean = () => false
+  /** This callback belongs to the main process; session settings and provider events never set it. */
+  setClaudeFullAutoPolicy(policy: () => boolean): void { this.claudeFullAutoPolicy = policy }
+  /** Reconcile every connected local Claude conversation after the owner's persisted policy
+   *  changes. Busy processes that lack the startup capability keep their work and restart when
+   *  the turn, subagents, and background tasks have all settled. */
+  async refreshClaudeFullAutoPolicy(): Promise<ClaudeFullAutoRefreshResult[]> {
+    const results: ClaudeFullAutoRefreshResult[] = []
+    for (const live of this.live.values()) if (live.spec.provider === 'claude' && !live.closed && !this.isApprovalReviewer(live.spec.id) && live.spec.profile !== 'evaluation') {
+      results.push(await this.refreshClaudeFullAutoFor(live))
+    }
+    return results
+  }
+  private refreshClaudeFullAutoFor(live: LiveSession): Promise<ClaudeFullAutoRefreshResult> {
+    if (live.claudePolicyRefresh) return live.claudePolicyRefresh
+    const refresh = this.refreshClaudeFullAutoNow(live).finally(() => { live.claudePolicyRefresh = undefined })
+    live.claudePolicyRefresh = refresh
+    return refresh
+  }
+  private async refreshClaudeFullAutoNow(live: LiveSession): Promise<ClaudeFullAutoRefreshResult> {
+    const agentSessionId = live.spec.id
+    if (live.closed || !live.adapter?.refreshClaudeFullAutoPolicy) return { agentSessionId, status: 'unchanged' }
+    try {
+      const state = this.database.structured.snapshot(agentSessionId)
+      if (!state) return { agentSessionId, status: 'unchanged' }
+      const result = await live.adapter.refreshClaudeFullAutoPolicy(state.settings)
+      if (result.status !== 'restart-pending') { live.claudePolicyRestartPending = false; return { agentSessionId, ...result } }
+      live.claudePolicyRestartPending = true
+      const handing = live.starting || live.submitting || live.steering || live.queueing || live.dispatchingQueue || live.interrupting || live.nativeAcceptance?.size
+      if (handing || active.has(state.phase) || this.ownsActiveSubagent(live) || this.ownsBackgroundWork(live)) return { agentSessionId, status: 'restart-pending' }
+      if (!state.nativeSessionId) {
+        // An unused process has no conversation to resume. Let the next submit create a fresh
+        // capable CLI instead of starting idle processes solely for a policy change.
+        this.retireBrowserTransport(live, 'Claude permission policy changed.')
+        live.claudePolicyRestartPending = false
+        return { agentSessionId, status: 'restart-pending' }
+      }
+      // reconnect() retains the native session id, durable queue, worktree, and agent identity.
+      await this.reconnect(live)
+      live.claudePolicyRestartPending = false
+      const resumed = await live.adapter?.refreshClaudeFullAutoPolicy?.(this.database.structured.snapshot(agentSessionId)?.settings)
+      return { agentSessionId, ...(resumed ?? { status: 'unchanged' as const }) }
+    } catch (error) {
+      return { agentSessionId, status: 'blocked', error: error instanceof Error ? error.message : String(error) }
+    }
+  }
   /** Hands a live Claude runtime its current grants; 'offline' when there is none to hand them to. */
   async applyPermissionRules(id: string): Promise<'applied' | 'unsupported' | 'offline'> {
     const adapter = this.live.get(id)?.adapter
@@ -381,6 +431,7 @@ export class StructuredSessions {
       ...(live.spec.provider === 'codex' && !isolated ? { conductorMcpConfig: this.conductorMcp?.configure(live.spec) ?? '' } : {}),
       ...(live.spec.provider === 'claude' && !isolated ? {
         conductorMcpConfig: this.conductorMcp?.configure(live.spec) ?? '',
+        claudeFullAutoAuthorized: () => this.claudeFullAutoPolicy(),
         ...(this.permissionGrants ? { permissionGrants: this.permissionGrants.adapterPort(id) } : {})
       } : {}),
       ...(lean ? { profile: 'evaluation' as const } : {}),
@@ -482,7 +533,11 @@ export class StructuredSessions {
       live.adapter = undefined; live.closed = false
       state = store.snapshot(id)!
       const settings = settingsForRuntime(state.settings)
-      this.emit(live, { data: { type: 'session', phase: state.phase, view: 'cli', settings } })
+      const capabilities = state.capabilities ? { ...state.capabilities, effectiveSettings: {
+        ...(state.capabilities.effectiveSettings && typeof state.capabilities.effectiveSettings === 'object' && !Array.isArray(state.capabilities.effectiveSettings) ? state.capabilities.effectiveSettings : {}),
+        permissionMode: null, permissionModeStatus: 'pending', permissionModeError: 'Interactive CLI handoff has no structured native permission acknowledgement'
+      } } : undefined
+      this.emit(live, { data: { type: 'session', phase: state.phase, view: 'cli', settings, ...(capabilities ? { capabilities } : {}) } })
       return { spec: live.spec, nativeSessionId: state.nativeSessionId!, settings, fresh: this.database.getSetting('newNative:' + id) === 'true' && (live.spec.provider === 'claude' ? !hasClaudeHistory(live.spec.cwd, state.nativeSessionId!) : live.spec.provider === 'grok' && !hasGrokHistory(state.nativeSessionId!)) }
     } finally { live.handoff = false }
   }
@@ -880,6 +935,12 @@ export class StructuredSessions {
   private async drainQueue(live: LiveSession): Promise<void> {
     let state = this.database.structured.snapshot(live.spec.id)
     if (!state || live.closed || live.submitting || live.steering || live.dispatchingQueue || live.refusalFallback || !live.adapter) return
+    if (live.claudePolicyRestartPending) {
+      await this.refreshClaudeFullAutoFor(live)
+      if (live.claudePolicyRestartPending) return
+      state = this.database.structured.snapshot(live.spec.id)
+      if (!state || live.closed || !live.adapter) return
+    }
     if (live.capStop && this.capSetting(live)?.key === live.capStop.capKey) return
     if (live.expediteReady && ['interrupted', 'completed'].includes(state.phase)) {
       const recovered = (state.pendingSteering ?? []).filter(input => live.expediteInput?.has(input.id) && input.status === 'cancelled')
@@ -1005,6 +1066,12 @@ export class StructuredSessions {
       // Never let that per-message snapshot overwrite the explicit, newer session authority.
       state = store.snapshot(id)!
       settings = this.messageSettings(state, settings)
+      if (live.claudePolicyRestartPending && !active.has(state.phase) && !this.ownsActiveSubagent(live) && !this.ownsBackgroundWork(live)) {
+        // A manual submit can race the queued idle checkpoint. Retire the old process before
+        // connect(), so the new turn uses a CLI launched with the current owner capability.
+        this.retireBrowserTransport(live, 'Claude permission policy changed.')
+        live.claudePolicyRestartPending = false
+      }
       await this.connect(live)
       if (live.closed || this.live.get(id) !== live || !live.adapter) throw new Error('Session closed during initialization; no prompt was sent')
       // connect/reconnect and attachment expansion can all yield to peer revocation. This final
@@ -1035,6 +1102,7 @@ export class StructuredSessions {
     if (settings.wizard !== undefined && typeof settings.wizard !== 'boolean') throw new Error('Invalid wizard setting')
     if (settings.wizard && capabilities && (capabilities.provider === 'local' || !isFrontierModel(capabilities.provider, settings.model))) throw new Error(`Wizard mode needs a frontier model (${WIZARD_MODEL_HINT}); this conversation runs ${settings.model ?? 'the provider default'}`)
     if (!settings || !['default', 'read-only', 'accept-edits', 'auto'].includes(settings.permission) || typeof settings.plan !== 'boolean') throw new Error('Invalid session settings')
+    if (settings.claudeGuardedAuto !== undefined && (typeof settings.claudeGuardedAuto !== 'boolean' || capabilities && capabilities.provider !== 'claude')) throw new Error('Guarded Auto applies to Claude only')
     if (settings.browserMcp !== undefined && typeof settings.browserMcp !== 'boolean') throw new Error('Invalid browser MCP setting')
     for (const key of ['localGit', 'localResearch'] as const) {
       if (settings[key] === undefined) continue
@@ -1060,11 +1128,12 @@ export class StructuredSessions {
    * may carry an older copy; preserve their model/effort/permission while taking browserMcp only
    * from the current durable projection. */
   private messageSettings(state: { settings: SessionSettings }, incoming: SessionSettings): SessionSettings {
-    const { browserMcp: _capturedBrowser, localGit: _capturedGit, localResearch: _capturedResearch, localContract: _capturedContract, reviewDelegatedActions: _capturedReview, wizard: _capturedWizard, ...message } = incoming
+    const { browserMcp: _capturedBrowser, localGit: _capturedGit, localResearch: _capturedResearch, localContract: _capturedContract, reviewDelegatedActions: _capturedReview, wizard: _capturedWizard, claudeGuardedAuto: _capturedGuardedAuto, ...message } = incoming
     const authority: SessionSettings = { ...message }
     // Same rule for the local grants: a queued prompt must not carry a repository or research
     // grant the owner has since withdrawn, nor lose one they have since given.
-    for (const key of ['browserMcp', 'localGit', 'localResearch', 'reviewDelegatedActions', 'wizard'] as const) if (state.settings[key] !== undefined) authority[key] = state.settings[key]
+    for (const key of ['browserMcp', 'localGit', 'localResearch', 'reviewDelegatedActions', 'wizard', 'claudeGuardedAuto'] as const) if (state.settings[key] !== undefined) authority[key] = state.settings[key]
+    if (state.settings.claudeGuardedAuto === undefined && incoming.claudeGuardedAuto !== undefined) authority.claudeGuardedAuto = incoming.claudeGuardedAuto
     if (state.settings.localContract !== undefined) authority.localContract = state.settings.localContract
     return authority
   }
@@ -1526,6 +1595,8 @@ export class StructuredSessions {
     }
     if (data.type === 'session') queueMicrotask(() => {
       if (data.phase === 'failed' && live.refusalFallback) void this.runSafeguardFallback(live)
+      else if (live.claudePolicyRestartPending && !active.has(data.phase) &&
+        (active.has(state.phase) || (data.backgroundTasks ?? 0) < (live.backgroundTasks ?? 0))) void this.refreshClaudeFullAutoFor(live).then(() => this.drainQueue(live))
       else void this.drainQueue(live)
     })
     if (data.type === 'session') {
@@ -1725,6 +1796,7 @@ export class StructuredSessions {
       throw error
     }).finally(() => { live.starting = undefined })
     await live.starting
+    if (live.spec.provider === 'claude') await this.refreshClaudeFullAutoFor(live)
     this.emit(live, { data: { type: 'notice', message: lostFrames
       ? `Conductor restarted while this turn kept running. ${lostFrames} provider events from while it was closed exceeded the buffer and are missing here; the native conversation has them.`
       : 'Conductor restarted while this turn kept running; it is reattached and continues here.' } })

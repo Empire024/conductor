@@ -9,6 +9,7 @@ import { RemoteControlSettings } from './RemoteControlSettings'
 import { AlwaysOnSettings } from './AlwaysOnSettings'
 import { PhoneAccessSettings } from './PhoneAccessSettings'
 import { AttentionLogSettings } from './AttentionLogSettings'
+import { ClaudeFullAutoControl } from './ClaudeFullAutoControl'
 import { matchingSettingsSections, resolveSettingsSection, SETTINGS_SECTIONS, type SettingsSectionId } from './settings-navigation'
 import './SettingsPanel.css'
 
@@ -268,6 +269,7 @@ export function SettingsPanel({
               </section>
             </>}
             {activeSection === 'runtimes' && <>
+              <ClaudeFullAutoControl />
               <section>
                 <div className="settings-section-title"><Bot size={14} /><div><strong>Frontier runtimes</strong><span>Conductor uses each provider's real local CLI.</span></div></div>
                 <div className="provider-settings">

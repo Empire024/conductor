@@ -22,7 +22,7 @@ class FakeTransport {
     if (!this.connected) throw new Error('Disconnected')
     this.sent.push(value)
     const message = value as { type?: string; request_id?: string; request?: { subtype?: string } }
-    if (this.autoControlResponses && message.type === 'control_request' && (message.request?.subtype !== 'initialize' || this.autoInitialize)) queueMicrotask(() => this.receive({ type: 'control_response', response: { subtype: 'success', request_id: message.request_id!, response: { models: [{ value: 'fixture-model', displayName: 'Synthetic model' }] } } }))
+    if (this.autoControlResponses && message.type === 'control_request' && (message.request?.subtype !== 'initialize' || this.autoInitialize)) queueMicrotask(() => this.receive({ type: 'control_response', response: { subtype: 'success', request_id: message.request_id!, response: { models: [{ value: 'fixture-model', displayName: 'Synthetic model' }], ...(message.request?.subtype === 'initialize' ? { current_permission_mode: this.options.args[this.options.args.indexOf('--permission-mode') + 1] } : {}) } } }))
   }
   receive(value: Json): void { this.options.onMessage(value) }
 }
@@ -117,6 +117,199 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     expect(f.adapter.capabilities.approvalRouting).toBe('stronger-review')
     await f.adapter.submit('Work', { permission: 'auto', plan: false })
     expect(f.projection().settings.permission).toBe('auto')
+  })
+
+  it('launches owner-authorized Full Auto with the native bypass capability and confirms it live', async () => {
+    const f = fixture({ settings: { permission: 'auto', plan: false }, claudeFullAutoAuthorized: () => true })
+    await f.adapter.start()
+    const args = f.transport.options.args
+    expect(args).toContain('--allow-dangerously-skip-permissions')
+    expect(args[args.indexOf('--permission-mode') + 1]).toBe('bypassPermissions')
+    expect(f.transport.sent).toContainEqual(expect.objectContaining({ request: { subtype: 'set_permission_mode', mode: 'bypassPermissions' } }))
+    expect(f.adapter.capabilities.effectiveSettings).toMatchObject({ requestedPermissionMode: 'bypassPermissions', permissionMode: 'bypassPermissions', permissionModeStatus: 'confirmed', claudeFullAutoAuthorized: true })
+    const initialize = f.transport.sent.find(value => (value as { request?: { subtype?: string } }).request?.subtype === 'initialize') as { request: { hooks: Record<string, unknown> } }
+    expect(Object.keys(initialize.request.hooks)).toEqual(expect.arrayContaining(['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'PermissionDenied']))
+    // The native bypass mode reaches nested subagents by inheritance; Conductor's tool hook
+    // still sees their non-read tool calls with the same owner policy fence.
+    f.transport.receive(hook('nested', 'conductor_before', 'child-tool', 'Bash', { command: 'git status' }))
+    await flush()
+    expect(f.transport.sent.at(-1)).toMatchObject({ response: { request_id: 'nested', subtype: 'success' } })
+  })
+  it('records native child PreToolUse mode once per subagent and mode without tool arguments or execution claims', async () => {
+    const executionStarted = vi.fn()
+    const f = fixture({ settings: { permission: 'auto', plan: false }, claudeFullAutoAuthorized: () => true,
+      permissionGrants: { rules: () => [], used: vi.fn(), executionStarted } })
+    await f.adapter.start()
+    const childHook = (requestId: string, toolUseId: string, mode: string, agentId?: string): Json => ({
+      type: 'control_request', request_id: requestId, request: { subtype: 'hook_callback', callback_id: 'conductor_before', tool_use_id: toolUseId,
+        input: { hook_event_name: 'PreToolUse', session_id: 'native-session', ...(agentId ? { agent_id: agentId } : {}),
+          permission_mode: mode, tool_use_id: toolUseId, tool_name: 'Bash', tool_input: { command: 'private fixture command' } } }
+    })
+    f.transport.receive(childHook('child-first', 'tool-one', 'bypassPermissions', 'child-one'))
+    f.transport.receive(childHook('child-repeat', 'tool-two', 'bypassPermissions', 'child-one'))
+    f.transport.receive(childHook('child-change', 'tool-three', 'plan', 'child-one'))
+    f.transport.receive(childHook('root', 'tool-four', 'bypassPermissions'))
+    await flush()
+    const receipts = f.events.filter(event => event.native?.method === 'hook/PreToolUse')
+    expect(receipts).toHaveLength(2)
+    expect(receipts[0]).toMatchObject({ data: { type: 'notice', payload: { session_id: 'native-session', agent_id: 'child-one',
+      tool_use_id: 'tool-one', permission_mode: 'bypassPermissions' } }, native: { method: 'hook/PreToolUse', payload: {
+      session_id: 'native-session', agent_id: 'child-one', tool_use_id: 'tool-one', permission_mode: 'bypassPermissions' } } })
+    expect(receipts[1]).toMatchObject({ native: { payload: { tool_use_id: 'tool-three', permission_mode: 'plan' } } })
+    expect(JSON.stringify(receipts)).not.toContain('private fixture command')
+    expect(executionStarted).not.toHaveBeenCalled()
+  })
+
+  it('keeps legacy Auto classifier-backed without owner policy, and allows explicit Guarded Auto under the policy', async () => {
+    const legacy = fixture({ settings: { permission: 'auto', plan: false } })
+    await legacy.adapter.start()
+    expect(legacy.transport.options.args).not.toContain('--allow-dangerously-skip-permissions')
+    expect(legacy.transport.options.args[legacy.transport.options.args.indexOf('--permission-mode') + 1]).toBe('auto')
+    legacy.transport.receive({ type: 'system', subtype: 'init', permissionMode: 'auto' })
+    expect(legacy.adapter.capabilities.effectiveSettings).toMatchObject({ requestedPermissionMode: 'auto', permissionMode: 'auto', permissionModeStatus: 'confirmed', claudeFullAutoAuthorized: false })
+
+    const guarded = fixture({ settings: { permission: 'auto', claudeGuardedAuto: true, plan: false }, claudeFullAutoAuthorized: () => true })
+    await guarded.adapter.start()
+    expect(guarded.transport.options.args[guarded.transport.options.args.indexOf('--permission-mode') + 1]).toBe('auto')
+    expect(guarded.transport.sent.some(value => JSON.stringify(value).includes('set_permission_mode'))).toBe(false)
+  })
+
+  it('downgrades a live bypass runtime on owner policy revocation and fences tools until native acknowledgement', async () => {
+    let authorized = true
+    const f = fixture({ settings: { permission: 'auto', plan: false }, claudeFullAutoAuthorized: () => authorized })
+    await f.adapter.start()
+    f.transport.autoControlResponses = false
+    authorized = false
+    const refreshing = f.adapter.refreshClaudeFullAutoPolicy()
+    await flush()
+    expect(f.transport.sent.at(-1)).toMatchObject({ request: { subtype: 'set_permission_mode', mode: 'auto' } })
+    f.transport.receive(hook('revoked-tool', 'conductor_before', 'tool-after-revoke', 'Bash', { command: 'git status' }))
+    await flush()
+    expect(f.transport.sent.at(-1)).toMatchObject({ response: { request_id: 'revoked-tool', response: { hookSpecificOutput: { permissionDecision: 'deny' } } } })
+    const control = f.transport.sent.slice().reverse().find(value => (value as { request?: { subtype?: string; mode?: string } }).request?.subtype === 'set_permission_mode' && (value as { request?: { mode?: string } }).request?.mode === 'auto') as { request_id: string }
+    f.transport.receive({ type: 'control_response', response: { subtype: 'success', request_id: control.request_id, response: { permissionMode: 'auto' } } })
+    await expect(refreshing).resolves.toEqual({ status: 'confirmed' })
+    expect(f.adapter.capabilities.effectiveSettings).toMatchObject({ requestedPermissionMode: 'auto', permissionMode: 'auto', permissionModeStatus: 'confirmed', claudeFullAutoAuthorized: false })
+  })
+
+  it('reports a deferred restart for an incapable existing process and blocks a failed bypass transition exactly', async () => {
+    let authorized = false
+    const old = fixture({ settings: { permission: 'auto', plan: false }, claudeFullAutoAuthorized: () => authorized })
+    await old.adapter.start()
+    old.transport.receive({ type: 'system', subtype: 'init', permissionMode: 'auto' })
+    authorized = true
+    await expect(old.adapter.refreshClaudeFullAutoPolicy()).resolves.toEqual({ status: 'restart-pending' })
+    expect(old.adapter.capabilities.effectiveSettings).toMatchObject({ requestedPermissionMode: 'bypassPermissions', permissionMode: 'auto', permissionModeStatus: 'restart-pending' })
+    await expect(old.adapter.submit('Do work', { permission: 'auto', plan: false })).rejects.toThrow('--allow-dangerously-skip-permissions')
+    expect(old.transport.sent.some(value => (value as { type?: string }).type === 'user')).toBe(false)
+
+    const blocked = fixture({ settings: { permission: 'default', plan: false }, claudeFullAutoAuthorized: () => true })
+    await blocked.adapter.start()
+    blocked.transport.receive({ type: 'system', subtype: 'init', permissionMode: 'manual' })
+    blocked.transport.autoControlResponses = false
+    const sending = blocked.adapter.submit('Full Auto request', { permission: 'auto', plan: false })
+    await flush()
+    const control = blocked.transport.sent.at(-1) as { request_id: string }
+    blocked.transport.receive({ type: 'control_response', response: { subtype: 'error', request_id: control.request_id, error: 'managed policy refused bypassPermissions' } })
+    await expect(sending).rejects.toThrow('managed policy refused bypassPermissions')
+    expect(blocked.adapter.capabilities.effectiveSettings).toMatchObject({ requestedPermissionMode: 'bypassPermissions', permissionMode: 'manual', permissionModeStatus: 'blocked', permissionModeError: 'managed policy refused bypassPermissions' })
+    expect(blocked.transport.sent.some(value => (value as { type?: string }).type === 'user')).toBe(false)
+  })
+
+  it('marks an exact managed-policy startup refusal blocked before the process is disposed', async () => {
+    const f = fixture({ settings: { permission: 'auto', plan: false }, claudeFullAutoAuthorized: () => true }, false)
+    const starting = f.adapter.start()
+    await flush()
+    f.transport.autoControlResponses = false
+    const initialize = f.transport.sent[0] as { request_id: string }
+    f.transport.receive({ type: 'control_response', response: { subtype: 'success', request_id: initialize.request_id, response: { models: [], current_permission_mode: 'manual' } } })
+    await flush()
+    const mode = f.transport.sent.at(-1) as { request_id: string; request: { subtype: string; mode: string } }
+    expect(mode.request).toMatchObject({ subtype: 'set_permission_mode', mode: 'bypassPermissions' })
+    f.transport.receive({ type: 'control_response', response: { subtype: 'error', request_id: mode.request_id, error: 'Managed disableBypassPermissionsMode refused bypassPermissions' } })
+    await expect(starting).rejects.toThrow('Managed disableBypassPermissionsMode refused bypassPermissions')
+    const failed = f.events.filter(event => event.data.type === 'session').at(-1)
+    expect(failed?.data).toMatchObject({ phase: 'disconnected', capabilities: { effectiveSettings: {
+      requestedPermissionMode: 'bypassPermissions', permissionMode: 'manual', permissionModeStatus: 'blocked', permissionModeError: 'Managed disableBypassPermissionsMode refused bypassPermissions'
+    } } })
+    expect(f.transport.sent.some(value => (value as { type?: string }).type === 'user')).toBe(false)
+  })
+
+  it('takes the saved owner Manual mode over an adapter that last submitted Auto', async () => {
+    let authorized = false
+    const f = fixture({ settings: { permission: 'auto', plan: false }, claudeFullAutoAuthorized: () => authorized })
+    await f.adapter.start()
+    f.transport.receive({ type: 'system', subtype: 'init', permissionMode: 'auto' })
+    authorized = true
+    await expect(f.adapter.refreshClaudeFullAutoPolicy({ permission: 'default', plan: false })).resolves.toEqual({ status: 'confirmed' })
+    expect(f.transport.sent.at(-1)).not.toMatchObject({ request: { mode: 'bypassPermissions' } })
+    expect(f.adapter.capabilities.effectiveSettings).toMatchObject({ requestedPermissionMode: 'manual', permissionMode: 'manual', permissionModeStatus: 'confirmed', claudeFullAutoAuthorized: true })
+  })
+
+  it('reports native pending, progress, and post-hook outcomes with exact identities, never calling progress at PreToolUse', async () => {
+    const nativePending = vi.fn(), executionStarted = vi.fn(), executionFinished = vi.fn()
+    const f = fixture({ permissionGrants: { rules: () => [], used: vi.fn(), nativePending, executionStarted, executionFinished } })
+    await f.adapter.start()
+    f.transport.receive({ type: 'system', subtype: 'init', session_id: 'native-grant-session', permissionMode: 'manual' })
+    await f.adapter.submit('Run exact tool', settings)
+    const input = { command: 'echo exact' }
+    f.transport.receive(permission('pending-native', 'tool-exact', 'Bash', input))
+    await flush()
+    expect(nativePending).toHaveBeenCalledWith({ runtimeId: 'incarnation-A', nativeSessionId: 'native-grant-session', requestId: 'pending-native', toolUseId: 'tool-exact', tool: 'Bash', input })
+    f.transport.receive(hook('pre-exact', 'conductor_before', 'tool-exact', 'Bash', input))
+    await flush()
+    expect(executionStarted).not.toHaveBeenCalled()
+    f.transport.receive({ type: 'tool_progress', tool_use_id: 'tool-exact', tool_name: 'Bash', elapsed_time_seconds: 0.01 })
+    await flush()
+    expect(executionStarted).toHaveBeenCalledWith(expect.objectContaining({ nativeSessionId: 'native-grant-session', requestId: 'pending-native', toolUseId: 'tool-exact', input }), 'tool-progress')
+    f.transport.receive(hook('post-exact', 'conductor_after', 'tool-exact', 'Bash', input, { exitCode: 0 }))
+    await flush()
+    expect(executionFinished).toHaveBeenCalledWith(expect.objectContaining({ toolUseId: 'tool-exact', input }), 'succeeded')
+
+    f.transport.receive(permission('pending-fast', 'tool-fast', 'Bash', { command: 'true' }))
+    f.transport.receive(hook('pre-fast', 'conductor_before', 'tool-fast', 'Bash', { command: 'true' }))
+    f.transport.receive(hook('post-fast', 'conductor_after', 'tool-fast', 'Bash', { command: 'true' }, { exitCode: 0 }))
+    await flush()
+    expect(executionStarted).toHaveBeenCalledTimes(1)
+    expect(executionFinished).toHaveBeenCalledWith(expect.objectContaining({ toolUseId: 'tool-fast' }), 'succeeded')
+  })
+
+  it('marks accepted Allow once unknown on disconnect before progress, while clearing terminal and cancelled calls', async () => {
+    const executionStarted = vi.fn(), executionFinished = vi.fn()
+    const f = fixture({ permissionGrants: { rules: () => [], used: vi.fn(), executionStarted, executionFinished } })
+    await f.adapter.start()
+    f.transport.receive({ type: 'system', subtype: 'init', session_id: 'native-grant-session', permissionMode: 'manual' })
+    await f.adapter.submit('Run approved tools', settings)
+    const approved = async (requestId: string, toolUseId: string, command: string): Promise<void> => {
+      f.transport.receive(permission(requestId, toolUseId, 'Bash', { command }))
+      await f.adapter.respond({ sessionId: 'session', runtimeId: 'incarnation-A', requestId, decision: 'allow' })
+    }
+    await approved('finished-request', 'finished-tool', 'echo finished')
+    f.transport.receive(hook('finished-post', 'conductor_after', 'finished-tool', 'Bash', { command: 'echo finished' }, { exitCode: 0 }))
+    await flush()
+    await approved('cancelled-request', 'cancelled-tool', 'echo cancelled')
+    f.transport.receive({ type: 'control_cancel_request', request_id: 'cancelled-request' })
+    await approved('uncertain-request', 'uncertain-tool', 'echo uncertain')
+    expect(executionStarted).not.toHaveBeenCalled()
+    f.transport.options.onExit?.(1, null)
+    expect(executionFinished.mock.calls).toEqual([
+      [expect.objectContaining({ nativeSessionId: 'native-grant-session', requestId: 'finished-request', toolUseId: 'finished-tool', input: { command: 'echo finished' } }), 'succeeded'],
+      [expect.objectContaining({ nativeSessionId: 'native-grant-session', requestId: 'cancelled-request', toolUseId: 'cancelled-tool', input: { command: 'echo cancelled' } }), 'cancelled'],
+      [expect.objectContaining({ nativeSessionId: 'native-grant-session', requestId: 'uncertain-request', toolUseId: 'uncertain-tool', input: { command: 'echo uncertain' } }), 'unknown']
+    ])
+  })
+  it('links an unrepresentable native grant to one approval interaction without losing the exact native request', async () => {
+    const nativePending = vi.fn(() => ({ id: 'native-grant:exact' } as import('../../shared/permission-grants').PermissionGrantRequest))
+    const f = fixture({ permissionGrants: { rules: () => [], used: vi.fn(), nativePending } })
+    await f.adapter.start()
+    f.transport.receive({ type: 'system', subtype: 'init', session_id: 'native-grant-session', permissionMode: 'manual' })
+    await f.adapter.submit('Run', settings)
+    f.transport.receive(permission('pending-native', 'tool-exact', 'Bash', { command: 'echo exact' }))
+    await flush()
+    expect(f.projection().items.find(item => item.data.type === 'interaction' && item.data.interaction.id === 'pending-native')?.data).toMatchObject({ interaction: { status: 'pending', permissionGrantId: 'native-grant:exact' } })
+    expect(nativePending).toHaveBeenCalledTimes(1)
+    await f.adapter.respond({ sessionId: 'session', runtimeId: 'incarnation-A', requestId: 'pending-native', decision: 'allow' })
+    expect(f.transport.sent.at(-1)).toMatchObject({ response: { request_id: 'pending-native', response: { behavior: 'allow', toolUseID: 'tool-exact' } } })
   })
 
   it('does not replay a cached allow after the native request changes arguments', async () => {
@@ -216,6 +409,98 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     expect(f.transport.options.args).not.toContain('--setting-sources')
     await f.adapter.submit('Follow up', settings)
     expect(f.transport.sent.at(-1)).toMatchObject({ type: 'user', session_id: 'native-session', message: { content: 'Follow up' } })
+  })
+
+  it('reads loaded settings asynchronously and emits only bounded, allowlisted diagnostics', async () => {
+    const f = fixture({}, false)
+    const starting = f.adapter.start()
+    await flush()
+    f.transport.autoControlResponses = false
+    const initialize = f.transport.sent[0] as { request_id: string }
+    f.transport.receive({ type: 'control_response', response: { subtype: 'success', request_id: initialize.request_id,
+      response: { current_permission_mode: 'manual' } } })
+    await starting
+    const getSettings = f.transport.sent.find(message => (message as { request?: { subtype?: string } }).request?.subtype === 'get_settings') as { request_id: string; request: { subtype: string } }
+    expect(getSettings.request).toEqual({ subtype: 'get_settings' })
+    await f.adapter.submit('A turn can start while settings are pending', settings)
+    expect(f.transport.sent).toContainEqual(expect.objectContaining({ type: 'user' }))
+    const mode = JSON.stringify(f.adapter.capabilities.effectiveSettings)
+    const secret = 'SECRET-DO-NOT-EMIT'
+    f.transport.receive({ type: 'control_response', response: { subtype: 'success', request_id: getSettings.request_id, response: {
+      effective: { permissions: { allow: Array(10_005).fill(`Bash(${secret})`), ask: [secret], deny: [], defaultMode: 'auto', disableBypassPermissionsMode: 'disable' },
+        hooks: { PreToolUse: [{ command: secret }], PostToolUse: [{ command: secret }], [secret]: [{ command: secret }] },
+        env: { API_KEY: secret }, path: `C:/private/${secret}`, token: secret },
+      sources: { userSettings: { permissions: { allow: [secret], defaultMode: 'default' }, hooks: { PermissionDenied: [{ command: secret }] }, path: secret },
+        localSettings: { permissions: { ask: [secret], defaultMode: secret, disableBypassPermissionsMode: secret } },
+        policySettings: { permissions: { deny: [secret], disableBypassPermissionsMode: 'disable' } },
+        [secret]: { permissions: { ask: [secret] } } },
+      applied: { token: secret }
+    } } })
+    await flush()
+    const summaries = f.events.filter(event => event.native?.method === 'get_settings/summary')
+    expect(summaries).toHaveLength(1)
+    expect(summaries[0]?.native?.payload).toEqual({ status: 'available',
+      effective: { permissions: { allow: 10_000, ask: 1, deny: 0, defaultMode: 'auto', disableBypassPermissionsMode: 'disable' },
+        hooks: ['PreToolUse', 'PostToolUse'] },
+      sources: [{ name: 'userSettings', permissions: { allow: 1, defaultMode: 'default' }, hooks: ['PermissionDenied'] },
+        { name: 'localSettings', permissions: { ask: 1 }, hooks: [] },
+        { name: 'policySettings', permissions: { deny: 1, disableBypassPermissionsMode: 'disable' }, hooks: [] }] })
+    expect(JSON.stringify(summaries)).not.toContain(secret)
+    expect(JSON.stringify(summaries)).not.toContain('path')
+    expect(JSON.stringify(f.adapter.capabilities.effectiveSettings)).toBe(mode)
+    expect((f.adapter as unknown as { controls: Map<string, unknown> }).controls.size).toBe(0)
+  })
+
+  it('reports unsupported and unknown settings responses generically without changing mode', async () => {
+    for (const unsupported of [true, false]) {
+      const f = fixture({}, false)
+      const starting = f.adapter.start()
+      await flush()
+      f.transport.autoControlResponses = false
+      const initialize = f.transport.sent[0] as { request_id: string }
+      f.transport.receive({ type: 'control_response', response: { subtype: 'success', request_id: initialize.request_id,
+        response: { current_permission_mode: 'manual' } } })
+      await starting
+      const mode = JSON.stringify(f.adapter.capabilities.effectiveSettings)
+      const request = f.transport.sent.at(-1) as { request_id: string }
+      f.transport.receive(unsupported
+        ? { type: 'control_response', response: { subtype: 'error', error: 'unsupported SECRET-DO-NOT-EMIT', request_id: request.request_id } }
+        : { type: 'control_response', response: { subtype: 'success', response: { arbitrary: 'SECRET-DO-NOT-EMIT' }, request_id: request.request_id } })
+      await flush()
+      const summary = f.events.filter(event => event.native?.method === 'get_settings/summary')
+      expect(summary).toHaveLength(1)
+      expect(summary[0]?.native?.payload).toEqual({ status: 'unavailable' })
+      expect(JSON.stringify(summary)).not.toContain('SECRET-DO-NOT-EMIT')
+      expect(JSON.stringify(f.adapter.capabilities.effectiveSettings)).toBe(mode)
+      expect((f.adapter as unknown as { controls: Map<string, unknown> }).controls.size).toBe(0)
+    }
+  })
+
+  it('times out the settings read in three seconds and retires its control request', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout'] })
+    try {
+      const f = fixture({}, false)
+      const starting = f.adapter.start()
+      await flush()
+      f.transport.autoControlResponses = false
+      const initialize = f.transport.sent[0] as { request_id: string }
+      f.transport.receive({ type: 'control_response', response: { subtype: 'success', request_id: initialize.request_id,
+        response: { current_permission_mode: 'manual' } } })
+      await starting
+      const mode = JSON.stringify(f.adapter.capabilities.effectiveSettings)
+      const request = f.transport.sent.at(-1) as { request_id: string; request: { subtype: string } }
+      expect(request.request.subtype).toBe('get_settings')
+      await vi.advanceTimersByTimeAsync(3_000)
+      expect(f.events.filter(event => event.native?.method === 'get_settings/summary')).toMatchObject([
+        { native: { payload: { status: 'unavailable' } } }
+      ])
+      expect((f.adapter as unknown as { controls: Map<string, unknown> }).controls.size).toBe(0)
+      f.transport.receive({ type: 'control_response', response: { subtype: 'success', request_id: request.request_id,
+        response: { effective: { env: { token: 'LATE-SECRET' } }, sources: {} } } })
+      await flush()
+      expect(f.events.filter(event => event.native?.method === 'get_settings/summary')).toHaveLength(1)
+      expect(JSON.stringify(f.adapter.capabilities.effectiveSettings)).toBe(mode)
+    } finally { vi.useRealTimers() }
   })
 
   it('publishes fresh capabilities before learning native identity from the first turn', async () => {
@@ -413,7 +698,19 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
   it('drives an actual fake process through handshake, approval, hook and result round trips', async () => {
     const events: AdapterEvent[] = []
     const adapter = new ClaudeAdapter({ executable: process.execPath, cwd: process.cwd(), runtimeId: 'fake-process-runtime', settings, emit: (event) => events.push(event) }, {
-      version: async () => CLAUDE_COMPATIBILITY, createTransport: (options) => new JsonLineTransport({ ...options, args: [resolve('scripts/fixtures/claude-runtime.mjs')] })
+      version: async () => CLAUDE_COMPATIBILITY, createTransport: (options) => {
+        const transport = new JsonLineTransport({ ...options, args: [resolve('scripts/fixtures/claude-runtime.mjs')] })
+        const send = transport.send.bind(transport)
+        // This older fixture covers the turn protocol; answer the new optional read in the test host.
+        transport.send = (message: Json) => {
+          const request = message as { type?: string; request_id?: string; request?: { subtype?: string } }
+          if (request.type === 'control_request' && request.request?.subtype === 'get_settings') {
+            queueMicrotask(() => options.onMessage({ type: 'control_response', response: { subtype: 'success',
+              request_id: request.request_id!, response: { effective: {}, sources: {} } } }))
+          } else send(message)
+        }
+        return transport
+      }
     })
     adapters.push(adapter)
     await adapter.start()
@@ -1049,6 +1346,7 @@ describe('Claude permission actions and native approval boundaries', () => {
     const switching = f.adapter.respond(answer('approval', 'auto-mode'))
     expect(f.transport.sent.at(-1)).toMatchObject({ type: 'control_request', request: { subtype: 'set_permission_mode', mode: 'auto' } })
     expect(request(f).status).toBe('pending')
+    expect(f.adapter.capabilities.effectiveSettings).toMatchObject({ requestedPermissionMode: 'auto', permissionModeStatus: 'pending' })
     expect(f.adapter.capabilities.effectiveSettings).toMatchObject({ permissionMode: 'plan' })
     await expect(f.adapter.respond(answer('approval', 'auto-mode'))).rejects.toThrow('already resolved')
     modeAck(f); await switching

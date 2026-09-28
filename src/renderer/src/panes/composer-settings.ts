@@ -84,6 +84,17 @@ export function conversationModes(capabilities?: ProviderCapabilities): Array<{ 
     ...(descriptions ? { description: descriptions[permission] } : {}),
     change: { permission, plan: false } as Partial<SessionSettings>
   }))
+  if (capabilities.provider === 'claude') {
+    const effective = capabilities.effectiveSettings
+    const authorized = effective && typeof effective === 'object' && !Array.isArray(effective) && effective.claudeFullAutoAuthorized === true
+    const auto = modes.find(mode => mode.id === 'auto')
+    if (auto) {
+      auto.label = authorized ? 'Auto / Full access' : 'Auto (Guarded until authorized)'
+      auto.description = authorized ? 'Owner-authorized bypassPermissions. Commands, files, and available credentials are accessible within the process OS access. The conversation reports when its runtime confirms the mode.' : 'Currently uses Claude’s permission classifier. The Full Auto activation control authorizes full access for current and future Auto sessions in this installation.'
+      auto.change.claudeGuardedAuto = false
+      modes.push({ id: 'guarded-auto', label: 'Guarded Auto', description: 'Keep Claude Code’s tool-permission classifier active in this conversation, including after Full Auto is authorized.', change: { permission: 'auto', plan: false, claudeGuardedAuto: true } })
+    }
+  }
   if (capabilities.plans) modes.push({ id: 'plan', label: 'Plan', change: { plan: true } })
   return modes
 }

@@ -5,11 +5,12 @@ import { app, ipcMain } from 'electron'
 import { autoModeDenialOf } from '../../shared/auto-mode-denial'
 import type { AgentSpec, LayoutNode, WorkspaceLayout } from '../../shared/models'
 import type { PhoneNotification } from '../../shared/phone-access'
-import { permissionGrantOf, type GrantDecision, type PermissionGrantRequest, type PermissionGrantsState } from '../../shared/permission-grants'
-import type { Json, SessionSettings, SessionProjection } from '../../shared/structured-agent'
+import { permissionGrantOf, type GrantCallIdentity, type GrantDecision, type PermissionGrantRequest, type PermissionGrantsState } from '../../shared/permission-grants'
+import type { InteractionResponse, Json, SessionSettings, SessionProjection } from '../../shared/structured-agent'
 import { SteeringUnavailableError } from '../providers/adapter'
 import { ConductorMcpServer, type ControlCall } from './control-mcp'
 import { PermissionGrants, type SavedPermissionGrants } from './service'
+import { grantCallIdentity } from './identity'
 
 /** What the grant service needs from StructuredSessions (index.ts passes agents.structured). */
 export interface GrantSessions {
@@ -26,13 +27,26 @@ export interface GrantSessions {
   cancelQueued(id: string, promptId?: string): unknown
   setPermissionGrants(grants: PermissionGrants): void
   setConductorMcp(server: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }): void
+  respond(response: InteractionResponse): Promise<void>
 }
 export interface GrantStore {
   spec<T>(id: string): T | null | undefined
-  snapshot(id: string): Pick<SessionProjection, 'items' | 'phase' | 'settings' | 'queuedPrompts' | 'pendingSteering'> | null | undefined
+  snapshot(id: string): Pick<SessionProjection, 'items' | 'phase' | 'settings' | 'queuedPrompts' | 'pendingSteering' | 'runtimeId' | 'nativeSessionId'> | null | undefined
 }
 
 export const permissionGrantsIpcChannels = ['permission-grants:state', 'permission-grants:decide', 'permission-grants:revoke', 'permission-grants:interrupt'] as const
+/** Verify the provider still has the exact native request and tool arguments the owner saw. */
+export function nativeResponseTarget(state: Pick<SessionProjection, 'items' | 'runtimeId' | 'nativeSessionId'> | null | undefined, call: GrantCallIdentity): boolean {
+  if (!state || state.runtimeId !== call.runtimeId || state.nativeSessionId !== call.nativeSessionId || !call.requestId) return false
+  const pending = state.items.filter(item => item.runtimeId === call.runtimeId && item.data.type === 'interaction' &&
+    item.data.interaction.id === call.requestId).at(-1)
+  const tool = state.items.filter(item => item.runtimeId === call.runtimeId && item.nativeItemId === call.toolUseId && item.data.type === 'tool').at(-1)
+  if (!pending || pending.data.type !== 'interaction' || pending.data.interaction.status !== 'pending' ||
+      !tool || tool.data.type !== 'tool' || tool.data.name !== call.tool || !tool.data.input) return false
+  const digest = (input: Json): string => grantCallIdentity({ runtimeId: call.runtimeId, nativeSessionId: call.nativeSessionId,
+    toolUseId: call.toolUseId, tool: call.tool, input, requestId: call.requestId }).argsDigest
+  return digest(pending.data.interaction.input) === call.argsDigest && digest(tool.data.input) === call.argsDigest
+}
 /** Phases in which a message can only follow the turn (StructuredSessions.queue) or be steered into it. */
 const TURN_UNDER_WAY = new Set(['starting', 'running', 'waiting_input', 'waiting_approval'])
 /** Phases in which a steered message reaches the running turn itself (StructuredSessions.followup). */
@@ -131,6 +145,16 @@ export async function startPermissionGrants(deps: {
     title: id => spec(id)?.title,
     cwd: id => spec(id)?.cwd,
     apply: id => deps.sessions.applyPermissionRules(id),
+    respondNative: async (id: string, call: GrantCallIdentity, decision: 'allow' | 'deny') => {
+      const state = deps.store.snapshot(id)
+      if (!nativeResponseTarget(state, call)) return 'stale'
+      try { await deps.sessions.respond({ sessionId: id, runtimeId: call.runtimeId, requestId: call.requestId!, decision }) }
+      catch (error) {
+        if (error instanceof Error && /stale|no longer pending|already submitted/i.test(error.message)) return 'stale'
+        throw error
+      }
+      return 'sent'
+    },
     phase: id => deps.store.snapshot(id)?.phase,
     restart: id => deps.sessions.resume(id),
     ...grantDelivery(deps.sessions, deps.store),

@@ -6,6 +6,7 @@ import { AgentControlServer } from '../agent-control-server'
 import { callPermissions } from './control'
 import { CONDUCTOR_MCP_TOOLS, ConductorMcpServer } from './control-mcp'
 import { PermissionGrants, type PermissionGrantPorts, type SavedPermissionGrants } from './service'
+import { grantCallIdentity, type NativeGrantCall } from './identity'
 
 const cwd = 'C:\\Users\\owner\\site\\theme'
 const tab = 'agent_tab'
@@ -101,7 +102,7 @@ describe('one narrow owner approval per refused call', () => {
     const { grant } = await h.grants.decide(tab, h.deny('toolu_i', 'Bash', { command: ssh }, 'Production Reads'), 'approve-session', 'owner')
     h.grants.adapterPort(tab).refused(grant!.rule)
     expect(h.grants.rules(tab)).toEqual([])
-    expect(h.notices.at(-1)).toMatchObject({ itemId: `grant-ineffective:${grant!.id}`, message: expect.stringMatching(/in a message of its own, but the claude CLI's classifier still refused the call/) })
+    expect(h.notices.at(-1)).toMatchObject({ itemId: `grant-ineffective:${grant!.id}`, message: expect.stringMatching(/provider refused the same call again.*terminally blocked.*will not retry it automatically/) })
   })
 
   it('tells an idle conversation to retry at once, and a restarted one after its restart', async () => {
@@ -174,7 +175,7 @@ describe('one narrow owner approval per refused call', () => {
     const second = await h.grants.decide(tab, h.deny('b', 'Bash', { command: ssh }, 'Modify Shared Resources'), 'approve-session', 'owner')
     h.grants.adapterPort(tab).refused(second.grant!.rule)
     expect(h.grants.rules(tab)).toEqual([])
-    expect(h.notices.at(-1)!.message).toMatch(/classifier still refused the call/)
+    expect(h.notices.at(-1)!.message).toMatch(/Inspect the native denial, rule matching and effective settings/)
     await h.grants.decide(tab, h.deny('c', 'Bash', { command: 'npm test' }, 'x'), 'approve-session', 'owner')
     h.grants.closed(tab)
     expect(h.grants.rules(tab)).toEqual([])
@@ -211,6 +212,126 @@ describe('one narrow owner approval per refused call', () => {
     h.setPhase('idle')
     await vi.waitFor(() => expect(h.ports.restart).toHaveBeenCalledWith(tab))
     await vi.waitFor(() => expect(h.told.at(-1)!.text).toMatch(/approved: Bash\(npm test\)/))
+  })
+})
+
+describe('exact native approvals and observed execution', () => {
+  const nativeCall = (toolUseId = 'tool-native', requestId = 'request-native'): NativeGrantCall => ({
+    runtimeId: 'runtime-native', nativeSessionId: 'session-native', toolUseId, requestId,
+    tool: 'Bash', input: { command: 'cd app && cat < input.txt' }
+  })
+
+  it('allows an unrepresentable pending provider request once and accepts a fast post result without a second pre hook', async () => {
+    const respondNative = vi.fn(async () => 'sent' as const)
+    const h = harness({ respondNative })
+    const request = h.grants.nativePending(tab, nativeCall())!
+    expect(request).toMatchObject({ source: 'native', status: 'pending', execution: { status: 'pending' } })
+    expect(request.rule).toBeUndefined()
+    const result = await h.grants.decide(tab, request.id, 'approve-once', 'owner')
+    expect(result.status).toBe('approved-once')
+    expect(respondNative).toHaveBeenCalledWith(tab, request.call, 'allow')
+    expect(h.ports.apply).not.toHaveBeenCalled()
+    expect(h.ports.retry).not.toHaveBeenCalled()
+    // A native allow reply is still only applying; the provider may deny after PreToolUse.
+    expect(request.execution?.status).toBe('applying')
+    h.grants.executionFinished(tab, nativeCall('tool-native', undefined), 'succeeded')
+    expect(request.execution?.status).toBe('succeeded')
+    expect(h.grants.state().requests.find(entry => entry.id === request.id)?.execution?.status).toBe('succeeded')
+  })
+
+  it('keeps a completed request settled but permits a later distinct native request for the same command', async () => {
+    const respondNative = vi.fn(async () => 'sent' as const)
+    const h = harness({ respondNative })
+    const first = h.grants.nativePending(tab, nativeCall())!
+    await h.grants.decide(tab, first.id, 'approve-once', 'owner')
+    h.grants.executionFinished(tab, { ...nativeCall(), requestId: undefined }, 'succeeded')
+    expect(first).toMatchObject({ status: 'used', nativeAvailable: false, execution: { status: 'succeeded' } })
+    expect(h.grants.nativePending(tab, nativeCall())).toBe(first)
+    await expect(h.grants.decide(tab, first.id, 'approve-once', 'owner')).rejects.toThrow('already answered')
+
+    const later = h.grants.nativePending(tab, nativeCall('tool-later', 'request-later'))!
+    expect(later).toMatchObject({ source: 'native', status: 'pending', nativeAvailable: true, execution: { status: 'pending' } })
+    expect(later.id).not.toBe(first.id)
+    await h.grants.decide(tab, later.id, 'approve-once', 'owner')
+    expect(respondNative).toHaveBeenCalledTimes(2)
+    expect(respondNative).toHaveBeenLastCalledWith(tab, later.call, 'allow')
+  })
+
+  it('treats uncertain native delivery as terminal and never submits the same authorization twice', async () => {
+    const respondNative = vi.fn(async () => { throw new Error('connection lost after send') })
+    const h = harness({ respondNative })
+    const request = h.grants.nativePending(tab, nativeCall())!
+    expect((await h.grants.decide(tab, request.id, 'approve-once', 'owner')).message).toMatch(/Do not retry automatically/)
+    expect(request.execution?.status).toBe('unknown')
+    await expect(h.grants.decide(tab, request.id, 'approve-once', 'owner')).rejects.toThrow('already answered')
+    expect(respondNative).toHaveBeenCalledTimes(1)
+    const later = h.grants.nativePending(tab, nativeCall('tool-later', 'request-later'))!
+    expect(later).toMatchObject({ status: 'expired', nativeAvailable: false, execution: { status: 'unknown' } })
+    await expect(h.grants.decide(tab, later.id, 'approve-once', 'owner')).rejects.toThrow('already answered')
+    expect(respondNative).toHaveBeenCalledTimes(1)
+  })
+
+  it('restores an authorized native call as unknown instead of replaying it', async () => {
+    const first = harness({ respondNative: vi.fn(async () => 'sent' as const) })
+    const request = first.grants.nativePending(tab, nativeCall())!
+    await first.grants.decide(tab, request.id, 'approve-once', 'owner')
+    const saved = first.grants.snapshot()
+    const second = harness({ respondNative: vi.fn(async () => 'sent' as const) })
+    second.grants.restore(saved, id => id === tab)
+    const restored = second.grants.state().requests.find(entry => entry.id === request.id)!
+    expect(restored.execution?.status).toBe('unknown')
+    await expect(second.grants.decide(tab, request.id, 'approve-once', 'owner')).rejects.toThrow('already answered')
+    expect(second.ports.respondNative).not.toHaveBeenCalled()
+  })
+
+  it('keeps a pending native card across restart but answers it only after the exact live request reappears', async () => {
+    const first = harness({ respondNative: vi.fn(async () => 'sent' as const) })
+    const request = first.grants.nativePending(tab, nativeCall())!
+    const second = harness({ respondNative: vi.fn(async () => 'sent' as const) })
+    second.grants.restore(first.grants.snapshot(), id => id === tab)
+    expect(second.grants.list(tab).requests.find(entry => entry.id === request.id)).toMatchObject({ status: 'pending', nativeAvailable: false })
+    await expect(second.grants.decide(tab, request.id, 'approve-once', 'owner')).rejects.toThrow('only be allowed once while the exact provider request is pending')
+    expect(second.ports.respondNative).not.toHaveBeenCalled()
+    expect(() => second.grants.nativePending(tab, { ...nativeCall(), input: { command: 'cd app && cat < other.txt' } })).toThrow('reused with changed arguments')
+    expect(second.grants.nativePending(tab, nativeCall())).toMatchObject({ id: request.id, nativeAvailable: true })
+    await second.grants.decide(tab, request.id, 'approve-once', 'owner')
+    expect(second.ports.respondNative).toHaveBeenCalledTimes(1)
+  })
+
+  it('closes a still-pending native card on a definitive cancellation without claiming execution', async () => {
+    const h = harness({ respondNative: vi.fn(async () => 'sent' as const) })
+    const request = h.grants.nativePending(tab, nativeCall())!
+    h.grants.executionFinished(tab, { ...nativeCall(), requestId: undefined }, 'cancelled')
+    expect(h.grants.list(tab).requests.find(entry => entry.id === request.id)).toMatchObject({ status: 'expired', nativeAvailable: false, execution: { status: 'cancelled' } })
+    await expect(h.grants.decide(tab, request.id, 'approve-once', 'owner')).rejects.toThrow('already answered')
+    expect(h.ports.respondNative).not.toHaveBeenCalled()
+  })
+
+  it('records a definite fast rule-based failure directly from post evidence without claiming pre execution', async () => {
+    const h = harness()
+    const original = { ...nativeCall('denied', 'request-denied'), input: { command: 'echo one' } }
+    const described = { ...describeGrantRequest({ tool: 'Bash', input: original.input, cwd }), call: grantCallIdentity(original) }
+    h.grants.denied(tab, 'auto-denial:denied', described)
+    const result = await h.grants.decide(tab, 'auto-denial:denied', 'approve-once', 'owner')
+    expect(result.grant?.execution?.status).toBe('applying')
+    const retry = { ...original, toolUseId: 'retried', requestId: undefined }
+    h.grants.executionFinished(tab, retry, 'failed')
+    expect(h.grants.state().requests.find(entry => entry.id === 'auto-denial:denied')?.execution?.status).toBe('failed')
+    expect(h.grants.rules(tab)).toEqual([])
+  })
+
+  it('dedupes a repeated unchanged blocked denial by runtime, session, tool, arguments and scope', async () => {
+    const h = harness()
+    const first = { ...describeGrantRequest({ tool: 'Bash', input: { command: 'echo one' }, cwd }),
+      call: grantCallIdentity({ ...nativeCall('first'), input: { command: 'echo one' } }) }
+    h.grants.denied(tab, 'auto-denial:first', first)
+    const { grant } = await h.grants.decide(tab, 'auto-denial:first', 'approve-once', 'owner')
+    h.grants.refused(tab, grant!.rule)
+    const repeated = { ...first, call: grantCallIdentity({ ...nativeCall('second'), input: { command: 'echo one' } }) }
+    h.grants.denied(tab, 'auto-denial:second', repeated)
+    expect(h.grants.state().requests.filter(entry => entry.status === 'pending')).toEqual([])
+    expect(h.grants.state().settled).toContainEqual({ agentSessionId: tab, id: 'auto-denial:second', status: 'ineffective' })
+    expect(h.grants.state().requests.find(entry => entry.id === 'auto-denial:first')?.execution?.status).toBe('blocked')
   })
 })
 

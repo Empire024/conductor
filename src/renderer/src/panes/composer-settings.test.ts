@@ -80,10 +80,16 @@ describe('conversation modes', () => {
     expect(conversationModes(codex(undefined))).toEqual([])
     expect(conversationModes(undefined)).toEqual([])
   })
-  it('leaves the Claude modes carrying the shared wording', () => {
+  it('distinguishes classifier-backed Claude Auto before owner activation', () => {
     const modes = conversationModes({ provider: 'claude', permissions: ['default', 'accept-edits', 'auto'], plans: true } as unknown as ProviderCapabilities)
-    expect(modes.map(mode => mode.id)).toEqual(['default', 'accept-edits', 'auto', 'plan'])
-    expect(modes.every(mode => mode.description === undefined)).toBe(true)
+    expect(modes.map(mode => mode.id)).toEqual(['default', 'accept-edits', 'auto', 'guarded-auto', 'plan'])
+    expect(modes.find(mode => mode.id === 'auto')?.label).toContain('Guarded until authorized')
+    expect(modes.find(mode => mode.id === 'guarded-auto')?.change.claudeGuardedAuto).toBe(true)
+  })
+  it('labels authorized Auto as full access while keeping an explicit Guarded choice', () => {
+    const modes = conversationModes({ provider: 'claude', permissions: ['auto'], effectiveSettings: { claudeFullAutoAuthorized: true } } as unknown as ProviderCapabilities)
+    expect(modes[0]).toMatchObject({ label: 'Auto / Full access', change: { claudeGuardedAuto: false } })
+    expect(modes[1]).toMatchObject({ label: 'Guarded Auto', change: { claudeGuardedAuto: true } })
   })
   it('offers Grok its three modes, each explained in Grok\'s terms, plus its plan mode', () => {
     const modes = conversationModes({ provider: 'grok', permissions: ['default', 'accept-edits', 'auto'], plans: true } as unknown as ProviderCapabilities)

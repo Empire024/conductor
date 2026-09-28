@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createUpdateInstallSeam, INSTALLER_STUB_FILE, INSTALLER_STUB_HISTORY, testInstallProfile } from './update-install-seam'
@@ -28,6 +28,37 @@ const request = { version: '0.1.60-local.5', installerPath: 'C:\\cache\\Conducto
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
 
 describe('update install seam', () => {
+  it('isolates explicit packaged acceptance and blocks every real installer entry point', () => {
+    const root = mkdtempSync(join(tmpdir(), 'conductor-packaged-acceptance-')); roots.push(root)
+    const userData = join(root, 'profile'); mkdirSync(userData)
+    const env = { CONDUCTOR_PACKAGED_ACCEPTANCE: '1', CONDUCTOR_TEST_USER_DATA: userData }
+    expect(testInstallProfile({ isPackaged: true, env })).toBe(userData)
+    const relaunch = vi.fn(), updater = new FakeBaseUpdater()
+    const seam = createUpdateInstallSeam({ isPackaged: true, env, relaunch })
+    seam.prepare(updater)
+    expect(updater.app.baseCachePath).toBe(userData)
+    expect(updater.autoInstallOnAppQuit).toBe(false)
+    expect(() => updater.quitAndInstall()).toThrow(/never runs an installer/)
+    expect(() => updater.install()).toThrow(/never runs an installer/)
+    expect(() => updater.doInstall()).toThrow(/never runs an installer/)
+    updater.addQuitHandler(); updater.quit()
+    expect(() => seam.install(updater, request)).toThrow(/cannot install updates/)
+    expect(updater.spawned).toEqual([])
+    expect(relaunch).not.toHaveBeenCalled()
+    expect(existsSync(join(userData, INSTALLER_STUB_FILE))).toBe(false)
+  })
+
+  it('rejects missing, ordinary, traversed and redirected packaged acceptance profiles', () => {
+    const root = mkdtempSync(join(tmpdir(), 'conductor-packaged-acceptance-')); roots.push(root)
+    const ordinary = profile()
+    for (const directory of [undefined, 'relative/profile', ordinary, join(root, '..')]) {
+      expect(() => testInstallProfile({ isPackaged: true, env: { CONDUCTOR_PACKAGED_ACCEPTANCE: '1', CONDUCTOR_TEST_USER_DATA: directory } })).toThrow()
+    }
+    const redirected = join(root, 'profile')
+    symlinkSync(ordinary, redirected, process.platform === 'win32' ? 'junction' : 'dir')
+    expect(() => testInstallProfile({ isPackaged: true, env: { CONDUCTOR_PACKAGED_ACCEPTANCE: '1', CONDUCTOR_TEST_USER_DATA: redirected } })).toThrow(/dedicated/)
+  })
+
   it('never reaches the real installer in test mode: no spawn by install, quitAndInstall or quit', () => {
     const userData = profile(), relaunch = vi.fn()
     const seam = createUpdateInstallSeam({ isPackaged: false, env: { CONDUCTOR_TEST_USER_DATA: userData }, relaunch, now: () => new Date('2026-09-25T10:00:00Z') })

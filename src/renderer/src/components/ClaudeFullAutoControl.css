@@ -1,0 +1,7 @@
+.sa-full-auto-control { padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; }
+.sa-full-auto-control p { margin: 0 0 10px; font-size: 12px; line-height: 1.5; }
+.sa-full-auto-control p:last-child { margin-bottom: 0; margin-top: 8px; }
+.sa-full-auto-control button { white-space: normal; text-align: left; }
+.sa-full-auto-control [role="alert"] { color: var(--error, #ef8d8d); }
+.sa-full-auto-details { margin: 6px 0; font-size: 12px; }
+.sa-full-auto-details summary { cursor: pointer; padding: 4px 0; }

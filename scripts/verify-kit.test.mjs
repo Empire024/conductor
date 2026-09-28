@@ -1,14 +1,25 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   REPO, VERDICT, ancestorsOf, cpuPercent, descendantsOf, formatRecordLine, identityOf, ignoredTabs, judgeLoad, leavesFirst, listProcesses, loadInfo, matchProcesses, midTurnTabs, newInstance, suppliedControl,
   ownedTree, parseLlamaCommandLine, parseNvidiaSmi, parseProcessList, poll, readGateThresholds, registerRelaunch, registerRoot, retryAck, safeClose,
   sameProcesses, terminateIdentity, trackDescendants, withDeadline, commandHasArg, creationMs, startTracking, stopTracking, assertBuildHash, registerOwnChild,
-  possibleDescendants
+  possibleDescendants, packagedAcceptanceExecutable
 } from './verify-kit.mjs'
+
+test('packaged acceptance requires an explicit absolute executable and matching bytes before launch', () => {
+  assert.equal(packagedAcceptanceExecutable({}), null)
+  const executable = join(REPO, 'package.json')
+  const hash = createHash('sha256').update(readFileSync(executable)).digest('hex')
+  assert.throws(() => packagedAcceptanceExecutable({ CONDUCTOR_PACKAGED_ACCEPTANCE_EXE: 'relative.exe', CONDUCTOR_PACKAGED_ACCEPTANCE_SHA256: hash }), /absolute/)
+  assert.throws(() => packagedAcceptanceExecutable({ CONDUCTOR_PACKAGED_ACCEPTANCE_EXE: executable }), /SHA256/)
+  assert.throws(() => packagedAcceptanceExecutable({ CONDUCTOR_PACKAGED_ACCEPTANCE_EXE: executable, CONDUCTOR_PACKAGED_ACCEPTANCE_SHA256: '0'.repeat(64) }), /not the granted/)
+  assert.deepEqual(packagedAcceptanceExecutable({ CONDUCTOR_PACKAGED_ACCEPTANCE_EXE: executable, CONDUCTOR_PACKAGED_ACCEPTANCE_SHA256: hash }), { executable, executableSha256: hash })
+})
 
 // shell(100) -> agent node(200) -> smoke-lock(300) -> smoke(400) -> electron(500) -> renderer(501), fixture(502)
 //                                                    smoke(400) -> powershell query(600) -> conhost(601)

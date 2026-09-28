@@ -1,5 +1,6 @@
-import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { appendFileSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { isAbsolute, join, relative, resolve } from 'node:path'
 
 /** The part of electron-updater's NsisUpdater the install step touches. */
 export interface InstallableUpdater {
@@ -24,11 +25,21 @@ const CACHE_DIRECTORY = 'updater-cache'
  *  quit handler's install(), and the doInstall() both of them end in, which spawns it. */
 const INSTALL_ENTRY_POINTS = ['quitAndInstall', 'install', 'doInstall'] as const
 
-/** The automation profile an unpackaged launch runs in, or null for a real launch. A packaged build
- *  ignores CONDUCTOR_TEST_USER_DATA entirely, so the owner's installed app always installs for real. */
+/** Packaged acceptance is explicit, isolated in a canonical temporary directory, and cannot use
+ * the owner's profile. Ordinary installed launches still ignore CONDUCTOR_TEST_USER_DATA. */
 export function testInstallProfile(options: { isPackaged: boolean; env?: NodeJS.ProcessEnv }): string | null {
-  if (options.isPackaged) return null
-  const directory = (options.env ?? process.env).CONDUCTOR_TEST_USER_DATA?.trim()
+  const env = options.env ?? process.env
+  if (options.isPackaged && env.CONDUCTOR_PACKAGED_ACCEPTANCE !== '1') return null
+  const directory = env.CONDUCTOR_TEST_USER_DATA?.trim()
+  if (options.isPackaged) {
+    if (!directory || !isAbsolute(directory)) throw new Error('Packaged acceptance requires an absolute temporary profile')
+    const canonical = realpathSync(directory)
+    const withinTemp = relative(realpathSync(tmpdir()), canonical).replace(/\\/g, '/')
+    if (!/^conductor-packaged-acceptance-[a-z0-9_-]+\/profile$/i.test(withinTemp)) {
+      throw new Error('Packaged acceptance profile must be a dedicated conductor-packaged-acceptance-* temporary directory')
+    }
+    return canonical
+  }
   return directory ? resolve(directory) : null
 }
 
@@ -47,7 +58,7 @@ export interface UpdateInstallSeam {
 /**
  * The one place Conductor hands a downloaded build to an installer. A real launch calls
  * electron-updater's quitAndInstall exactly as before. A test instance (CONDUCTOR_TEST_USER_DATA,
- * never packaged) must not: the NSIS package installs over the owner's app whatever profile the
+ * or explicitly isolated packaged acceptance) must not: NSIS installs over the owner's app whatever profile the
  * test uses. So there the seam records what would have been installed in
  * <test userData>/installer-stub.json and relaunches the app the way a finished install does.
  */
@@ -84,6 +95,7 @@ export function createUpdateInstallSeam(options: { isPackaged: boolean; env?: No
       }
     },
     install(_updater, request) {
+      if (options.isPackaged) throw new Error('Isolated packaged acceptance cannot install updates; use the real owner profile')
       const record: InstallerStubRecord = { ...request, requestedAt: (options.now?.() ?? new Date()).toISOString() }
       mkdirSync(testUserData, { recursive: true })
       const temporary = `${stubPath}.${process.pid}.tmp`
@@ -93,6 +105,7 @@ export function createUpdateInstallSeam(options: { isPackaged: boolean; env?: No
       options.relaunch()
     },
     reportedVersion(actual) {
+      if (options.isPackaged) return actual
       try {
         const record = JSON.parse(readFileSync(stubPath, 'utf8')) as Partial<InstallerStubRecord>
         return typeof record.version === 'string' && record.version ? record.version : actual

@@ -48,7 +48,19 @@ class FakeProvider implements ProviderAdapter {
   responseGate?: Promise<void>
   renameGate?: Promise<void>
   onResponse?: (response: InteractionResponse) => Promise<void>
-  constructor(readonly options: AdapterOptions) {}
+  readonly fullAutoLaunchCapable: boolean
+  constructor(readonly options: AdapterOptions) { this.fullAutoLaunchCapable = options.claudeFullAutoAuthorized?.() === true }
+  permissionRefreshes: string[] = []
+  async refreshClaudeFullAutoPolicy(settings?: SessionSettings): Promise<{ status: 'confirmed' | 'restart-pending' | 'blocked' | 'unchanged' }> {
+    const selected = settings ?? this.options.settings
+    const mode = selected.plan ? 'plan' : selected.permission === 'auto'
+      ? this.options.claudeFullAutoAuthorized?.() && selected.claudeGuardedAuto !== true ? 'bypassPermissions' : 'auto'
+      : selected.permission === 'accept-edits' ? 'acceptEdits' : 'manual'
+    this.permissionRefreshes.push(mode)
+    if (mode === 'bypassPermissions' && !this.fullAutoLaunchCapable) return { status: 'restart-pending' }
+    this.capabilities.effectiveSettings = { permissionMode: mode, requestedPermissionMode: mode, permissionModeStatus: 'confirmed' }
+    return { status: 'confirmed' }
+  }
   async start(): Promise<void> { this.starts++; await this.startGate; this.emit({ data: { type: 'session', phase: 'idle', nativeSessionId: this.options.nativeSessionId ?? (this.nativeIdentityOnStart ? `native-${this.options.runtimeId}` : undefined) } }) }
   async submit(text: string, settings: SessionSettings, attachments?: ContextAttachment[]): Promise<void> { if (this.disposed) throw new Error('Fake runtime disposed'); this.submissions.push({ text, settings, attachments }); await this.submitGate }
   async respond(response: InteractionResponse): Promise<void> { this.responses.push(response); await this.responseGate; await this.onResponse?.(response) }
@@ -1286,6 +1298,73 @@ describe('permission response acknowledgment and mode persistence', () => {
     await expect(f.manager.respond({ ...response, decision: 'allow' })).rejects.toThrow('Transport disconnected')
     expect(f.database.structured.snapshot(f.spec.id)?.items.find(item => item.data.type === 'interaction')?.data).toMatchObject({ interaction: { status: 'expired', outcome: 'Response delivery uncertain' } })
     await expect(f.manager.respond({ ...response, decision: 'allow' })).rejects.toThrow('already submitted')
+  })
+})
+
+describe('Claude Full Auto host policy reconciliation', () => {
+  const offered: ProviderCapabilities['permissions'] = ['default', 'accept-edits', 'auto']
+
+  it('defers an incapable active runtime, then resumes the same native session before draining queued work', async () => {
+    const f = fixture('claude', true, undefined, offered)
+    let authorized = false
+    f.manager.setClaudeFullAutoPolicy(() => authorized)
+    const auto: SessionSettings = { permission: 'auto', plan: false }
+    f.manager.saveSettings(f.spec.id, auto)
+    await f.manager.submit(f.spec.id, 'First turn', auto)
+    const first = f.current, nativeSessionId = f.database.structured.snapshot(f.spec.id)?.nativeSessionId
+    await f.manager.queue(f.spec.id, 'Queued after first turn', auto)
+    authorized = true
+    expect(await f.manager.refreshClaudeFullAutoPolicy()).toEqual([{ agentSessionId: f.spec.id, status: 'restart-pending' }])
+    expect(f.current).toBe(first)
+    first.finish()
+    await vi.waitFor(() => expect(f.adapters).toHaveLength(2))
+    await vi.waitFor(() => expect(f.current.submissions.map(input => input.text)).toEqual(['Queued after first turn']))
+    expect(first.disposed).toBe(true)
+    expect(f.current.options.nativeSessionId).toBe(nativeSessionId)
+    expect(f.current.fullAutoLaunchCapable).toBe(true)
+    expect(f.current.permissionRefreshes).toContain('bypassPermissions')
+    expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts ?? []).toHaveLength(0)
+  })
+
+  it('keeps an owner-saved Manual choice authoritative when policy enables, then reconciles saved Auto', async () => {
+    const f = fixture('claude', true, undefined, offered)
+    let authorized = false
+    f.manager.setClaudeFullAutoPolicy(() => authorized)
+    const auto: SessionSettings = { permission: 'auto', plan: false }
+    f.manager.saveSettings(f.spec.id, auto)
+    await f.manager.submit(f.spec.id, 'First turn', auto)
+    f.current.finish()
+    f.manager.saveSettings(f.spec.id, settings)
+    authorized = true
+    const beforeManualRefresh = f.adapters.length
+    expect(await f.manager.refreshClaudeFullAutoPolicy()).toEqual([{ agentSessionId: f.spec.id, status: 'confirmed' }])
+    expect(f.current.permissionRefreshes.at(-1)).toBe('manual')
+    expect(f.adapters).toHaveLength(beforeManualRefresh)
+    f.manager.saveSettings(f.spec.id, auto)
+    expect(await f.manager.refreshClaudeFullAutoPolicy()).toEqual([{ agentSessionId: f.spec.id, status: 'confirmed' }])
+    expect(f.adapters).toHaveLength(beforeManualRefresh + 1)
+    expect(f.current.permissionRefreshes.at(-1)).toBe('bypassPermissions')
+  })
+
+  it('keeps background work and child agents on the old runtime until they finish', async () => {
+    const f = fixture('claude', true, undefined, offered)
+    let authorized = false
+    f.manager.setClaudeFullAutoPolicy(() => authorized)
+    const auto: SessionSettings = { permission: 'auto', plan: false }
+    f.manager.saveSettings(f.spec.id, auto)
+    await f.manager.submit(f.spec.id, 'Start child', auto)
+    const first = f.current
+    first.background = 1
+    first.emit({ data: { type: 'subagent', nativeSessionId: 'child', name: 'Child', status: 'running' } })
+    first.finish()
+    authorized = true
+    const beforeRefresh = f.adapters.length
+    expect(await f.manager.refreshClaudeFullAutoPolicy()).toEqual([{ agentSessionId: f.spec.id, status: 'restart-pending' }])
+    expect(f.adapters).toHaveLength(beforeRefresh)
+    first.emit({ data: { type: 'subagent', nativeSessionId: 'child', name: 'Child', status: 'completed' } })
+    first.background = 0
+    first.emit({ data: { type: 'notice', message: 'Background task completed' } })
+    await vi.waitFor(() => expect(f.adapters).toHaveLength(beforeRefresh + 1))
   })
 })
 

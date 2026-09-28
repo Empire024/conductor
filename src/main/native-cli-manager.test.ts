@@ -24,9 +24,33 @@ describe('native conversation launch arguments', () => {
     expect(nativeCliArgs('claude', 'same-id', settings, true).slice(0, 2)).toEqual(['--session-id', 'same-id'])
     expect(() => nativeCliArgs('codex', '--last; run', settings)).toThrow()
   })
+  it('carries host-authorized Full Auto into an exact CLI handoff without escalating Manual, Plan or Guarded Auto', () => {
+    const args = nativeCliArgs('claude', 'same-id', { permission: 'auto', plan: false }, false, true)
+    expect(args).toContain('bypassPermissions')
+    expect(args).toContain('--allow-dangerously-skip-permissions')
+    expect(nativeCliArgs('claude', 'same-id', { permission: 'auto', plan: false })).not.toContain('bypassPermissions')
+    for (const settings of [{ permission: 'auto', plan: true }, { permission: 'default', plan: false }, { permission: 'auto', plan: false, claudeGuardedAuto: true }] as const) expect(nativeCliArgs('claude', 'same-id', settings, false, true)).not.toContain('bypassPermissions')
+    expect(nativeCliArgs('codex', 'same-id', { permission: 'auto', plan: false }, false, true)).not.toContain('--allow-dangerously-skip-permissions')
+  })
 })
 
 describe('CLI startup recovery', () => {
+  it('never passes owner Full Auto authorization to isolated reviewers or evaluations', async () => {
+    for (const role of ['reviewer', 'evaluation']) {
+      const spec = { id: 'isolated', provider: 'claude', cwd: process.cwd(), ...(role === 'evaluation' ? { profile: 'evaluation' } : {}) }
+      const settings = { permission: 'auto', plan: false }
+      const sessions = { cliSpec: () => spec, isApprovalReviewer: () => role === 'reviewer', prepareCli: async () => ({ spec, nativeSessionId: 'same-id', settings }), cancelCli: vi.fn() }
+      const database = { structured: { snapshot: () => ({ settings }) } }
+      vi.mocked(pty.spawn).mockReturnValueOnce({ onData: vi.fn(), onExit: vi.fn(), kill: vi.fn() } as unknown as ReturnType<typeof pty.spawn>)
+      const manager = new NativeCliManager(sessions as unknown as StructuredSessions, database as unknown as ConductorDatabase, () => 'claude.exe', vi.fn())
+      manager.setClaudeFullAutoPolicy(() => true)
+      await manager.ensure('isolated')
+      expect(vi.mocked(pty.spawn).mock.calls.at(-1)?.[1]).not.toContain('bypassPermissions')
+      expect(vi.mocked(pty.spawn).mock.calls.at(-1)?.[1]).not.toContain('--allow-dangerously-skip-permissions')
+      expect(await manager.refreshClaudeFullAutoPolicy()).toEqual([])
+      manager.dispose()
+    }
+  })
   it('omits inherited settings and provider defaults from native arguments', () => {
     const args = nativeCliArgs('codex', 'same-id', { permission: 'default', plan: false, model: 'default', effort: 'auto', sandbox: 'inherit', approvalPolicy: 'inherit' })
     expect(args).toEqual(['resume', 'same-id'])
@@ -71,6 +95,29 @@ describe('CLI startup recovery', () => {
 })
 
 describe('native CLI work evidence', () => {
+  it('reports a busy interactive mode limitation once and preserves the command while preventing new input after revocation', async () => {
+    const spec = { id: 'pane', provider: 'claude', cwd: process.cwd() }
+    const settings = { permission: 'auto', plan: false }
+    const sessions = { cliSpec: () => spec, prepareCli: vi.fn(async () => ({ spec, nativeSessionId: 'same-id', settings })), cancelCli: vi.fn() }
+    const database = { structured: { snapshot: () => ({ settings }) } }
+    const fixtureProcess = { onData: vi.fn(), onExit: vi.fn(), write: vi.fn(), kill: vi.fn() }
+    vi.mocked(pty.spawn).mockReturnValueOnce(fixtureProcess as unknown as ReturnType<typeof pty.spawn>)
+    const broadcast = vi.fn()
+    const manager = new NativeCliManager(sessions as unknown as StructuredSessions, database as unknown as ConductorDatabase, () => 'claude.exe', broadcast)
+    let authorized = true
+    manager.setClaudeFullAutoPolicy(() => authorized)
+    await manager.ensure('pane')
+    manager.write('pane', 'long authorized job\r')
+    authorized = false
+    const results = await manager.refreshClaudeFullAutoPolicy()
+    expect(results).toEqual([expect.objectContaining({ agentSessionId: 'pane', status: 'blocked', error: expect.stringContaining('no acknowledged permission-mode control') })])
+    await manager.refreshClaudeFullAutoPolicy()
+    expect(broadcast).toHaveBeenCalledTimes(1)
+    expect(fixtureProcess.kill).not.toHaveBeenCalled()
+    manager.write('pane', 'another command\r')
+    expect(fixtureProcess.write).toHaveBeenCalledTimes(1)
+    manager.dispose()
+  })
   it('requires non-empty submitted input and clears only on an explicit interrupt', () => {
     let state = { draft: '', submitted: false }
     state = trackNativeCliInput(state, '\r')

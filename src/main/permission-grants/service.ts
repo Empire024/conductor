@@ -2,9 +2,10 @@ import { randomUUID } from 'node:crypto'
 import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, classifierOutageMessage, classifierOutagePayload, isClassifierOutage, type AutoModeDenial, type DenialGrantRequest } from '../../shared/auto-mode-denial'
 import {
   describeGrantRequest, grantApprovedMessage, grantDeniedMessage, grantHolderLabel, grantNeedsPhone, grantRequestSummary, nativeGrantRules,
-  type GrantDecision, type GrantRule, type GrantStatus, type PermissionGrant, type PermissionGrantDecisionResult, type PermissionGrantRequest, type PermissionGrantsState
+  type GrantCallIdentity, type GrantDecision, type GrantExecution, type GrantExecutionStatus, type GrantRule, type GrantStatus, type PermissionGrant, type PermissionGrantDecisionResult, type PermissionGrantRequest, type PermissionGrantsState
 } from '../../shared/permission-grants'
 import type { Json } from '../../shared/structured-agent'
+import { grantCallIdentity, grantWorkKey, sameNativeCall, sameToolAttempt, type NativeGrantCall } from './identity'
 
 /**
  * One narrow owner approval per sensitive action, consumed by the conversation that asked
@@ -15,7 +16,9 @@ import type { Json } from '../../shared/structured-agent'
  * any class. An approval becomes exactly one native allow rule for that
  * one conversation, handed to the running CLI (apply_flag_settings) or, where the CLI cannot take
  * it live, through --settings on its next start, and the conversation is told to retry in a user
- * turn of its own (retry), which is what the classifier honours. Waiting requests and unspent
+ * turn of its own (retry). A classifier denial itself has no pending native request to answer.
+ * Whether a correctly matching rule takes precedence in Guarded Auto remains unconfirmed.
+ * Waiting requests and unspent
  * grants survive an
  * app restart (snapshot/restore, permission-grants.json in userData); they end with the tab, when
  * the owner revokes them, or (approve once) when their call has run.
@@ -38,6 +41,9 @@ export interface PermissionGrantPorts {
   cwd(agentSessionId: string): string | undefined
   /** Hands the live runtime its current rules; 'offline' when there is none (its next start reads them). */
   apply(agentSessionId: string): Promise<'applied' | 'unsupported' | 'offline'>
+  /** Answer only a still-pending provider request with this exact identity. A stale response must
+   *  return stale; a transport failure with uncertain delivery must throw. */
+  respondNative?(agentSessionId: string, call: GrantCallIdentity, decision: 'allow' | 'deny'): Promise<'sent' | 'stale'>
   phase(agentSessionId: string): string | undefined
   /** Restarts the idle conversation's runtime on the same native conversation. */
   restart(agentSessionId: string): Promise<void>
@@ -45,8 +51,8 @@ export interface PermissionGrantPorts {
   tell(agentSessionId: string, text: string): Promise<void>
   /** Delivers an approval's "retry it now" as a user turn of its own: queued behind a turn that is
    *  under way, never steered into it, and started at once when the conversation is idle. The
-   *  classifier let an approved call through only when the approval arrived that way
-   *  (docs/permissions-classifier.md, Evidence 2026-09-28). */
+   *  delivery as a separate turn keeps the approval visible and ordered, though the haftheme
+   *  case did not establish that delivery form caused its classifier result. */
   retry(agentSessionId: string, text: string): Promise<void>
   /** Whether that turn is still waiting in the conversation's queue. A refusal before it starts is
    *  the agent retrying on its own, which says nothing yet about the grant. */
@@ -90,6 +96,8 @@ export interface SavedPermissionGrants {
   movedOut: Array<[string, string[]]>
   aliases: Array<[string, Array<[string, string]>]>
   settled: Array<[string, string, GrantStatus]>
+  /** Terminal work keys prevent a repeated unchanged denial from asking the owner again. */
+  terminal?: Array<[string, string, GrantExecution]>
 }
 export interface AgentGrantRequest { tool?: string; command?: string; path?: string; url?: string; reason?: string; rollback?: string }
 
@@ -100,6 +108,7 @@ const DECIDED: Record<Exclude<GrantDecision, 'deny'>, GrantStatus> = { 'approve-
 const SAVED_SETTLED = 200
 const SAVED_MOVED = 200
 const LIVE_STATUSES = new Set<GrantStatus>(['pending', 'approved-once', 'approved-session'])
+const TERMINAL_EXECUTIONS = new Set<GrantExecutionStatus>(['succeeded', 'failed', 'blocked', 'cancelled', 'unknown'])
 const STEERABLE_PHASES = new Set(['running', 'waiting_approval', 'waiting_input'])
 /** An approval turn queued behind a turn still running this long: the owner is told how to
  *  interrupt it; a wizard's approval interrupts it (owner decision 2026-09-28, H06). */
@@ -155,6 +164,7 @@ export class PermissionGrants {
   private readonly aliases = new Map<string, Map<string, string>>()
   /** Answers a previous run gave (restore): a request answered before the restart stays answered. */
   private readonly settled = new Map<string, Map<string, GrantStatus>>()
+  private readonly terminal = new Map<string, { agentSessionId: string; execution: GrantExecution }>()
   /** A grant -> the approval turn it was announced with (retry), until the grant ends. */
   private readonly retries = new Map<string, string>()
   /** Approval turns being delivered, by conversation and text (deliver, followDeliveries). */
@@ -182,7 +192,8 @@ export class PermissionGrants {
     const settled: SavedPermissionGrants['settled'] = []
     for (const [agentSessionId, statuses] of this.settled) for (const [id, status] of statuses) settled.push([agentSessionId, id, status])
     for (const [agentSessionId, open] of this.requests) for (const request of open.values()) {
-      if (request.status === 'pending' || granted.has(`${agentSessionId}\n${request.id}`)) requests.push({ ...request, agentSessionId })
+      if (request.status === 'pending' || granted.has(`${agentSessionId}\n${request.id}`) || request.source === 'native' ||
+          request.execution && TERMINAL_EXECUTIONS.has(request.execution.status)) requests.push({ ...request, agentSessionId })
       else settled.push([agentSessionId, request.id, request.status])
     }
     const movedOut = new Map<string, string[]>()
@@ -196,7 +207,8 @@ export class PermissionGrants {
       movedFrom: [...this.movedFrom].filter(([id]) => ids.has(id)),
       movedOut: [...movedOut],
       aliases: [...this.aliases].map(([agentSessionId, views]) => [agentSessionId, [...views]]),
-      settled: settled.slice(-SAVED_SETTLED)
+      settled: settled.slice(-SAVED_SETTLED),
+      terminal: [...this.terminal].slice(-SAVED_SETTLED).map(([key, value]) => [key, value.agentSessionId, value.execution])
     }
   }
 
@@ -213,11 +225,24 @@ export class PermissionGrants {
     const text = (value: unknown): value is string => typeof value === 'string' && value.length > 0
     let dropped = 0, restoredRequests = 0, restoredGrants = 0
     for (const entry of list(data.requests)) {
-      if (!entry || !text(entry.id) || !text(entry.agentSessionId) || !LIVE_STATUSES.has(entry.status)) continue
+      if (!entry || !text(entry.id) || !text(entry.agentSessionId) ||
+          (!LIVE_STATUSES.has(entry.status) && !(entry.execution && TERMINAL_EXECUTIONS.has(entry.execution.status)))) continue
       const { agentSessionId, ...request } = entry
       if (!exists(agentSessionId)) { dropped++; continue }
       // A classifier outage an older build saved as a card was never a question: withdrawn, not asked again.
       if (request.status === 'pending' && outageCard(request)) { this.settledAs(agentSessionId, request.id, 'expired'); dropped++; continue }
+      if (request.source === 'native') {
+        // A kept native runtime can preserve the pending request through an app restart. The
+        // card remains visible but cannot answer until that *same* can_use_tool is observed live
+        // again. An already authorized response is uncertain and must never be replayed.
+        request.nativeAvailable = false
+        if (request.execution && request.execution.status !== 'pending' && !TERMINAL_EXECUTIONS.has(request.execution.status))
+          request.execution = { ...request.execution, status: 'unknown', updatedAt: this.now(), detail: 'The app restarted after authorization; inspect execution before any retry.' }
+      } else if (request.execution && request.execution.status !== 'pending' && !TERMINAL_EXECUTIONS.has(request.execution.status)) {
+        request.execution = { ...request.execution, status: 'unknown', updatedAt: this.now(), detail: 'The app restarted after authorization and before execution was confirmed; do not retry automatically.' }
+      }
+      if (request.execution && TERMINAL_EXECUTIONS.has(request.execution.status))
+        this.terminal.set(grantWorkKey(request.execution.call, request.execution.scope), { agentSessionId, execution: request.execution })
       const open = this.requests.get(agentSessionId) ?? new Map<string, PermissionGrantRequest>()
       if (open.has(request.id)) continue
       this.requests.set(agentSessionId, open.set(request.id, request))
@@ -226,7 +251,7 @@ export class PermissionGrants {
     for (const grant of list(data.grants)) {
       if (!grant || !text(grant.id) || !text(grant.rule) || !text(grant.agentSessionId) || (grant.scope !== 'once' && grant.scope !== 'session')) continue
       const request = this.requests.get(grant.agentSessionId)?.get(grant.requestId)
-      if (!request || request.status === 'pending') { dropped++; continue }
+      if (!request || request.status === 'pending' || request.execution?.status === 'unknown') { dropped++; continue }
       const held = this.grants.get(grant.agentSessionId) ?? []
       if (held.some(entry => entry.id === grant.id || entry.rule === grant.rule)) continue
       this.grants.set(grant.agentSessionId, [...held, { ...grant, delivery: 'pending' }])
@@ -235,7 +260,8 @@ export class PermissionGrants {
     // A request saved as approved whose grant did not come back is not approved any more.
     for (const [agentSessionId, open] of [...this.requests]) {
       for (const request of [...open.values()]) {
-        if (request.status === 'pending' || (this.grants.get(agentSessionId) ?? []).some(grant => grant.requestId === request.id)) continue
+        if (request.status === 'pending' || request.source === 'native' || request.execution && TERMINAL_EXECUTIONS.has(request.execution.status) ||
+            (this.grants.get(agentSessionId) ?? []).some(grant => grant.requestId === request.id)) continue
         open.delete(request.id)
         this.settledAs(agentSessionId, request.id, 'expired')
         restoredRequests--
@@ -254,6 +280,12 @@ export class PermissionGrants {
       if (map.size) this.aliases.set(agentSessionId, map)
     }
     for (const [agentSessionId, id, status] of list(data.settled)) if (text(agentSessionId) && text(id) && text(status) && !LIVE_STATUSES.has(status) && exists(agentSessionId)) this.settledAs(agentSessionId, id, status)
+    for (const entry of list(data.terminal)) {
+      if (!Array.isArray(entry) || entry.length !== 3) continue
+      const [key, agentSessionId, execution] = entry
+      if (text(key) && text(agentSessionId) && exists(agentSessionId) && execution && TERMINAL_EXECUTIONS.has(execution.status))
+        this.terminal.set(key, { agentSessionId, execution })
+    }
     this.changed()
     return { requests: restoredRequests, grants: restoredGrants, dropped }
   }
@@ -272,8 +304,107 @@ export class PermissionGrants {
   }
 
   /** What the Claude adapter is given (AdapterOptions.permissionGrants). */
-  adapterPort(agentSessionId: string): { rules(): GrantRule[]; used(rule: string): void; refused(rule: string): void; denied(itemId: string, request: DenialGrantRequest): void } {
-    return { rules: () => this.rules(agentSessionId), used: rule => this.used(agentSessionId, rule), refused: rule => this.refused(agentSessionId, rule), denied: (itemId, request) => this.denied(agentSessionId, itemId, request) }
+  adapterPort(agentSessionId: string): { rules(): GrantRule[]; used(rule: string): void; refused(rule: string): void; denied(itemId: string, request: DenialGrantRequest): void;
+    nativePending(call: NativeGrantCall): PermissionGrantRequest | undefined; executionStarted(call: NativeGrantCall, evidence: 'tool-progress'): void;
+    executionFinished(call: NativeGrantCall, outcome: 'succeeded' | 'failed' | 'blocked' | 'cancelled' | 'unknown'): void } {
+    return { rules: () => this.rules(agentSessionId), used: rule => this.used(agentSessionId, rule), refused: rule => this.refused(agentSessionId, rule),
+      denied: (itemId, request) => this.denied(agentSessionId, itemId, request), nativePending: call => this.nativePending(agentSessionId, call),
+      executionStarted: (call, evidence) => this.executionStarted(agentSessionId, call, evidence), executionFinished: (call, outcome) => this.executionFinished(agentSessionId, call, outcome) }
+  }
+
+  /** A provider request that is still pending can be answered once without adding a reusable
+   *  permission rule. The provider must supply its exact runtime, session, request and arguments. */
+  nativePending(agentSessionId: string, call: NativeGrantCall): PermissionGrantRequest | undefined {
+    if (!call.requestId || call.tool === 'AskUserQuestion' || !this.ports.respondNative || this.ports.provider(agentSessionId) !== 'claude') return undefined
+    const cwd = this.ports.cwd(agentSessionId)
+    if (!cwd) return undefined
+    const described = describeGrantRequest({ tool: call.tool, input: call.input, cwd })
+    if (described.rule) return undefined
+    const identity = grantCallIdentity(call)
+    const id = `native-grant:${identity.runtimeId}:${identity.requestId}`
+    const existing = this.requests.get(agentSessionId)?.get(id)
+    if (existing) {
+      if (!existing.call || !sameNativeCall(existing.call, identity)) throw new Error('Native request identity was reused with changed arguments')
+      if (existing.status === 'pending' && existing.execution?.status === 'pending' && !existing.nativeAvailable) {
+        existing.nativeAvailable = true
+        this.card(agentSessionId, existing)
+        this.changed()
+      }
+      return existing
+    }
+    const terminal = this.terminal.get(grantWorkKey(identity, 'once'))
+    if (terminal?.agentSessionId === agentSessionId && ['blocked', 'unknown'].includes(terminal.execution.status)) {
+      const request: PermissionGrantRequest = { ...described, id, source: 'native', call: identity,
+        status: terminal.execution.status === 'blocked' ? 'ineffective' : 'expired', requestedAt: this.now(), execution: terminal.execution, nativeAvailable: false }
+      const open = this.requests.get(agentSessionId) ?? new Map<string, PermissionGrantRequest>()
+      this.requests.set(agentSessionId, open.set(id, request))
+      this.card(agentSessionId, request)
+      this.changed()
+      return request
+    }
+    const request: PermissionGrantRequest = { ...described, id, source: 'native', call: identity, nativeAvailable: true, status: 'pending', requestedAt: this.now(),
+      execution: { status: 'pending', call: identity, scope: 'once', updatedAt: this.now() } }
+    const open = this.requests.get(agentSessionId) ?? new Map<string, PermissionGrantRequest>()
+    this.requests.set(agentSessionId, open.set(id, request))
+    this.card(agentSessionId, request)
+    this.changed()
+    return request
+  }
+
+  /** The provider observed the exact authorized tool begin. Only this event makes execution
+   *  "executing"; handing a rule to the CLI or answering a request never does. */
+  executionStarted(agentSessionId: string, raw: NativeGrantCall, evidence: 'tool-progress'): void {
+    if (evidence !== 'tool-progress') return
+    const call = grantCallIdentity(raw)
+    for (const grant of this.grants.get(agentSessionId) ?? []) {
+      const request = this.requests.get(agentSessionId)?.get(grant.requestId)
+      if (!request?.call || request.call.tool !== call.tool || request.call.argsDigest !== call.argsDigest ||
+          request.call.nativeSessionId !== call.nativeSessionId || request.call.runtimeId !== call.runtimeId ||
+          TERMINAL_EXECUTIONS.has(grant.execution?.status ?? 'pending')) continue
+      const execution: GrantExecution = { status: 'executing', call, scope: grant.scope, updatedAt: this.now() }
+      grant.execution = execution
+      request.execution = execution
+      this.changed()
+      return
+    }
+    const native = [...(this.requests.get(agentSessionId)?.values() ?? [])].find(request =>
+      request.source === 'native' && request.call && sameToolAttempt(request.call, call) && request.status === 'approved-once')
+    if (native?.execution && !TERMINAL_EXECUTIONS.has(native.execution.status)) {
+      native.execution = { ...native.execution, status: 'executing', updatedAt: this.now() }
+      this.changed()
+    }
+  }
+
+  /** A definite provider result closes the exact attempt. A missing or mismatched result leaves
+   *  it executing until recovery marks it unknown; it is never guessed from the approval. */
+  executionFinished(agentSessionId: string, raw: NativeGrantCall, outcome: Extract<GrantExecutionStatus, 'succeeded' | 'failed' | 'blocked' | 'cancelled' | 'unknown'>): void {
+    const call = grantCallIdentity(raw)
+    const request = [...(this.requests.get(agentSessionId)?.values() ?? [])].find(entry => {
+      if (!entry.execution || TERMINAL_EXECUTIONS.has(entry.execution.status) || !entry.call) return false
+      return entry.source === 'native' ? sameToolAttempt(entry.call, call) :
+        entry.call.runtimeId === call.runtimeId && entry.call.nativeSessionId === call.nativeSessionId &&
+        entry.call.tool === call.tool && entry.call.argsDigest === call.argsDigest
+    })
+    if (!request?.execution) return
+    const execution: GrantExecution = { ...request.execution, call, status: outcome, updatedAt: this.now() }
+    request.execution = execution
+    this.terminal.set(grantWorkKey(call, execution.scope), { agentSessionId, execution })
+    if (this.terminal.size > SAVED_SETTLED) this.terminal.delete(this.terminal.keys().next().value!)
+    if (request.source === 'native') {
+      request.nativeAvailable = false
+      this.statusOf(agentSessionId, request.id, outcome === 'succeeded' ? 'used' : outcome === 'failed' || outcome === 'blocked' ? 'ineffective' : 'expired')
+      return
+    }
+    const grant = (this.grants.get(agentSessionId) ?? []).find(entry => entry.requestId === request.id)
+    if (grant) {
+      grant.execution = execution
+      if (grant.scope === 'once' || outcome === 'blocked' || outcome === 'cancelled' || outcome === 'unknown') {
+        this.drop(agentSessionId, grant.id)
+        this.statusOf(agentSessionId, request.id, outcome === 'succeeded' ? 'used' : outcome === 'failed' || outcome === 'blocked' ? 'ineffective' : 'expired')
+        void this.ports.apply(agentSessionId).catch(() => undefined)
+      }
+    }
+    this.changed()
   }
 
   /**
@@ -297,13 +428,25 @@ export class PermissionGrants {
       this.card(agentSessionId, { ...described, id: itemId, source: 'denial', status: answered, requestedAt: this.now() })
       return
     }
+    if (described.call) {
+      const terminal = (['once', 'session'] as const).map(scope => this.terminal.get(grantWorkKey(described.call!, scope)))
+        .find(entry => entry?.agentSessionId === agentSessionId && ['blocked', 'unknown'].includes(entry.execution.status))
+      if (terminal) {
+        const status: GrantStatus = terminal.execution.status === 'blocked' ? 'ineffective' : 'expired'
+        this.settledAs(agentSessionId, itemId, status)
+        this.card(agentSessionId, { ...described, id: itemId, source: 'denial', status, execution: terminal.execution, requestedAt: this.now() })
+        this.save()
+        return
+      }
+    }
     if (this.movedOut.get(agentSessionId)?.has(itemId)) {
       const moved = this.lookup(agentSessionId, itemId)
       if (moved) this.card(agentSessionId, { ...moved, status: 'moved' })
       return
     }
     const aliased = this.aliases.get(agentSessionId)?.get(itemId)
-    const sameCall = (entry: PermissionGrantRequest | undefined): entry is PermissionGrantRequest => entry?.tool === described.tool && entry.resource === described.resource
+    const sameCall = (entry: PermissionGrantRequest | undefined): entry is PermissionGrantRequest => entry?.tool === described.tool &&
+      (entry.call && described.call ? entry.call.runtimeId === described.call.runtimeId && entry.call.nativeSessionId === described.call.nativeSessionId && entry.call.argsDigest === described.call.argsDigest : entry.resource === described.resource)
     const same = aliased ? this.lookup(agentSessionId, aliased)
       : [...(this.requests.get(agentSessionId)?.values() ?? [])].find(entry => entry.status === 'pending' && !outageCard(entry) && sameCall(entry))
         ?? [...(this.movedOut.get(agentSessionId) ?? [])].map(id => this.lookup(agentSessionId, id)).find(sameCall)
@@ -411,18 +554,50 @@ export class PermissionGrants {
     const decidedAt = this.now()
     if (decision === 'deny') {
       this.settle(agentSessionId, request, { status: 'denied', decidedAt, decidedBy: actor })
+      if (request.source === 'native' && request.call && this.ports.respondNative) {
+        try { await this.ports.respondNative(agentSessionId, request.call, 'deny') }
+        catch { /* The owner denied it; a lost response cannot grant execution. */ }
+        request.execution = { status: 'cancelled', call: request.call, scope: 'once', updatedAt: this.now(), detail: 'The owner denied this native request.' }
+        this.changed()
+      }
       await this.ports.tell(agentSessionId, grantDeniedMessage(request, actor)).catch(error => console.warn('The denied grant could not be reported to the conversation', error))
       return { status: 'denied', message: 'Denied; the conversation was told not to retry it.' }
+    }
+    if (request.source === 'native') {
+      if (decision !== 'approve-once' || !request.nativeAvailable || !request.call || !request.call.requestId || !this.ports.respondNative)
+        throw new Error('This native request can only be allowed once while the exact provider request is pending')
+      request.execution = { status: 'owner-authorized', call: request.call, scope: 'once', updatedAt: this.now() }
+      this.settle(agentSessionId, request, { status: 'approved-once', decidedAt, decidedBy: actor })
+      request.execution = { ...request.execution, status: 'applying', updatedAt: this.now() }
+      this.changed()
+      try {
+        const response = await this.ports.respondNative(agentSessionId, request.call, 'allow')
+        if (response === 'stale') {
+          request.execution = { ...request.execution, status: 'cancelled', updatedAt: this.now(), detail: 'The exact native request was no longer pending.' }
+          this.changed()
+          return { status: 'approved-once', message: 'The exact provider request had already ended; nothing was run.' }
+        }
+        this.changed()
+        return { status: 'approved-once', message: 'Allowed this exact pending provider request once; waiting for evidence of execution or its result.' }
+      } catch (error) {
+        request.execution = { ...request.execution, status: 'unknown', updatedAt: this.now(), detail: 'The native response may have been delivered; inspect its result before any retry.' }
+        this.terminal.set(grantWorkKey(request.call, 'once'), { agentSessionId, execution: request.execution })
+        this.changed()
+        return { status: 'approved-once', message: `Provider response is uncertain (${error instanceof Error ? error.message : String(error)}). Do not retry automatically.` }
+      }
     }
     if (!request.rule) throw new Error(request.refusal ?? 'No narrow rule can cover this request')
     if (this.ports.provider(agentSessionId) !== 'claude') throw new Error('Permission grants apply to Claude conversations only')
     const scope = decision === 'approve-once' ? 'once' : 'session'
     const grant: PermissionGrant = {
       id: randomUUID(), agentSessionId, requestId: request.id, rule: request.rule, scope, class: request.class, tool: request.tool,
-      resource: request.resource, grantedAt: decidedAt, decidedBy: actor, delivery: 'pending'
+      resource: request.resource, grantedAt: decidedAt, decidedBy: actor, delivery: 'pending',
+      ...(request.call ? { execution: { status: 'owner-authorized' as const, call: request.call, scope, updatedAt: decidedAt } } : {})
     }
+    if (grant.execution) request.execution = grant.execution
     this.grants.set(agentSessionId, [...(this.grants.get(agentSessionId) ?? []).filter(entry => entry.rule !== grant.rule), grant])
     this.settle(agentSessionId, request, { status: DECIDED[decision], decidedAt, decidedBy: actor })
+    if (grant.execution) { grant.execution = { ...grant.execution, status: 'applying', updatedAt: this.now() }; request.execution = grant.execution; this.changed() }
     const applied = await this.ports.apply(agentSessionId).catch(error => { this.drop(agentSessionId, grant.id); throw error })
     const text = this.approvalText(agentSessionId, [grant])
     this.retries.set(grant.id, text)
@@ -586,24 +761,31 @@ export class PermissionGrants {
       if (grant) agentSessionId = next
     }
     if (!grant) return
+    // The provider has announced this exact attempt and will report its real result. A pre-tool
+    // hook alone proves neither success nor failure, so keep the grant until that result arrives.
+    if (grant.execution && !TERMINAL_EXECUTIONS.has(grant.execution.status)) return
     this.movedFrom.delete(grant.id)
     this.drop(agentSessionId, grant.id)
     this.statusOf(agentSessionId, grant.requestId, 'used')
     void this.ports.apply(agentSessionId).catch(error => console.warn('A spent grant could not be removed from the live conversation; it ends with the runtime', error))
   }
 
-  /** The classifier refused a call the owner had granted. The allow rule alone does not decide a
-   *  call in Auto (docs/permissions-classifier.md, Evidence 2026-09-28); the approval turn does. A
-   *  refusal while that turn still waits in the queue is the agent retrying on its own, so the grant
-   *  stands and the turn still comes. A refusal after it means the classifier refused even the
-   *  owner's approval: the grant is withdrawn and the owner told how to approve it another way. */
+  /** The provider refused a call after its matching rule was applied. A refusal while the
+   *  owner-approved retry still waits in the queue leaves the grant in place. Once that retry
+   *  has been delivered, a repeated refusal ends the grant without another automatic retry. */
   refused(agentSessionId: string, rule: string): void {
     const grant = (this.grants.get(agentSessionId) ?? []).find(entry => entry.rule === rule)
     if (!grant) return
     if (this.retryWaiting(agentSessionId, grant.id)) return
+    if (grant.execution?.call) {
+      const execution: GrantExecution = { ...grant.execution, status: 'blocked', updatedAt: this.now(), detail: 'The provider refused the approved call.' }
+      this.terminal.set(grantWorkKey(execution.call, grant.scope), { agentSessionId, execution })
+      const request = this.requests.get(agentSessionId)?.get(grant.requestId)
+      if (request) request.execution = execution
+    }
     this.drop(agentSessionId, grant.id)
     this.statusOf(agentSessionId, grant.requestId, 'ineffective')
-    this.ports.notice(agentSessionId, `Conductor handed this conversation ${rule} and told it to retry in a message of its own, but the claude CLI's classifier still refused the call. Switch the conversation to Edit mode: the next attempt then asks you with an ordinary Allow card.`, { permissionGrantIneffective: { rule } }, `grant-ineffective:${grant.id}`)
+    this.ports.notice(agentSessionId, `Conductor applied ${rule}, but the provider refused the same call again. This approval is terminally blocked and has been withdrawn; Conductor will not retry it automatically. Inspect the native denial, rule matching and effective settings before deciding what to do. Full Auto is a separate owner-controlled setting.`, { permissionGrantIneffective: { rule } }, `grant-ineffective:${grant.id}`)
     void this.ports.apply(agentSessionId).catch(() => undefined)
   }
 
@@ -620,7 +802,23 @@ export class PermissionGrants {
   async transfer(fromId: string, toId: string): Promise<{ requests: number; grants: number }> {
     const open = this.requests.get(fromId)
     const held = this.grants.get(fromId) ?? []
-    const pending = [...(open?.values() ?? [])].filter(request => request.status === 'pending')
+    // A provider request is tied to the predecessor's live runtime. A successor cannot answer it.
+    let nativeChanged = false
+    for (const request of open?.values() ?? []) {
+      if (request.source !== 'native') continue
+      if (request.status === 'pending') {
+        request.status = 'expired'
+        if (request.execution) request.execution = { ...request.execution, status: 'cancelled', updatedAt: this.now(), detail: 'The native request stayed with the previous runtime at handoff.' }
+        this.card(fromId, request)
+        nativeChanged = true
+      } else if (request.execution && !TERMINAL_EXECUTIONS.has(request.execution.status)) {
+        request.execution = { ...request.execution, status: 'unknown', updatedAt: this.now(), detail: 'The previous runtime may have executed this call; inspect it before retrying.' }
+        this.card(fromId, request)
+        nativeChanged = true
+      }
+    }
+    if (nativeChanged) this.changed()
+    const pending = [...(open?.values() ?? [])].filter(request => request.status === 'pending' && request.source !== 'native')
     if (fromId === toId || (!pending.length && !held.length) || this.ports.provider(toId) !== 'claude') return { requests: 0, grants: 0 }
     // Only a recent approval is the successor's to retry; an older unspent grant (a session grant
     // is never spent) would reach it as "retry it now" for a call it never made.
@@ -810,9 +1008,9 @@ export class PermissionGrants {
    *  has no such notice, so its card is built from the request under the same item id. */
   private card(agentSessionId: string, request: PermissionGrantRequest): void {
     this.aliasCards(agentSessionId, request)
-    if (request.source === 'agent') {
+    if (request.source !== 'denial') {
       const message = request.status === 'pending'
-        ? `Permission requested: ${grantRequestSummary(request)}${request.rule ? `. Approving hands this conversation exactly ${request.rule}.` : `. ${request.refusal ?? ''}`}`
+        ? `Permission requested: ${grantRequestSummary(request)}${request.rule ? `. Approving hands this conversation exactly ${request.rule}.` : request.source === 'native' ? '. The exact native provider request can be allowed once while it remains pending.' : `. ${request.refusal ?? ''}`}`
         : `Permission ${request.status}: ${grantRequestSummary(request)}`
       this.ports.notice(agentSessionId, message, { permissionGrant: request as unknown as Json }, request.id)
       return

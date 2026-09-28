@@ -10,7 +10,7 @@ for await (const line of input) {
   if (message.type === 'control_request' && message.request.subtype === 'initialize') {
     if (!message.request.hooks.PreToolUse[0].hookCallbackIds.includes('conductor_before')) throw new Error('Missing pre hook')
     initialized = true
-    success(message.request_id, { models: [{ value: 'fixture-only', displayName: 'Synthetic model' }] })
+    success(message.request_id, { models: [{ value: 'fixture-only', displayName: 'Synthetic model' }], current_permission_mode: 'manual' })
   } else if (message.type === 'user') {
     if (!initialized) throw new Error('User input arrived before initialization')
     send({ type: 'system', subtype: 'init', session_id: 'fixture-native', claude_code_version: '2.1.263' })

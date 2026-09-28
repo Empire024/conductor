@@ -13,6 +13,7 @@ import { callMatchesRule, describeGrantRequest, nativeGrantRules } from '../../s
 import { BROWSER_MCP_SERVER_NAME, BROWSER_TOOLS } from '../../shared/browser-mcp'
 import { LOCAL_ASSIST_MCP_SERVER_NAME } from '../local-assist/contract'
 import { LOCAL_ASSIST_TOOLS } from '../local-assist/tools'
+import { grantCallIdentity, type NativeGrantCall } from '../permission-grants/identity'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 
 /** The local CLI bridge is checked against the official CLI/extension 2.1.278: the 2026-09-21
@@ -39,6 +40,33 @@ const object = (value: Json | undefined): ObjectValue => value && typeof value =
 const string = (value: Json | undefined): string | undefined => typeof value === 'string' ? value : undefined
 const number = (value: Json | undefined): number | undefined => typeof value === 'number' && Number.isFinite(value) ? value : undefined
 const array = (value: Json | undefined): Json[] => Array.isArray(value) ? value : []
+/** get_settings returns { effective, sources }, but its response is not typed by the SDK.
+ * Only these fixed names and bounded counts leave this adapter; rules and other values stay private. */
+const SETTINGS_SOURCE_NAMES = ['userSettings', 'projectSettings', 'localSettings', 'flagSettings', 'policySettings', 'managedSettings', 'user', 'project', 'local', 'flag', 'policy', 'managed'] as const
+const SETTINGS_HOOK_EVENTS = ['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'PermissionRequest', 'PermissionDenied', 'UserPromptSubmit', 'Notification', 'Stop', 'StopFailure', 'SubagentStart', 'SubagentStop', 'PreCompact', 'PostCompact', 'SessionStart', 'SessionEnd', 'TeammateIdle', 'TaskCompleted', 'ConfigChange', 'WorktreeCreate', 'WorktreeRemove', 'InstructionsLoaded', 'Elicitation', 'ElicitationResult', 'PostToolBatch'] as const
+const SETTINGS_DEFAULT_MODES = ['default', 'manual', 'acceptEdits', 'auto', 'bypassPermissions', 'dontAsk', 'plan'] as const
+const SETTINGS_READ_TIMEOUT_MS = 3_000
+function settingsScopeSummary(value: Json): ObjectValue {
+  const raw = object(value)
+  const settings = raw.settings && typeof raw.settings === 'object' && !Array.isArray(raw.settings) ? object(raw.settings) : raw
+  const permissions = object(settings.permissions)
+  const counts: ObjectValue = {}
+  for (const name of ['allow', 'ask', 'deny'] as const) if (Array.isArray(permissions[name])) counts[name] = Math.min(permissions[name].length, 10_000)
+  const defaultMode = string(permissions.defaultMode)
+  if (defaultMode && SETTINGS_DEFAULT_MODES.some(mode => mode === defaultMode)) counts.defaultMode = defaultMode
+  if (permissions.disableBypassPermissionsMode === 'disable') counts.disableBypassPermissionsMode = 'disable'
+  const hooks = object(settings.hooks)
+  return { ...(Object.keys(counts).length ? { permissions: counts } : {}),
+    hooks: SETTINGS_HOOK_EVENTS.filter(name => Object.hasOwn(hooks, name)).slice(0, 24) }
+}
+function settingsDiagnosticSummary(response: ObjectValue): ObjectValue {
+  if (!response.effective || typeof response.effective !== 'object' || Array.isArray(response.effective)
+    || !response.sources || typeof response.sources !== 'object' || Array.isArray(response.sources)) return { status: 'unavailable' }
+  const sources = object(response.sources)
+  return { status: 'available', effective: settingsScopeSummary(response.effective),
+    sources: SETTINGS_SOURCE_NAMES.filter(name => sources[name] && typeof sources[name] === 'object' && !Array.isArray(sources[name]))
+      .slice(0, 12).map(name => ({ name, ...settingsScopeSummary(sources[name]!) })) }
+}
 /** The CLI's own tool_result wording for a classifier outage (no PermissionDenied hook ran). */
 const CLASSIFIER_OUTAGE_RESULT = /auto mode classifier gave no verdict|^Auto mode unavailable\b|^Auto mode could not evaluate this action/im
 const safeguardRefusal = (message: string): boolean => /API Error:\s*.+?s safeguards flagged this message/i.test(message)
@@ -157,6 +185,8 @@ export class ClaudeAdapter implements ProviderAdapter {
   private settings: SessionSettings
   private phase: Extract<AdapterEvent['data'], { type: 'session' }>['phase'] = 'idle'
   private ready = false
+  /** The native process received the opt-in flag at launch; a kept process retains this value. */
+  private fullAutoLaunchCapable = false
   /** Models the native catalog explicitly lists without effort (supportsEffort: false), e.g. Haiku. */
   private effortless = new Set<string>()
   private disposed = false
@@ -166,6 +196,12 @@ export class ClaudeAdapter implements ProviderAdapter {
   private requests = new Map<string, Request>()
   private controls = new Map<string, { resolve(value: ObjectValue): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>()
   private tools = new Map<string, Tool>()
+  /** Exact provider call arguments, kept through the permission request and lifecycle hooks. */
+  private grantCalls = new Map<string, NativeGrantCall>()
+  /** Actual provider progress seen without a later definitive post hook. */
+  private grantProgress = new Set<string>()
+  /** Exact calls whose native allow response was sent; permission can remain applying before progress. */
+  private grantAuthorized = new Map<string, NativeGrantCall>()
   /** Tool calls the CLI's own auto-mode classifier refused, by tool_use_id (../../shared/auto-mode-denial.ts). */
   private autoModeDenials = new Map<string, { tool: string; reason: string; parentId?: string; confirmed?: boolean; request?: DenialGrantRequest }>()
   /** Classifier outages of the current turn, shown as one notice item (classifier-unavailable:<turn>), never as a card. */
@@ -180,6 +216,8 @@ export class ClaudeAdapter implements ProviderAdapter {
   private taskOutputRevision = new Map<string, number>()
   private seen = new Set<string>()
   private hookRequests = new Set<string>()
+  /** Native PreToolUse mode receipts, once per subagent/mode in this runtime. */
+  private subagentModeHooks = new Set<string>()
   private completedBlocks = new Set<string>()
   private replies = new Map<string, ObjectValue>()
   private messageUsage = new Map<string, ObjectValue>()
@@ -263,9 +301,13 @@ export class ClaudeAdapter implements ProviderAdapter {
     const compatibility = claudeCompatibility(version)
     if (!compatibility.supported) throw new Error(`Claude Code ${version} is below the tested ${CLAUDE_COMPATIBILITY} bridge baseline; update Claude Code to ${CLAUDE_COMPATIBILITY} or newer`)
     if (!compatibility.verified) this.capabilities.limitations.push(`Runtime ${version} is newer than the fixture-verified ${CLAUDE_COMPATIBILITY} baseline; protocol changes in this release are not covered by Conductor's tests.`)
+    this.fullAutoLaunchCapable = !this.options.approvalReviewer && this.options.profile !== 'evaluation' && this.fullAutoAuthorized()
+    const launchMode = this.permissionMode(this.settings)
     const args = ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
       '--include-partial-messages', '--permission-prompt-tool', 'stdio', '--permission-prompts', 'host',
-      '--forward-subagent-text', '--permission-mode', this.permissionMode(this.settings)]
+      '--forward-subagent-text', '--permission-mode', launchMode]
+    if (this.fullAutoLaunchCapable) args.push('--allow-dangerously-skip-permissions')
+    this.permissionEvidence(launchMode, undefined, 'pending')
     if (this.settings.model) args.push('--model', this.settings.model)
     if (this.settings.effort) args.push('--effort', this.settings.effort)
     if (this.options.approvalReviewer) {
@@ -301,8 +343,8 @@ export class ClaudeAdapter implements ProviderAdapter {
     // CLI defaults retain the coding-agent prompt, user/project/local configuration and policy.
     this.transport = this.createTransport(args)
     this.emit({ data: { type: 'session', phase: 'starting', capabilities: this.capabilities } })
-    this.transport.start()
     try {
+      this.transport.start()
       const timeout = this.transport.detachable ? HOSTED_HOOK_TIMEOUT_SEC : HOOK_TIMEOUT_SEC
       const initialized = await this.control({ subtype: 'initialize', hooks: {
         PreToolUse: [{ matcher: PRE_TOOL_USE_MATCHER, hookCallbackIds: ['conductor_before'], timeout }],
@@ -322,9 +364,19 @@ export class ClaudeAdapter implements ProviderAdapter {
       })
       this.ready = true
       this.initializedMetadata = initialized
+      const nativeMode = string(initialized.current_permission_mode) ?? string(initialized.permissionMode)
+      this.permissionEvidence(launchMode, nativeMode, nativeMode === launchMode || nativeMode === 'default' && launchMode === 'manual' ? 'confirmed' : 'pending')
+      // Startup in bypass mode must be acknowledged by the live process. A launch argument alone
+      // is a request, not proof that managed native policy accepted the mode.
+      if (launchMode === 'bypassPermissions' || !nativeMode) await this.setNativePermissionMode(launchMode)
       this.emit({ data: { type: 'notice', message: 'Claude runtime capabilities and discovered configuration', payload: initialized }, native: { method: 'initialize', payload: initialized } })
       this.emit({ data: { type: 'session', phase: 'idle', nativeSessionId: this.nativeSessionId, capabilities: this.capabilities } })
+      // This diagnostic never gates startup, a turn, or the native permission-mode acknowledgement.
+      void this.control({ subtype: 'get_settings' }, SETTINGS_READ_TIMEOUT_MS)
+        .then(response => { if (!this.disposed) this.emitSettingsSummary(settingsDiagnosticSummary(response)) })
+        .catch(() => { if (!this.disposed) this.emitSettingsSummary({ status: 'unavailable' }) })
     } catch (error) {
+      this.permissionEvidence(launchMode, string(object(this.capabilities.effectiveSettings).permissionMode), 'blocked', error instanceof Error ? error.message : String(error))
       this.fail(error)
       this.transport.close()
       throw error
@@ -387,8 +439,21 @@ export class ClaudeAdapter implements ProviderAdapter {
     // The store closed this conversation's open work when it loaded (an app that stopped is
     // assumed to have ended its turn), so the adapter restates what is still live.
     for (const [id, tool] of this.tools) if (tool.status === 'preparing' || tool.status === 'running' || tool.status === 'awaiting_approval') this.updateTool(id, {})
-    for (const [id, request] of this.requests) this.emit({ requestId: id, itemId: request.toolId, data: { type: 'interaction', interaction: request.interaction } })
+    for (const [id, request] of this.requests) {
+      // Re-register only a request the kept native process still holds. A response already in
+      // flight is uncertain, never a new permission to answer or replay.
+      if (!request.submitting && request.interaction.kind === 'approval' && request.toolId && !this.replies.has(id)) {
+        const tool = this.tools.get(request.toolId)
+        const call = tool ? this.grantCall(request.toolId, tool.name, request.input, id) : undefined
+        const grant = call ? this.options.permissionGrants?.nativePending?.(call) : undefined
+        if (grant) Object.assign(request.interaction, { permissionGrantId: grant.id })
+      }
+      this.emit({ requestId: id, itemId: request.toolId, data: { type: 'interaction', interaction: request.interaction } })
+    }
     this.emit({ data: { type: 'session', phase: this.phase, nativeSessionId: this.nativeSessionId } })
+    // A kept process retains its original launch flags. Re-evaluate the current persisted owner
+    // policy and selected mode before the next turn; an older process may need a safe restart.
+    await this.refreshClaudeFullAutoPolicy(this.options.settings)
     // Grants live only as long as this app's grant service remembers them: a CLI that outlived an
     // app restart is handed the current set (normally none), so no forgotten rule stays in force.
     if (this.options.permissionGrants) void this.applyPermissionRules().catch(error => console.warn('Could not restate permission grants on a reattached Claude runtime', error))
@@ -399,6 +464,12 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (this.active || this.requests.size) throw new Error('Claude is already processing a turn')
     settings = settingsForRuntime(settings, this.options.runtimeId)
     this.validateSettings(settings)
+    const requestedAtSubmit = this.permissionMode(settings)
+    if (requestedAtSubmit === 'bypassPermissions' && !this.fullAutoLaunchCapable) {
+      const error = 'Claude Full Auto needs a runtime launched with --allow-dangerously-skip-permissions; restart is pending until this conversation and its background work are idle.'
+      this.permissionEvidence(requestedAtSubmit, undefined, 'restart-pending', error)
+      throw new Error(error)
+    }
     // A model the native catalog lists with no effort levels (Haiku) gets none: an effort carried
     // over from another model is neither sent nor reported as effective.
     const chosenModel = settings.model ?? string(object(this.capabilities.effectiveSettings).model)
@@ -407,12 +478,11 @@ export class ClaudeAdapter implements ProviderAdapter {
     const message = await this.userMessage(text, attachments, messageId)
     try {
       const effective = object(this.capabilities.effectiveSettings)
-      // Before the first native init frame, retain the launch configuration as the
-      // provisional effective state. Once native reports a value, it remains authoritative.
+      // Requested and native-confirmed permission are separate. A launch argument is not native
+      // evidence, so an absent init receipt remains pending until the control ACK below.
       this.capabilities.effectiveSettings = {
         ...effective,
         ...(effective.effort === undefined ? { effort: this.settings.effort ?? null } : {}),
-        ...(effective.permissionMode === undefined ? { permissionMode: this.permissionMode(this.settings) } : {})
       }
       if (settings.effort !== this.settings.effort) {
         const response = await this.control({ subtype: 'apply_flag_settings', settings: { effortLevel: settings.effort ?? null } })
@@ -423,13 +493,10 @@ export class ClaudeAdapter implements ProviderAdapter {
         this.capabilities.effectiveSettings = { ...object(this.capabilities.effectiveSettings), model: string(response.model) ?? settings.model ?? null }
       }
       const requestedMode = this.permissionMode(settings)
-      const nativeMode = string(effective.permissionMode) ?? this.permissionMode(this.settings)
-      if (requestedMode !== (nativeMode === 'default' ? 'manual' : nativeMode)) {
-        const response = await this.control({ subtype: 'set_permission_mode', mode: requestedMode })
-        this.capabilities.effectiveSettings = { ...object(this.capabilities.effectiveSettings), permissionMode: string(response.permissionMode) ?? string(response.mode) ?? requestedMode }
-        const applied = string(object(this.capabilities.effectiveSettings).permissionMode)
-        if ((applied === 'default' ? 'manual' : applied) !== requestedMode) throw new Error(`Claude did not apply permission mode ${requestedMode}; native mode remains ${applied}`)
-      }
+      const nativeMode = string(object(this.capabilities.effectiveSettings).permissionMode)
+      if (!nativeMode && requestedMode === this.permissionMode(this.settings)) this.permissionEvidence(requestedMode, undefined, 'pending')
+      else if (requestedMode !== (nativeMode === 'default' ? 'manual' : nativeMode)) await this.setNativePermissionMode(requestedMode)
+      else this.permissionEvidence(requestedMode, nativeMode, 'confirmed')
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Claude setting update failed'
       this.emit({ data: { type: 'error', message } })
@@ -514,7 +581,7 @@ export class ClaudeAdapter implements ProviderAdapter {
         const mode = sessionEditMode ? 'acceptEdits' : 'auto'
         // Change the real provider mode first. A managed-policy refusal must leave
         // the request unanswered so the owner can still allow once or deny it.
-        try { await this.control({ subtype: 'set_permission_mode', mode }) }
+        try { await this.setNativePermissionMode(mode) }
         catch (error) {
           if (error instanceof ClaudeControlRejectedError) throw new InteractionResponseRejectedError(`Claude could not switch to ${sessionEditMode ? 'session Edit mode' : 'auto-mode'}: ${error.message}`)
           throw error
@@ -523,16 +590,27 @@ export class ClaudeAdapter implements ProviderAdapter {
         const { temporaryPermission, ...current } = this.settings
         this.settings = sessionEditMode
           ? { ...current, permission: 'accept-edits', plan: false, temporaryPermission: { runtimeId: this.options.runtimeId, restore: temporaryPermission?.restore ?? current.permission } }
-          : { ...current, permission: 'auto', plan: false }
-        this.capabilities.effectiveSettings = { ...object(this.capabilities.effectiveSettings), permissionMode: mode }
+          : { ...current, permission: 'auto', claudeGuardedAuto: true, plan: false }
+        this.permissionEvidence(mode, mode, 'confirmed')
         this.emit({ data: { type: 'session', phase: this.phase, settings: { ...this.settings } } })
         // The provider may cancel/reissue permission requests while changing mode.
         // Never send a stale allow or resurrect a cancelled/finished request.
         if (this.requests.get(response.requestId) !== pending) return
       }
+      const authorizedCall = allowed && pending.interaction.kind === 'approval' && pending.toolId
+        ? this.grantCalls.get(pending.toolId) : undefined
       this.reply(response.requestId, allowed
         ? { behavior: 'allow', updatedInput: input, ...(decision === 'allow-session' ? { updatedPermissions: pending.permissionUpdates ?? [] } : {}), ...(pending.toolId ? { toolUseID: pending.toolId } : {}) }
         : { behavior: 'deny', message: decision === 'abort' ? 'User cancelled this turn' : 'User denied this operation', interrupt: decision === 'abort', ...(pending.toolId ? { toolUseID: pending.toolId } : {}) })
+      if (authorizedCall?.requestId === response.requestId && pending.toolId) {
+        this.grantAuthorized.set(pending.toolId, authorizedCall)
+        if (this.grantAuthorized.size > 4096) {
+          const [oldId, oldCall] = this.grantAuthorized.entries().next().value!
+          this.grantAuthorized.delete(oldId)
+          this.grantProgress.delete(oldId)
+          this.options.permissionGrants?.executionFinished?.(oldCall, 'unknown')
+        }
+      }
       this.requests.delete(response.requestId)
       this.emit({ requestId: response.requestId, itemId: pending.toolId, data: { type: 'interaction', interaction: { ...pending.interaction, status: 'resolved', outcome: decision, ...(answered ? { answers: answered } : {}) } } })
       if (pending.toolId) this.updateTool(pending.toolId, { status: allowed ? 'preparing' : decision === 'abort' ? 'interrupted' : 'rejected' })
@@ -573,6 +651,38 @@ export class ClaudeAdapter implements ProviderAdapter {
     return 'applied'
   }
 
+  async refreshClaudeFullAutoPolicy(settings?: SessionSettings): Promise<{ status: 'confirmed' | 'restart-pending' | 'blocked' | 'unchanged'; error?: string }> {
+    if (this.options.approvalReviewer || this.options.profile === 'evaluation' || this.disposed || !this.ready || !this.transport?.connected) return { status: 'unchanged' }
+    if (settings) {
+      const stored = settingsForRuntime(settings, this.options.runtimeId)
+      this.validateSettings(stored)
+      // A saved composer choice is authoritative for permission reconciliation. Model and effort
+      // remain the current turn's settings until that turn completes.
+      this.settings = { ...this.settings, permission: stored.permission, plan: stored.plan, claudeGuardedAuto: stored.claudeGuardedAuto }
+    }
+    const requested = this.permissionMode(this.settings)
+    const current = string(object(this.capabilities.effectiveSettings).permissionMode)
+    if (requested === 'bypassPermissions' && !this.fullAutoLaunchCapable) {
+      const error = 'Claude Full Auto needs a runtime launched with --allow-dangerously-skip-permissions.'
+      if (object(this.capabilities.effectiveSettings).permissionModeStatus !== 'restart-pending' || object(this.capabilities.effectiveSettings).requestedPermissionMode !== requested) {
+        this.permissionEvidence(requested, current, 'restart-pending', error)
+        this.emit({ data: { type: 'session', phase: this.phase, capabilities: this.capabilities } })
+      }
+      return { status: 'restart-pending' }
+    }
+    try {
+      if (requested !== (current === 'default' ? 'manual' : current) || object(this.capabilities.effectiveSettings).permissionModeStatus !== 'confirmed') await this.setNativePermissionMode(requested)
+      else this.permissionEvidence(requested, current, 'confirmed')
+      this.emit({ data: { type: 'session', phase: this.phase, capabilities: this.capabilities } })
+      return { status: 'confirmed' }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.permissionEvidence(requested, current, 'blocked', message)
+      this.emit({ data: { type: 'session', phase: this.phase, capabilities: this.capabilities } })
+      return { status: 'blocked', error: message }
+    }
+  }
+
   async stop(): Promise<void> { this.dispose(); await this.transport?.closeAndWait?.() }
   dispose(): void {
     if (this.disposed) return
@@ -598,7 +708,38 @@ export class ClaudeAdapter implements ProviderAdapter {
    *  manual: a worker the owner put on Auto runs on Auto, and the review only sees the requests
    *  the runtime raises on its own. Only the isolated reviewer itself is pinned to manual. */
   // An evaluation turn has no tools, so plan mode would only add its instructions to the prompt.
-  private permissionMode(settings: SessionSettings): string { return this.options.profile === 'evaluation' ? 'manual' : settings.plan ? 'plan' : this.options.approvalReviewer ? 'manual' : settings.permission === 'accept-edits' ? 'acceptEdits' : settings.permission === 'auto' ? 'auto' : 'manual' }
+  private fullAutoAuthorized(): boolean { return this.options.claudeFullAutoAuthorized?.() === true }
+  private permissionMode(settings: SessionSettings): string {
+    return this.options.profile === 'evaluation' || this.options.approvalReviewer ? 'manual'
+      : settings.plan ? 'plan'
+        : settings.permission === 'accept-edits' ? 'acceptEdits'
+          : settings.permission === 'auto' ? (this.fullAutoAuthorized() && settings.claudeGuardedAuto !== true ? 'bypassPermissions' : 'auto') : 'manual'
+  }
+  private permissionEvidence(requested: string, nativeMode: string | undefined, status: 'pending' | 'confirmed' | 'blocked' | 'restart-pending', error?: string): void {
+    this.capabilities.effectiveSettings = {
+      ...object(this.capabilities.effectiveSettings),
+      requestedPermissionMode: requested,
+      ...(nativeMode === undefined ? {} : { permissionMode: nativeMode }),
+      permissionModeStatus: status,
+      claudeFullAutoAuthorized: this.fullAutoAuthorized(),
+      ...(error ? { permissionModeError: error } : { permissionModeError: null })
+    }
+  }
+  private async setNativePermissionMode(requested: string): Promise<void> {
+    const previous = string(object(this.capabilities.effectiveSettings).permissionMode)
+    this.permissionEvidence(requested, previous, 'pending')
+    try {
+      const response = await this.control({ subtype: 'set_permission_mode', mode: requested })
+      const applied = string(response.permissionMode) ?? string(response.mode) ?? requested
+      const matches = (applied === 'default' ? 'manual' : applied) === requested
+      this.permissionEvidence(requested, applied, matches ? 'confirmed' : 'blocked',
+        matches ? undefined : `Claude did not apply permission mode ${requested}; native mode remains ${applied}`)
+      if (!matches) throw new Error(`Claude did not apply permission mode ${requested}; native mode remains ${applied}`)
+    } catch (error) {
+      if (object(this.capabilities.effectiveSettings).permissionModeStatus !== 'blocked') this.permissionEvidence(requested, previous, 'blocked', error instanceof Error ? error.message : String(error))
+      throw error
+    }
+  }
   private async imageInput(attachment: ContextAttachment): Promise<Json> {
     if (!attachment.path) throw new Error('Claude image attachment requires a local workspace path')
     const path = await workspacePath(this.options.cwd, attachment.path)
@@ -624,10 +765,14 @@ export class ClaudeAdapter implements ProviderAdapter {
       return { type: 'image', source: { type: 'base64', media_type: mediaType, data: bytes.toString('base64') } }
     } finally { await file.close() }
   }
-  private control(request: ObjectValue): Promise<ObjectValue> {
+  private emitSettingsSummary(summary: ObjectValue): void {
+    this.emit({ data: { type: 'notice', message: 'Claude settings diagnostic', payload: summary },
+      native: { method: 'get_settings/summary', payload: summary } })
+  }
+  private control(request: ObjectValue, timeoutMs = 30_000): Promise<ObjectValue> {
     const id = `${this.options.runtimeId}:control:${randomUUID()}`
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.controls.delete(id); reject(new Error(`Claude control request timed out (${string(request.subtype) ?? 'unknown'})`)) }, 30_000)
+      const timer = setTimeout(() => { this.controls.delete(id); reject(new Error(`Claude control request timed out (${string(request.subtype) ?? 'unknown'})`)) }, timeoutMs)
       this.controls.set(id, { resolve, reject, timer })
       try { this.transport!.send({ type: 'control_request', request_id: id, request }) }
       catch (error) { clearTimeout(timer); this.controls.delete(id); reject(error) }
@@ -658,7 +803,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (type === 'control_request') return this.runtimeRequest(message)
     if (type === 'control_cancel_request') {
       const id = string(message.request_id)
-      if (id) { this.expireRequest(id, 'Provider cancelled request'); this.emitWaiting() }
+      if (id) { this.cancelAuthorizedRequest(id); this.expireRequest(id, 'Provider cancelled request'); this.emitWaiting() }
       return
     }
     const uuid = string(message.uuid)
@@ -728,6 +873,9 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (type === 'tool_progress' && typeof message.tool_use_id === 'string') {
       const id = message.tool_use_id
       if (!this.tools.has(id)) this.declareTool(id, string(message.tool_name) ?? 'Tool', {}, parentId)
+      const tool = this.tools.get(id)
+      const call = this.grantCalls.get(id) ?? (tool ? this.grantCall(id, tool.name, tool.input) : undefined)
+      if (call) { this.grantProgress.add(id); this.options.permissionGrants?.executionStarted?.(call, 'tool-progress') }
       this.updateTool(id, { status: 'running' })
       return
     }
@@ -801,6 +949,12 @@ export class ClaudeAdapter implements ProviderAdapter {
           ...(typeof message.effort === 'string' ? { effort: message.effort } : {}),
           ...((typeof message.permissionMode === 'string' || typeof message.permission_mode === 'string') ? { permissionMode: string(message.permissionMode) ?? string(message.permission_mode) } : {})
         }
+      }
+      const reportedMode = string(message.permissionMode) ?? string(message.permission_mode)
+      if (reportedMode) {
+        const requested = this.permissionMode(this.settings)
+        const matches = (reportedMode === 'default' ? 'manual' : reportedMode) === requested
+        this.permissionEvidence(requested, reportedMode, matches ? 'confirmed' : 'blocked', matches ? undefined : `Claude reported native permission mode ${reportedMode}; requested ${requested}`)
       }
       if (typeof message.claude_code_version === 'string') this.capabilities.runtimeVersion = message.claude_code_version
       this.emit({ data: { type: 'session', phase: this.active ? 'running' : 'idle', nativeSessionId: this.nativeSessionId, capabilities: this.capabilities }, native: { method: 'system/init', payload: message } })
@@ -1039,6 +1193,15 @@ export class ClaudeAdapter implements ProviderAdapter {
     const description = string(object(tool.input).description)
     this.emit({ itemId: id, parentId: tool.parentId, data: { type: 'tool', name: tool.name, ...(data.inputDelta !== undefined ? {} : { input: tool.input }), status: tool.status, ...(tool.detached ? { detached: true } : {}), ...(description ? { description } : {}), ...data } })
   }
+  private grantCall(toolUseId: string, tool: string, input: Json, requestId?: string): NativeGrantCall | undefined {
+    if (!this.nativeSessionId) return undefined
+    const prior = this.grantCalls.get(toolUseId)
+    const call: NativeGrantCall = { runtimeId: this.options.runtimeId, nativeSessionId: this.nativeSessionId, toolUseId, tool, input,
+      ...(requestId || prior?.requestId ? { requestId: requestId ?? prior?.requestId } : {}) }
+    this.grantCalls.set(toolUseId, call)
+    if (this.grantCalls.size > 4096) this.grantCalls.delete(this.grantCalls.keys().next().value!)
+    return call
+  }
   /** In Auto the CLI's classifier can refuse a tool without ever sending can_use_tool, so no card
    *  exists and the only trace is the tool_result's wording. The tool stays failed; the conversation
    *  also gets one notice item per denial that names the actual decider, which the renderer shows
@@ -1049,6 +1212,8 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (!reason && HOOK_UNANSWERED_RESULT.test(output)) { this.hookOutage(toolUseId, output); return }
     if (!reason || this.autoModeDenials.has(toolUseId)) return
     const tool = this.tools.get(toolUseId)
+    const call = this.grantCalls.get(toolUseId)
+    if (call) { this.grantProgress.delete(toolUseId); this.grantAuthorized.delete(toolUseId); this.options.permissionGrants?.executionFinished?.(call, 'blocked') }
     const granted = tool ? (this.options.permissionGrants?.rules() ?? []).find(entry => callMatchesRule(entry.rule, tool.name, tool.input, this.options.cwd)) : undefined
     if (granted) this.options.permissionGrants?.refused?.(granted.rule)
     this.recordAutoModeDenial(toolUseId, reason, undefined, { method: 'tool_result/auto_mode_denial', payload: { tool_use_id: toolUseId, reason } })
@@ -1060,6 +1225,8 @@ export class ClaudeAdapter implements ProviderAdapter {
   private hookedAutoModeDenial(toolUseId: string, name: string, input: ObjectValue, rawReason: string): ObjectValue | undefined {
     if (isClassifierOutage(rawReason)) return this.classifierOutage(toolUseId, name, hookDenialReason(rawReason), { method: 'hook/permission_denied', payload: { tool_use_id: toolUseId, tool_name: name, reason: rawReason.slice(0, 400) } })
     const reason = hookDenialReason(rawReason)
+    const call = this.grantCall(toolUseId, name, input)
+    if (call) { this.grantProgress.delete(toolUseId); this.grantAuthorized.delete(toolUseId); this.options.permissionGrants?.executionFinished?.(call, 'blocked') }
     const granted = (this.options.permissionGrants?.rules() ?? []).find(entry => callMatchesRule(entry.rule, name, input, this.options.cwd))
     if (granted) this.options.permissionGrants?.refused?.(granted.rule)
     if (this.autoModeDenials.get(toolUseId)?.request) return
@@ -1099,7 +1266,9 @@ export class ClaudeAdapter implements ProviderAdapter {
   private recordAutoModeDenial(toolUseId: string, reason: string, call: { name: string; input: ObjectValue } | undefined, native: { method: string; payload: Json }): void {
     const tool = this.tools.get(toolUseId), name = call?.name ?? tool?.name
     const input = call?.input ?? (tool ? object(tool.input) : undefined)
-    const request = name && input ? describeGrantRequest({ tool: name, input, cwd: this.options.cwd, category: reason, toolUseId }) : undefined
+    const described = name && input ? describeGrantRequest({ tool: name, input, cwd: this.options.cwd, category: reason, toolUseId }) : undefined
+    const identity = name && input && this.nativeSessionId ? grantCallIdentity({ runtimeId: this.options.runtimeId, nativeSessionId: this.nativeSessionId, toolUseId, tool: name, input }) : undefined
+    const request = described ? { ...described, ...(identity ? { call: identity } : {}) } : undefined
     const denial = { tool: name ?? 'a tool', reason, ...(tool?.parentId ? { parentId: tool.parentId } : {}), ...(request ? { request } : {}) }
     if (this.autoModeDenials.size >= 256) this.autoModeDenials.delete(this.autoModeDenials.keys().next().value!)
     this.autoModeDenials.set(toolUseId, denial)
@@ -1150,6 +1319,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       return
     }
     const input = object(request.input), toolId = string(request.tool_use_id), name = string(request.tool_name) ?? 'Unknown tool'
+    const nativeCall = toolId ? this.grantCall(toolId, name, input, id) : undefined
     if (toolId) {
       if (!this.tools.has(toolId)) this.declareTool(toolId, name, input, string(request.parent_tool_use_id))
       this.updateTool(toolId, { status: 'awaiting_approval' })
@@ -1177,9 +1347,11 @@ export class ClaudeAdapter implements ProviderAdapter {
       : requiredApproval ? 'Claude requires an individual approval for this request; a session grant cannot replace it.'
         : this.settings.plan ? 'Plan mode requires individual approval for writes. Switch modes to change that behavior.'
           : 'Claude did not offer a reusable permission scope for this request. You can allow it once.'
-    const autoMode = this.settings.permission === 'auto' && !this.settings.plan
+    const autoMode = this.permissionMode(this.settings) === 'auto' && !this.settings.plan
+    const nativeGrant = !question && nativeCall ? this.options.permissionGrants?.nativePending?.(nativeCall) : undefined
     const interaction: PendingInteraction = {
       id, kind: question ? 'question' : 'approval', status: 'pending', title: string(request.title) ?? (question ? 'Claude needs your input' : `Allow ${name}?`),
+      ...(nativeGrant ? { permissionGrantId: nativeGrant.id } : {}),
       input, choices: [{ id: 'allow', label: question ? 'Submit answers' : 'Allow once' }, ...(!question ? [
         { id: 'allow-session', label: 'Allow for this session', description: sessionDescription, disabled: !permissionUpdates.length },
         { id: 'auto-mode', label: 'Switch to auto-mode', disabled: autoMode,
@@ -1198,15 +1370,27 @@ export class ClaudeAdapter implements ProviderAdapter {
   private async hook(request: ObjectValue): Promise<ObjectValue | undefined> {
     const input = object(request.input), callback = string(request.callback_id)
     const id = string(request.tool_use_id) ?? string(input.tool_use_id)
-    const name = string(input.tool_name) ?? 'Unknown tool', args = object(input.tool_input)
+    const priorCall = id ? this.grantCalls.get(id) : undefined
+    const name = string(input.tool_name) ?? priorCall?.tool ?? 'Unknown tool', args = object(input.tool_input ?? priorCall?.input as Json)
     if (id && callback === 'conductor_denied') return this.hookedAutoModeDenial(id, name, args, string(input.reason) ?? '')
     if (!id || !['conductor_before', 'conductor_after', 'conductor_failed'].includes(callback ?? '')) throw new Error('Unknown Claude lifecycle hook callback')
+    if (callback === 'conductor_before') this.recordSubagentModeHook(input, id)
     if (!this.tools.has(id)) this.declareTool(id, name, args)
+    const nativeCall = this.grantCall(id, name, args)
     const paths = ['Edit', 'Write', 'NotebookEdit', 'MultiEdit'].includes(name) ? [string(args.file_path) ?? string(args.notebook_path)].filter((path): path is string => Boolean(path)) : []
     if (callback === 'conductor_before') {
+      // Owner revocation takes effect even while an older bypass process is still changing mode.
+      // Read tools never reach this hook; all mutating or externally active tools do.
+      if (string(object(this.capabilities.effectiveSettings).permissionMode) === 'bypassPermissions' && !this.fullAutoAuthorized()) {
+        const reason = 'Claude Full Auto owner policy was disabled; this tool is blocked until native Guarded Auto is confirmed.'
+        this.updateTool(id, { status: 'rejected' })
+        if (nativeCall) { this.grantProgress.delete(id); this.grantAuthorized.delete(id); this.options.permissionGrants?.executionFinished?.(nativeCall, 'blocked') }
+        return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } }
+      }
       const denied = this.options.authorizeTool ? await this.options.authorizeTool(name, args) : undefined
       if (denied) {
         this.updateTool(id, { status: 'rejected' })
+        if (nativeCall) { this.grantProgress.delete(id); this.grantAuthorized.delete(id); this.options.permissionGrants?.executionFinished?.(nativeCall, 'blocked') }
         return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: denied } }
       }
       // PreToolUse also runs on automatically allowed operations, before execution.
@@ -1218,6 +1402,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       return
     }
     const response = object(input.tool_response), success = callback === 'conductor_after' && response.interrupted !== true && (number(response.exitCode) ?? 0) === 0
+    if (nativeCall) { this.grantProgress.delete(id); this.grantAuthorized.delete(id); this.options.permissionGrants?.executionFinished?.(nativeCall, success ? 'succeeded' : response.interrupted === true || input.is_interrupt === true ? 'cancelled' : 'failed') }
     if (paths.length) await this.options.afterTool?.(id, paths, success)
     // The call ran, so the permission check is behind it: an approve-once grant for exactly this
     // call is spent now, and the service takes it back out of the live settings.
@@ -1234,6 +1419,21 @@ export class ClaudeAdapter implements ProviderAdapter {
       return { text: string(todo.content) ?? '', status: todo.status === 'completed' ? 'completed' : todo.status === 'in_progress' ? 'in_progress' : 'pending' }
     }) } })
   }
+  private recordSubagentModeHook(input: ObjectValue, toolUseId: string): void {
+    const agentId = string(input.agent_id), sessionId = string(input.session_id), mode = string(input.permission_mode)
+    // The CLI provides agent_id only for a subagent. A parent ACK or assistant text is not
+    // evidence of the child's mode, and this pre-hook is not evidence of tool execution.
+    if (!agentId || !sessionId || string(input.tool_use_id) !== toolUseId ||
+      input.hook_event_name != null && input.hook_event_name !== 'PreToolUse' ||
+      !mode || !['default', 'plan', 'acceptEdits', 'auto', 'dontAsk', 'bypassPermissions'].includes(mode) ||
+      [agentId, sessionId, toolUseId].some(value => value.length > 256)) return
+    const key = JSON.stringify([sessionId, agentId, mode])
+    if (this.subagentModeHooks.has(key)) return
+    this.subagentModeHooks.add(key)
+    if (this.subagentModeHooks.size > 4096) this.subagentModeHooks.delete(this.subagentModeHooks.values().next().value!)
+    const evidence = { session_id: sessionId, agent_id: agentId, tool_use_id: toolUseId, permission_mode: mode }
+    this.emit({ data: { type: 'notice', message: `Claude subagent PreToolUse hook reported ${mode} before permission and execution.`, payload: evidence }, native: { method: 'hook/PreToolUse', payload: evidence } })
+  }
   private interruptWaitingTools(): void {
     for (const request of this.requests.values()) if (request.toolId) this.updateTool(request.toolId, { status: 'interrupted' })
   }
@@ -1245,10 +1445,30 @@ export class ClaudeAdapter implements ProviderAdapter {
     const pending = this.requests.get(id)
     if (!pending) return
     this.requests.delete(id)
+    if (reason === 'Provider cancelled request' && pending.toolId) {
+      const call = this.grantCalls.get(pending.toolId)
+      if (call?.requestId === id) this.options.permissionGrants?.executionFinished?.(call, 'cancelled')
+    }
     this.emit({ requestId: id, itemId: pending.toolId, data: { type: 'interaction', interaction: { ...pending.interaction, status: 'expired', outcome: reason } } })
   }
   private expireRequests(reason: string): void { for (const id of this.requests.keys()) this.expireRequest(id, reason) }
+  private cancelAuthorizedRequest(requestId: string): void {
+    this.replies.delete(requestId)
+    for (const [toolUseId, call] of this.grantAuthorized) if (call.requestId === requestId) {
+      this.grantAuthorized.delete(toolUseId)
+      this.grantProgress.delete(toolUseId)
+      this.options.permissionGrants?.executionFinished?.(call, 'cancelled')
+    }
+  }
   private disconnected(message: string): void {
+    const uncertain = new Map(this.grantAuthorized)
+    for (const id of this.grantProgress) if (!uncertain.has(id)) {
+      const call = this.grantCalls.get(id)
+      if (call) uncertain.set(id, call)
+    }
+    this.grantAuthorized.clear()
+    this.grantProgress.clear()
+    for (const call of uncertain.values()) this.options.permissionGrants?.executionFinished?.(call, 'unknown')
     for (const id of this.steeringInputs.keys()) this.inputDelivery(id, 'uncertain')
     this.ready = false
     this.expireRequests(message)

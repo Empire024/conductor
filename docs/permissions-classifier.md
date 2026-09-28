@@ -1,21 +1,28 @@
 # Auto-mode classifier denials and narrow owner grants
 
-In Auto, the claude CLI's own classifier can refuse a tool call (`Permission for this action was
+In Guarded Auto (Claude's native `auto` mode), the CLI's classifier can refuse a tool call
+(`Permission for this action was
 denied by the Claude Code auto mode classifier. Reason: [Modify Shared Resources] …`). Conductor
-cannot override that classifier, and it must not try. What it does is turn the refusal into
-**one narrow owner approval** and route the call into the narrowest permission flow the CLI
-supports, so the tab can retry and verify the work itself.
+cannot send an Allow once response after that refusal: the native request has already ended. A
+narrow owner grant may let the tab retry, subject to Claude's rule matching and classifier.
+Separately, the owner may explicitly enable genuine installation-wide Full Auto. Conductor Auto
+then requests native `bypassPermissions` and counts it active only after provider acknowledgement.
 
-## Boundary (owner, 2026-09-25)
+## Boundary (owner decisions, 2026-09-25 and 2026-09-28)
 
-- Never disable or weaken Claude Code's protections: no allow-all rules, no `bypassPermissions`,
-  and nothing that lets an agent grant itself permission.
-- Sensitive steps (production, shared, destructive, credentialed, external) still need an
-  approval, but it is **one** approval the owner gives in Conductor.
+- No allow-all rule, provider binary modification or managed-policy override. An agent cannot
+  grant itself permission. The owner may explicitly activate Full Auto installation-wide; only an
+  acknowledged native `bypassPermissions` mode counts as active. An unacknowledged or refused
+  activation remains blocked and visible, with no silent fallback to Guarded Auto.
+- Sensitive steps (production, shared, destructive, credentialed, external) need an approval when
+  the owner has not enabled Full Auto. The native provider may still require an individual,
+  request-specific approval where its policy mandates one.
 - The owner answers in the card or with the owner's own control credential. A wizard tab holds
   the owner's authority (AGENTS.md) and answers **every** class, production included (owner
   decision 2026-09-28, gap H13); it never answers its own request.
-- A grant is exactly one native allow rule for one conversation. It ends when its call has run
+- A representable grant is a narrow native allow rule for one conversation. A still-pending native
+  request with no safely representable rule can instead receive an exact Allow once response,
+  without changing the session's mode. A grant ends when its call has run
   (approve once), when the owner revokes it, or when its tab closes. Waiting requests and unspent
   grants survive an app restart or crash (`permission-grants.json` in the app's userData, restored
   before any runtime resumes); answered, spent and expired ones are not brought back.
@@ -31,7 +38,10 @@ supports, so the tab can retry and verify the work itself.
    `Bash(ssh … root@host bash -s < app/prod/fix-pool.sh)`. A command containing `*` or ending in
    `:*` is never turned into a rule, because the CLI would read it as a wildcard or prefix rule.
 2. **The card.** The denial's notice in the conversation becomes a card with Approve once,
-   Approve for this session and Deny (`src/renderer/src/components/permission-grants/`). Shared,
+   Approve for this session and Deny when a narrow rule exists
+   (`src/renderer/src/components/permission-grants/`). An unrepresentable call can receive Allow
+   once only if the provider still has its exact `can_use_tool` request pending. An ended classifier
+   denial cannot receive that response. Shared,
    destructive and external requests an agent files itself are also pushed to the owner's phone;
    a denial already reaches the phone through `phone-notifications.ts`.
 3. **The grant.** On approval, `PermissionGrants` (`src/main/permission-grants/service.ts`) hands the
@@ -44,7 +54,15 @@ supports, so the tab can retry and verify the work itself.
    withdrawn as soon as its call has run (the `PostToolUse` hook). Deny tells the tab not to retry
    or work around it. The grants list is visible and revocable in the card. A closed tab's grants
    are swept within about two seconds, and the rule is taken back out of a runtime that is still
-   running.
+   running. The lifecycle distinguishes owner authorization, applying a permission, observed
+   execution, and a definite succeeded/failed/blocked/cancelled result. A process loss after
+   authorization without a definite result is **unknown**; Conductor never retries that call
+   automatically. `PreToolUse` merely precedes provider permission checks and does not prove
+   execution. `tool_progress` can show a running call; `PostToolUse` or `PostToolUseFailure` supplies
+   a definite outcome, including for a fast call with no progress event. A pending native Allow
+   once card survives an app restart but is disabled until the same live runtime re-emits the
+   same request, tool and arguments. An already authorized response without a confirmed result
+   becomes unknown and is never replayed.
 4. **Asking first.** An agent that knows a call will be refused (production, shared, external)
    calls `request_permission` (the `conductor` MCP server) or app-control `permissions.request`
    with exactly one of `{command | path | url}`, plus `reason` and `rollback`. The per-turn
@@ -103,7 +121,7 @@ attempt raises an ordinary Allow card.
   - a different external action is still refused;
   - Deny keeps it blocked;
   - Approve for this session ends when the tab closes.
-- **Precedence, observed live (2026-09-28, claude 2.1.282).** The haftheme tab
+- **Haftheme sequence, observed live (2026-09-28, claude 2.1.282).** The haftheme tab
   (`agent_muldox0q_y4hp2rg`, native session `ff698e13-…`) was refused
   `cd …/app && ssh … root@45.63.56.18 'bash -s -- --check' < prod/fix-lsphp-pool.sh 2>&1 | tail -40`
   as `[Production Reads]`. Sources: Conductor's durable timeline (one runtime,
@@ -118,19 +136,11 @@ attempt raises an ordinary Allow card.
     was folded in (an owner or wizard Stop, not the adapter). Conductor re-queued the cancelled steer as a
     new turn, so the approval reached the CLI as a **user message** (15:10:58.172Z). The retry at
     15:11:01Z ran (15:11:31Z), and the PostToolUse hook spent the grant.
-  - All three grants had the same rule text and the same live delivery. `refused` matched the rule
-    both times and `used` matched it once, so scope, rule text and delivery path (H1, H2) do not
-    explain the difference, and neither does a race (H3): each retry came 24 s or more after its
-    apply. Every one of the four calls, including the one that ran, has its own
-    `serverClassifierRequest` in the transcript: the classifier judged each call. A live
-    flag-settings allow rule did not stop it from refusing.
-  - The only difference is how the approval arrived: as a user turn, or as a queued command
-    inside a running turn. The CLI's classifier transcript builder frames the two differently
-    (`queued_command` attachments are rendered as mid-turn input). Its denial text also tells the
-    agent to get the user's consent (`autoModeConsentFlow`). Conductor now always delivers the
-    approval as a turn of its own (`retry` in `src/main/permission-grants/service.ts`), and the
-    synthetic CLI encodes this precedence under `CONDUCTOR_TEST_CLASSIFIER=approval-turn`
-    (`smoke-permission-grant.mjs`, step 3b).
+  - The three grants had the same displayed rule and were applied live. That rule did not
+    match this command, so these retries cannot establish precedence between a matching allow
+    rule and the classifier, or between a queued steer and a user turn. The final retry ran in a
+    different classifier context after an owner-approved user turn; this is an observation, not
+    proof that delivery form was the cause.
   - **Corrected the same day (rule matching, below):** that rule could never have matched. The
     command was piped (`… | tail -40`) and read a file after a `cd` (`cd …/app && ssh … <
     prod/fix-lsphp-pool.sh`). The CLI checks a pipeline part by part and never lets a rule allow an

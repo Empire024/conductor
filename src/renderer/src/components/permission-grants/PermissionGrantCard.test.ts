@@ -79,6 +79,36 @@ describe('permission grant card', () => {
     expect(buttons(PermissionGrantCard({ request, status: 'pending' }))).toEqual([])
   })
 
+  it('offers request-specific Allow once only for a live native request and shows uncertain execution', () => {
+    const native: GrantCardRequest = { ...request, source: 'native', nativeAvailable: true, rule: undefined, refusal: 'No safe reusable rule',
+      call: { runtimeId: 'r', nativeSessionId: 's', requestId: 'q', toolUseId: 't', tool: 'Bash', argsDigest: 'digest' },
+      execution: { status: 'pending', updatedAt: 'now', scope: 'once', call: { runtimeId: 'r', nativeSessionId: 's', requestId: 'q', toolUseId: 't', tool: 'Bash', argsDigest: 'digest' } } }
+    const onDecide = vi.fn()
+    const card = PermissionGrantCard({ request: native, status: 'pending', onDecide })
+    expect(renderToStaticMarkup(card)).toContain('Allow this provider request once')
+    expect(buttons(card).map(button => button.props.className)).toEqual(['sa-grant-once', 'sa-grant-deny'])
+    ;(buttons(card)[0]!.props.onClick as () => void)()
+    expect(onDecide).toHaveBeenCalledWith('approve-once')
+    const uncertain = renderToStaticMarkup(PermissionGrantCard({ request: { ...native, execution: { ...native.execution!, status: 'unknown', detail: 'Inspect before retry' } }, status: 'approved-once', onDecide }))
+    expect(uncertain).toContain('unknown: Inspect before retry')
+    expect(uncertain).not.toContain('Allow this provider request once</button>')
+    const detached = renderToStaticMarkup(PermissionGrantCard({ request: { ...native, nativeAvailable: false }, status: 'pending' }))
+    expect(detached).toContain('Waiting for this exact provider request to be confirmed again')
+    expect(detached).not.toContain('Allow this provider request once</button>')
+    expect(detached).not.toContain('needs-attention')
+  })
+
+  it('reports a failed native call without blaming the classifier or claiming success', () => {
+    const failed = renderToStaticMarkup(PermissionGrantCard({
+      request: { ...request, source: 'native', rule: undefined,
+        execution: { status: 'failed', updatedAt: 'now', scope: 'once', call: { runtimeId: 'r', nativeSessionId: 's', requestId: 'q', toolUseId: 't', tool: 'Bash', argsDigest: 'digest' } } },
+      status: 'ineffective'
+    }))
+    expect(failed).toContain('Action failed')
+    expect(failed).not.toContain('classifier')
+    expect(failed).not.toContain('Action succeeded')
+  })
+
   it('shows the answer and a Revoke for a live grant', () => {
     const onRevoke = vi.fn()
     const grant = { id: 'g', agentSessionId: 'a', requestId: 'r', rule: request.rule!, scope: 'session' as const, class: 'external' as const, tool: 'Bash', resource: request.resource, grantedAt: 'now', decidedBy: 'owner' as const, delivery: 'live' as const }

@@ -6,6 +6,8 @@ import { Archive, ArrowDown, ArrowLeft, ClipboardCopy, EyeOff, FileDiff, FilePlu
 import type { AgentSpec, AgentActivityPhase, TurnMemoryRecall } from '../../../shared/models'
 import { isFrontierModel, MAX_PROMPT_CHARS, WIZARD_MODEL_HINT } from '../../../shared/structured-agent'
 import { permissionParity } from '../../../shared/permission-parity'
+import { singlePermissionCards } from './single-permission-card'
+import { ClaudeFullAutoControl } from '../components/ClaudeFullAutoControl'
 import type { AgentEvent, ContextAttachment, ConversationSearchResult, FileChange, Json, PromptOrigin, SessionProjection, SessionSettings, TimelineItem } from '../../../shared/structured-agent'
 import { emptyProjection, projectAgentEvents } from '../../../shared/structured-agent-reducer'
 import { coalesceTextDeltas } from './coalesce-stream-events'
@@ -279,7 +281,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
         const modeUpdate = events.filter(event => event.data.type === 'session' && event.data.settings).at(-1)
         if (modeUpdate?.data.type === 'session' && modeUpdate.data.settings) {
           const confirmed = modeUpdate.data.settings
-          setSettings(current => ({ ...current, permission: confirmed.permission, plan: confirmed.plan, temporaryPermission: confirmed.temporaryPermission }))
+          setSettings(current => ({ ...current, permission: confirmed.permission, plan: confirmed.plan, temporaryPermission: confirmed.temporaryPermission, claudeGuardedAuto: confirmed.claudeGuardedAuto }))
         }
       },
       render() {
@@ -917,7 +919,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     return []
   })), [projection.items, subagentLabels])
   const labelAnchors = useMemo(() => parentLabelAnchors(visibleItems), [visibleItems])
-  const activityGroups = useMemo(() => groupConversationActivities(visibleItems), [visibleItems])
+  const activityGroups = useMemo(() => groupConversationActivities(singlePermissionCards(visibleItems)), [visibleItems])
   // A composer choice belongs to the conversation, not to this mounting of the pane: switching
   // project or restarting must reopen on the model and effort the user picked, so the change is
   // saved with the conversation instead of waiting for a message that may never be sent.
@@ -1030,7 +1032,9 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       <QueuedMessageList prompts={queuedPrompts} onRemove={prompt => { void window.conductor.structured.cancelQueued(activeId, prompt.id).then(queued => { if (!queued) return; setMessage(draftRef.current.message ? draftRef.current.message + '\n\n' + queued.text : queued.text); setAttachments(current => [...current, ...queued.attachments].slice(-20)); composer.current?.focus() }).catch((reason: unknown) => setError(String(reason))) }} />
       {attachments.length > 0 && <div className="sa-context-chips">{attachments.map(attachment => <span key={attachment.id}><button type="button" title="Inspect attached context" onClick={() => setInspectAttachment(attachment)}>{attachment.kind === 'image' && <PromptImageThumbnail projectId={props.project.id} attachment={attachment} />}{attachment.name}{attachment.startLine ? ':' + attachment.startLine + (attachment.endLine ? '–' + attachment.endLine : '') : ''}</button><button type="button" aria-label={'Remove context ' + attachment.name} onClick={() => { if (isPastedText(attachment)) { const next = removePastedText(draftRef.current.message, draftRef.current.attachments, attachment.id); setDraft(next.message, next.attachments) } else setAttachments(current => current.filter(item => item.id !== attachment.id)) }}><X size={11} /></button></span>)}</div>}
       {promptChars > MAX_PROMPT_CHARS * 0.9 && <p className={'sa-prompt-limit' + (sendBlocked === 'oversized' ? ' sa-prompt-limit-over' : '')} role="status">{sendBlocked === 'oversized' ? `Too large to send: ${promptChars.toLocaleString()} of ${MAX_PROMPT_CHARS.toLocaleString()} characters including attachments. Remove or shorten an attachment, or trim the message.` : `${promptChars.toLocaleString()} / ${MAX_PROMPT_CHARS.toLocaleString()} characters`}</p>}
-      {permissionParity(settings, capabilities) && <p className="sa-request-summary" role="status">{permissionParity(settings, capabilities)}</p>}
+      {!cliOwned && permissionParity(settings, capabilities) && <p className="sa-request-summary" role="status">{permissionParity(settings, capabilities)}</p>}
+      {cliOwned && provider === 'claude' && <p className="sa-request-summary" role="status">The interactive CLI owns this conversation. Its permission mode is shown in its terminal; the previous Chat runtime confirmation does not apply.</p>}
+      {provider === 'claude' && <details className="sa-full-auto-details"><summary>Claude Full Auto authorization</summary><ClaudeFullAutoControl /></details>}
       {commandsOpen && <CommandAutocomplete id={commandListId} commands={commands} selected={Math.min(commandIndex, commands.length - 1)} loading={commandLoading} onSelect={setCommandIndex} onChoose={chooseCommand} />}
       <textarea ref={composer} aria-autocomplete="list" aria-controls={commandsOpen ? commandListId : undefined} aria-expanded={commandsOpen} aria-activedescendant={commandsOpen ? commandListId + '-' + Math.min(commandIndex, commands.length - 1) : undefined} aria-label={'Message ' + name} placeholder={succession ? `Continued in ${succession.title}; send messages there` : cliOwned ? 'The native CLI has this conversation. Continue in Chat to send here.' : historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : steering ? (pendingSteering.some(input => input.status === 'sending' || input.status === 'accepted') ? 'Add another message' : 'Message after the next tool use') : activePhases.has(projection.phase) ? 'Queue a message after this turn' : 'Message ' + name} value={message} disabled={!ready || historical || resuming || projection.archived || cliOwned || Boolean(succession)} rows={2} onFocus={() => { if (ready && !historical && !projection.nativeSessionId && !activePhases.has(projection.phase)) void connect().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }} onBlur={() => { setCommandDismissed(true); flushDraft() }} onChange={event => {
         // A long paste or drop folds into a "[Pasted text #N: L lines]" chip, as the Claude CLI does.

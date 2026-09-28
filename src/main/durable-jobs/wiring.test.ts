@@ -349,7 +349,16 @@ describe('service with the real ports', () => {
     let now = Date.parse('2026-09-24T00:00:00Z')
     const store = new DurableJobStore(':memory:', () => new Date(now))
     const ports = durableJobPorts({ store, snapshot: () => null, modelConfig: window.modelConfig, probeHealth: async () => ({ healthy: true }), serverPorts: async () => { throw new Error('unused') }, endpointOverride: () => 'stub', gate: new LocalGenerationGate({ now: Date.now, sleep: tick, interactiveActive: async () => null }) })
-    const runtime = new FakeRuntime([], { kind: 'answer', text: 'A part done.\nJOB STATUS: CONTINUE: do the next part' })
+    // Advance at the first completed answer, before the next stage can start. A timer polling
+    // stage 1 can otherwise lose a race against the unrelated repeated-answer loop guard.
+    const runtime = new FakeRuntime([{ kind: 'answer', text: 'A part done.\nJOB STATUS: CONTINUE: do the next part' }], { kind: 'hang' })
+    const observe = runtime.observe.bind(runtime)
+    let advanced = false
+    runtime.observe = id => {
+      const observation = observe(id)
+      if (!advanced && observation.phase === 'completed') { advanced = true; now += 120_000 }
+      return observation
+    }
     const service = new DurableJobsServiceImpl({ store, runtime, worktrees: new FakeWorktrees(), logRoot: dir, projectPath: () => dir, sleep: tick, pollMs: 0, clock: () => new Date(now), ...ports })
     services.push(service)
     const created = await service.create({ projectId: 'p', title: 'Budgeted', objective: 'Two parts', model: 'local/qwen3.6-35b-a3b', budgets: { maxElapsedMs: 60_000 }, stages: [{ title: 'Investigate the parser', kind: 'investigate', objective: 'Read it', completionCriteria: [] }], createdBy: { kind: 'agent', agentSessionId: 'agent_x', title: 'Controller' } })
@@ -357,9 +366,9 @@ describe('service with the real ports', () => {
     expect(stored.createdBy).toEqual({ kind: 'agent', agentSessionId: 'agent_x', title: 'Controller' })
     expect(stored.stages[0]!.kind).toBe('investigate')
     await until(() => service.get(created.id).stages[0]!.status === 'completed')
-    now += 120_000
     await until(() => service.status(created.id).status === 'blocked')
     expect(service.status(created.id).statusReason).toMatch(/elapsed-time budget/)
+    expect(runtime.opened).toHaveLength(1)
     expect(service.checkpoints(created.id)).toEqual(store.checkpoints(created.id))
     const written = await service.report(created.id)
     expect(written.reportPath.endsWith('report.md')).toBe(true)

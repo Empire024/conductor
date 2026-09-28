@@ -38,6 +38,9 @@ export interface SessionSettings {
   model?: string
   effort?: string
   permission: 'default' | 'read-only' | 'accept-edits' | 'auto'
+  /** Claude only: deliberately keep classifier-backed Auto even when this installation's
+   * owner has enabled Full Auto. This flag never grants Full Auto authorization. */
+  claudeGuardedAuto?: boolean
   /** A provider-offered Edit-mode grant lasts only for this runtime, never a resume. */
   temporaryPermission?: { runtimeId: string; restore: SessionSettings['permission'] }
   sandbox?: 'inherit' | 'read-only' | 'workspace-write'
@@ -116,6 +119,8 @@ export interface InputQuestion {
 }
 export interface PendingInteraction {
   id: string
+  /** Exact native grant card replacing this interaction's owner controls, not its projection. */
+  permissionGrantId?: string
   kind: 'approval' | 'question'
   title: string
   input: Json

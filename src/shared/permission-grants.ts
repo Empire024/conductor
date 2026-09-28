@@ -16,11 +16,31 @@
 export type GrantClass = 'local' | 'shared' | 'destructive' | 'external'
 export type GrantDecision = 'approve-once' | 'approve-session' | 'deny'
 export type GrantStatus = 'pending' | 'approved-once' | 'approved-session' | 'denied' | 'used' | 'revoked' | 'expired' | 'ineffective' | 'moved'
+/** Provider execution is separate from the owner's decision. In particular, an approval is not
+ * evidence that a tool ran, and an unknown result must never be retried automatically. */
+export type GrantExecutionStatus = 'pending' | 'owner-authorized' | 'applying' | 'executing' | 'succeeded' | 'failed' | 'blocked' | 'cancelled' | 'unknown'
+export interface GrantCallIdentity {
+  runtimeId: string
+  nativeSessionId: string
+  toolUseId: string
+  tool: string
+  /** SHA-256 of the full canonical native arguments, not merely the displayed resource. */
+  argsDigest: string
+  /** The pending native permission request, when the provider still accepts an exact reply. */
+  requestId?: string
+}
+export interface GrantExecution {
+  status: GrantExecutionStatus
+  call: GrantCallIdentity
+  scope: 'once' | 'session'
+  updatedAt: string
+  detail?: string
+}
 
 export interface PermissionGrantRequest {
   /** Unique per conversation: the denial's notice item id, or `grant:<uuid>` for an agent's request. */
   id: string
-  source: 'denial' | 'agent'
+  source: 'denial' | 'agent' | 'native'
   /** The native tool name (Write, Bash, mcp__server__tool). */
   tool: string
   /** In words: "Write a file", "Run a command". */
@@ -39,6 +59,12 @@ export interface PermissionGrantRequest {
   reason?: string
   rollback?: string
   toolUseId?: string
+  /** Exact call being authorized, when the provider supplied its runtime identity and arguments. */
+  call?: GrantCallIdentity
+  /** Native request-specific approval is answerable only while this exact provider request has
+   *  been observed live. Restore clears this until the same can_use_tool request is re-emitted. */
+  nativeAvailable?: boolean
+  execution?: GrantExecution
   status: GrantStatus
   requestedAt: string
   decidedAt?: string
@@ -65,6 +91,7 @@ export interface PermissionGrant {
    *  where; one conversation's session permissions, never a settings file other tabs read. */
   nativeRules?: string[]
   installedIn?: string
+  execution?: GrantExecution
 }
 
 /** What the renderer holds: every open request and live grant, per conversation. */

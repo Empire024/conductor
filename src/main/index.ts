@@ -34,6 +34,8 @@ import { startLocalAssist, type LocalAssist } from './local-assist/wiring'
 import { weeklyUsage as weeklyUsagePercent, type ModelIntelligence } from './model-intelligence'
 import { latestModelsFromSchedules, latestModelsWatcher, startModelIntelligence, turnObserver, vramTotalGb, withStageCapture } from './model-intelligence/app-wiring'
 import { registerPermissionGrantsIpc, startPermissionGrants } from './permission-grants/wiring'
+import { ClaudeFullAutoPolicy } from './claude-full-auto'
+import { registerClaudeFullAutoIpc } from './claude-full-auto-ipc'
 import { BrowserViews } from './browser-views'
 import { RemoteControlService } from './remote-control-ipc'
 import { safeStorageCipher } from './safe-storage-vault'
@@ -203,6 +205,7 @@ let localAssist: LocalAssist | undefined
 let modelIntelligence: ModelIntelligence | undefined
 let disposeModelObserver: (() => void) | undefined
 let permissionGrants: Awaited<ReturnType<typeof startPermissionGrants>> | undefined
+let claudeFullAuto: ClaudeFullAutoPolicy
 let browserViews: BrowserViews | undefined
 let projectFileChanges: ProjectFileChanges | undefined
 /** The catalog a local update build records for its compatibility report: the configured model
@@ -276,12 +279,13 @@ const RESTORE_WINDOWS_AFTER_UPDATE_KEY = 'restoreWindowsAfterUpdate'
 
 app.setName('Conductor')
 // Isolated automation profile is chosen before the single-instance lock.
-if (!app.isPackaged && process.env.CONDUCTOR_TEST_USER_DATA) app.setPath('userData', resolve(process.env.CONDUCTOR_TEST_USER_DATA))
+const automationProfile = testInstallProfile({ isPackaged: app.isPackaged })
+if (automationProfile) app.setPath('userData', automationProfile)
 if (app.isPackaged) delete process.env.CONDUCTOR_OFFLINE_TESTS
 /** An automation profile (CONDUCTOR_TEST_USER_DATA). Gates the watchdog below, the dialog guard in
  *  ./test-mode-dialogs, and routing main-process errors to a log instead of a native error box -
  *  none of which a real, owner-driven launch should ever behave differently for. */
-const testMode = !app.isPackaged && !!process.env.CONDUCTOR_TEST_USER_DATA
+const testMode = Boolean(automationProfile)
 if (testMode) {
   // A leaked overnight verifier left Electron and its fixture CLIs running for hours after the
   // smoke script that launched it was gone (feature-list.md: smoke-instances-never-leak). This
@@ -303,7 +307,7 @@ if (testMode) {
  *  is working: an automation profile (CONDUCTOR_TEST_USER_DATA) parks its windows off-screen,
  *  out of the taskbar, and never activates or raises them. Set CONDUCTOR_BACKGROUND_WINDOWS=0 to
  *  watch a run, or =1 to park a normal launch. */
-export const backgroundWindows = !app.isPackaged && (process.env.CONDUCTOR_BACKGROUND_WINDOWS ?? (process.env.CONDUCTOR_TEST_USER_DATA ? '1' : '0')) === '1'
+export const backgroundWindows = app.isPackaged ? testMode : (process.env.CONDUCTOR_BACKGROUND_WINDOWS ?? (testMode ? '1' : '0')) === '1'
 // A parked instance is background work: below normal priority, GPU and renderers included, so the
 // owner's own Conductor never waits on it (typing-lag-under-test-load).
 startParkedPriority(app, backgroundWindows, process.env, message => console.log(message))
@@ -2622,6 +2626,7 @@ const registerIpc = (): void => {
   if (ideasRegistration) disposeIdeasIpc = ideasRegistration.registerIpc(event => trustedStructured(event))
   if (ideaRunsRegistration) disposeIdeaRunsIpc = ideaRunsRegistration.registerIpc(event => trustedStructured(event))
   registerPermissionGrantsIpc(() => permissionGrants?.grants, event => trustedStructured(event))
+  registerClaudeFullAutoIpc(ipcMain, claudeFullAuto, event => trustedStructured(event))
   cloud?.registerIpc({
     authorize: (event, projectId) => { trustedStructured(event); requireLocalProject(database, structuredId(projectId), 'Cloud sessions') },
     projectPath: projectId => { const project = database.getProject(projectId); return project && !project.remote ? project.path : null }
@@ -2683,6 +2688,15 @@ app.whenReady().then(async () => {
   })
   browserMcp = new BrowserMcpServer(browserViews)
   agents = new AgentManager(database, new AgentCollaborationRuntime(collaboration), spec => agentControlServer?.briefing(spec) ?? '', browserMcp)
+  claudeFullAuto = new ClaudeFullAutoPolicy(database, async () => {
+    const results = [...await agents.nativeCli.refreshClaudeFullAutoPolicy(), ...await agents.structured.refreshClaudeFullAutoPolicy()]
+    const blocked = results.filter(result => result.status === 'blocked')
+    if (blocked.length) throw new Error(blocked.map(result => `${result.agentSessionId}: ${result.error ?? 'Provider permission transition blocked'}`).join('\n'))
+  }, state => {
+    for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('claude-full-auto:changed', state)
+  })
+  agents.structured.setClaudeFullAutoPolicy(claudeFullAuto.authorized)
+  agents.nativeCli.setClaudeFullAutoPolicy(claudeFullAuto.authorized)
   // What a window is told about a conversation, the owner's phone is told too: session events
   // and phase changes come from the agent manager's own broadcast, mirrored-machine events and
   // structural changes through publish below.

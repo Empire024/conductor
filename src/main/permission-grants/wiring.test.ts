@@ -3,7 +3,8 @@ import type { WorkspaceLayout } from '../../shared/models'
 import type { PermissionGrantRequest } from '../../shared/permission-grants'
 
 vi.mock('electron', () => ({ app: { getPath: () => '' }, ipcMain: { handle: vi.fn(), removeHandler: vi.fn() } }))
-const { grantDelivery, recoverFromTimelines } = await import('./wiring')
+const { grantDelivery, nativeResponseTarget, recoverFromTimelines } = await import('./wiring')
+const { grantCallIdentity } = await import('./identity')
 const { SteeringUnavailableError } = await import('../providers/adapter')
 
 const request = (id: string, status: PermissionGrantRequest['status']): PermissionGrantRequest => ({
@@ -11,6 +12,23 @@ const request = (id: string, status: PermissionGrantRequest['status']): Permissi
 })
 const card = (value: PermissionGrantRequest) => ({ data: { type: 'notice', message: 'Permission', payload: { permissionGrant: value } } })
 const layout = (...ids: string[]) => ({ root: { type: 'leaf', tabs: ids.map(resourceId => ({ resourceId })) } }) as unknown as WorkspaceLayout
+
+describe('one native response is bound to the live tool and arguments', () => {
+  it('rejects a changed request, tool, arguments, runtime or native session', () => {
+    const input = { command: 'cd app && cat < input.txt' }
+    const call = grantCallIdentity({ runtimeId: 'runtime', nativeSessionId: 'native', requestId: 'request', toolUseId: 'tool', tool: 'Bash', input })
+    const tool = { runtimeId: 'runtime', nativeItemId: 'tool', data: { type: 'tool', name: 'Bash', input, status: 'awaiting_approval' } }
+    const pending = { runtimeId: 'runtime', data: { type: 'interaction', interaction: { id: 'request', status: 'pending', input } } }
+    const state = { runtimeId: 'runtime', nativeSessionId: 'native', items: [tool, pending] }
+    const check = (value: unknown) => nativeResponseTarget(value as never, call)
+    expect(check(state)).toBe(true)
+    expect(check({ ...state, runtimeId: 'restarted' })).toBe(false)
+    expect(check({ ...state, nativeSessionId: 'another' })).toBe(false)
+    expect(check({ ...state, items: [tool, { ...pending, data: { ...pending.data, interaction: { ...pending.data.interaction, status: 'resolved' } } }] })).toBe(false)
+    expect(check({ ...state, items: [{ ...tool, data: { ...tool.data, input: { command: 'cd app && cat < other.txt' } } }, pending] })).toBe(false)
+    expect(nativeResponseTarget(state as never, { ...call, toolUseId: 'another' })).toBe(false)
+  })
+})
 
 describe('the first launch of a build that saves grants (grant-survives-restart)', () => {
   it('takes back the agent requests an open tab\'s timeline still shows waiting, judged by each request\'s last card', () => {

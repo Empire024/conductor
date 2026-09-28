@@ -27,7 +27,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { createServer } from 'node:net'
 import { cpus, tmpdir } from 'node:os'
-import { basename, dirname, join, relative, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { lowerPriority } from './lib/background-priority.mjs'
 import { LOCK_DIR, parseHolderText } from './smoke-lock.mjs'
@@ -609,6 +609,16 @@ export async function processAlive(marker) {
 const freePort = () => new Promise((done, fail) => { const probe = createServer().once('error', fail).listen(0, '127.0.0.1', () => { const { port } = probe.address(); probe.close(() => done(port)) }) })
 const electronPath = () => createRequire(import.meta.url)('electron')
 
+/** An installed executable is never selected implicitly or from an unverified path. */
+export function packagedAcceptanceExecutable(env = process.env) {
+  const executable = env.CONDUCTOR_PACKAGED_ACCEPTANCE_EXE
+  if (!executable) return null
+  const hash = env.CONDUCTOR_PACKAGED_ACCEPTANCE_SHA256
+  if (!isAbsolute(executable) || !/^[a-f0-9]{64}$/i.test(hash ?? '')) throw new Error('Packaged acceptance requires an absolute executable and its exact SHA256')
+  assertBuildHash(executable, hash.toLowerCase())
+  return { executable, executableSha256: hash.toLowerCase() }
+}
+
 /** A parked Conductor on a fresh temp profile. mode 'playwright' drives the UI through
  *  _electron.launch; mode 'spawn' starts plain Electron (with a CDP port for the UI) and is the one
  *  to use for anything that restarts the app - Playwright loses a relaunched app (RV1 C10).
@@ -617,14 +627,17 @@ const electronPath = () => createRequire(import.meta.url)('electron')
  *  of an older commit, for an upgrade run); relaunchParked keeps it unless given a new one. */
 export async function launchParked({ mode = 'playwright', name, env: extraEnv = {}, fixtures, args = [], launchTimeoutMs = 60_000, build = BUILD } = {}) {
   if (mode !== 'playwright' && mode !== 'spawn') throw new Error(`launchParked mode must be 'playwright' or 'spawn', got ${JSON.stringify(mode)}`)
+  const packaged = packagedAcceptanceExecutable()
+  if (packaged && mode !== 'spawn') throw new Error('Packaged acceptance requires spawn mode with an isolated parked profile')
   if (!existsSync(build)) throw new Error(`${build} is missing: build first (npx electron-vite build)`)
   if (!process.env.CONDUCTOR_TEST_PARENT_PID) console.warn('[verify-kit] not under smoke-lock: run it as node scripts/smoke-lock.mjs -- node <smoke>')
   // Background work even without smoke-lock: the driver below normal, and the instance lowers its own
   // tree (src/main/background-priority.ts), so the owner's typing never waits on a verifier.
   lowerPriority()
   const label = name ?? state.name ?? scriptName()
-  const root = await mkdtemp(join(tmpdir(), `conductor-${slug(label)}-`))
+  const root = await mkdtemp(join(tmpdir(), `${packaged ? 'conductor-packaged-acceptance-' : 'conductor-'}${slug(label)}-`))
   const profile = join(root, 'profile')
+  await mkdir(profile)
   const env = { ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_NODE_EXECUTABLE: process.execPath, CONDUCTOR_TEST_USER_DATA: profile, CONDUCTOR_PROJECTS_ROOT: join(root, 'projects') }
   for (const key of ['ELECTRON_RUN_AS_NODE', 'CONDUCTOR_LIVE_TESTS', 'CONDUCTOR_BACKGROUND_WINDOWS', 'CONDUCTOR_UPDATE_DEV', 'CONDUCTOR_TEST_DIALOGS']) delete env[key]
   if (fixtures) {
@@ -634,7 +647,14 @@ export async function launchParked({ mode = 'playwright', name, env: extraEnv = 
     env.CONDUCTOR_TEST_FIXTURE_DIR = dir
   }
   for (const [key, value] of Object.entries(extraEnv)) { if (value === undefined) delete env[key]; else env[key] = String(value) }
-  const inst = newInstance({ mode, build, name: label, root, profile, env })
+  if (packaged) {
+    env.CONDUCTOR_PACKAGED_ACCEPTANCE = '1'
+    env.CONDUCTOR_TEST_USER_DATA = profile
+    delete env.CONDUCTOR_OFFLINE_TESTS
+    delete env.CONDUCTOR_TEST_NODE_EXECUTABLE
+    delete env.CONDUCTOR_TEST_FIXTURE_DIR
+  } else delete env.CONDUCTOR_PACKAGED_ACCEPTANCE
+  const inst = newInstance({ mode, build, name: label, root, profile, env, ...(packaged ?? {}) })
   state.instances.push(inst)
   state.current = inst
   step(`launch ${mode} (${root})`)
@@ -654,7 +674,7 @@ export async function launchParked({ mode = 'playwright', name, env: extraEnv = 
     inst.cdpPort = await freePort()
     const log = openSync(join(root, 'app.log'), 'a')
     const spawnedAtMs = Date.now()
-    inst.child = spawn(electronPath(), [`--remote-debugging-port=${inst.cdpPort}`, build, ...args], { env, stdio: ['ignore', log, log], windowsHide: true })
+    inst.child = spawn(inst.executable ?? electronPath(), [`--remote-debugging-port=${inst.cdpPort}`, ...(packaged ? [] : [build]), ...args], { env, stdio: ['ignore', log, log], windowsHide: true })
     closeSync(log)
     await registerSpawnedRoot(inst, 'launch', spawnedAtMs)
     await owner(inst, { pid: inst.child.pid, timeoutMs: launchTimeoutMs })
@@ -662,6 +682,10 @@ export async function launchParked({ mode = 'playwright', name, env: extraEnv = 
   // Descendants are tracked by identity while the app runs, so a later exit cannot hide them.
   startTracking(inst, { log: message => console.warn(message) })
   console.log(`[verify-kit] launched ${mode} pid ${inst.credential.pid}`)
+  if (packaged) {
+    if (inst.credential.packaged !== true) throw new Error('Expected a packaged runtime receipt from the installed executable')
+    record('packaged-executable', 'INFO', { executable: packaged.executable, sha256: packaged.executableSha256, appVersion: inst.credential.appVersion, packaged: true, profile }, 'Actual packaged executable on a separate temporary acceptance profile; this is not a genuine owner activation')
+  }
   return inst
 }
 
@@ -785,7 +809,8 @@ export async function relaunchParked(inst = state.current, { env: extraEnv = {},
   step(`relaunch spawn (${inst.root}${inst.build !== BUILD ? ', ' + inst.build : ''})`)
   const log = openSync(join(inst.root, 'app.log'), 'a')
   const spawnedAtMs = Date.now()
-  inst.child = spawn(electronPath(), [`--remote-debugging-port=${inst.cdpPort}`, inst.build ?? BUILD, ...args], { env: inst.env, stdio: ['ignore', log, log], windowsHide: true })
+  if (inst.executable) assertBuildHash(inst.executable, inst.executableSha256)
+  inst.child = spawn(inst.executable ?? electronPath(), [`--remote-debugging-port=${inst.cdpPort}`, ...(inst.executable ? [] : [inst.build ?? BUILD]), ...args], { env: inst.env, stdio: ['ignore', log, log], windowsHide: true })
   closeSync(log)
   await registerSpawnedRoot(inst, 'relaunchParked', spawnedAtMs)
   inst.closed = false

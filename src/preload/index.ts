@@ -14,6 +14,7 @@ import { orchestrationBridge } from './orchestration'
 import { agentCollaborationBridge } from './agent-collaboration'
 import { deliveryBridge } from './delivery'
 import { permissionGrantsBridge } from './permission-grants'
+import { claudeFullAutoBridge } from './claude-full-auto'
 import { durableJobsBridge } from './durable-jobs'
 import { cloudBridge } from './cloud'
 import { logicLoopsBridge } from './logic-loops'
@@ -197,6 +198,7 @@ const bridge: ConductorBridge = {
   collaboration: agentCollaborationBridge,
   delivery: deliveryBridge,
   permissionGrants: permissionGrantsBridge,
+  claudeFullAuto: claudeFullAutoBridge,
   durableJobs: durableJobsBridge,
   cloud: cloudBridge,
   ideas: ideasBridge,
