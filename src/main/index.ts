@@ -853,12 +853,17 @@ const runningLocalServers = (): ReturnType<typeof listLocalServers> => {
 /** local.stop: one Conductor-started server, refused while a turn uses it unless forced. */
 const stopRunningLocalServer = (request: LocalStopRequest): ReturnType<typeof stopLocalServer> => {
   const config = loadLocalConfig(), apiKey = readLocalApiKey()
-  return stopLocalServer(runningLocalServers(), request, {
+  const servers = runningLocalServers()
+  return stopLocalServer(servers, request, {
     busy: server => releaseVerdict(server, apiKey),
     stop: async model => {
       const target = config.models[model]
       if (!target) throw new Error(`${model} is not configured in the local model stack`)
-      return stopLlamaServer(target)
+      // The pid chosen from this list is the one the stop must find: a record that names another
+      // process by the time the stop runs is refused, not stopped.
+      const chosen = servers.filter(server => server.model === model && server.startedByConductor && (request.pid === undefined || server.pid === request.pid))
+      if (chosen.length !== 1 || chosen[0]!.pid === null) throw new Error(`${model}: the server chosen to stop could not be pinned to one pid; nothing was stopped`)
+      return stopLlamaServer(target, { expectedPid: chosen[0]!.pid })
     }
   })
 }

@@ -1,10 +1,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
-  REPO, VERDICT, ancestorsOf, cpuPercent, descendantsOf, formatRecordLine, judgeLoad, matchProcesses, parseLlamaCommandLine,
-  parseNvidiaSmi, parseProcessList, poll, readGateThresholds, retryAck, sameProcesses, withDeadline
+  REPO, VERDICT, ancestorsOf, cpuPercent, descendantsOf, formatRecordLine, identityOf, judgeLoad, leavesFirst, listProcesses, matchProcesses, midTurnTabs, newInstance, suppliedControl,
+  ownedTree, parseLlamaCommandLine, parseNvidiaSmi, parseProcessList, poll, readGateThresholds, registerRelaunch, registerRoot, retryAck, safeClose,
+  sameProcesses, terminateIdentity, trackDescendants, withDeadline, commandHasArg, creationMs, startTracking, stopTracking, assertBuildHash, registerOwnChild
 } from './verify-kit.mjs'
 
 // shell(100) -> agent node(200) -> smoke-lock(300) -> smoke(400) -> electron(500) -> renderer(501), fixture(502)
@@ -24,9 +26,373 @@ const list = [
 ]
 
 test('parseProcessList reads one row or many and keeps a null command line empty', () => {
-  assert.deepEqual(parseProcessList('{"ProcessId":4,"ParentProcessId":0,"Name":"System","CommandLine":null}'), [{ pid: 4, ppid: 0, name: 'System', commandLine: '' }])
+  assert.deepEqual(parseProcessList('{"ProcessId":4,"ParentProcessId":0,"Name":"System","CommandLine":null}'), [{ pid: 4, ppid: 0, name: 'System', commandLine: '', creationTime: null, executable: null }])
   assert.equal(parseProcessList('[{"ProcessId":1,"ParentProcessId":0,"Name":"a","CommandLine":"x"},{"ProcessId":2,"ParentProcessId":1,"Name":"b","CommandLine":"y"}]').length, 2)
   assert.deepEqual(parseProcessList(''), [])
+})
+
+test('parseProcessList keeps OS identity only when it is usable and refuses a broken inventory', () => {
+  const [row] = parseProcessList('{"ProcessId":500,"ParentProcessId":400,"Name":"electron.exe","CommandLine":"e","ExecutablePath":"C:\\\\app\\\\electron.exe","CreationTime":"13403612345678901"}')
+  assert.deepEqual(identityOf(row), { pid: 500, creationTime: '13403612345678901', executable: 'C:\\app\\electron.exe' })
+  for (const created of [null, '', '0', 'yesterday']) assert.equal(identityOf(parseProcessList(JSON.stringify({ ProcessId: 5, ParentProcessId: 1, Name: 'x', ExecutablePath: 'C:\\x.exe', CreationTime: created }))[0]), null)
+  assert.equal(identityOf(parseProcessList('{"ProcessId":5,"ParentProcessId":1,"Name":"x","CreationTime":"123"}')[0]), null)
+  assert.throws(() => parseProcessList('[{"Name":"no id"}]'), /without a process id \(fields: Name:string\)/)
+})
+
+// ---- ownership: identity-verified trees, fail-closed cleanup (docs/verification/2026-09-28-local-safety-review.md)
+
+const EXE = 'C:\\app\\electron.exe'
+const proc = (pid, ppid, created, extra = {}) => ({ pid, ppid, name: 'electron.exe', commandLine: 'electron out/main/index.js', creationTime: created == null ? null : String(created), executable: EXE, ...extra })
+const idOf = entry => ({ pid: entry.pid, creationTime: entry.creationTime, executable: entry.executable })
+// Registered root 500 (created 1000) -> renderer 501, gpu 502 -> helper 503. Foreign neighbour 700.
+const owned = [proc(500, 400, 1000), proc(501, 500, 1001), proc(502, 500, 1002), proc(503, 502, 1003), proc(700, 1, 5, { name: 'node.exe', executable: 'C:\\node\\node.exe' })]
+const root = idOf(owned[0])
+const pids = tree => tree.members.map(member => member.pid).sort()
+
+test('ownedTree admits the exact registered tree and nothing beside it', () => {
+  const tree = ownedTree(owned, [root])
+  assert.deepEqual(pids(tree), [500, 501, 502, 503])
+  assert.deepEqual(tree.unresolved, [])
+  assert.deepEqual(leavesFirst(tree.members).map(member => member.pid), [503, 501, 502, 500])
+})
+
+test('ownedTree: a reused root pid is not the root, even with the same name and command line', () => {
+  const reused = [proc(500, 400, 9999), proc(501, 500, 10000)]
+  const tree = ownedTree(reused, [root])
+  assert.deepEqual(pids(tree), [])
+  assert.match(tree.unresolved[0].reason, /belongs to another process/)
+})
+
+test('ownedTree: same pid and creation time with a different image is not the root', () => {
+  assert.deepEqual(pids(ownedTree([proc(500, 400, 1000, { executable: 'C:\\Windows\\notepad.exe' }), proc(501, 500, 1001)], [root])), [])
+})
+
+test('ownedTree: missing creation identity stops admission there, for roots and children alike', () => {
+  assert.deepEqual(pids(ownedTree([proc(500, 400, null), proc(501, 500, 1001)], [root])), [])
+  const tree = ownedTree([proc(500, 400, 1000), proc(502, 500, null), proc(503, 502, 1003)], [root])
+  assert.deepEqual(pids(tree), [500])
+  assert.match(tree.unresolved[0].reason, /no readable OS identity/)
+  assert.deepEqual(pids(ownedTree([proc(500, 400, 1000, { executable: null })], [root])), [])
+})
+
+test('ownedTree: an exited root and a foreign process that inherited its pid as parent', () => {
+  const tree = ownedTree([proc(501, 500, 1001), proc(900, 500, 50000)], [root])
+  assert.deepEqual(pids(tree), [])
+  assert.match(tree.unresolved[0].reason, /no longer running/)
+})
+
+test('ownedTree: a child created before its listed parent means the parent pid was reused', () => {
+  const tree = ownedTree([proc(500, 400, 1000), proc(501, 500, 999)], [root])
+  assert.deepEqual(pids(tree), [500])
+  assert.match(tree.unresolved[0].reason, /created before its listed parent/)
+})
+
+test('ownedTree: cyclic ancestry terminates and admits nothing foreign', () => {
+  const cycle = [proc(500, 501, 1000), proc(501, 500, 1001), proc(502, 501, 1002)]
+  assert.deepEqual(pids(ownedTree(cycle, [root])), [500, 501, 502])
+  const foreignCycle = [proc(600, 601, 1), proc(601, 600, 2)]
+  assert.deepEqual(pids(ownedTree(foreignCycle, [root])), [])
+})
+
+test('ownedTree: a pid listed twice is never acted on', () => {
+  const tree = ownedTree([proc(500, 400, 1000), proc(501, 500, 1001), proc(501, 500, 1001)], [root])
+  assert.deepEqual(pids(tree), [500])
+})
+
+/** A scripted machine for safeClose: `snapshots` answers each inventory call in turn (an Error
+ *  throws), the last one repeating; terminate answers are scripted per pid. */
+function machine({ snapshots, terminate = () => ({ state: 'exited' }), roots = [root], observed = true }) {
+  const calls = { list: 0, terminate: [] }
+  const ledger = []
+  const inst = newInstance({ name: 'kit-test' })
+  // observed: the tracker saw each root alive with its subtree (see trackDescendants).
+  inst.roots = roots.map(entry => ({ ...entry, generation: inst.generation, source: 'launch', observedTree: observed }))
+  let clock = 0
+  const deps = {
+    listProcesses: async () => { const answer = snapshots[Math.min(calls.list++, snapshots.length - 1)]; if (answer instanceof Error) throw answer; return { list: answer } },
+    terminate: async (identity, budgetMs) => { calls.terminate.push(identity.pid); return terminate(identity, budgetMs) },
+    now: () => clock, sleep: async ms => { clock += ms }, ledger: entry => ledger.push(entry)
+  }
+  return { inst, deps, calls, ledger }
+}
+const quietClose = async (inst, options) => { const log = console.log; console.log = () => {}; try { return await safeClose(inst, options) } finally { console.log = log } }
+
+test('safeClose kills the exact owned tree leaves first, re-proved after the close, and leaves the neighbour', async () => {
+  const m = machine({ snapshots: [owned, owned, [owned[4]]] })
+  const report = await quietClose(m.inst, { deps: m.deps })
+  assert.deepEqual(m.calls.terminate, [503, 501, 502, 500])
+  assert.deepEqual(report.leftovers, [])
+  assert.deepEqual(report.unresolved, [])
+  assert.equal(report.tree, 4)
+  assert.deepEqual(m.ledger.filter(entry => entry.event === 'terminate').map(entry => entry.pid), [503, 501, 502, 500])
+})
+
+test('safeClose: children orphaned by the close stay attributable by their own identity', async () => {
+  const orphaned = [proc(501, 500, 1001), proc(503, 502, 1003), owned[4]]
+  const m = machine({ snapshots: [owned, orphaned, [owned[4]]] })
+  const report = await quietClose(m.inst, { deps: m.deps })
+  assert.deepEqual(m.calls.terminate.sort(), [501, 503])
+  assert.deepEqual(report.unresolved, [])
+})
+
+for (const [name, snapshots] of [
+  ['inventory failing before the close', [new Error('Access denied')]],
+  ['inventory failing after the close', [owned, new Error('query timed out')]]
+]) {
+  test(`safeClose: ${name} means zero kills and an unresolved report, never a pid fallback`, async () => {
+    const m = machine({ snapshots })
+    m.inst.pids.add(500); m.inst.pids.add(501)
+    const report = await quietClose(m.inst, { deps: m.deps })
+    assert.deepEqual(m.calls.terminate, [])
+    assert.ok(report.unresolved.some(entry => /process inventory failed/.test(entry.reason)))
+  })
+}
+
+test('safeClose: an instance with only numeric pids (no registered identity) kills nothing', async () => {
+  const m = machine({ snapshots: [owned], roots: [] })
+  for (const pid of [500, 501, 502, 503]) m.inst.pids.add(pid)
+  const report = await quietClose(m.inst, { deps: m.deps })
+  assert.deepEqual(m.calls.terminate, [])
+  assert.equal(m.calls.list, 0)
+  assert.match(report.unresolved[0].reason, /no registered root identity/)
+})
+
+test('safeClose: a root from a stale generation is not authority', async () => {
+  const m = machine({ snapshots: [owned] })
+  m.inst.roots[0].generation = 'an-earlier-run'
+  const report = await quietClose(m.inst, { deps: m.deps })
+  assert.deepEqual(m.calls.terminate, [])
+  assert.ok(report.unresolved.some(entry => /another generation/.test(entry.reason)))
+})
+
+test('safeClose: a member pid reused by the same program after the close is left alone', async () => {
+  const reusedAfter = [proc(500, 400, 7000), proc(501, 500, 7001), owned[4]]
+  const m = machine({ snapshots: [owned, reusedAfter] })
+  const report = await quietClose(m.inst, { deps: m.deps })
+  assert.deepEqual(m.calls.terminate, [])
+  assert.deepEqual(report.leftovers, [])
+})
+
+test('safeClose: a member whose identity is unreadable after the close is reported, not killed', async () => {
+  const partial = [proc(500, 400, 1000), proc(501, 500, null), owned[4]]
+  const m = machine({ snapshots: [[owned[0], owned[1], owned[4]], partial, [owned[4]]] })
+  const report = await quietClose(m.inst, { deps: m.deps })
+  assert.deepEqual(m.calls.terminate, [500])
+  assert.ok(report.unresolved.some(entry => entry.pid === 501 && /no readable OS identity/.test(entry.reason)))
+})
+
+test('safeClose: a pid that changed between selection and kill is refused by the kill helper and not counted', async () => {
+  const m = machine({ snapshots: [[owned[0], owned[4]], [owned[0], owned[4]], [owned[4]]], terminate: () => ({ state: 'mismatch', creationTime: '42', executable: EXE }) })
+  const report = await quietClose(m.inst, { deps: m.deps })
+  assert.deepEqual(report.killed, [])
+  assert.equal(report.attempts[0].result.state, 'mismatch')
+})
+
+test('safeClose: kill-helper failure or hang is bounded and the survivor is a leftover', async () => {
+  for (const terminate of [() => ({ state: 'unknown', detail: 'kill helper exited 1' }), () => new Promise(() => {})]) {
+    const m = machine({ snapshots: [[owned[0], owned[4]]], terminate })
+    const started = Date.now()
+    const report = await quietClose(m.inst, { deps: m.deps, killWindowMs: 50 })
+    assert.ok(Date.now() - started < 5000)
+    assert.deepEqual(report.leftovers, [{ pid: 500, name: 'electron.exe' }])
+    assert.equal(report.attempts[0].result.state, 'unknown')
+  }
+})
+
+test('safeClose: an explicitly registered relaunch is owned; its exited predecessor is only noted', async () => {
+  const relaunch = proc(800, 1, 3000)
+  const m = machine({ snapshots: [[relaunch, proc(801, 800, 3001), owned[4]], [relaunch, owned[4]], [owned[4]]], roots: [root, idOf(relaunch)] })
+  const report = await quietClose(m.inst, { deps: m.deps })
+  assert.deepEqual(m.calls.terminate, [800])
+  assert.deepEqual(report.unresolved, [])
+  assert.match(report.notes[0].reason, /no longer running/)
+})
+
+// ---- S-B3: relaunch needs this profile's credential, written while the process already held the pid.
+const BUILD_PATH = 'C:\\repo\\out\\main\\index.js'
+const PROFILE = 'C:\\Temp\\conductor-kit-abc\\profile'
+// Creation 3000 s after the Unix epoch, as listProcesses' microseconds since 1601.
+const US_1601 = ms => String((BigInt(ms) + 11_644_473_600_000n) * 1000n)
+const relaunchInst = () => {
+  const inst = newInstance({ name: 'kit-test', build: BUILD_PATH, profile: PROFILE })
+  inst.roots.push({ ...root, creationTime: US_1601(1_000_000), generation: inst.generation, source: 'launch' })
+  return inst
+}
+const relaunchedApp = (over = {}) => proc(800, 1, US_1601(3_000_000), { commandLine: `"C:\\e\\electron.exe" --remote-debugging-port=1 "${BUILD_PATH}"`, ...over })
+const proofFor = (over = {}) => ({ path: `${PROFILE}\\control-owner.json`, pid: 800, mtimeMs: 3_000_500, ...over })
+
+test('registerRelaunch accepts the app this profile\'s credential names, proven alive when it was written', async () => {
+  const inst = relaunchInst()
+  const registered = await registerRelaunch(inst, 800, { list: [relaunchedApp()], credential: proofFor() })
+  assert.equal(registered.source, 'relaunch')
+  assert.ok(inst.roots.some(entry => entry.pid === 800))
+})
+
+for (const [name, entry, credential, message] of [
+  ['stale credential pid reused by a foreign same-image, same-build app', relaunchedApp({ creationTime: US_1601(3_600_000) }), proofFor(), /created after the profile credential was written/],
+  ['a credential from another profile', relaunchedApp(), proofFor({ path: 'C:\\Temp\\conductor-other\\profile\\control-owner.json' }), /own profile/],
+  ['no credential at all', relaunchedApp(), null, /own profile/],
+  ['a credential naming another pid', relaunchedApp(), proofFor({ pid: 801 }), /names pid 801/],
+  ['a build-prefix lookalike argument', relaunchedApp({ commandLine: `electron "${BUILD_PATH}.bak"` }), proofFor(), /build is not one of its arguments/],
+  ['a build path only inside another argument', relaunchedApp({ commandLine: `electron --x=${BUILD_PATH}` }), proofFor(), /build is not one of its arguments/],
+  ['a different Electron image', relaunchedApp({ executable: 'C:\\other\\electron.exe' }), proofFor(), /no earlier root of this generation/],
+  ['an unreadable identity', relaunchedApp({ creationTime: null }), proofFor(), /unreadable/]
+]) {
+  test(`registerRelaunch refuses ${name}: nothing registered, nothing killed`, async () => {
+    const inst = relaunchInst()
+    await assert.rejects(registerRelaunch(inst, 800, { list: [entry], credential }), message)
+    assert.equal(inst.roots.length, 1)
+  })
+}
+
+test('registerRelaunch refuses when only another generation\'s root runs the image', async () => {
+  const inst = relaunchInst()
+  inst.roots[0].generation = 'an-earlier-run'
+  await assert.rejects(registerRelaunch(inst, 800, { list: [relaunchedApp()], credential: proofFor() }), /no earlier root of this generation/)
+})
+
+// ---- Correction review S-C1: register only a child still running after its snapshot.
+test('registerOwnChild: a child that exited (or was signalled) before the snapshot check is never registered', async () => {
+  for (const child of [{ pid: 800, exitCode: 0, signalCode: null }, { pid: 800, exitCode: null, signalCode: 'SIGKILL' }, null]) {
+    const inst = newInstance({ name: 'kit-test' })
+    await assert.rejects(registerOwnChild(inst, child, { source: 'launch', list: [relaunchedApp()], spawnedAtMs: 2_999_000, now: () => 3_001_000 }), /exited before its identity was read/)
+    assert.deepEqual(inst.roots, [])
+  }
+})
+
+test('registerOwnChild: a live child inside the spawn window registers (control); outside it does not', async () => {
+  const live = { pid: 800, exitCode: null, signalCode: null }
+  const inst = newInstance({ name: 'kit-test' })
+  assert.equal((await registerOwnChild(inst, live, { source: 'launch', list: [relaunchedApp()], spawnedAtMs: 2_999_000, now: () => 3_001_000 })).pid, 800)
+  for (const [spawnedAtMs, now] of [[3_100_000, () => 3_101_000], [2_000_000, () => 2_900_000]]) {
+    const fresh = newInstance({ name: 'kit-test' })
+    await assert.rejects(registerOwnChild(fresh, live, { source: 'launch', list: [relaunchedApp()], spawnedAtMs, now }), /outside the spawn window/)
+    assert.deepEqual(fresh.roots, [])
+  }
+})
+
+test('commandHasArg matches whole arguments only', () => {
+  assert.equal(commandHasArg(`electron "${BUILD_PATH}" --x`, BUILD_PATH), true)
+  assert.equal(commandHasArg(`electron C:/repo/out/main/index.js`, BUILD_PATH), true)
+  assert.equal(commandHasArg(`electron ${BUILD_PATH}x`, BUILD_PATH), false)
+  assert.equal(commandHasArg('', BUILD_PATH), false)
+  assert.equal(creationMs(US_1601(3_000_000)), 3_000_000)
+})
+
+// ---- S-B2: unknown identity is never exit, and an exited root proves nothing about its orphans.
+
+test('safeClose: a kill that returns unknown, then a same-pid row with unreadable identity, is unresolved - not exit', async () => {
+  const unreadable = { ...owned[0], creationTime: null }
+  const m = machine({ snapshots: [[owned[0], owned[4]], [owned[0], owned[4]], [unreadable, owned[4]]], terminate: () => ({ state: 'unknown', detail: 'kill helper exited 1' }) })
+  const report = await quietClose(m.inst, { deps: m.deps })
+  assert.deepEqual(report.leftovers, [])
+  assert.ok(report.unresolved.some(entry => entry.pid === 500 && /unreadable OS identity: exit not proven/.test(entry.reason)), JSON.stringify(report.unresolved))
+})
+
+test('safeClose: a member pid now held by a valid different identity has exited (control)', async () => {
+  const m = machine({ snapshots: [[owned[0], owned[4]], [owned[0], owned[4]], [{ ...owned[0], creationTime: '999999' }, owned[4]]] })
+  const report = await quietClose(m.inst, { deps: m.deps })
+  assert.deepEqual(report.leftovers, [])
+  assert.deepEqual(report.unresolved, [])
+})
+
+test('safeClose: a root that exited before its descendants were ever observed cannot close clean', async () => {
+  const m = machine({ snapshots: [[owned[4]]], observed: false })
+  const report = await quietClose(m.inst, { deps: m.deps })
+  assert.deepEqual(m.calls.terminate, [])
+  assert.match(report.unresolved[0].reason, /never observed/)
+})
+
+test('safeClose: an observed exited root with a possible untracked orphan is unresolved and the orphan is untouched', async () => {
+  const orphan = proc(950, 500, 1500, { name: 'node.exe', executable: EXE })
+  const m = machine({ snapshots: [[orphan, owned[4]]] })
+  const report = await quietClose(m.inst, { deps: m.deps })
+  assert.deepEqual(m.calls.terminate, [])
+  assert.deepEqual(report.unresolved.map(entry => entry.pid), [950])
+})
+
+test('safeClose: an observed exited root with no possible orphans is only a note (clean control)', async () => {
+  const older = proc(960, 500, 900) // lists 500 as parent but predates the root: not its child
+  const m = machine({ snapshots: [[older, owned[4]]] })
+  const report = await quietClose(m.inst, { deps: m.deps })
+  assert.deepEqual(report.unresolved, [])
+  assert.match(report.notes[0].reason, /no longer running/)
+})
+
+test('registerRoot tracks the subtree its own snapshot shows, marking it observed', async () => {
+  const inst = newInstance({ name: 'kit-test' })
+  await registerRoot(inst, 500, { source: 'launch', list: owned })
+  assert.deepEqual(inst.roots.map(entry => entry.pid).sort(), [500, 501, 502, 503])
+  assert.ok(inst.roots.every(entry => entry.observedTree))
+})
+
+test('startTracking: a failed inventory is counted, never read as no descendants; stopTracking stops it', async () => {
+  const inst = newInstance({ name: 'kit-test' })
+  await registerRoot(inst, 500, { source: 'launch', list: [owned[0]] })
+  let calls = 0
+  const tick = startTracking(inst, { intervalMs: 60_000, list: async () => { calls++; if (calls === 1) throw new Error('denied'); return { list: owned } } })
+  // The first (immediate) tick fails; later ones run one at a time once it has settled.
+  for (let i = 0; i < 4; i++) { await new Promise(resolve => setImmediate(resolve)); await tick() }
+  assert.ok(inst.trackFailures >= 1)
+  assert.deepEqual(inst.roots.map(entry => entry.pid).sort(), [500, 501, 502, 503])
+  stopTracking(inst)
+  assert.equal(inst.tracker, null)
+})
+
+// ---- S-B5 / S-B6 helpers
+
+test('assertBuildHash: the build about to launch must be the granted bytes', () => {
+  const good = 'a'.repeat(64)
+  assert.equal(assertBuildHash('C:\\b\\index.js', good, { digest: () => good }), good)
+  assert.throws(() => assertBuildHash('C:\\b\\index.js', good, { digest: () => 'b'.repeat(64) }), /not the granted/)
+  assert.throws(() => assertBuildHash('C:\\b\\index.js', 'short', { digest: () => good }), /full sha256/)
+  assert.throws(() => assertBuildHash('C:\\b\\index.js', good, { digest: () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }) } }), /cannot be read: ENOENT/)
+})
+
+test('parseProcessList reports a malformed row by field names only, never its command line', () => {
+  const secret = 'SYNTHETIC-KEY-0123456789abcdef0123456789abcdef'
+  let message = ''
+  try { parseProcessList(JSON.stringify([{ Name: 'llama-server.exe', CommandLine: `llama-server --api-key ${secret}` }])) } catch (error) { message = error.message }
+  assert.match(message, /without a process id \(fields: Name:string, CommandLine:string\)/)
+  assert.ok(!message.includes(secret))
+})
+
+test('trackDescendants keeps verified identities attributable after their parent exits, and nothing else', async () => {
+  const m = machine({ snapshots: [[proc(501, 500, 1001), proc(503, 502, 1003), proc(900, 500, 50000), owned[4]], [proc(501, 500, 1001), proc(503, 502, 1003), owned[4]], [owned[4]]] })
+  assert.deepEqual(trackDescendants(m.inst, owned).map(entry => entry.pid).sort(), [501, 502, 503])
+  assert.equal(trackDescendants(m.inst, owned).length, 0, 'idempotent')
+  assert.deepEqual(leavesFirst(ownedTree(owned, m.inst.roots).members).map(member => member.pid), [503, 501, 502, 500], 'tracked roots keep their depth')
+  // Root and 502 exit; 900 lists the dead root's pid as its parent. Only proven identities are
+  // killed, and 900 - which may be an untracked orphan - keeps the close from counting as clean.
+  const report = await quietClose(m.inst, { deps: m.deps })
+  assert.deepEqual(m.calls.terminate.sort(), [501, 503])
+  assert.deepEqual(report.unresolved.map(entry => entry.pid), [900])
+  assert.match(report.unresolved[0].reason, /possible untracked orphan of exited root 500/)
+  m.inst.roots.forEach(root => assert.equal(root.generation, m.inst.generation))
+})
+
+test('registerRoot with `under` needs a verified descendant in the same snapshot', async () => {
+  const inst = newInstance({ name: 'kit-test' })
+  assert.equal((await registerRoot(inst, 501, { source: 'electron main', list: owned, under: [root] })).pid, 501)
+  await assert.rejects(registerRoot(inst, 700, { source: 'electron main', list: owned, under: [root] }), /not a verified descendant/)
+  await assert.rejects(registerRoot(inst, 999, { source: 'x', list: owned }), /not running/)
+})
+
+// Read-only on this machine: the inventory's identity for a child of this test equals what the
+// kill helper reads through its own handle (same precision), and a wrong image is refused unkilled.
+test('listProcesses and terminateIdentity agree on a live identity and refuse a mismatch', { skip: process.platform !== 'win32' }, async () => {
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true })
+  await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject) })
+  try {
+    const { list } = await listProcesses()
+    const identity = identityOf(list.find(entry => entry.pid === child.pid))
+    assert.ok(identity, 'no identity for our own child')
+    assert.equal(identity.executable.toLowerCase(), process.execPath.toLowerCase())
+    const refused = await terminateIdentity({ ...identity, executable: 'C:\\Windows\\notepad.exe' }, { budgetMs: 15_000 })
+    assert.equal(refused.state, 'mismatch')
+    assert.equal(refused.creationTime, identity.creationTime, 'inventory and handle disagree on creation time precision')
+    assert.equal(child.exitCode, null)
+  } finally { child.kill() }
 })
 
 test('ancestorsOf walks the parent chain and survives a reused-pid cycle', () => {
@@ -84,9 +450,9 @@ test('readGateThresholds reads the live schedule-gate.ts (CPU 30 %, GPU 40 % per
 
 test('judgeLoad is quiet only with no foreign lock, low CPU and GPU, idle llama and no extra mid-turn tab', () => {
   const thresholds = { machineCpuPercent: 30, gpuPercent: 40 }
-  const quiet = { lock: { held: true, self: true, holder: { pid: 300 } }, cpuPercent: 12, gpuPercent: 3, llama: [{ pid: 9, port: 8081, busy: false }], midTurn: { count: 1 } }
+  const quiet = { inventory: { ok: true }, lock: { held: true, self: true, holder: { pid: 300 } }, cpuPercent: 12, gpuPercent: 3, llama: [{ pid: 9, port: 8081, busy: false }], midTurn: { count: 1 } }
   assert.deepEqual(judgeLoad(quiet, thresholds), { quiet: true, reasons: [] })
-  const loaded = { lock: { held: true, self: false, holder: { pid: 77, command: 'node smoke-other.mjs' } }, cpuPercent: 30, gpuPercent: 64, llama: [{ pid: 9, port: 8081, busy: true }, { pid: 10, port: 8082, busy: null }], midTurn: { count: 3 } }
+  const loaded = { inventory: { ok: true }, lock: { held: true, self: false, holder: { pid: 77, command: 'node smoke-other.mjs' } }, cpuPercent: 30, gpuPercent: 64, llama: [{ pid: 9, port: 8081, busy: true }, { pid: 10, port: 8082, busy: null }], midTurn: { count: 3 } }
   const { quiet: isQuiet, reasons } = judgeLoad(loaded, thresholds)
   assert.equal(isQuiet, false)
   assert.equal(reasons.length, 6)
@@ -94,6 +460,80 @@ test('judgeLoad is quiet only with no foreign lock, low CPU and GPU, idle llama 
   assert.equal(judgeLoad({ ...quiet, midTurn: { count: 0 } }, thresholds, { selfTabs: 0 }).quiet, true)
   assert.equal(judgeLoad({ ...quiet, midTurn: { count: 1 } }, thresholds, { selfTabs: 0 }).quiet, false)
   assert.deepEqual(judgeLoad({ ...quiet, cpuPercent: null, gpuPercent: null, midTurn: { count: null, note: 'refused' } }, thresholds).reasons, ['CPU load unknown', 'GPU load unknown', 'mid-turn tabs unknown (refused)'])
+})
+
+test('judgeLoad: a missing or failed process inventory and an unreadable lock are never quiet', () => {
+  const thresholds = { machineCpuPercent: 30, gpuPercent: 40 }
+  const quiet = { inventory: { ok: true }, lock: { held: false }, cpuPercent: 5, gpuPercent: 1, llama: [], midTurn: { count: 1 } }
+  assert.equal(judgeLoad(quiet, thresholds).quiet, true)
+  assert.deepEqual(judgeLoad({ ...quiet, inventory: { ok: false, error: 'process query took over 30 s' } }, thresholds).reasons, ['process inventory unavailable (process query took over 30 s)'])
+  assert.deepEqual(judgeLoad({ ...quiet, inventory: undefined }, thresholds).reasons, ['process inventory unavailable'])
+  assert.deepEqual(judgeLoad({ ...quiet, lock: { held: false, unknown: true } }, thresholds).reasons, ['smoke lock state unknown (holder file unreadable)'])
+})
+
+const TOKEN = 't'.repeat(64)
+const ENDPOINT = 'http://127.0.0.1:55908/control'
+
+test('suppliedControl takes only the caller\'s own loopback endpoint and token from its environment', () => {
+  assert.deepEqual(suppliedControl({ CONDUCTOR_CONTROL_ENDPOINT: ENDPOINT, CONDUCTOR_CONTROL_TOKEN: TOKEN }), { endpoint: ENDPOINT, token: TOKEN })
+  assert.deepEqual(suppliedControl({ CONDUCTOR_CONTROL_ENDPOINT: ENDPOINT, CONDUCTOR_CONTROL_TOKEN: TOKEN, CONDUCTOR_CONTROL_PROJECT_ID: 'p1', CONDUCTOR_CONTROL_WORKSPACE_ID: 'w1' }), { endpoint: ENDPOINT, token: TOKEN, projectId: 'p1', workspaceId: 'w1' })
+  for (const env of [{}, { CONDUCTOR_CONTROL_ENDPOINT: ENDPOINT }, { CONDUCTOR_CONTROL_TOKEN: TOKEN }, { CONDUCTOR_CONTROL_ENDPOINT: 'http://example.com:55908/control', CONDUCTOR_CONTROL_TOKEN: TOKEN },
+    { CONDUCTOR_CONTROL_ENDPOINT: 'https://127.0.0.1:1/x', CONDUCTOR_CONTROL_TOKEN: TOKEN }, { CONDUCTOR_CONTROL_ENDPOINT: ENDPOINT, CONDUCTOR_CONTROL_TOKEN: 'short' },
+    { CONDUCTOR_CONTROL_ENDPOINT: ENDPOINT, CONDUCTOR_CONTROL_TOKEN: TOKEN, CONDUCTOR_CONTROL_WORKSPACE_ID: 'w1' }, { APPDATA: 'C:\\Users\\x\\AppData\\Roaming' }])
+    assert.equal(suppliedControl(env), null, JSON.stringify(env))
+})
+
+/** A scripted control endpoint: `routes[method]` answers ({status, body}) given the request scope. */
+function controlServer(routes) {
+  const calls = []
+  const fetchImpl = async (url, init) => {
+    const request = JSON.parse(init.body)
+    calls.push({ url, method: request.method, scope: request.scope ?? null, auth: init.headers.Authorization })
+    const answer = routes[request.method]?.(request.scope) ?? { status: 404, body: { error: 'unknown' } }
+    return { status: answer.status ?? 200, json: async () => { if (answer.raw) throw new Error('bad json'); return answer.body } }
+  }
+  return { calls, fetchImpl }
+}
+const ok = result => ({ status: 200, body: { result } })
+
+test('midTurnTabs counts mid-turn tabs across every project and workspace through the supplied credential', async () => {
+  const server = controlServer({
+    'projects.list': () => ok([{ id: 'p1', workspaces: [{ id: 'w1' }, { id: 'w2' }] }, { id: 'p2', workspaces: [{ id: 'w3' }] }]),
+    'agents.list': scope => ok({ w1: [{ agentSessionId: 'a1', phase: 'running' }, { agentSessionId: 'a2', phase: 'idle' }], w2: [], w3: [{ agentSessionId: 'a3', phase: 'waiting_approval' }] }[scope.workspaceId])
+  })
+  const result = await midTurnTabs({ control: { endpoint: ENDPOINT, token: TOKEN, projectId: 'p1', workspaceId: 'w1' }, fetchImpl: server.fetchImpl })
+  assert.equal(result.count, 2)
+  assert.deepEqual(result.tabs.map(tab => tab.agentSessionId), ['a1', 'a3'])
+  assert.ok(server.calls.every(call => call.url === ENDPOINT && call.auth === `Bearer ${TOKEN}`))
+  assert.deepEqual(server.calls[0].scope, { projectId: 'p1', workspaceId: 'w1' })
+  assert.deepEqual(server.calls.slice(1).map(call => call.scope.workspaceId), ['w1', 'w2', 'w3'])
+})
+
+test('midTurnTabs is unknown, never zero, without a credential or with any incomplete listing', async () => {
+  const none = await midTurnTabs({ control: null, fetchImpl: async () => { throw new Error('must not be called') } })
+  assert.equal(none.count, null)
+  assert.match(none.note, /owner credential is never used/)
+  const control = { endpoint: ENDPOINT, token: TOKEN }
+  const projects = ok([{ id: 'p1', workspaces: [{ id: 'w1' }] }, { id: 'p2', workspaces: [{ id: 'w2' }] }])
+  for (const [name, routes] of [
+    ['projects.list refused', { 'projects.list': () => ({ status: 403, body: { error: `denied for ${TOKEN}` } }) }],
+    ['no projects', { 'projects.list': () => ok([]) }],
+    ['project without workspace list', { 'projects.list': () => ok([{ id: 'p1' }]) }],
+    ['one workspace refused', { 'projects.list': () => projects, 'agents.list': scope => scope.projectId === 'p2' ? { status: 403, body: { error: 'cross-project' } } : ok([]) }],
+    ['agents.list not a list', { 'projects.list': () => projects, 'agents.list': () => ok({ agents: [] }) }],
+    ['agent without phase', { 'projects.list': () => projects, 'agents.list': () => ok([{ agentSessionId: 'a1' }]) }],
+    ['unreadable body', { 'projects.list': () => ({ status: 200, raw: true }) }]
+  ]) {
+    const result = await midTurnTabs({ control, fetchImpl: controlServer(routes).fetchImpl })
+    assert.equal(result.count, null, name)
+    assert.ok(!String(result.note).includes(TOKEN), `${name}: note leaks the token`)
+  }
+})
+
+test('verify-kit never reads the installed owner credential for load admission', () => {
+  const source = readFileSync(join(REPO, 'scripts', 'verify-kit.mjs'), 'utf8')
+  assert.doesNotMatch(source, /APPDATA/)
+  assert.doesNotMatch(source, /'Conductor', 'control-owner\.json'/)
 })
 
 test('VERDICT holds the v3 vocabulary and NOT RUN must name its reason', () => {

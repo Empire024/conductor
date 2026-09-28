@@ -1,13 +1,15 @@
 import { _electron as electron, expect } from '@playwright/test'
-import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { execFileSync } from 'node:child_process'
+import { appendFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { acceptanceFailures, auditSoak } from './lib/durable-attempt-audit.mjs'
 import { stopDurableSmokeServer } from './lib/stop-durable-smoke-server.mjs'
-import { safeClose } from './verify-kit.mjs'
+import { assertBuildHash, identityOf, listProcesses, newInstance, registerPlaywrightRoots, safeClose, sameIdentity, startTracking, terminateIdentity } from './verify-kit.mjs'
 
 // End-to-end check of durable local-model jobs in the built app (docs/durable-jobs.md). The app
 // runs parked off-screen under CONDUCTOR_TEST_USER_DATA, is driven as the owner through
@@ -43,12 +45,21 @@ import { safeClose } from './verify-kit.mjs'
 //                   pass is refused. After a second restart the job is still blocked, nothing is
 //                   rewritten, and one resume continues it once in a fresh conversation to completion.
 //   --soak          (with --real-model --fixture=crossref or --fixture=index) only this: the
-//                   fixture's job runs back to back, unattended, for DURABLE_SMOKE_TIMEOUT_MS
-//                   (default 6h, minus a 15-minute buffer for the last iteration). Both fixtures
-//                   force a lower contextRolloverFraction so every iteration rolls over reliably
-//                   (crossref across its four stages, index across the one). Asserts at least one
-//                   rollover, at least two iterations, at least one completed iteration, and no
-//                   iteration blocked on "used all N attempts" from rollovers alone.
+//                   fixture's job runs back to back, unattended, until the measured workload time
+//                   reaches DURABLE_SOAK_WORKLOAD_MS (default 6h; iterations start only before
+//                   that, the last one is bounded by the stage timeout, and the overall watchdog is
+//                   workload + stage timeout + 10 minutes of cleanup - give smoke-lock at least that).
+//                   Outputs are cleared before each iteration and a completed one is checked
+//                   against the fixture's own truth. Both fixtures force a lower
+//                   contextRolloverFraction so every iteration rolls over reliably. Asserts the
+//                   measured workload, at least one rollover, two iterations and one content-
+//                   verified completion; the stage-aware attempt audit
+//                   (scripts/lib/durable-attempt-audit.mjs) over each job's full paged ledger must
+//                   find no violation and no unprovable job, and a credited rollover that went on
+//                   is reported EXERCISED or NOT EXERCISED. Per-stage ledgers are appended to
+//                   artifacts/durable-jobs/soak-ledger.ndjson as each iteration settles.
+//   --kill-server / --restart-app on the main job also require that same job to end completed with
+//                   correct output: a report for blocked or cancelled work is not a recovery.
 // Every observation is printed with its timestamp; the JSON summary is the evidence.
 const argv = process.argv.slice(2)
 const flag = name => argv.some(arg => arg === `--${name}` || arg.startsWith(`--${name}=`))
@@ -56,6 +67,14 @@ const value = (name, fallback) => argv.find(arg => arg.startsWith(`--${name}=`))
 const realModel = flag('real-model')
 const model = value('real-model', value('model', 'local/qwen3.6-35b-a3b'))
 if (flag('kill-server') && !realModel) throw new Error('--kill-server needs --real-model: there is no llama-server to kill in stub mode')
+// --app=<abs path to out/main/index.js> --app-sha256=<hash>: launch exactly that build, hashed again
+// right before each launch. Without --app, the checkout's out/main/index.js (unhashed, as before).
+const appPath = resolve(value('app', 'out/main/index.js'))
+const appSha256 = value('app-sha256', null)
+if (flag('app') !== Boolean(appSha256)) throw new Error('--app and --app-sha256 go together: a named build is launched only with its hash')
+// --acceptance: the uninterrupted control for a fault run; like --kill-server/--restart-app it
+// requires the same job to complete with correct output.
+const acceptanceRun = flag('acceptance') || flag('kill-server') || flag('restart-app')
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-durable-jobs-'))
 const output = resolve('artifacts/durable-jobs')
@@ -104,6 +123,34 @@ if (fixture === 'index') {
     while (lines.join('\n').length < 2_000) lines.push(`filler ${lines.length} for ${name}: ${'x'.repeat(60)}`)
     await writeFile(join(projectPath, 'inputs', name), lines.join('\n') + '\n')
   }
+}
+/** What a correct run of the fixture leaves in the project, checked against the fixture's own
+ *  construction (not against the model's claims). Returns the list of problems; empty is correct. */
+const outputProblems = async () => {
+  const read = async path => { try { return await readFile(join(projectPath, path), 'utf8') } catch { return null } }
+  const problems = []
+  if (fixture === 'crossref') {
+    for (const name of MODULES) if (!(await read(`notes/${name}.md`))?.trim()) problems.push(`notes/${name}.md missing or empty`)
+    const table = (await read('CROSSREF.md')) ?? ''
+    if (!table.trim()) problems.push('CROSSREF.md missing or empty')
+    const lines = table.split(/\r?\n/).map(line => line.toLowerCase())
+    for (const [index, name] of MODULES.entries()) {
+      const next = MODULES[(index + 1) % MODULES.length], other = MODULES[(index + 3) % MODULES.length]
+      for (const [from, fns] of [[next, [`${next}Transform0`, `${next}Check0`]], [other, [`${other}Transform1`]]])
+        if (!lines.some(line => line.includes(name) && line.includes(from) && fns.every(fn => line.includes(fn.toLowerCase())))) problems.push(`CROSSREF.md has no row: ${name} imports ${fns.join(', ')} from ${from}`)
+    }
+  } else if (fixture === 'index') {
+    const lines = ((await read('INDEX.md')) ?? '').split(/\r?\n/).map(line => line.trim()).filter(Boolean)
+    const expected = Array.from({ length: INDEX_FILE_COUNT }, (_, i) => `file${String(i + 1).padStart(3, '0')}.txt: TOKEN-${String(i + 1).padStart(3, '0')}`)
+    if (lines.length !== expected.length) problems.push(`INDEX.md has ${lines.length} lines, expected ${expected.length}`)
+    const wrong = expected.findIndex((line, i) => lines[i] !== line)
+    if (wrong >= 0) problems.push(`INDEX.md line ${wrong + 1} is ${JSON.stringify(lines[wrong] ?? null)}, expected ${JSON.stringify(expected[wrong])}`)
+  } else if (!/(^|\n)durable smoke\s*$/.test((await read('notes.txt')) ?? '')) problems.push('notes.txt does not end with the line durable smoke')
+  return problems
+}
+/** Clears the fixture's outputs so each soak iteration's content is its own work. */
+const clearOutputs = async () => {
+  for (const path of fixture === 'crossref' ? ['notes', 'CROSSREF.md'] : fixture === 'index' ? ['INDEX.md'] : []) await rm(join(projectPath, path), { recursive: true, force: true })
 }
 const git = (...args) => execFileSync('git', args, { cwd: projectPath, stdio: 'pipe' }).toString().trim()
 git('init', '-q', '-b', 'main'); git('-c', 'user.email=smoke@example.invalid', '-c', 'user.name=Smoke', 'add', '.'); git('-c', 'user.email=smoke@example.invalid', '-c', 'user.name=Smoke', 'commit', '-q', '-m', 'Initial')
@@ -179,11 +226,16 @@ const credential = async expectedPid => {
   return JSON.parse(await readFile(path, 'utf8'))
 }
 const launch = async label => {
-  app = await electron.launch({ args: [resolve('out/main/index.js')], env, timeout: 60_000 })
+  // The granted build, re-hashed immediately before every launch (relaunches included), is the one
+  // Electron gets: a shared out/ rebuilt between the grant and the launch is refused, not run.
+  if (appSha256) assertBuildHash(appPath, appSha256)
+  const spawnedAtMs = Date.now()
+  app = await electron.launch({ args: [appPath], env, timeout: 60_000 })
   const launcherPid = app.process().pid
-  instance = { app, profile, pids: new Set([launcherPid]), closed: false }
-  const mainPid = await app.evaluate(() => process.pid)
-  instance.pids.add(mainPid)
+  // Cleanup authority is the launch's own OS identities (verify-kit roots), never a pid set.
+  instance = newInstance({ name: 'durable-jobs', app, profile, root, build: appPath })
+  const mainPid = await registerPlaywrightRoots(instance, app, { spawnedAtMs })
+  startTracking(instance, { log: message => observe('tracking', { message }) })
   owner = await credential(mainPid)
   assert.equal(owner.pid, mainPid, 'parked owner credential does not name Electron main')
   page = await app.firstWindow()
@@ -197,6 +249,7 @@ const closeApp = async label => {
   const closed = await safeClose(instance)
   observe(label, { cleanup: closed })
   assert.deepEqual(closed.leftovers, [], `${label}: parked process tree survived cleanup`)
+  assert.deepEqual(closed.unresolved, [], `${label}: cleanup could not account for every process`)
   await expect.poll(() => profileProcesses().length, { timeout: 10_000 }).toBe(0)
   instance = null
   return closed
@@ -209,6 +262,18 @@ const call = async (method, args = {}, { expectError = false } = {}) => {
   return body.result
 }
 const status = jobId => call('jobs.status', { jobId })
+/** Every event of a job, paged to the end. `complete` only when the pages ran out on their own and
+ *  the first event is the job's creation: a last-N slice is never proof of a whole ledger. */
+const allEvents = async (jobId, maxPages = 500) => {
+  const all = []
+  for (let after, pages = 0; pages < maxPages; pages++) {
+    const page = await call('jobs.events', { jobId, limit: 200, ...(after ? { afterId: after } : {}) })
+    all.push(...page)
+    if (page.length < 200) return { events: all, complete: all[0]?.kind === 'transition' && all[0]?.data?.to === 'queued' }
+    after = page.at(-1).id
+  }
+  return { events: all, complete: false }
+}
 const waitFor = async (jobId, predicate, label, timeout) => {
   let last
   try { await expect.poll(async () => predicate(last = await status(jobId)), { timeout, intervals: [1000] }).toBe(true) }
@@ -227,7 +292,11 @@ const jobTabIn = async () => page.evaluate(async id => {
 }, projectId)
 
 const STAGE_TIMEOUT = Number(process.env.DURABLE_SMOKE_STAGE_TIMEOUT_MS ?? (realModel ? 20 * 60_000 : 90_000))
-const watchdog = setTimeout(() => { observe('watchdog: giving up'); process.stdout.write(JSON.stringify({ root, observations }, null, 2) + '\n', () => process.exit(1)) }, Number(process.env.DURABLE_SMOKE_TIMEOUT_MS ?? (realModel ? 90 : 10) * 60_000))
+const SOAK_WORKLOAD_MS = Number(process.env.DURABLE_SOAK_WORKLOAD_MS ?? 6 * 3_600_000)
+// A soak's watchdog covers the whole workload, its bounded last iteration and ten minutes of
+// cleanup; a smaller DURABLE_SMOKE_TIMEOUT_MS cannot cut the workload short.
+const WATCHDOG_MS = flag('soak') ? Math.max(Number(process.env.DURABLE_SMOKE_TIMEOUT_MS ?? 0), SOAK_WORKLOAD_MS + STAGE_TIMEOUT + 10 * 60_000) : Number(process.env.DURABLE_SMOKE_TIMEOUT_MS ?? (realModel ? 90 : 10) * 60_000)
+const watchdog = setTimeout(() => { observe('watchdog: giving up'); process.stdout.write(JSON.stringify({ root, observations }, null, 2) + '\n', () => process.exit(1)) }, WATCHDOG_MS)
 let failed = null
 try {
   await launch('app launched (parked)')
@@ -290,14 +359,19 @@ try {
   // --- Blocked restart: a job blocked with its stage still running continues once after restarts --
   if (flag('blocked-restart')) {
     if (!stub) throw new Error('--blocked-restart scripts the stub model; run it without --real-model')
-    const events = async jobId => { const all = []; for (let after; ;) { const page = await call('jobs.events', { jobId, limit: 200, ...(after ? { afterId: after } : {}) }); all.push(...page); if (page.length < 200) return all; after = page.at(-1).id } }
-    // A hard stop of the whole tree: the crash reconcile.ts exists for (a graceful quit with a job
-    // running waits on a dialog). The next launch waits until nothing holds the profile.
+    const events = async jobId => (await allEvents(jobId)).events
+    // A hard stop of Electron main: the crash reconcile.ts exists for (a graceful quit with a job
+    // running waits on a dialog). Only the registered main identity is killed, on its own handle;
+    // its children go with it, and safeClose accounts for any that do not.
     const kill = async label => {
-      const pid = app.process().pid
-      try { execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'pipe' }) } catch { /* already gone */ }
+      const main = instance.roots.find(entry => entry.pid === owner.pid)
+      assert.ok(main, `parked main pid ${owner.pid} is not a registered root`)
+      const result = await terminateIdentity(main, { budgetMs: 15_000 })
+      assert.ok(['exited', 'signalled', 'absent'].includes(result.state), `kill of parked main refused or failed: ${JSON.stringify(result)}`)
+      // Observation only (never a kill grant): the next launch waits until nothing holds the profile.
       await expect.poll(() => profileProcesses().length, { timeout: 30_000 }).toBe(0)
-      observe(label, { pid })
+      await closeApp(`${label} (cleanup)`)
+      observe(label, { pid: main.pid, result: result.state })
     }
     const job = await call('jobs.create', { title: 'Smoke: blocked restart', model, objective: 'BLOCKED-RESTART-CASE: run the slow step.', stages: [{ title: 'Slow step', objective: 'BLOCKED-RESTART-CASE: run sleep 120 in the workspace', completionCriteria: ['The slow step ran'] }] })
     await expect.poll(() => stubRequests.filter(entry => entry.blockedRestartCase).length, { timeout: 60_000 }).toBeGreaterThan(0)
@@ -371,13 +445,19 @@ try {
   if (flag('soak')) {
     if (!realModel || (fixture !== 'crossref' && fixture !== 'index')) throw new Error('--soak is meant for --real-model --fixture=crossref or --fixture=index')
     const buildSoakJob = fixture === 'index' ? indexJob : crossrefJob
-    // Leaves 15 minutes of the overall watchdog (DURABLE_SMOKE_TIMEOUT_MS, capped at 6h by the
-    // caller) so the last iteration can settle and the report/summary still gets written.
-    const deadline = Date.now() + Number(process.env.DURABLE_SMOKE_TIMEOUT_MS ?? 6 * 3_600_000) - 15 * 60_000
-    let iteration = 0, totalRollovers = 0, totalStages = 0, totalRetries = 0, totalRecoveries = 0, totalCompleted = 0
-    const blockedOnAttempts = []
-    while (Date.now() < deadline) {
+    // The workload is measured on a monotonic clock from the first job to the last settlement,
+    // excluding setup and cleanup. Iterations start only while it is short of SOAK_WORKLOAD_MS; the
+    // last one is bounded by STAGE_TIMEOUT like every other. Nothing is subtracted and still
+    // called six hours: a short workload fails the assertion below.
+    const ledgerFile = join(output, 'soak-ledger.ndjson')
+    const workloadStarted = performance.now()
+    const workloadElapsed = () => Math.round(performance.now() - workloadStarted)
+    observe('soak workload started', { workloadMs: SOAK_WORKLOAD_MS, stageTimeoutMs: STAGE_TIMEOUT, ledgerFile })
+    let iteration = 0, totalRollovers = 0, totalStages = 0, totalRetries = 0, totalRecoveries = 0, totalCompleted = 0, verifiedCompletions = 0
+    const audited = []
+    while (workloadElapsed() < SOAK_WORKLOAD_MS) {
       iteration++
+      await clearOutputs()
       const soakJob = await call('jobs.create', buildSoakJob(`Smoke: soak iteration ${iteration}`))
       const settled = await waitFor(soakJob.id, s => ['completed', 'blocked', 'failed'].includes(s.status), `soak iteration ${iteration} settled`, STAGE_TIMEOUT)
       totalRollovers += settled.counters.contextRollovers
@@ -385,24 +465,29 @@ try {
       totalRetries += settled.counters.retries
       totalRecoveries += settled.counters.recoveries
       if (settled.status === 'completed') totalCompleted++
-      // A stage that keeps writing new lines every rollover must never block on "used all N
-      // attempts" once one of those rollovers was itself credited (made file progress and was not
-      // supposed to count): that is the overnight-blocking bug this fixture exists to catch
-      // (docs/verification/2026-09-24-v1-local-models.md). A stage that blocks after N rollovers
-      // that never touched a file is stuck for a real reason (still reading, never writing) and
-      // correctly spends its attempts; that is not this bug.
-      if (settled.status === 'blocked' && /used all \d+ attempts/.test(settled.statusReason ?? '')) {
-        const events = await call('jobs.events', { jobId: soakJob.id, limit: 500 })
-        if (events.some(event => event.kind === 'retry' && event.data?.attemptCredited)) blockedOnAttempts.push(iteration)
-      }
-      observe('soak iteration done', { iteration, status: settled.status, statusReason: settled.statusReason, counters: settled.counters, elapsedMs: settled.elapsedMs, activeMs: settled.activeMs })
+      const problems = settled.status === 'completed' ? await outputProblems() : null
+      if (problems && !problems.length) verifiedCompletions++
+      // The whole ledger, paged, with the blocked stage taken from structured state: the audit
+      // judges each stage's charged versus credited attempts, not any credit anywhere in the job.
+      const { events, complete } = await allEvents(soakJob.id)
+      const entry = { iteration, jobId: soakJob.id, events, complete, status: settled.status, statusReason: settled.statusReason ?? '', blockedStageId: settled.status === 'blocked' ? settled.currentStage?.id ?? null : null, maxStageAttempts: settled.budgets?.maxStageAttempts ?? 3 }
+      audited.push(entry)
+      const [judged] = auditSoak([entry]).perJob
+      appendFileSync(ledgerFile, JSON.stringify({ at: new Date().toISOString(), workloadElapsedMs: workloadElapsed(), iteration, jobId: soakJob.id, status: settled.status, statusReason: settled.statusReason ?? null, counters: settled.counters, outputProblems: problems, audit: { verdict: judged.verdict, reasons: judged.reasons, violations: judged.violations, stages: judged.stages, creditedTransitions: judged.creditedTransitions, creditedFollowed: judged.creditedFollowed }, eventCount: events.length, complete }) + '\n')
+      observe('soak iteration done', { iteration, status: settled.status, statusReason: settled.statusReason, counters: settled.counters, elapsedMs: settled.elapsedMs, activeMs: settled.activeMs, outputProblems: problems, audit: judged.verdict, workloadElapsedMs: workloadElapsed() })
       if (settled.status !== 'completed') await call('jobs.cancel', { jobId: soakJob.id, reason: 'Smoke soak: iteration did not complete cleanly' })
     }
-    observe('soak finished', { iterations: iteration, totalRollovers, totalStages, totalRetries, totalRecoveries, totalCompleted })
+    const measured = workloadElapsed()
+    const audit = auditSoak(audited)
+    observe('soak finished', { iterations: iteration, workloadMs: measured, requiredWorkloadMs: SOAK_WORKLOAD_MS, totalRollovers, totalStages, totalRetries, totalRecoveries, totalCompleted, verifiedCompletions, audit: { verdict: audit.verdict, credited: audit.credited, creditedTransitions: audit.creditedTransitions, creditedFollowed: audit.creditedFollowed, violations: audit.violations, unproven: audit.unproven } })
+    assert.ok(measured >= SOAK_WORKLOAD_MS, `the measured workload was ${measured} ms, short of ${SOAK_WORKLOAD_MS} ms`)
     assert.ok(totalRollovers > 0, `the soak never triggered a context rollover across ${iteration} iteration(s)`)
     assert.ok(iteration >= 2, `the soak only completed ${iteration} iteration(s); not enough for an unattended-hours check`)
-    assert.ok(totalCompleted > 0, `no soak iteration completed across ${iteration} iteration(s); rollovers alone must not block an overnight job`)
-    assert.equal(blockedOnAttempts.length, 0, `iteration(s) ${blockedOnAttempts.join(', ')} used up all stage attempts on rollovers alone`)
+    assert.ok(verifiedCompletions > 0, `no soak iteration completed with correct output across ${iteration} iteration(s) (${totalCompleted} reported completed)`)
+    assert.deepEqual(audit.violations, [], 'a stage blocked on its attempt budget with fewer charged failures than the budget')
+    // NOT EXERCISED (no credited rollover went on) is UNVERIFIED too: the run fails rather than pass.
+    observe(`credited rollover must-have: ${audit.credited}`, { creditedFollowed: audit.creditedFollowed, verdict: audit.verdict, reasons: audit.reasons })
+    assert.equal(audit.verdict, 'PASS', `soak UNVERIFIED: ${audit.reasons.join('; ')} ${JSON.stringify(audit.unproven).slice(0, 600)}`)
     throw Object.assign(new Error('soak only'), { skipped: true })
   }
 
@@ -452,16 +537,22 @@ try {
   // --- Optional: kill the model server mid-stage (real model only) ----------------------------
   if (flag('kill-server')) {
     await waitFor(job.id, s => s.status === 'running' && Boolean(s.currentStage), 'stage running before kill', STAGE_TIMEOUT)
-    const stopped = await stopDurableSmokeServer({
-      call, model, appPid: owner.pid,
-      parentPidOf: pid => {
-        const result = execFileSync('powershell', ['-NoProfile', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").ParentProcessId`], { encoding: 'utf8', timeout: 10_000 }).trim()
-        return /^\d+$/.test(result) ? Number(result) : null
-      }
-    })
-    observe('llama-server killed', stopped)
+    // The parked main's identity as registered at launch; ownership is re-proved from the OS inside.
+    const appRoot = instance.roots.find(entry => entry.pid === owner.pid)
+    assert.ok(appRoot, `parked main pid ${owner.pid} is not a registered root`)
+    const snapshot = async () => (await listProcesses()).list
+    const stopped = await stopDurableSmokeServer({ call, model, app: appRoot, snapshot })
+    observe('llama-server stopped and its exit observed', { pid: stopped.pid, model: stopped.model, creationTime: stopped.identity.creationTime })
     await waitFor(job.id, s => s.counters.recoveries > afterReload.counters.recoveries || s.lastEvent?.kind === 'server', 'server loss noticed', 5 * 60_000)
     await waitFor(job.id, s => s.status === 'running' || s.status === 'completed', 'job running again after server restart', STAGE_TIMEOUT)
+    // Exactly one replacement: one app-registered server for the model, a different OS process than
+    // the one stopped, started by this parked app.
+    const replacements = (await call('local.servers')).filter(entry => entry.model === model)
+    const list = await snapshot()
+    const replacement = replacements.length === 1 ? list.find(entry => entry.pid === replacements[0].pid) : null
+    observe('replacement server', { servers: replacements.map(entry => ({ pid: entry.pid, startedByConductor: entry.startedByConductor })), parent: replacement?.ppid ?? null })
+    assert.equal(replacements.length, 1, `expected exactly one ${model} server after recovery; found ${replacements.length}`)
+    assert.ok(replacement && identityOf(replacement) && !sameIdentity(identityOf(replacement), stopped.identity) && replacement.ppid === appRoot.pid, 'the replacement server is not a new process started by the parked app')
   }
 
   // --- Optional: restart the app mid-job -------------------------------------------------------
@@ -480,6 +571,14 @@ try {
   let final = await status(job.id)
   try { final = await waitFor(job.id, s => ['completed', 'blocked', 'failed'].includes(s.status), 'job settled', STAGE_TIMEOUT) }
   catch { final = await call('jobs.cancel', { jobId: job.id, reason: 'Smoke time limit' }); observe('job cancelled at the smoke time limit', { status: final.status }) }
+  // A recovery run is only accepted when that same job finished its work correctly: a report for
+  // blocked or cancelled work, or a completion with wrong output, is not a recovery.
+  if (acceptanceRun) {
+    const problems = final.status === 'completed' ? await outputProblems() : null
+    const failures = acceptanceFailures({ jobId: job.id, final, problems })
+    observe(flag('acceptance') ? 'control run outcome' : 'fault run outcome', { jobId: job.id, status: final.status, statusReason: final.statusReason ?? null, outputProblems: problems, failures })
+    assert.deepEqual(failures, [], `acceptance run did not prove a completed, correct job: ${failures.join('; ')}`)
+  }
   const report = await call('jobs.report', { jobId: job.id })
   assert.ok(existsSync(report.reportPath), 'report.md was not written')
   assert.ok(existsSync(join(report.reportPath, '..', 'report.json')), 'report.json was not written')

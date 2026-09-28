@@ -13,7 +13,7 @@ import {
 } from './sandbox.ts'
 import {
   adoptRunningServer, describeStartupFailure, findFreePort, llamaServerArgs, logFile, portBindable,
-  inspectAdmission, processAlive, readRunRecord, startServer, validateExtraArgs
+  inspectAdmission, processAlive, processControl, readRunRecord, startServer, validateExtraArgs
 } from './llama.ts'
 import { StreamAccumulator } from './client.ts'
 import { repairToolProtocol, RESPONSE_RESERVE_TOKENS, trimMessages } from './agent.ts'
@@ -456,7 +456,12 @@ describe('llama.cpp server lifecycle', () => {
     const orphan = await fakeOrphan(QWEN_9B)
     const small = { ...defaultModelConfig(QWEN_9B), port: orphan.port }
     const large = { ...defaultModelConfig(QWEN_35B), port: await findFreePort(small) }
-    writeFileSync(runFile(small), JSON.stringify({ pid: sleeper.pid, port: orphan.port, model: small.id, file: small.file, startedAt: '2026-09-21' }))
+    // A record as a launch writes it: generation plus the OS identity read while the pid is pinned
+    // (here by this test's own child handle). Only that identity makes the process stoppable.
+    const identity = await processControl.inspect(sleeper.pid!, 15_000)
+    expect(identity.state).toBe('running')
+    if (identity.state !== 'running') return
+    writeFileSync(runFile(small), JSON.stringify({ pid: sleeper.pid, port: orphan.port, model: small.id, file: small.file, startedAt: '2026-09-21', generation: 'test-generation', identity: { creationTime: identity.creationTime, executable: identity.executable } }))
     const asked: string[] = []
     const release = async (running: resources.BlockingServer): Promise<'idle'> => {
       asked.push(`${running.model}:${running.pid}:${running.ours}`)
@@ -468,6 +473,25 @@ describe('llama.cpp server lifecycle', () => {
     expect(asked).toEqual([`${QWEN_9B}:${sleeper.pid}:true`])
     expect(processAlive(sleeper.pid!)).toBe(false)
     expect(readRunRecord(small)).toBeNull()
+  }, 60_000)
+
+  it('refuses to make room by killing a server whose record has no launch identity (legacy record): zero kills, record kept', async () => {
+    scratchRoot()
+    vi.spyOn(resources, 'runningLlamaProcesses').mockReturnValue([])
+    const sleeper = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true })
+    await new Promise<void>((resolve, reject) => { sleeper.once('spawn', () => resolve()); sleeper.once('error', reject) })
+    cleanup.push(() => { try { sleeper.kill() } catch { /* already gone */ } })
+    const orphan = await fakeOrphan(QWEN_9B)
+    const small = { ...defaultModelConfig(QWEN_9B), port: orphan.port }
+    const large = { ...defaultModelConfig(QWEN_35B), port: await findFreePort(small) }
+    writeFileSync(runFile(small), JSON.stringify({ pid: sleeper.pid, port: orphan.port, model: small.id, file: small.file, startedAt: '2026-09-21' }))
+    const before = readFileSync(runFile(small), 'utf8')
+    const release = vi.fn(async () => 'idle' as const)
+    await expect(startServer('must-never-spawn', large, key, { release })).rejects.toThrow(/no launch identity[\s\S]*No second server was started/)
+    expect(processAlive(sleeper.pid!)).toBe(true)
+    expect(sleeper.exitCode).toBeNull()
+    expect(readFileSync(runFile(small), 'utf8')).toBe(before)
+    expect(orphan.server.listening).toBe(true)
   })
 
   it('refuses to stop a server that is busy or that it did not start, and says why', async () => {

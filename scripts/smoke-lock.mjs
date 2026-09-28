@@ -4,6 +4,12 @@
 //
 // Usage: node scripts/smoke-lock.mjs [--timeout-min N] [--priority normal] -- <command> [args...]
 //
+// Exit codes: the command's own code, except 124 (the run hit its timeout), 130 (interrupted) and
+// 3 = "the command passed, but cleanup is unaccounted": some process could not be proven gone or
+// proven foreign, so nothing was killed for it. That includes a child that exited before its
+// identity could be read, any run on a non-Windows host (the identity inventory is Windows-only),
+// and possible orphans of the run. Treat 3 as not clean; the log says which processes.
+//
 // The run starts below normal priority, and so does everything it launches (Electron with its GPU
 // and renderer processes, builds, test workers): the owner types into their own Conductor on this
 // machine, and a smoke must never make that lag (scripts/lib/background-priority.mjs,
@@ -15,10 +21,13 @@
 // conductor-smoke.queue next to it, and print their place in line. A holder whose pid is dead, or whose age exceeds 2x its
 // recorded timeout, is stale and is broken with a logged reason.
 //
-// The run is killed - the whole process tree, not just the spawned pid, since Electron and its
-// fixture CLIs leave grandchildren behind - on the run's own hard timeout, on normal exit, on
-// SIGINT/SIGTERM, and when this process's own parent (whatever invoked it) is gone. That is what
-// keeps a smoke from outliving the run that asked for it (feature-list.md: smoke-instances-never-leak).
+// The run's own processes are stopped - the spawned child and every descendant proven by OS identity
+// (tracked while the run lives, so grandchildren stay attributable after their parents exit) - on
+// the run's own hard timeout, on normal exit, on SIGINT/SIGTERM, and when this process's own parent
+// is gone. There is no numeric tree kill: a reused pid or an unprovable process is reported, and a
+// cleanup that cannot account for everything makes a successful run exit 3. Cleanup is bounded, and
+// the lock is always released. That keeps a smoke from outliving the run that asked for it
+// (feature-list.md: smoke-instances-never-leak) without ever touching someone else's process.
 import { spawn, spawnSync } from 'node:child_process'
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -99,11 +108,13 @@ export function waiterExpired(startedMs, now, limitMin = WAITER_GIVE_UP_MIN) {
   return now - startedMs > limitMin * 60_000
 }
 
-/** Kills a process and everything it spawned. Windows has no process-group signal, so `/T` walks
- *  the tree by recorded parent pid, which Windows keeps even after the parent itself has exited. */
+/** Numeric tree kill, kept ONLY for scripts/perf-input.mjs (out of this review's scope; its
+ *  cleanup is unreviewed and the guard scenarios are refused by run-local-acceptance). smoke-lock
+ *  itself never calls it: `/T` walks recorded parent pids, which can name reused, foreign
+ *  processes. Bounded to 15 s so it can at least never hang its caller. */
 export function killTree(pid, log = () => {}) {
   if (process.platform === 'win32') {
-    const result = spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' })
+    const result = spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', timeout: 15_000, windowsHide: true })
     // 128: no such process - already gone, not a failure worth logging.
     if (result.status !== 0 && result.status !== 128) log(`[smoke-lock] taskkill for ${pid} exited ${result.status}`)
     return
@@ -112,6 +123,77 @@ export function killTree(pid, log = () => {}) {
 }
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+// --------------------------------------------------------------------- run cleanup
+//
+// The run's processes are owned by OS identity, never by a numeric tree: the direct child is
+// registered by its (pid, creation time, image) while our own handle pins it, its descendants are
+// tracked by identity as they appear (verify-kit trackDescendants), and cleanup is verify-kit
+// safeClose - identity-verified on each killing handle, leaves first, bounded. A reused pid, a
+// foreign process or anything unprovable is reported, never killed. `kit` is verify-kit (imported
+// lazily by main(): verify-kit itself imports this file).
+
+export const CLEANUP_DEADLINE_MS = 45_000
+export const TRACK_INTERVAL_MS = 5000
+
+/** Registers the spawned child as the run's root and starts tracking. Resolves to the tracker, or
+ *  null when the child's identity could not be read (then only the child itself is stopped, through
+ *  Node's own handle). */
+export async function trackRun(child, kit, { log = () => {}, intervalMs = TRACK_INTERVAL_MS, spawnedAtMs } = {}) {
+  const tracker = kit.newInstance({ name: 'smoke-lock', generation: `smoke-lock-${process.pid}-${Date.now()}` })
+  try {
+    // The snapshot takes a moment; a child that exited meanwhile may have handed its pid to someone
+    // else, so registerOwnChild refuses it (and anything created outside the spawn window).
+    const { list } = await kit.listProcesses()
+    await kit.registerOwnChild(tracker, child, { source: 'smoke-lock child', list, spawnedAtMs })
+    kit.startTracking(tracker, { intervalMs, log, list: () => kit.listProcesses({ timeoutMs: 20_000 }) })
+    return tracker
+  } catch (error) {
+    log(`[smoke-lock] could not register the run's identity (${String(error?.message ?? error).slice(0, 200)}); cleanup will stop only the direct child, through its own handle`)
+    return null
+  }
+}
+
+/** Cleans up one run with no numeric tree kill. Returns {clean, report}. */
+export async function cleanupRun({ child, tracking, kit, log = () => {}, deps = {} }) {
+  const tracker = await tracking
+  if (!tracker) {
+    if (child.exitCode === null && child.signalCode === null) { try { child.kill() } catch { /* already gone */ } }
+    return { clean: false, report: { unresolved: [{ pid: child.pid, reason: 'run identity never registered: descendants neither attributed nor killed' }] } }
+  }
+  const report = await kit.safeClose(tracker, {
+    boundMs: 0, killWindowMs: 20_000,
+    deps: { ...kit.closeDeps, ...deps, ledger: line => { if (line.event === 'terminate' || line.event === 'inventory-failed') log(`[smoke-lock] cleanup ${line.event} ${JSON.stringify({ pid: line.pid, name: line.name, result: line.result, label: line.label })}`) } }
+  })
+  const clean = Boolean(report) && !report.leftovers.length && !report.unresolved.length
+  if (!clean) log(`[smoke-lock] cleanup could not account for every process: ${JSON.stringify({ leftovers: report?.leftovers, unresolved: report?.unresolved }).slice(0, 1500)}`)
+  return { clean, report }
+}
+
+/** One finish for every ending - normal exit, timeout, signal, parent loss: timers cleared, cleanup
+ *  bounded by `deadlineMs` (a hung cleanup is abandoned, never waited on), the lock released, and
+ *  the process exited. A run whose own code was 0 but whose cleanup is unaccounted exits 3. */
+export function createFinisher({ cleanup, release, exit, clearTimers = () => {}, deadlineMs = CLEANUP_DEADLINE_MS, log = () => {} }) {
+  let finishing = null
+  return code => {
+    if (finishing) return finishing
+    finishing = (async () => {
+      clearTimers()
+      let timer
+      const outcome = await Promise.race([
+        Promise.resolve().then(cleanup).then(value => ({ value }), error => ({ error })),
+        new Promise(resolve => { timer = setTimeout(() => resolve({ timedOut: true }), deadlineMs) })
+      ])
+      clearTimeout(timer)
+      if (outcome.timedOut) log(`[smoke-lock] cleanup did not finish within ${deadlineMs / 1000} s; abandoned`)
+      if (outcome.error) log(`[smoke-lock] cleanup failed: ${String(outcome.error?.message ?? outcome.error).slice(0, 300)}`)
+      const clean = Boolean(outcome.value?.clean)
+      try { release() } catch (error) { log(`[smoke-lock] lock release failed: ${error.message}`) }
+      exit(code === 0 && !clean ? 3 : (code ?? 1))
+    })()
+    return finishing
+  }
+}
 
 // --------------------------------------------------------------------- the waiting line
 //
@@ -234,8 +316,11 @@ async function main() {
   // Direct spawn keeps arguments intact; only a .cmd/.bat launcher (npm.cmd) needs the shell. The
   // child gets its own process group off Windows so a POSIX kill(-pid) can reach its descendants.
   // CONDUCTOR_TEST_PARENT_PID names *this* process - not the smoke script's own, closer parent -
-  // as the one every Electron instance the smoke launches should watch, so an abrupt kill of this
-  // process (taskkill /F, no /T - the smoke script itself is left running) still tears the app down.
+  // as the one every Electron instance the smoke launches should watch, so an abrupt forced kill of
+  // this process alone (the smoke script itself left running) still tears the app down.
+  // Loaded before the spawn, so no exit event can fire before its handler is attached.
+  const kit = await import('./verify-kit.mjs')
+  const spawnedAtMs = Date.now()
   const child = spawn(command[0], command.slice(1), {
     stdio: 'inherit',
     shell: /\.(?:cmd|bat)$/i.test(command[0]),
@@ -243,19 +328,18 @@ async function main() {
     env: { ...process.env, CONDUCTOR_TEST_PARENT_PID: String(process.pid) }
   })
 
-  let finished = false
-  const finish = code => {
-    if (finished) return
-    finished = true
-    clearTimeout(timeoutTimer)
-    clearInterval(parentTimer)
-    killTree(child.pid, console.error)
-    release()
-    process.exit(code ?? 1)
-  }
+  // Identity ownership of the run, then one bounded finish for every way it can end.
+  const tracking = trackRun(child, kit, { log: message => console.error(message), spawnedAtMs })
+  const finish = createFinisher({
+    cleanup: () => cleanupRun({ child, tracking, kit, log: message => console.error(message) }),
+    release: () => release(),
+    exit: code => process.exit(code),
+    clearTimers: () => { clearTimeout(timeoutTimer); clearInterval(parentTimer) },
+    log: message => console.error(message)
+  })
 
   const timeoutTimer = setTimeout(() => {
-    console.error(`[smoke-lock] run exceeded ${timeoutMin} min, killing the process tree`)
+    console.error(`[smoke-lock] run exceeded ${timeoutMin} min, stopping the run's own processes`)
     finish(124)
   }, timeoutMin * 60_000)
 
@@ -264,7 +348,7 @@ async function main() {
   const initialParentPid = process.ppid
   const parentTimer = setInterval(() => {
     if (!isProcessAlive(initialParentPid)) {
-      console.error(`[smoke-lock] parent ${initialParentPid} is gone, killing the process tree`)
+      console.error(`[smoke-lock] parent ${initialParentPid} is gone, stopping the run's own processes`)
       finish(1)
     }
   }, PARENT_POLL_MS)

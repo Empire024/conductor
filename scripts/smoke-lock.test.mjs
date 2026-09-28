@@ -5,7 +5,141 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { BACKGROUND_PRIORITY, NORMAL_PRIORITY, lowerPriority, restoreNormalPriority, wrappedCommand } from './lib/background-priority.mjs'
-import { DEFAULT_TIMEOUT_MIN, WAITER_GIVE_UP_MIN, acquire, ownsLock, parseArgs, parseHolderText, queuePosition, release, staleReason, ticketName, waiterExpired } from './smoke-lock.mjs'
+import { DEFAULT_TIMEOUT_MIN, WAITER_GIVE_UP_MIN, acquire, cleanupRun, createFinisher, ownsLock, parseArgs, parseHolderText, queuePosition, release, staleReason, ticketName, trackRun, waiterExpired } from './smoke-lock.mjs'
+import * as kit from './verify-kit.mjs'
+
+// ---- S-B1: run cleanup is identity-owned and bounded; no numeric tree kill on any ending.
+
+const EXE = 'C:\\node\\node.exe'
+const p = (pid, ppid, created, name = 'node.exe', executable = EXE) => ({ pid, ppid, name, commandLine: '', creationTime: String(created), executable })
+const runRoot = p(4000, 300, 1000), runChild = p(4001, 4000, 1001, 'electron.exe', 'C:\\e\\electron.exe'), neighbour = p(9000, 1, 5, 'notepad.exe', 'C:\\Windows\\notepad.exe')
+
+test('smoke-lock main() has no numeric tree kill: killTree and taskkill /T are gone from every ending', () => {
+  const source = readFileSync(new URL('./smoke-lock.mjs', import.meta.url), 'utf8')
+  const main = source.slice(source.indexOf('async function main()'))
+  assert.doesNotMatch(main, /killTree\(|taskkill|'\/T'/)
+  const cleanup = source.slice(source.indexOf('export async function trackRun'), source.indexOf('// --------------------------------------------------------------------- the waiting line'))
+  assert.doesNotMatch(cleanup, /killTree\(|taskkill|process\.kill\(/)
+})
+
+/** A scripted machine for cleanupRun: `snapshots` answer each inventory in turn (the last repeats). */
+async function scriptedRun({ registered = [runRoot, neighbour], snapshots, terminate = () => ({ state: 'exited' }) }) {
+  const tracker = kit.newInstance({ name: 'smoke-lock-test' })
+  await kit.registerRoot(tracker, 4000, { source: 'smoke-lock child', list: registered })
+  const terminated = []
+  let calls = 0, clock = 0
+  const deps = {
+    listProcesses: async () => { const answer = snapshots[Math.min(calls++, snapshots.length - 1)]; if (answer instanceof Error) throw answer; return { list: answer } },
+    terminate: async identity => { terminated.push(identity.pid); return terminate(identity) },
+    now: () => clock, sleep: async ms => { clock += ms }
+  }
+  const log = console.log; console.log = () => {}
+  try { return { ...(await cleanupRun({ child: { pid: 4000, exitCode: 0, signalCode: null }, tracking: Promise.resolve(tracker), kit, deps })), terminated } }
+  finally { console.log = log }
+}
+
+test('cleanupRun: normal exit with the root pid reused and a foreign descendant kills nothing and is not clean', async () => {
+  const reusedRoot = p(4000, 7, 5000, 'node.exe'), foreignChild = p(4100, 4000, 5001, 'cmd.exe', 'C:\\Windows\\cmd.exe')
+  const outcome = await scriptedRun({ snapshots: [[reusedRoot, foreignChild, neighbour]] })
+  assert.deepEqual(outcome.terminated, [])
+  assert.equal(outcome.clean, false)
+  assert.ok(outcome.report.unresolved.some(entry => entry.pid === 4100), JSON.stringify(outcome.report.unresolved))
+})
+
+test('cleanupRun: timeout or parent loss with the run still alive stops exactly its tree, leaves first, by identity', async () => {
+  const outcome = await scriptedRun({ registered: [runRoot, runChild, neighbour], snapshots: [[runRoot, runChild, neighbour], [runRoot, runChild, neighbour], [neighbour]] })
+  assert.deepEqual(outcome.terminated, [4001, 4000])
+  assert.equal(outcome.clean, true)
+})
+
+test('cleanupRun: a normal exit whose tree is already gone is clean with no kill', async () => {
+  const outcome = await scriptedRun({ snapshots: [[neighbour]] })
+  assert.deepEqual(outcome.terminated, [])
+  assert.equal(outcome.clean, true)
+})
+
+test('cleanupRun: failed inventory at cleanup kills nothing and is not clean', async () => {
+  const outcome = await scriptedRun({ snapshots: [new Error('Access denied')] })
+  assert.deepEqual(outcome.terminated, [])
+  assert.equal(outcome.clean, false)
+})
+
+test('cleanupRun: without a registered identity only the direct child is stopped, through its own handle', async () => {
+  let handleKills = 0
+  const child = { pid: 4000, exitCode: null, signalCode: null, kill: () => { handleKills++ } }
+  const outcome = await cleanupRun({ child, tracking: Promise.resolve(null), kit: { ...kit, safeClose: () => { throw new Error('must not run') } } })
+  assert.equal(handleKills, 1)
+  assert.equal(outcome.clean, false)
+  const exited = await cleanupRun({ child: { ...child, exitCode: 0 }, tracking: Promise.resolve(null), kit })
+  assert.equal(handleKills, 1, 'an exited child is not killed again')
+  assert.equal(exited.clean, false)
+})
+
+// ---- Correction review S-C1: a child that exits before its snapshot is never registered.
+const US_1601 = ms => String((BigInt(ms) + 11_644_473_600_000n) * 1000n)
+
+test('trackRun: a child that exited before its identity snapshot gives zero registration and zero kills', async () => {
+  // The pid is already held by a foreign process by the time the inventory runs.
+  const foreign = p(4000, 7, US_1601(Date.now()), 'node.exe')
+  const child = { pid: 4000, exitCode: 0, signalCode: null, kill: () => { throw new Error('must not kill') } }
+  const logs = []
+  const tracker = await trackRun(child, { ...kit, listProcesses: async () => ({ list: [foreign, neighbour] }) }, { log: message => logs.push(message), spawnedAtMs: Date.now() - 1000 })
+  assert.equal(tracker, null)
+  assert.match(logs.join(' '), /exited before its identity was read/)
+  const outcome = await cleanupRun({ child, tracking: Promise.resolve(tracker), kit: { ...kit, safeClose: () => { throw new Error('must not run') } } })
+  assert.equal(outcome.clean, false)
+})
+
+test('trackRun: a live child created inside its spawn window registers (control); one created before it does not', async () => {
+  const spawnedAtMs = Date.now() - 500
+  const live = { pid: 4000, exitCode: null, signalCode: null }
+  const own = p(4000, process.pid, US_1601(spawnedAtMs + 100))
+  const fakeKit = { ...kit, listProcesses: async () => ({ list: [own, neighbour] }) }
+  const tracker = await trackRun(live, fakeKit, { spawnedAtMs })
+  try { assert.deepEqual(tracker.roots.map(entry => entry.pid), [4000]) } finally { kit.stopTracking(tracker) }
+  const stale = p(4000, process.pid, US_1601(spawnedAtMs - 60_000))
+  assert.equal(await trackRun(live, { ...kit, listProcesses: async () => ({ list: [stale] }) }, { spawnedAtMs }), null)
+})
+
+test('trackRun: an unreadable identity is reported, and yields no tracker', async () => {
+  const logs = []
+  const unreadable = { ...p(4000, process.pid, 1000), creationTime: null }
+  const tracker = await trackRun({ pid: 4000, exitCode: null, signalCode: null }, { ...kit, listProcesses: async () => ({ list: [unreadable] }) }, { log: message => logs.push(message) })
+  assert.equal(tracker, null)
+  assert.match(logs[0], /could not register the run's identity/)
+})
+
+for (const [ending, code] of [['normal exit', 0], ['a failing run', 2], ['timeout', 124], ['a signal', 130], ['parent loss', 1]]) {
+  test(`createFinisher: ${ending} cleans up once, releases the lock and exits ${code === 0 ? '0 when clean' : code}`, async () => {
+    const calls = { cleanup: 0, release: 0, exit: [], cleared: 0 }
+    const finish = createFinisher({ cleanup: async () => { calls.cleanup++; return { clean: true } }, release: () => { calls.release++ }, exit: value => calls.exit.push(value), clearTimers: () => { calls.cleared++ } })
+    await Promise.all([finish(code), finish(99), finish(130)])
+    assert.deepEqual(calls, { cleanup: 1, release: 1, exit: [code], cleared: 1 })
+  })
+}
+
+test('createFinisher: a hung cleanup is abandoned at the deadline; the lock is still released and the run exits', async () => {
+  const calls = { release: 0, exit: [] }
+  const logs = []
+  const started = Date.now()
+  await createFinisher({ cleanup: () => new Promise(() => {}), release: () => { calls.release++ }, exit: value => calls.exit.push(value), deadlineMs: 50, log: message => logs.push(message) })(0)
+  assert.ok(Date.now() - started < 2000)
+  assert.deepEqual(calls, { release: 1, exit: [3] })
+  assert.match(logs.join(' '), /did not finish within/)
+})
+
+test('createFinisher: an unclean or failing cleanup never lets a successful run exit 0', async () => {
+  for (const cleanup of [async () => ({ clean: false }), async () => { throw new Error('boom') }]) {
+    const exits = []
+    let released = 0
+    await createFinisher({ cleanup, release: () => { released++ }, exit: value => exits.push(value) })(0)
+    assert.deepEqual(exits, [3])
+    assert.equal(released, 1)
+  }
+  const exits = []
+  await createFinisher({ cleanup: async () => ({ clean: false }), release: () => {}, exit: value => exits.push(value) })(124)
+  assert.deepEqual(exits, [124], 'a failing code is kept')
+})
 
 test('parseArgs: default timeout with no flag', () => {
   assert.deepEqual(parseArgs(['--', 'node', 'scripts/smoke-foo.mjs']), { command: ['node', 'scripts/smoke-foo.mjs'], timeoutMin: DEFAULT_TIMEOUT_MIN, priority: 'background' })
