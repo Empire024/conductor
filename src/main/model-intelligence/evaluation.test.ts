@@ -262,6 +262,43 @@ describe('batched cloud evaluation (N9)', () => {
     expect(prompt.prompt).toContain('## TASK 1 of 2: first')
     expect(prompt.prompt).toContain('"### JOB <task id>"')
   })
+  it('forgives near-miss headers and an answer wrapped whole in one fence (N15)', () => {
+    const ids = ['predict-output', 'log-timeouts'], both = { 'predict-output': '4+6', 'log-timeouts': '3' }
+    const variants = [
+      '### job predict-output\n4+6\n### job log-timeouts\n3',
+      '### JOB: predict-output\n4+6\n### JOB: log-timeouts\n3',
+      '### JOB `predict-output`\n4+6\n### JOB `log-timeouts`\n3',
+      '**JOB predict-output**\n4+6\n**JOB log-timeouts**\n3',
+      '**JOB predict-output** 4+6\n**JOB: log-timeouts** (task 2)\n3',
+      '### JOB predict-output (task 1)\n4+6\n### JOB log-timeouts (task 2)\n3',
+      '# JOB predict-output\n4+6\n###### JOB log-timeouts\n3',
+      '### **JOB predict-output**\n4+6\n### **JOB log-timeouts.**\n3',
+      '### JOB 1\n4+6\n### JOB 2\n3',
+      'Here are my answers.\n\n### JOB predict-output\n4+6\n### JOB log-timeouts\n3',
+      '```\n### JOB predict-output\n4+6\n### JOB log-timeouts\n3\n```',
+      '```markdown\n### JOB predict-output\n4+6\n### JOB log-timeouts\n3\n```',
+    ]
+    for (const text of variants) expect(splitBatchAnswer(text, ids), text).toEqual(both)
+    // A fenced block of the last job's own is kept whole; only a fence that closes nothing is dropped.
+    expect(splitBatchAnswer('```\n### JOB a\none\n### JOB b\n```json\n{"n": 2}\n```\n```', ['a', 'b'])).toEqual({ a: 'one', b: '```json\n{"n": 2}\n```' })
+    expect(splitBatchAnswer('### JOB a\n```js\nx\n```', ['a'])).toEqual({ a: '```js\nx\n```' })
+    // Numbers count only when no header names a task; a heading of 7 hashes or a plain line is not a header.
+    expect(splitBatchAnswer('### JOB a\none\n### JOB 2\ntwo', ['a', 'b'])).toEqual({ a: 'one\n### JOB 2\ntwo' })
+    expect(splitBatchAnswer('####### JOB a\nx\nJOB b\ny', ['a', 'b'])).toEqual({})
+  })
+  it('records nothing when no section is found for the whole batch (N15)', async () => {
+    const spends: Array<{ tokens: number }> = []
+    const { ports, recorded } = harness(() => ({ answer: 'Sure! 4+6, {"n": 2}, and no.', tokens: 41_000 }), { recordSpend: spend => { spends.push(spend) } })
+    const result = await evaluate(CLOUD, mixed, ports, { maxTokens: 60_000 })
+    expect(recorded).toEqual([])
+    expect(result).toMatchObject({ tokens: 41_000, stoppedBy: null, outcomes: [] })
+    expect(result.jobs.every(entry => entry.result === 'not-gradable')).toBe(true)
+    expect(result.jobs.filter(entry => entry.id !== 'checked').map(entry => entry.detail)).toEqual(Array(4).fill('not graded: the batched answer had no "### JOB <id>" section for any task'))
+    expect(spends.at(-1)!.tokens).toBe(41_000)
+    // Near-miss headers through the whole run: graded, not N invalid-output failures.
+    const slipped = await evaluate(CLOUD, mixed, harness(() => ({ answer: answer.split('### JOB ').join('### JOB: '), tokens: 41_000 })).ports, { maxTokens: 60_000 })
+    expect(slipped.jobs.map(entry => entry.result)).toEqual(['success', 'not-gradable', 'success', 'success', 'failure'])
+  })
   it('runs every one-shot job of a cloud run in one turn, pays the overhead once and grades each job separately', async () => {
     const turns: Array<{ job: EvaluationJob; budget?: { maxTokens: number } }> = [], spends: Array<{ tokens: number }> = []
     const { ports, recorded } = harness(() => ({ answer: 'unused' }), {

@@ -62,7 +62,7 @@ export function localRunPort(runnerFor: (modelId: string) => LocalModelRunner, b
 /** One evaluation turn on a cloud model (AgentControl.evaluationTurn): a native tab at the lowest effort.
  *  `maxTokens` is the job's budget: the turn is interrupted once its usage passes it, and a turn that
  *  fails, times out or reports no usage counts it as spent (a failure throws an EvaluationTurnError). */
-export type CloudTurn = (key: ModelKey, prompt: { system: string; user: string }, signal: AbortSignal, options?: { maxTokens?: number }) => Promise<{ answer: string; tokens: number | null; costUsd: number | null; durationMs: number; effort: string | null; /** The turn's whole input as reported (cache included), null when unreported. */ inputTokens?: number | null }>
+export type CloudTurn = (key: ModelKey, prompt: { system: string; user: string }, signal: AbortSignal, options?: { maxTokens?: number }) => Promise<{ answer: string; tokens: number | null; costUsd: number | null; durationMs: number; effort: string | null; /** The input the fixed overhead is learned from (cache included): the turn's first API call where the provider reports calls, else the whole turn's; null when unreported. */ inputTokens?: number | null }>
 
 /** A cloud job's run with the turn's fixed input overhead, when the turn reported its input. */
 export type CloudRun = EvaluationRun & { overheadTokens?: number | null }

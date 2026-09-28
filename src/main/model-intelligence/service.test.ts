@@ -8,7 +8,7 @@ import type { AccountLimitWindow } from '../../shared/usage-accounting'
 import type { ReviewAction } from '../approval-review'
 import type { LocalModelRequest } from '../local-assist/contract'
 import { outcome as outcomeRow } from './capture/common'
-import type { EvaluationSuite } from './evaluation'
+import { batchJobTokens, type EvaluationSuite } from './evaluation'
 import { softmax } from './deciders/scorer'
 import {
   CALLER_DECIDER_ID, callerFrontier, chosenOnTop, closeCandidates, createModelIntelligence, DEFAULT_EVALUATION_CAPS, DEFAULT_EXCLUDED_MODELS, EVALUATION_CAPS_SETTING, EXCLUDED_MODELS_SETTING,
@@ -240,25 +240,74 @@ describe('cloud evaluation under the owner caps (gap 8)', () => {
     expect(s.store.evaluationSpend('2026-09-27T12:00:00Z').runs).toBe(3)
     await expect(s.startEvaluation(OPUS, 'mini')).rejects.toThrow(/3 cloud evaluations ran in the last 24 h; the cap is 3/)
   })
-  it('caps a run at what is left of the day and refuses one below the 20k floor (N2)', async () => {
+  it('caps a run at what is left of the day and refuses one below the 45k floor (the default overhead plus a job) (N2, N14)', async () => {
     const over = cloud(10)
-    over.s.store.recordEvaluationSpend({ runId: 'x', key: OPUS, at: NOW.toISOString(), tokens: 130_001, jobs: 1, gradedJobs: 1, stoppedBy: null })
-    await expect(over.s.startEvaluation(OPUS, 'mini')).rejects.toThrow(/used 130001 tokens in the last 24 h; 19999 of the daily 150000 are left, below the 20000 a run needs/)
+    over.s.store.recordEvaluationSpend({ runId: 'x', key: OPUS, at: NOW.toISOString(), tokens: 105_001, jobs: 1, gradedJobs: 1, stoppedBy: null })
+    await expect(over.s.startEvaluation(OPUS, 'mini')).rejects.toThrow(/used 105001 tokens in the last 24 h; 44999 of the daily 150000 are left, below the 45000 a run needs/)
     const edge = cloud(10)
-    edge.s.store.recordEvaluationSpend({ runId: 'x', key: OPUS, at: NOW.toISOString(), tokens: 130_000, jobs: 1, gradedJobs: 1, stoppedBy: null })
-    expect((await edge.s.startEvaluation(OPUS, 'mini')).maxTokens).toBe(20_000)
+    edge.s.store.recordEvaluationSpend({ runId: 'x', key: OPUS, at: NOW.toISOString(), tokens: 105_000, jobs: 1, gradedJobs: 1, stoppedBy: null })
+    expect((await edge.s.startEvaluation(OPUS, 'mini')).maxTokens).toBe(45_000)
     const tight = cloud(10, values => values.set(EVALUATION_CAPS_SETTING, JSON.stringify({ perDayTokens: 1000 })))
-    await expect(tight.s.startEvaluation(OPUS, 'mini')).rejects.toThrow(/1000 of the daily 1000 are left, below the 20000 a run needs/)
-    expect(tight.s.evaluationCaps()).toMatchObject({ perDayTokens: 1000, perRunTokens: 60_000, minRunTokens: 20_000, weeklyStop: { claude: 85, codex: 55 } })
+    await expect(tight.s.startEvaluation(OPUS, 'mini')).rejects.toThrow(/1000 of the daily 1000 are left, below the 45000 a run needs/)
+    expect(tight.s.evaluationCaps()).toMatchObject({ perDayTokens: 1000, perRunTokens: 60_000, minRunTokens: 45_000, weeklyStop: { claude: 85, codex: 55 } })
+    // A per-run cap below any native turn's overhead can never hold a job: refused, not run.
     const small = cloud(10, values => values.set(EVALUATION_CAPS_SETTING, JSON.stringify({ perRunTokens: 1000, perDayTokens: 1000 })))
-    expect((await small.s.startEvaluation(OPUS, 'mini')).maxTokens).toBe(1000)
+    await expect(small.s.startEvaluation(OPUS, 'mini')).rejects.toThrow(/A 1000-token run cannot hold a claude turn's 5000 fixed tokens plus the smallest job's \d+; no run was counted/)
+    expect(small.s.store.evaluationSpend('2026-09-27T12:00:00Z').runs).toBe(0)
+  })
+  it('never lets a learned overhead lock a provider out, and refuses a run that cannot fit before it counts (N14)', async () => {
+    const smallest = batchJobTokens({ id: 'answer', category: 'simple-coding', complexity: 1, prompt: 'Say 42', grader: { kind: 'exact', expected: '42' } })
+    // A multi-call turn learned 500k as the "overhead" under the old code: read back, it is bounded so a full run still holds one job.
+    const locked = cloud(10, values => values.set(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ claude: { tokens: 500_000, at: NOW.toISOString() } })))
+    expect(locked.s.fixedOverheadTokens('claude')).toBe(60_000)
+    locked.runCloud.mockImplementation(async () => ({ answer: '42', tokens: 41_000, costUsd: null, durationMs: 1, overheadTokens: 39_000 }))
+    const full = await locked.s.startEvaluation(OPUS, 'mini')
+    expect(full.maxTokens).toBe(60_000)
+    await vi.waitFor(() => expect(locked.s.evaluation(full.runId)!.state).not.toBe('running'))
+    // The next real turn re-measured it.
+    expect(locked.s.fixedOverheadTokens('claude')).toBe(39_000)
+    // A turn whose input is huge is learned bounded; the raw measurement is kept beside it.
+    const huge = cloud(10)
+    huge.runCloud.mockImplementation(async () => ({ answer: '42', tokens: 41_000, costUsd: null, durationMs: 1, overheadTokens: 250_000 }))
+    const run = await huge.s.startEvaluation(OPUS, 'mini')
+    await vi.waitFor(() => expect(huge.s.evaluation(run.runId)!.state).not.toBe('running'))
+    expect(JSON.parse(huge.s.decisions['ports'].settings.getSetting(EVALUATION_OVERHEAD_SETTING)!)).toEqual({ claude: { tokens: 60_000 - smallest, measured: 250_000, at: NOW.toISOString() } })
+    // What is left of the day cannot hold that overhead plus a job: refused before the run is counted, the runner never called.
+    huge.runCloud.mockClear()
+    huge.s.store.recordEvaluationSpend({ runId: 'earlier', key: OPUS, at: NOW.toISOString(), tokens: 60_000, jobs: 1, gradedJobs: 1, stoppedBy: null })
+    const before = huge.s.store.evaluationSpend('2026-09-27T12:00:00Z')
+    await expect(huge.s.startEvaluation(OPUS, 'mini')).rejects.toThrow(new RegExp(`A ${150_000 - before.tokens}-token run cannot hold a claude turn's ${60_000 - smallest} fixed tokens plus the smallest job's ${smallest}; the day has ${150_000 - before.tokens} of its 150000 left; no run was counted`))
+    expect(huge.s.store.evaluationSpend('2026-09-27T12:00:00Z')).toEqual(before)
+    expect(huge.runCloud).not.toHaveBeenCalled()
+    // And a small learned value is raised to the band's floor.
+    const tiny = cloud(10, values => values.set(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ claude: { tokens: 12, at: NOW.toISOString() } })))
+    expect(tiny.s.fixedOverheadTokens('claude')).toBe(5_000)
+  })
+  it('refuses a cloud run of a suite whose jobs all need a command runner', async () => {
+    const onlyCommands: EvaluationSuite = { name: 'commands', jobs: [{ id: 'check', category: 'simple-coding', complexity: 1, prompt: 'Write add.js', grader: { kind: 'command', cmd: 'node', args: ['test.mjs'], expectExit: 0, timeoutSec: 10 } }] }
+    const runCloud = vi.fn(async () => ({ answer: '42', tokens: 900, costUsd: null, durationMs: 1 }))
+    const s = createModelIntelligence({ dbPath: ':memory:', settings: settings(), timers: noTimers, clock: () => NOW, log: () => {}, evaluation: { runCloud, usage: () => 10, suites: () => ({ commands: onlyCommands }) } })
+    register(s, [[OPUS, 'Opus']])
+    await expect(s.startEvaluation(OPUS, 'commands')).rejects.toThrow(/No job of commands can be graded in a cloud run/)
+    expect(s.store.evaluationSpend('2026-09-27T12:00:00Z').runs).toBe(0)
+  })
+  it('validates an evaluation-caps weeklyStop override: a malformed value never disables the stop (N17)', async () => {
+    const bad = cloud(86, values => values.set(EVALUATION_CAPS_SETTING, JSON.stringify({ weeklyStop: { codex: 'x', claude: 150, grok: -1 } })))
+    expect(bad.s.evaluationCaps().weeklyStop).toEqual({ claude: 85, codex: 55 })
+    await expect(bad.s.startEvaluation(OPUS, 'mini')).rejects.toThrow(/claude is at 86% of its week, at or above the 85% stop/)
+    const garbage = cloud(10, values => values.set(EVALUATION_CAPS_SETTING, JSON.stringify({ weeklyStop: 'off' })))
+    expect(garbage.s.evaluationCaps().weeklyStop).toEqual({ claude: 85, codex: 55 })
+    const good = cloud(10, values => values.set(EVALUATION_CAPS_SETTING, JSON.stringify({ weeklyStop: { codex: 70, claude: 'x' } })))
+    expect(good.s.evaluationCaps().weeklyStop).toEqual({ claude: 85, codex: 70 })
   })
   it('three runs that each spend their whole cap stay within the daily token cap', async () => {
     // Each run's one turn spends exactly the budget it is handed (the whole run cap); no fixed overhead, so every cap fits the job.
     const big: EvaluationSuite = { name: 'big', jobs: [{ id: 'big', category: 'simple-coding', complexity: 5, prompt: 'Say 42', maxTokens: 1_000, grader: { kind: 'exact', expected: '42' } }] }
     const runCloud = vi.fn(async (..._args: unknown[]) => ({ answer: '42', tokens: (_args[3] as { maxTokens: number }).maxTokens, costUsd: null, durationMs: 1 }))
     const store = settings()
+    // The smallest overhead the band allows, and a floor that lets the day's 30k remainder run.
     store.values.set(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ claude: { tokens: 0, at: NOW.toISOString() } }))
+    store.values.set(EVALUATION_CAPS_SETTING, JSON.stringify({ minRunTokens: 20_000 }))
     const s = createModelIntelligence({ dbPath: ':memory:', settings: store, timers: noTimers, clock: () => NOW, log: () => {}, evaluation: { runCloud, usage: () => 10, suites: () => ({ big }) } })
     register(s, [[OPUS, 'Opus']])
     const caps: number[] = []
@@ -280,7 +329,7 @@ describe('cloud evaluation under the owner caps (gap 8)', () => {
     await vi.waitFor(() => expect(s.evaluation(handle.runId)!.state).not.toBe('running'))
     expect(s.fixedOverheadTokens('claude')).toBe(38_500)
     expect(s.fixedOverheadTokens('codex')).toBe(40_000)
-    expect(JSON.parse(s.decisions['ports'].settings.getSetting(EVALUATION_OVERHEAD_SETTING)!)).toEqual({ claude: { tokens: 38_500, at: NOW.toISOString() } })
+    expect(JSON.parse(s.decisions['ports'].settings.getSetting(EVALUATION_OVERHEAD_SETTING)!)).toEqual({ claude: { tokens: 38_500, measured: 38_500, at: NOW.toISOString() } })
     // A failed turn that reported its input still teaches the overhead.
     runCloud.mockImplementation(async () => { throw Object.assign(new Error('the evaluation turn ended failed'), { tokens: 6_000, overheadTokens: 41_000 }) })
     const next = await s.startEvaluation(OPUS, 'mini')

@@ -269,13 +269,38 @@ export function batchPrompt(jobs: EvaluationJob[]): EvaluationJob {
   ].join('\n')
   return { id: BATCH_JOB_ID, category: 'general', complexity: Math.max(1, ...jobs.map(job => job.complexity)) as EvaluationJob['complexity'], prompt, grader: { kind: 'regex', pattern: '.' } }
 }
+/**
+ * A job's header line: a markdown heading of any depth or a bold line naming JOB and the task, with the usual slips
+ * forgiven ("### JOB: id", "### JOB `id`", "**JOB id**", "### JOB id (task 1)", any case). 1: opener, 2: id, 3: the rest.
+ */
+const BATCH_HEADER = /^[ \t]*(#{1,6}[ \t]*(?:\*\*|__)?|\*\*|__)[ \t]*JOB\b[ \t]*[:#\u2013\u2014-]?[ \t]*[`'"]?([\w.-]+)[`'"]?(.*)$/gim
+const FENCE_LINE = /^[ \t]*(?:```|~~~)/, BARE_FENCE_LINE = /^[ \t]*(?:```|~~~)[ \t]*$/
+/** A section's last line when it is a fence that closes nothing: the end of an answer wrapped whole in one fence. */
+const dropStrayFence = (section: string): string => {
+  const lines = section.split('\n')
+  return lines.filter(line => FENCE_LINE.test(line)).length % 2 === 1 && BARE_FENCE_LINE.test(lines[lines.length - 1]!) ? lines.slice(0, -1).join('\n').trim() : section
+}
 /** Each job's section of a batched answer, by its "### JOB <id>" header; a job without one is absent. */
 export function splitBatchAnswer(answer: string, ids: string[]): Record<string, string> {
   const visible = visibleAnswer(answer), known = new Set(ids), sections: Record<string, string> = {}
-  const headers = [...visible.matchAll(/^[ \t]*#{2,4}[ \t]*JOB[ \t]+([\w.-]+)[ \t]*:?[ \t]*$/gim)].filter(match => known.has(match[1]!))
-  headers.forEach((match, index) => {
-    const id = match[1]!, end = headers[index + 1]?.index ?? visible.length
-    if (!(id in sections)) sections[id] = visible.slice(match.index! + match[0].length, end).trim()
+  const named = (raw: string): string | undefined => {
+    const trimmed = raw.replace(/[._]+$/, '')
+    return known.has(raw) ? raw : known.has(trimmed) ? trimmed : undefined
+  }
+  const matches = [...visible.matchAll(BATCH_HEADER)]
+  // "### JOB 2" means the second task only when the answer never names a task by its id.
+  const byId = matches.some(match => named(match[2]!) !== undefined)
+  const headers = matches.flatMap(match => {
+    const id = named(match[2]!) ?? (!byId && /^\d+$/.test(match[2]!) ? ids[Number(match[2]) - 1] : undefined)
+    return id === undefined ? [] : [{ id, match }]
+  })
+  headers.forEach(({ id, match }, index) => {
+    if (id in sections) return
+    // A heading line is all title; a bold header may start the answer after its closing marker ("**JOB a** 4+6").
+    const rest = match[3]!, close = match[1]!.includes('#') ? -1 : rest.search(/\*\*|__/)
+    const inline = close < 0 ? '' : rest.slice(close + 2).replace(/^[ \t]*(?:\([^)\n]*\))?[ \t]*:?[ \t]*/, '')
+    const end = headers[index + 1]?.match.index ?? visible.length
+    sections[id] = dropStrayFence((inline + visible.slice(match.index! + match[0].length, end)).trim())
   })
   return sections
 }
@@ -375,6 +400,12 @@ export async function evaluate(key: ModelKey, suite: EvaluationSuite, ports: Eva
     }
     const used = run.tokens ?? budget?.maxTokens ?? runTokens(prompt, run), sections = splitBatchAnswer(run.answer, batched.map(job => job.id))
     tokens += used; spent += run.costUsd ?? 0
+    if (budget && used > budget.maxTokens) stoppedBy = 'token-cap'
+    // No section at all is a format slip over the whole reply, not N wrong answers: nothing is graded.
+    if (!Object.keys(sections).length) {
+      for (const job of batched) notGradable(job, 'not graded: the batched answer had no "### JOB <id>" section for any task')
+      return
+    }
     for (const job of batched) {
       const section = sections[job.id]
       const graded: Grade = section === undefined ? { pass: false, invalidOutput: true, detail: `no "### JOB ${job.id}" section in the batched answer` }
@@ -386,7 +417,6 @@ export async function evaluate(key: ModelKey, suite: EvaluationSuite, ports: Eva
       })
       results.push({ id: job.id, category: job.category, result: graded.pass ? 'success' : 'failure', detail: graded.detail, timedOut: false, durationMs: run.durationMs ?? ports.now().getTime() - started, costUsd: null, tokens: null })
     }
-    if (budget && used > budget.maxTokens) stoppedBy = 'token-cap'
   }
 
   const runEach = async (): Promise<void> => {

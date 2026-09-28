@@ -13,6 +13,8 @@ import type { AgentProviderInfo, AgentSpec, PaneTab } from '../../shared/models'
 import type { RouteDecision } from '../../shared/model-routing'
 import type { ProviderCapabilities } from '../../shared/structured-agent'
 import type { ProviderAdapter } from '../providers/adapter'
+import { cloudRunPort, evaluationPrompt } from './evaluation-ports'
+import type { EvaluationJob } from './evaluation'
 import { createModelIntelligence } from './index'
 
 const dispose: Array<() => void> = []
@@ -22,7 +24,7 @@ const LOCAL = 'local/qwen-test'
 const GiB = 1024 ** 3
 /** AgentControl + StructuredSessions (zero-inference adapter) + model intelligence on a temp db,
  *  with a local provider whose VRAM envelope and admission verdicts the test chooses. */
-type Emit = (event: { turnId?: string; itemId?: string; data: Record<string, unknown> }) => void
+type Emit = (event: { turnId?: string; itemId?: string; parentId?: string; data: Record<string, unknown> }) => void
 /** The zero-inference turn: an answer, usage and completion, unless the test scripts another. */
 const answerTurn = (emit: Emit) => {
   emit({ turnId: 't1', data: { type: 'session', phase: 'running' } })
@@ -133,6 +135,45 @@ describe('routing live facts and dispatch (AgentControl over model intelligence)
     // The whole input comes back too: the fixed overhead is learned from it (N9).
     expect(await f.control.evaluationTurn(SYNTHETIC, PROMPT, new AbortController().signal, { maxTokens: 20_000 })).toMatchObject({ tokens: 9_100, inputTokens: 9_000 })
   })
+  // N14: the fixed overhead is learned from the turn's first API call, not the summed input of every call.
+  const usageItem = (itemId: string, data: Record<string, unknown>, parentId?: string) => ({ turnId: 't1', itemId, ...(parentId ? { parentId } : {}), data: { type: 'usage', source: 'provider', ...data } })
+  it('learns from the first API call of a turn that reports its calls (Claude), ignoring subagent calls', async () => {
+    const f = fixture({ vramBytes: 7 * GiB, availability: () => ({ available: true }), turn: emit => {
+      emit({ turnId: 't1', data: { type: 'session', phase: 'running' } })
+      // Three API calls of one turn (a tool call in between), a subagent's own call, and the turn total.
+      for (const [id, input] of [['m1', 45_000], ['m2', 52_000], ['m3', 60_000]] as const) emit(usageItem(`usage:message:${id}`, { scope: 'message', inputTokens: input, outputTokens: 300 }))
+      emit(usageItem('usage:message:sub', { scope: 'message', inputTokens: 1_000, outputTokens: 50 }, 'task:sub'))
+      emit(usageItem('usage:turn:t1', { scope: 'turn', inputTokens: 157_000, outputTokens: 900 }))
+      emit({ turnId: 't1', itemId: 'answer', data: { type: 'text', role: 'assistant', text: '### JOB j\n42', mode: 'snapshot' } })
+      emit({ turnId: 't1', data: { type: 'session', phase: 'completed' } })
+    } })
+    const result = await f.control.evaluationTurn(SYNTHETIC, PROMPT, new AbortController().signal, { maxTokens: 200_000 })
+    expect(result.inputTokens).toBe(45_000)
+    // Through the port, the learned value is that first call's input less the prompt it was sent.
+    const job: EvaluationJob = { id: 'j', category: 'simple-coding', complexity: 1, prompt: 'Say 42', grader: { kind: 'exact', expected: '42' } }
+    const prompt = evaluationPrompt(job)
+    const run = await cloudRunPort((key, sent, signal, options) => f.control.evaluationTurn(key, sent, signal, options))(SYNTHETIC, job, new AbortController().signal, { maxTokens: 200_000 })
+    expect(run.overheadTokens).toBe(45_000 - Math.ceil((prompt.system.length + prompt.user.length) / 4))
+  })
+  it('falls back to the whole turn input when only turn totals are reported (Codex)', async () => {
+    const f = fixture({ vramBytes: 7 * GiB, availability: () => ({ available: true }), turn: emit => {
+      emit({ turnId: 't1', data: { type: 'session', phase: 'running' } })
+      emit(usageItem('usage:thread', { scope: 'session', inputTokens: 70_000, cachedTokens: 30_000, outputTokens: 500 }))
+      emit({ turnId: 't1', itemId: 'answer', data: { type: 'text', role: 'assistant', text: '42', mode: 'snapshot' } })
+      emit({ turnId: 't1', data: { type: 'session', phase: 'completed' } })
+    } })
+    expect((await f.control.evaluationTurn(SYNTHETIC, PROMPT, new AbortController().signal, { maxTokens: 200_000 })).inputTokens).toBe(70_000)
+  })
+  it('a failed turn carries the first call\'s input for the overhead too', async () => {
+    const f = fixture({ vramBytes: 7 * GiB, availability: () => ({ available: true }), turn: emit => {
+      emit({ turnId: 't1', data: { type: 'session', phase: 'running' } })
+      emit(usageItem('usage:message:m1', { scope: 'message', inputTokens: 41_000, outputTokens: 10 }))
+      emit(usageItem('usage:message:m2', { scope: 'message', inputTokens: 48_000, outputTokens: 10 }))
+      emit({ turnId: 't1', data: { type: 'session', phase: 'failed' } })
+    } })
+    await expect(f.control.evaluationTurn(SYNTHETIC, PROMPT, new AbortController().signal, { maxTokens: 200_000 })).rejects.toMatchObject({ inputTokens: 41_000 })
+  })
+
   it('counts a usage-less turn at its budget', async () => {
     const f = fixture({ vramBytes: 7 * GiB, availability: () => ({ available: true }), turn: emit => {
       emit({ turnId: 't1', data: { type: 'session', phase: 'running' } })

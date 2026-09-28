@@ -1473,8 +1473,14 @@ export class AgentControl {
     const id = tab.resourceId!
     const budget = options.maxTokens !== undefined && Number.isFinite(options.maxTokens) && options.maxTokens > 0 ? options.maxTokens : null
     const spentOf = (items: SessionProjection['items'] | undefined): number | null => items ? evaluationTokens(summarizeUsage(items).tokens) : null
-    // The turn's whole input (cache included), from which the fixed overhead of a native turn is learned.
-    const inputOf = (items: SessionProjection['items'] | undefined): number | null => (items ? summarizeUsage(items).tokens?.inputTokens : undefined) ?? null
+    // The input the fixed overhead is learned from: the turn's first API call (its smallest per-call input,
+    // since context only grows), where the provider reports calls (Claude, top-level 'message' usage; a subagent's
+    // own calls are left out); else the turn's whole input (Codex reports turn totals only).
+    const inputOf = (items: SessionProjection['items'] | undefined): number | null => {
+      if (!items) return null
+      const calls = items.flatMap(item => item.data.type === 'usage' && item.data.scope === 'message' && !item.parentId && typeof item.data.inputTokens === 'number' && item.data.inputTokens > 0 ? [item.data.inputTokens] : [])
+      return calls.length ? Math.min(...calls) : summarizeUsage(items).tokens?.inputTokens ?? null
+    }
     // What a turn that did not complete counts: its measured spend, never below the budget it was given.
     const worstCase = (measured: number | null): number | null => measured === null ? budget : Math.max(measured, budget ?? 0)
     try {
@@ -1494,7 +1500,7 @@ export class AgentControl {
           reject(new EvaluationTurnError('evaluation turn aborted', worstCase(spentOf(items)), inputOf(items)))
         }, { once: true })
       })
-      const usage = summarizeUsage(settled.items), measured = evaluationTokens(usage.tokens), inputTokens = usage.tokens?.inputTokens ?? null
+      const usage = summarizeUsage(settled.items), measured = evaluationTokens(usage.tokens), inputTokens = inputOf(settled.items)
       if (overBudget) throw new EvaluationTurnError(`the evaluation turn passed its ${budget}-token budget and was stopped`, worstCase(measured), inputTokens)
       if (settled.phase !== 'completed') throw new EvaluationTurnError(`the evaluation turn ended ${settled.phase}`, worstCase(measured), inputTokens)
       const answer = [...settled.items].reverse().find(item => item.data.type === 'text' && item.data.role === 'assistant')

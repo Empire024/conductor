@@ -17,7 +17,7 @@ import { createFrontierDecider, type FrontierPort } from './deciders/frontier'
 import { createLocalLlmDecider } from './deciders/local-llm'
 import { createScorerDecider, defaultUsageStop, SCORER_TEMPERATURE, softmax } from './deciders/scorer'
 import defaultSuite from './suites/default.json'
-import { evaluate, validateSuite, type CommandRequest, type CommandResult, type EvaluationJob, type EvaluationOptions, type EvaluationPorts, type EvaluationResult, type EvaluationRun, type EvaluationSuite } from './evaluation'
+import { batchJobTokens, evaluate, validateSuite, type CommandRequest, type CommandResult, type EvaluationJob, type EvaluationOptions, type EvaluationPorts, type EvaluationResult, type EvaluationRun, type EvaluationSuite } from './evaluation'
 import { DEFAULT_FIXED_OVERHEAD_TOKENS, EvaluationTurnError, type CloudRun } from './evaluation-ports'
 import { explainRoute } from './explain'
 import { refreshAll, type IngestionPorts, type IngestionSourceName, type RefreshResult } from './ingest'
@@ -65,7 +65,16 @@ export interface EvaluationCaps { perRunTokens: number; perDayEvaluations: numbe
 export const WEEKLY_STOP_SETTING = 'model-intelligence:weekly-stop'
 export const DEFAULT_WEEKLY_STOP: Readonly<Record<string, number>> = { claude: 85, codex: 55 }
 export const ROUTING_FALLBACK_STOP = 95
-export const DEFAULT_EVALUATION_CAPS: EvaluationCaps = { perRunTokens: 60_000, perDayEvaluations: 3, perDayTokens: 150_000, minRunTokens: 20_000, weeklyStop: { ...DEFAULT_WEEKLY_STOP } }
+export const DEFAULT_EVALUATION_CAPS: EvaluationCaps = { perRunTokens: 60_000, perDayEvaluations: 3, perDayTokens: 150_000, minRunTokens: DEFAULT_FIXED_OVERHEAD_TOKENS + 5_000, weeklyStop: { ...DEFAULT_WEEKLY_STOP } }
+/** The learned fixed overhead of a cloud turn is kept within [OVERHEAD_MIN_TOKENS, the per-run cap less the
+ *  suite's smallest one-shot job], so a learned value can never leave a full run unable to hold one job (N14). */
+export const OVERHEAD_MIN_TOKENS = 5_000
+/** What the smallest job a cloud run can grade adds to its batched turn (command-graded jobs are not
+ *  gradable in the cloud); null when the suite has none. */
+export function smallestCloudJob(jobs: EvaluationJob[]): number | null {
+  const sizes = jobs.filter(job => job.grader.kind !== 'command').map(batchJobTokens)
+  return sizes.length ? Math.min(...sizes) : null
+}
 
 export interface ModelIntelligenceOptions {
   dbPath: string | DatabaseSync
@@ -289,12 +298,8 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
 
   /** The weekly stops, defaults overlaid with the setting's valid percents; an unreadable setting keeps the defaults. */
   const weeklyStops = (): Record<string, number> => {
-    try {
-      const stored: unknown = JSON.parse(options.settings.getSetting(WEEKLY_STOP_SETTING) ?? '{}')
-      const valid = stored && typeof stored === 'object' && !Array.isArray(stored)
-        ? Object.entries(stored as Record<string, unknown>).filter((entry): entry is [string, number] => typeof entry[1] === 'number' && Number.isFinite(entry[1]) && entry[1] >= 0 && entry[1] <= 100) : []
-      return { ...DEFAULT_WEEKLY_STOP, ...Object.fromEntries(valid) }
-    } catch { return { ...DEFAULT_WEEKLY_STOP } }
+    try { return { ...DEFAULT_WEEKLY_STOP, ...validStops(JSON.parse(options.settings.getSetting(WEEKLY_STOP_SETTING) ?? '{}')) } }
+    catch { return { ...DEFAULT_WEEKLY_STOP } }
   }
   const weeklyStop = (provider: string): number => weeklyStops()[provider] ?? ROUTING_FALLBACK_STOP
   const evaluationCaps = (): EvaluationCaps => {
@@ -303,7 +308,7 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
       const count = (value: unknown, fallback: number): number => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback
       return {
         perRunTokens: count(stored.perRunTokens, DEFAULT_EVALUATION_CAPS.perRunTokens), perDayEvaluations: count(stored.perDayEvaluations, DEFAULT_EVALUATION_CAPS.perDayEvaluations),
-        perDayTokens: count(stored.perDayTokens, DEFAULT_EVALUATION_CAPS.perDayTokens), minRunTokens: count(stored.minRunTokens, DEFAULT_EVALUATION_CAPS.minRunTokens), weeklyStop: { ...weeklyStops(), ...stored.weeklyStop && typeof stored.weeklyStop === 'object' ? stored.weeklyStop : {} }
+        perDayTokens: count(stored.perDayTokens, DEFAULT_EVALUATION_CAPS.perDayTokens), minRunTokens: count(stored.minRunTokens, DEFAULT_EVALUATION_CAPS.minRunTokens), weeklyStop: { ...weeklyStops(), ...validStops(stored.weeklyStop) }
       }
     } catch { return { ...DEFAULT_EVALUATION_CAPS, weeklyStop: weeklyStops() } }
   }
@@ -315,13 +320,19 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
       return stored && typeof stored === 'object' && !Array.isArray(stored) ? stored as Record<string, { tokens: number; at: string }> : {}
     } catch { return {} }
   }
-  const fixedOverheadTokens = (provider: string): number => {
+  /** The band a learned overhead is kept in: at least OVERHEAD_MIN_TOKENS, and small enough that a full
+   *  run still holds the smallest job (`smallestJob`, 0 when unknown). */
+  const overheadBand = (smallestJob = 0): { min: number; max: number } => ({ min: OVERHEAD_MIN_TOKENS, max: Math.max(OVERHEAD_MIN_TOKENS, evaluationCaps().perRunTokens - smallestJob) })
+  const clampOverhead = (tokens: number, smallestJob = 0): number => { const band = overheadBand(smallestJob); return Math.round(Math.min(band.max, Math.max(band.min, tokens))) }
+  const fixedOverheadTokens = (provider: string, smallestJob = 0): number => {
     const tokens = overheads()[provider]?.tokens
-    return typeof tokens === 'number' && Number.isFinite(tokens) && tokens >= 0 ? tokens : DEFAULT_FIXED_OVERHEAD_TOKENS
+    return clampOverhead(typeof tokens === 'number' && Number.isFinite(tokens) && tokens >= 0 ? tokens : DEFAULT_FIXED_OVERHEAD_TOKENS, smallestJob)
   }
-  const recordOverhead = (provider: string, tokens: unknown): void => {
+  /** Learns a provider's overhead from one turn (the port's measurement: its first API call's input less the
+   *  job prompt), bounded; the raw measurement is kept beside it for audit. */
+  const recordOverhead = (provider: string, tokens: unknown, smallestJob = 0): void => {
     if (typeof tokens !== 'number' || !Number.isFinite(tokens) || tokens < 0) return
-    try { options.settings.setSetting(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ ...overheads(), [provider]: { tokens: Math.round(tokens), at: clock().toISOString() } })) }
+    try { options.settings.setSetting(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ ...overheads(), [provider]: { tokens: clampOverhead(tokens, smallestJob), measured: Math.round(tokens), at: clock().toISOString() } })) }
     catch (error) { log('evaluation overhead not saved', error) }
   }
   /** The owner's exclusion patterns; an unreadable setting keeps the defaults, an empty array excludes nothing. */
@@ -461,6 +472,7 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
       // Everything from here to the handle is synchronous, so two starts cannot both pass the checks.
       if ([...evaluations.values()].some(handle => handle.state === 'running')) throw new Error('An evaluation is already running; one at a time on this machine')
       let maxTokens: number | undefined
+      const jobs = suite.jobs.slice(0, evaluationOptions.maxJobs ?? suite.jobs.length), smallestJob = cloud ? smallestCloudJob(jobs) : null
       if (cloud) {
         const caps = evaluationCaps(), stop = caps.weeklyStop[target.provider]
         const usage = wiring.usage?.(target.provider) ?? null
@@ -474,6 +486,11 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
         const reserved = [...evaluations.values()].reduce((sum, handle) => sum + (handle.state === 'running' && handle.maxTokens !== undefined ? Math.max(0, handle.maxTokens - (runSpend.get(handle.runId) ?? 0)) : 0), 0)
         const remaining = caps.perDayTokens - spent.tokens - reserved, runCap = Math.min(caps.perRunTokens, remaining), floor = Math.min(caps.minRunTokens, caps.perRunTokens)
         if (runCap < floor) throw new Error(`Cloud evaluations used ${spent.tokens} tokens in the last 24 h${reserved ? ` and ${reserved} more are reserved by a run in progress` : ''}; ${Math.max(0, remaining)} of the daily ${caps.perDayTokens} are left, below the ${floor} a run needs`)
+        // A cloud run is one batched turn: it must hold the turn's fixed overhead and at least one job, or it is
+        // refused here, before it counts as one of the day's runs (N14). The overhead is bounded, so a full run always fits.
+        if (smallestJob === null) throw new Error(`No job of ${suite.name} can be graded in a cloud run: every one needs a command runner`)
+        const overhead = fixedOverheadTokens(target.provider, smallestJob)
+        if (overhead + smallestJob > runCap) throw new Error(`A ${runCap}-token run cannot hold a ${target.provider} turn's ${overhead} fixed tokens plus the smallest job's ${smallestJob}${runCap < caps.perRunTokens ? `; the day has ${Math.max(0, remaining)} of its ${caps.perDayTokens} left` : ''}; no run was counted`)
         maxTokens = runCap
       }
       const notGradable = command ? [] : suite.jobs.filter(job => job.grader.kind === 'command').map(job => `${job.id} (command: not gradable here)`)
@@ -490,10 +507,10 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
         const jobBudget = budget ?? (maxTokens !== undefined ? { maxTokens } : undefined)
         try {
           const { overheadTokens, ...result }: CloudRun = await run(runKey, job, signal, jobBudget)
-          recordOverhead(runKey.provider, overheadTokens)
+          recordOverhead(runKey.provider, overheadTokens, smallestJob ?? 0)
           return result.tokens == null && jobBudget ? { ...result, tokens: jobBudget.maxTokens } : result
         } catch (error) {
-          recordOverhead(runKey.provider, (error as { overheadTokens?: unknown } | null)?.overheadTokens)
+          recordOverhead(runKey.provider, (error as { overheadTokens?: unknown } | null)?.overheadTokens, smallestJob ?? 0)
           const reported = (error as { tokens?: unknown } | null)?.tokens
           const measured = typeof reported === 'number' && Number.isFinite(reported) ? reported : null
           throw new EvaluationTurnError(error instanceof Error ? error.message : String(error), jobBudget ? Math.max(measured ?? 0, jobBudget.maxTokens) : measured)
@@ -509,7 +526,7 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
         reputation: (reputationKey, dimension) => reputation.reputation(reputationKey, dimension),
         alternatives: altKey => registry.list({ provider: altKey.provider }).map(record => record.key).slice(0, 4),
         writeReport: (reportName, markdown) => { try { wiring.writeReport?.(reportName, markdown) } catch (error) { log('evaluation report not written', error) } },
-        now: clock, ...spendPort, fixedOverheadTokens
+        now: clock, ...spendPort, fixedOverheadTokens: provider => fixedOverheadTokens(provider, smallestJob ?? 0)
       }
       const tokenCap = maxTokens !== undefined ? { maxTokens } : {}
       const runOptions: EvaluationOptions = { runId: handle.runId, ...(evaluationOptions.maxJobs ? { maxJobs: evaluationOptions.maxJobs } : {}), ...tokenCap }
@@ -535,6 +552,12 @@ export { BINDING_TTL_DAYS }
 export function bundledSuites(): Record<string, EvaluationSuite> {
   const suite = validateSuite(defaultSuite)
   return { [suite.name]: suite }
+}
+
+/** The valid percents (0..100) of a stored stop map; anything else is dropped, so its provider keeps its default. */
+function validStops(value: unknown): Record<string, number> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).filter((entry): entry is [string, number] => typeof entry[1] === 'number' && Number.isFinite(entry[1]) && entry[1] >= 0 && entry[1] <= 100))
 }
 
 /** Providers none of whose candidates may be used because of a usage limit, with the first reason. */
