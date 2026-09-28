@@ -666,3 +666,119 @@ The paths:
 - **Queued messages:** `structured-sessions*`, `structured-store*`, `structured-agent-reducer*`, `StructuredAgentPane.tsx` and `StructuredAgentRenderers.tsx`.
 - **Other docs and scripts:** the other `docs/verification/2026-09-28-*` docs and `scripts/smoke-verify-v4-*`.
 - **`feature-list.md`: flagged.** Its only routing hunk is the added "[~] Adaptive model intelligence and routing" line, among other agents' lines (Codex questions, local-model work, queued messages, `tabs.open`, tab archive). Ship that hunk alone or leave the file out.
+
+## Re-verification 4: fix batch 4 (N14–N17), 2026-09-28
+
+Same verifier as round 3. The brief is `fix-batch-4.txt`, on top of a9b715f (batch 3, shipped). HEAD moved to 90f2501 (another agent's permission-grant commit) during the run; none of the 8 batch paths is touched by it. I fixed no product code. My tests are in `.conductor-scratch/model-routing/verify/reverify4.verify.test.ts` (28 tests), and its outputs are in `reverify4-summary.json`.
+
+### Verdict: **SHIP WITH NOTES**
+
+- **N15 and N17 are fixed. N14's lockout is gone**, and a run that cannot fit into the day is refused before it counts.
+- **Two low notes remain** (N19, N20) and one doc sentence is stale (N16 residual). None of them affects a run under the default caps.
+
+**The first cloud `models.evaluate` may run under the owner caps** (60k per run; 3 runs and 150k per day; weekly stop Claude 85 %, Codex 55 %).
+- Pick a Claude model. Claude's week is at 7 %.
+- Codex is at 55 %, so an evaluation on it is refused ("at or above the 55% stop").
+- **What to expect:** one batched turn of about 40k tokens, with the 7 one-shot jobs graded and the 7 command jobs not-gradable.
+- With spends like that, 3 runs fit in a day (121k in total), and the 4th is refused by the count.
+
+### Tests run
+
+| Command | Result |
+| --- | --- |
+| `npx tsc --noEmit` on the working tree (`verify/typecheck-5.log`) | exit 0, no errors anywhere. The permission-grant work was committed as 90f2501 in the meantime. |
+| `npm test` in the background (`verify/npm-test-5.log`) | 413 files passed, 1 failed. **4588 tests passed, 1 failed, 9 skipped.** The failure is the known `database-wal.test.ts` 5 s flake. |
+| `npm run test:scripts` (`verify/test-scripts-5.log`) | 190 passed, 0 failed, 3 skipped |
+| **Isolated tree:** `git archive HEAD` plus exactly the 8 batch paths, with `node_modules` junctioned (`verify/ship-tree-4-*.log`) | `tsc` exit 0. `vitest run` over `src/main/model-intelligence`, `approval-review`, `agent-control`, `durable-jobs`, `control`, `local-assist` and `src/shared/model-routing.test.ts`: **63 files, 712 passed, 1 skipped** |
+| reverify4 | **28/28** |
+| All scratch tests (`verify/scratch-all-5.log`) | 78 tests: 74 pass. The 4 failures are the expected flips (item 5 below) plus N10. |
+
+### Items
+
+**N15: batch answer splitting. PASS.**
+- **Every header variant grades all 7 jobs through the service with 0 failures:**
+  - exact, lower case, `### JOB: id`, ``### JOB `id` ``, `**JOB id**`, `### JOB id (task 1)`
+  - `# JOB id`, `###### JOB id`, `### JOB — id`, `### JOB id.`
+  - numbered only (`### JOB 1`), and `### JOB 1: id`.
+- **Whole-answer fences** (```` ``` ````, ```` ```markdown ````, `~~~`): 0 failures. Each job's own inner fence survives: the ```` ```json ```` blocks and ```` ```out/summary.json ````.
+- **Zero sections:** every job is not-gradable ("…had no "### JOB <id>" section for any task") and there are **0 outcome rows**.
+- **One section missing** among the found ones: only that job fails (1 row).
+- **Numbering never misassigns when ids are present.** Id headers in reverse order split correctly, and numbered-only headers map to the task order.
+- **Answers that still split into nothing** are now not-gradable, not failures:
+  - `**JOB:** id`
+  - an upper-cased id
+  - an echoed `## TASK 1 of 3: id`
+- Case N20 below is the one exception.
+
+**N14: the overhead bound and admission. PASS, with N19.**
+- **No lockout.** A stored overhead of 500k reads back clamped to 59,165 (the 60k cap less the smallest job, 835). The run starts with the smallest job, and the real turn re-measures the overhead as `{tokens: 39115, measured: 39115}`.
+- **Refused before counting.** After two full-cap runs (120k), the third is refused: "…30000 of the daily 150000 are left, below the 45000 a run needs". The journal is unchanged (2 runs, 120k).
+- **A suite of command jobs only** is refused for cloud keys, and no run is counted.
+- **The 45k floor against the 150k/day cap: acceptable.**
+  - Runs that spend their full 60k: 2 per day, and the doc says so ("two full runs").
+  - Realistic runs of 40,452 tokens: all **3** fit (caps 60k, 60k, 60k; 121,356 in total). The 4th is refused by the daily count.
+- **The first-call overhead** (`agent-control.ts` `inputOf`):
+  - Claude learns from the smallest top-level message-scope call, and subagent calls are left out.
+  - Codex falls back to the turn total.
+  - The builder's `dispatch-routing` tests cover all three cases through the real `AgentControl.evaluationTurn`.
+- **Checked against the live shape.** This verifier's own first turn, read from the owner database with a bounded primary-key query:
+  - Per-call inputs are 40,858, 45,070, 46,902 and 55,626. The first call is the smallest.
+  - Learned from it, less the batched prompt (about 1.4k), the overhead is **~39.5k**. That is sane.
+  - The old summed figure would have been 188,456.
+
+**N17: the evaluation caps' weekly stop. PASS.**
+- **Malformed overrides keep Codex at 55**, and evaluation at 55 % is refused:
+  - `{codex: "x"}`, `150`, `-5`, `null`, `"55"`, an array, non-JSON.
+- **A valid `{codex: 60}`** applies to evaluation only; routing keeps 55.
+
+**N16: docs. PASS with one residual.** `docs/model-routing.md` now matches the code:
+- the same-provider fallback;
+- one batched turn per run, the largest jobs dropped first, zero sections giving not-gradable;
+- the 45k floor, and refusal before journaling;
+- the pre-charge and reconcile;
+- the clamp band;
+- `weeklyStop` validation.
+
+**Residual:** line 222 still says the measurement "is the whole turn's [input], so a turn that makes several API calls over-measures". Since this batch's `inputOf` change, Claude learns from the first call. Only Codex, which reports turn totals only, still over-measures.
+
+**Item 5: my earlier scratch tests that flipped as expected.**
+- reverify2 "N2/N4 the day": the 30k third run is now refused (45k floor).
+- reverify2 "N7": the runner is no longer started.
+- reverify3 "cap 30k": it **no longer starts no turn**. It now starts a turn that is sure to be cut off (see N19).
+- reverify2 "N1" is still N10 (cost weight 1).
+
+**Item 7: the ship list has only batch 4 hunks.**
+- `agent-control.ts` has 2 hunks against HEAD, both `inputOf` (its definition, and its use for the settled turn).
+- The other 7 files hold only N14–N17 changes and their tests.
+- Everything else modified in the tree belongs to other agents: the scraper, the Codex question, queued messages and `feature-list.md`.
+
+### New defects
+
+**N19 — With a per-run cap below the real overhead, every run is spent re-measuring it and overruns the cap** (low: it does not happen with the default caps).
+- **Where:** `index.ts` `overheadBand` clamps the learned value to at most `perRunTokens - smallestJob`. So the admission guard `overhead + smallestJob > runCap` never fires for a full run.
+- **Repro** (reverify4, "perRunTokens 30k"): owner caps `{perRunTokens: 30000}` and a real overhead of 39,115.
+  - The run is admitted and starts a turn with 1 job and a 30k budget.
+  - The turn is cut off. It is charged **39,353** and records nothing.
+  - The stored overhead is `{tokens: 29165, measured: 39115}`, so the next run does the same.
+- The same happens with the default caps only if the native preamble grows past about 59k.
+- **Expected:** admit on the raw `measured` value when it is recent. For example, refuse with the reason when `measured + smallestJob > perRunTokens`, and re-measure only when the preamble could have changed.
+
+**N20 — A numbered header among id headers is swallowed into the previous section** (low; mixed styles are unlikely).
+- **Where:** `evaluation.ts` `splitBatchAnswer` skips the numbered header but not its text.
+- **Repro:** `### JOB a\nA\n### JOB 2\nB\n### JOB c\nC` gives `a = "A\n### JOB 2\nB"`. An exact grader then fails `a`, which is a false failure, and `b` counts as a missing section.
+- **Expected:** a skipped header should still end the previous section.
+
+**N16 residual** — `docs/model-routing.md:222`, the over-measuring sentence (above).
+
+N10 and N18 stand as recorded in round 3.
+
+### The batch 4 ship: exact paths (9)
+
+- `src/main/model-intelligence/evaluation.ts`, `evaluation.test.ts`
+- `src/main/model-intelligence/index.ts`, `service.test.ts`
+- `src/main/model-intelligence/evaluation-ports.ts`, `dispatch-routing.test.ts`
+- `src/main/agent-control.ts`
+- `docs/model-routing.md`
+- `docs/verification/2026-09-28-model-routing-verification.md` (this section)
+
+The first 8 are proven by the isolated tree above. The list is in `verify/ship-paths-4.txt`, without this doc.
