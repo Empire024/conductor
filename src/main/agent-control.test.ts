@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AgentControl } from './agent-control'
 import { AgentControlServer } from './agent-control-server'
+import { controlMethodClass } from './control-method-classes'
 import { ConductorDatabase } from './database'
 import { StructuredSessions } from './structured-sessions'
 import { OrchestrationStore } from './orchestration-store'
@@ -1872,6 +1873,30 @@ describe('the owner control credential', () => {
     await expect(control.call(f.scope, 'app.restart', {})).rejects.toThrow(/owner's own control credential/)
     await expect(control.call(f.scope, 'projects.open', { path: folder })).rejects.toThrow(/owner's own control credential/)
     await expect(f.control.call(f.control.ownerScope({ projectId: f.project.id }), 'app.restart', {})).rejects.toThrow(/unavailable in this Conductor/)
+  })
+
+  it('tabs.archive closes tabs into the workspace archive for the owner and a wizard only, naming each refusal', async () => {
+    const f = fixture()
+    const archive = vi.fn(async (_projectId: string, _sessionId: string, tabIds: string[]) => ({
+      archived: tabIds.slice(0, 1).map(tabId => ({ tabId, title: 'Shell' })),
+      refused: tabIds.slice(1).map(tabId => ({ tabId, title: 'Busy', reason: 'its turn is still running', message: '“Busy” was not archived: its turn is still running.' }))
+    }))
+    const control = new AgentControl({ ...f.deps, tabArchive: { archive } })
+    const owner = control.ownerScope({ projectId: f.project.id })
+    expect(Object.keys(await control.call(owner, 'tools.list', {}) as object)).toContain('tabs.archive')
+    expect(Object.keys(await control.call(f.scope, 'tools.list', {}) as object)).not.toContain('tabs.archive')
+    expect(await control.call(owner, 'tabs.archive', { tabIds: ['tab_a', 'tab_b'] })).toEqual({
+      archived: [{ tabId: 'tab_a', title: 'Shell' }],
+      refused: [{ tabId: 'tab_b', title: 'Busy', reason: 'its turn is still running', message: '“Busy” was not archived: its turn is still running.' }]
+    })
+    expect(archive).toHaveBeenCalledWith(f.project.id, owner.sessionId, ['tab_a', 'tab_b'])
+    expect(await control.call({ ...f.scope, wizard: true }, 'tabs.archive', { tabIds: ['tab_c'] })).toMatchObject({ archived: [{ tabId: 'tab_c' }] })
+    await expect(control.call(f.scope, 'tabs.archive', { tabIds: ['tab_a'] })).rejects.toThrow(/owner's own control credential/)
+    await expect(control.call(owner, 'tabs.archive', { tabIds: [] })).rejects.toThrow(/tabIds/)
+    await expect(control.call(owner, 'tabs.archive', { tabIds: ['tab_a'], force: true })).rejects.toThrow(/force/)
+    expect(archive).toHaveBeenCalledTimes(2)
+    expect(controlMethodClass('tabs.archive')).toBe('mutation')
+    await expect(f.control.call(f.control.ownerScope({ projectId: f.project.id }), 'tabs.archive', { tabIds: ['tab_a'] })).rejects.toThrow(/unavailable in this Conductor/)
   })
 
   it('serves the owner credential over the loopback server from a file it writes at start and removes at close', async () => {

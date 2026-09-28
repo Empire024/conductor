@@ -17,6 +17,8 @@ export interface CrossWindowTabPayload {
   projectId: string
   sessionId: string
   detachedId?: string
+  /** A dragged selection: every tab in it, `tab` (the one under the pointer) among them. */
+  tabs?: PaneTab[]
 }
 
 export const encodeCrossWindowTab = (payload: CrossWindowTabPayload): string => JSON.stringify(payload)
@@ -31,7 +33,9 @@ export const decodeCrossWindowTab = (raw: string): CrossWindowTabPayload | null 
     if (!tab || typeof tab !== 'object' || typeof tab.id !== 'string' || typeof tab.kind !== 'string') return null
     if (typeof sourceGroupId !== 'string' || typeof projectId !== 'string' || typeof sessionId !== 'string') return null
     if (detachedId !== undefined && typeof detachedId !== 'string') return null
-    return { tab, sourceGroupId, projectId, sessionId, ...(detachedId ? { detachedId } : {}) }
+    // A dragged selection (layout/tab-selection.ts) carries every tab; malformed extras are dropped.
+    const tabs = Array.isArray(value.tabs) ? value.tabs.filter((item): item is PaneTab => Boolean(item) && typeof item === 'object' && typeof item.id === 'string' && typeof item.kind === 'string') : []
+    return { tab, sourceGroupId, projectId, sessionId, ...(detachedId ? { detachedId } : {}), ...(tabs.length > 1 ? { tabs } : {}) }
   } catch {
     return null
   }

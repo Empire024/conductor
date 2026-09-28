@@ -1,13 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Bot, Braces, ChevronRight, FolderTree, Monitor, PanelsTopLeft, Search, Terminal } from 'lucide-react'
+import { Archive, Bot, Braces, ChevronRight, FolderTree, Monitor, PanelsTopLeft, Search, Terminal } from 'lucide-react'
 import { focusDirectoryEntry, matchConversationTabs, refreshConversationDirectory, useConversationDirectory, type DirectoryEntry } from '../conversation-directory'
+import type { ArchivedTab } from '../../../shared/tab-archive'
 
 export interface PaletteCommand {
   id: string
   label: string
   detail?: string
   category: string
-  icon: 'agent' | 'terminal' | 'file' | 'browser' | 'layout' | 'code'
+  icon: 'agent' | 'terminal' | 'file' | 'browser' | 'layout' | 'code' | 'archive'
   shortcut?: string
   run(): void
 }
@@ -18,7 +19,8 @@ const icons = {
   file: FolderTree,
   browser: Monitor,
   layout: PanelsTopLeft,
-  code: Braces
+  code: Braces,
+  archive: Archive
 }
 
 /** A tab found by id or title, as a palette entry that jumps to it (switching project/workspace,
@@ -33,6 +35,18 @@ export function tabCommand(entry: DirectoryEntry, currentProjectId: string | nul
     category: 'Tabs',
     icon: entry.kind === 'agent' ? 'agent' : entry.kind === 'terminal' ? 'terminal' : entry.kind === 'browser' ? 'browser' : 'layout',
     run: () => { void focusDirectoryEntry(entry).catch((reason: unknown) => console.warn('The tab could not be shown', reason)) }
+  }
+}
+
+/** A closed tab from a workspace archive (src/shared/tab-archive.ts): Enter reopens it where it was. */
+export function archivedTabCommand(entry: ArchivedTab): PaletteCommand {
+  return {
+    id: 'archived:' + entry.sessionId + ':' + entry.tab.id,
+    label: entry.tab.title,
+    detail: ['Archived', entry.workspaceName, entry.tab.resourceId ?? entry.tab.id].filter(Boolean).join(' · '),
+    category: 'Archived tabs',
+    icon: 'archive',
+    run: () => { void window.conductor.tabArchive.reopen(entry.sessionId, [entry.tab.id]).catch((reason: unknown) => console.warn('The archived tab could not be reopened', reason)) }
   }
 }
 
@@ -54,11 +68,23 @@ export function CommandPalette({
   const inputRef = useRef<HTMLInputElement>(null)
   const directory = useConversationDirectory()
   const searchTabs = currentProjectId !== undefined
+  // Closed tabs are found too, from every open workspace's archive; open ones come first.
+  const [archived, setArchived] = useState<ArchivedTab[]>([])
+  useEffect(() => {
+    const q = query.trim()
+    if (!searchTabs || q.length < 2 || !window.conductor.tabArchive) { setArchived([]); return }
+    let live = true
+    const timer = window.setTimeout(() => { void window.conductor.tabArchive.search(q, 10).then(found => { if (live) setArchived(found) }).catch(() => undefined) }, 120)
+    return () => { live = false; window.clearTimeout(timer) }
+  }, [query, searchTabs])
   const filtered = useMemo(() => {
     const q = query.toLowerCase().trim()
     const matching = q ? commands.filter((item) => `${item.label} ${item.category}`.toLowerCase().includes(q)) : commands
-    return searchTabs && q ? [...matching, ...matchConversationTabs(directory, q).map(entry => tabCommand(entry, currentProjectId ?? null, currentDetachedId))] : matching
-  }, [commands, query, directory, searchTabs, currentProjectId, currentDetachedId])
+    if (!searchTabs || !q) return matching
+    const open = matchConversationTabs(directory, q)
+    const openIds = new Set(directory.entries.map(entry => entry.tabId))
+    return [...matching, ...open.map(entry => tabCommand(entry, currentProjectId ?? null, currentDetachedId)), ...archived.filter(entry => !openIds.has(entry.tab.id)).map(archivedTabCommand)]
+  }, [commands, query, directory, searchTabs, currentProjectId, currentDetachedId, archived])
 
   useEffect(() => inputRef.current?.focus(), [])
   // Tabs opened in another project or window since the last read are found too.

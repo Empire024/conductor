@@ -42,6 +42,7 @@ import { SuccessionBanner, successionOf } from './SuccessionBanner'
 import { cleanIpcError } from '../ipc-errors'
 import { copyText } from '../clipboard'
 import { onAgentControlGrants, onAgentControlSettings } from '../agent-control-settings'
+import { TabLineageLine } from './TabLineageLine'
 import './StructuredAgentPane.css'
 
 let focusedAgent: { sessionId: string; projectId: string; historical: boolean } | null = null
@@ -961,6 +962,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       if (!nearBottom.current) setReadingWindow((current) => current ?? lastVisibleItems.current)
       else if (!hasTimelineSelection(el, window.getSelection())) { setReadingWindow(null); setNewOutput(false) }
     }}><div ref={timelineContent} className="sa-timeline-content">
+      <TabLineageLine agentSessionId={props.resourceId} />
       {(!ready || !conversationItems.length) && <div className="sa-empty"><strong>{ready ? 'What are we working on?' : 'Opening conversation…'}</strong>{ready && <p>Ask {name} about your code, or describe a change.</p>}</div>}
       {(earlierCount > 0 || older.status === 'idle' || older.status === 'loading') && <button ref={observeEarlier} className="sa-load-earlier" disabled={earlierCount === 0 && older.status === 'loading'} onClick={() => loadEarlierRef.current()}>{earlierCount > 0 ? `Show earlier activities (${earlierCount})` :older.status === 'loading' ? 'Loading earlier activity…' : 'Load earlier activity'}</button>}
       {earlierCount === 0 && older.status === 'unavailable' && <p className="sa-history-note">Earlier activity in this conversation is no longer stored.</p>}
@@ -977,7 +979,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
         return <details className="sa-completed-group" key={group[0]!.id}><summary><span>{coalesced ? coalescedEditLabel(coalesced) : `${group.length} completed actions`}</span>{latestTask && <span className="sa-completed-latest" title={latestTask}><b>Latest</b> {latestTask}{latestOutput && <code>OUT {latestOutput}</code>}</span>}</summary><div>{activities}</div></details>
       })}
       {(projection.phase === 'running' || projection.phase === 'starting') && <div className="sa-working" role="status"><i />{projection.phase === 'starting' ? 'Connecting…' : ['Thinking…', 'Spelunking…', 'Working…', 'Considering…'][workingWord]}<StructuredLiveTokens items={projection.items} /></div>}
-    </div></div>{newOutput && <button className="sa-jump" onClick={jumpToLatest}><ArrowDown size={13} /> New output · Jump to latest</button>}</div>, [pinnedPrompt, conversationItems, name, ready, earlierCount, older.status, observeEarlier, readingWindow, projection.items, projection.runtimeId, projection.phase, activityGroups, activeId, props.project.id, fileCwd, expansion, historical, dockedQuestions, labelAnchors, parentLabels, onExpand, onOpenFile, onRespond, focusOrigin, setQuestionDocked, provider, switchPermission, recallByItem, loadTurnRecalls, workingWord, newOutput])
+    </div></div>{newOutput && <button className="sa-jump" onClick={jumpToLatest}><ArrowDown size={13} /> New output · Jump to latest</button>}</div>, [pinnedPrompt, conversationItems, name, ready, earlierCount, older.status, observeEarlier, readingWindow, projection.items, projection.runtimeId, projection.phase, activityGroups, activeId, props.project.id, fileCwd, expansion, historical, dockedQuestions, labelAnchors, parentLabels, onExpand, onOpenFile, onRespond, focusOrigin, setQuestionDocked, provider, switchPermission, recallByItem, loadTurnRecalls, workingWord, newOutput, props.resourceId])
 
   return <AgentFileMachineContext.Provider value={fileMachineId}><section ref={pane} className="structured-agent-pane" data-provider={provider} data-structured-session={activeId} data-file-machine={fileMachineId} onFocusCapture={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id, historical } }} onPointerDown={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id, historical } }}>
     <header className="sa-session-bar">

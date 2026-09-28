@@ -90,6 +90,9 @@ import { sshTransport } from './remote-jobs/transport'
 import { durableJobPorts, gatedRuntime } from './durable-jobs/wiring'
 import { LocalGenerationGate, createLlamaServerPorts } from './durable-jobs/server-lifecycle'
 import { registerDurableJobsIpc } from './durable-jobs-ipc'
+import { recordTabOpener, registerTabArchiveIpc, reopenedConversation, uncollectedReport } from './tab-archive-ipc'
+import { TabArchiver } from './tab-archive-eligibility'
+import { randomUUID } from 'node:crypto'
 import { createCloud, type CloudRegistration } from './cloud/register'
 import { health as llamaHealth, processAlive as llamaProcessAlive, readRunRecord, stopServer as stopLlamaServer } from './local-models/llama'
 import { resourceRequirements, runningLlamaProcesses } from './local-models/resource-guard'
@@ -171,6 +174,7 @@ let disposeScheduleIpc: (() => void) | undefined
 let disposeDeliveryIpc: (() => void) | undefined
 let coworkerAutoClose: CoworkerAutoClose | undefined
 let finishedTabs: FinishedTabs | undefined
+let tabArchiver: TabArchiver | undefined
 /** The owner's Ideas inbox (src/main/ideas/register.ts); undefined until the app is ready. */
 let ideasRegistration: IdeasRegistration | undefined
 let disposeIdeasIpc: (() => void) | undefined
@@ -1903,6 +1907,12 @@ const registerIpc = (): void => {
     }
     return facts
   })
+  // The per-workspace tab archive and the "continued from" / "opened by" line (src/shared/tab-archive.ts).
+  registerTabArchiveIpc({
+    database, trusted: trustedStructured, ui: () => agentControlUi?.request, archiver: () => tabArchiver,
+    reopened: ids => { for (const id of ids) agents?.structured.endArchive(id) },
+    publish: (channel, payload) => { for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send(channel, payload) }
+  })
   ipcMain.handle('workspace:close-finished', async (event, projectId: unknown, sessionId: unknown, tabIds: unknown) => {
     trustedStructured(event)
     if (typeof projectId !== 'string' || typeof sessionId !== 'string' || !Array.isArray(tabIds) || tabIds.some(id => typeof id !== 'string') || tabIds.length > 500) throw new Error('Invalid close request')
@@ -2560,8 +2570,9 @@ const registerIpc = (): void => {
   })
   ipcMain.handle(
     'window:detach',
-    (_event, projectId: string, sessionId: string, tab: PaneTab, sourceLayout?: WorkspaceLayout, options?: { alwaysOnTop?: boolean }) => {
-      const record = database.createDetachedWindow(projectId, sessionId, tab, sourceLayout)
+    (_event, projectId: string, sessionId: string, tab: PaneTab, sourceLayout?: WorkspaceLayout, options?: { alwaysOnTop?: boolean; extraTabs?: PaneTab[] }) => {
+      const extraTabs = Array.isArray(options?.extraTabs) ? options.extraTabs.slice(0, 200) : []
+      const record = database.createDetachedWindow(projectId, sessionId, tab, sourceLayout, extraTabs)
       const window = openDetachedWindow(record.id, true)
       if (options?.alwaysOnTop) {
         database.setSetting('floatingDetachedWindows', JSON.stringify([...new Set([...floatingDetachedIds(), record.id])]))
@@ -2789,7 +2800,9 @@ app.whenReady().then(async () => {
     },
     delivery,
     localModels: { availability: localModelAvailability, servers: runningLocalServers, stop: stopRunningLocalServer, vramTotalGb: () => vramTotalGb() },
-    providers: () => agents.listProviders(), ui: agentControlUi.request,
+    tabArchive: { archive: (projectId, sessionId, tabIds) => { if (!tabArchiver) throw new Error('The tab archive is still starting; try again in a moment'); return tabArchiver.archive(projectId, sessionId, tabIds) } },
+    // A tab an agent opens remembers who opened it, for its "opened by" / "continued from" line.
+    providers: () => agents.listProviders(), ui: request => { recordTabOpener(database, request); const reopened = reopenedConversation(request); if (reopened) agents.structured.endArchive(reopened); return agentControlUi!.request(request) },
     machines: () => remoteControl!.machines(),
     openRemote: (machineId, request) => remoteControl!.openRemote(machineId, request),
     confirm: (scope, message) => agentConfirms.request(scope.agentSessionId, message),
@@ -2876,6 +2889,16 @@ app.whenReady().then(async () => {
     ...(sweepOverride ? { ageOverrideMs: sweepOverride } : {})
   })
   finishedTabs.start()
+  // Closes nobody confirms go to the archive only when nothing is lost (tab-archive-eligibility.ts).
+  tabArchiver = new TabArchiver({
+    layoutTab: (projectId, sessionId, tabId) => { const session = database.listSessions(projectId).find(item => item.id === sessionId); return session ? findLayoutTab(session.layout.root, tabId)?.tab : undefined },
+    targets: () => control.finishTargets(), snapshot: id => database.structured.snapshot(id),
+    pendingWork: (id, projectId) => { const run = delivery.current(projectId); return run?.state === 'running' && run.requestedBy.kind === 'agent' && run.requestedBy.agentSessionId === id ? 'a git.ship delivery it started is still running, and its result would have nowhere to go' : null },
+    uncollectedReport: (id, target) => uncollectedReport(database, id, target?.controller ?? null),
+    closeAgent: target => autoClose.closeSettled(target),
+    latch: { begin: id => agents.structured.beginArchive(id), end: id => agents.structured.endArchive(id) },
+    closeOther: async (projectId, sessionId, tabId) => { await agentControlUi!.request({ projectId, sessionId, agentSessionId: 'owner', id: randomUUID(), action: 'tabs.close', params: { tabId } }) }
+  })
   // A finished latest-models run is new registry evidence (model-intelligence latest-models source).
   const latestModelsChanged = latestModelsWatcher(() => latestModelsFromSchedules(schedules), () => modelIntelligence?.latestModelsRan())
   // Scheduled tasks (docs/schedules.md): scripts at night and in idle windows, local churn through

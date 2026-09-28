@@ -6,7 +6,7 @@ import { ProjectBacklogPane } from '../components/ProjectBacklogPane'
 import { DurableJobPanel, DurableJobsPane } from '../components/DurableJobsPane'
 import '../navigation.css'
 import { ProviderIcon } from '../components/ProviderIcon'
-import { PaneTabMenu, TabGroupMenu } from '../components/PaneTabMenu'
+import { PaneTabMenu, SelectionTabMenu, TabGroupMenu } from '../components/PaneTabMenu'
 import { TabActivityIndicator } from '../components/TabActivityIndicator'
 import { applyTabGroupAction, applyWorkspaceTabAction } from './workspace-tab-actions'
 import { mountedTabIds, touchRecentTabs } from './tab-keep-alive'
@@ -94,6 +94,8 @@ import { fileMachineId, isRemoteFileMachine, statMachineFile } from '../remote-f
 import { coworkerCloseTargets, coworkerTabGroups } from './coworker-tab-groups'
 import { ControlledByBadge } from '../components/ControlActivity'
 import { guardTabClose, offerCloseUndo } from './close-work-guard'
+import { applyBulkTabAction, dockTabsAt, EMPTY_SELECTION, insertForeignTabs, isBulk, moveTabsToBar, orderedSelection, pruneSelection, selectAll, selectionClick, type BulkTabAction, type TabSelection } from './tab-selection'
+import '../components/TabArchiveDialog.css'
 import './coworker-tab-groups.css'
 import './workspace-clarity.css'
 
@@ -116,6 +118,8 @@ interface PaneWorkspaceProps {
   onMaximize(groupId: string | null): void
   onClosed(tab: PaneTab): void
   onDetach(groupId: string, tab: PaneTab, options?: { alwaysOnTop?: boolean }): void
+  /** Opens a selection of this pane's tabs together in one new window. Absent: not offered. */
+  onDetachMany?(groupId: string, tabs: PaneTab[]): void
   canReopen: boolean
   onReopen(groupId: string): void
   /** Puts these just-closed tabs back (the close undo). Without it, onReopen restores the last one. */
@@ -139,10 +143,13 @@ interface TabDragState {
    *  moves together, and the drag is restricted to a pane edge (a side-by-side split) rather
    *  than a tab-bar reorder or a cross-window move. */
   groupTabIds?: string[]
+  /** A selection of two or more tabs (tab-selection.ts) dragged together, `tab` among them: they
+   *  land together on a strip, a pane edge, another window, or outside every window. */
+  selection?: PaneTab[]
 }
 
 interface PaneDragActions {
-  start(groupId: string, tab: PaneTab, width: number, point: { x: number; y: number }, groupTabIds?: string[]): void
+  start(groupId: string, tab: PaneTab, width: number, point: { x: number; y: number }, groupTabIds?: string[], selection?: PaneTab[]): void
 }
 
 const iconFor = (tab: PaneTab): typeof Bot => {
@@ -317,6 +324,9 @@ function PaneGroup({
   const [openingTabIds, setOpeningTabIds] = useState<Set<string>>(() => new Set())
   const [spotlight, setSpotlight] = useState<{ tabId: string; key: number } | null>(null)
   const [expandedCoworkers, setExpandedCoworkers] = useState<Set<string>>(() => new Set())
+  // Tabs selected like files in Explorer (tab-selection.ts); two or more are a bulk selection.
+  const [selectionState, setSelection] = useState<TabSelection>(EMPTY_SELECTION)
+  const [selectionMenu, setSelectionMenu] = useState<{ x: number; y: number } | null>(null)
   const knownTabIdsRef = useRef(new Set(group.tabs.map((tab) => tab.id)))
   const closeTimersRef = useRef(new Map<string, number>())
   const workspaceRef = useRef(workspace)
@@ -339,6 +349,10 @@ function PaneGroup({
   const isHidden = (tab: PaneTab): boolean => Boolean(hiddenIds?.has(tab.id)) && tab.id !== activeTab.id
   const stripTabs = hiddenIds?.size ? group.tabs.filter(tab => !isHidden(tab)) : group.tabs
   const hiddenTabs = hiddenIds?.size ? group.tabs.filter(isHidden) : []
+  const stripOrder = stripTabs.map(tab => tab.id)
+  const selection = pruneSelection(selectionState, stripOrder)
+  const bulk = isBulk(selection)
+  const selectedTabs = bulk ? orderedSelection(selection, stripOrder).flatMap(id => group.tabs.filter(tab => tab.id === id)) : []
   // A drop index counts the tabs the strip leaves out too: each shown slot also stands for the
   // hidden run right before it, so a dropped tab lands where it appears to.
   const hiddenBefore = new Map<string, number>()
@@ -470,7 +484,7 @@ function PaneGroup({
     closeTimersRef.current.clear()
   }, [])
 
-  const beginDrag = (event: React.DragEvent, tab: PaneTab, groupTabIds?: string[]): void => {
+  const beginDrag = (event: React.DragEvent, tab: PaneTab, groupTabIds?: string[], selected?: PaneTab[]): void => {
     event.dataTransfer.effectAllowed = 'move'
     // A group drag moves several tabs at once and only ever lands as a pane split within this
     // window, so there is nothing coherent to hand a cross-window drop - it simply is not offered.
@@ -480,14 +494,15 @@ function PaneGroup({
         sourceGroupId: group.id,
         projectId: workspace.project.id,
         sessionId: workspace.session.id,
-        ...(workspace.detachedId ? { detachedId: workspace.detachedId } : {})
+        ...(workspace.detachedId ? { detachedId: workspace.detachedId } : {}),
+        ...(selected ? { tabs: selected } : {})
       }))
     }
     const transparentImage = document.createElement('canvas')
     transparentImage.width = 1
     transparentImage.height = 1
     event.dataTransfer.setDragImage(transparentImage, 0, 0)
-    dragActions.start(group.id, tab, event.currentTarget.getBoundingClientRect().width, { x: event.clientX, y: event.clientY }, groupTabIds)
+    dragActions.start(group.id, tab, event.currentTarget.getBoundingClientRect().width, { x: event.clientX, y: event.clientY }, groupTabIds, selected)
   }
 
   const showContextMenu = (event: React.MouseEvent, tab: PaneTab = activeTab): void => {
@@ -501,6 +516,34 @@ function PaneGroup({
       tabId: tab.id
     })
   }
+
+  const showSelectionMenu = (event: React.MouseEvent): void => {
+    event.preventDefault()
+    event.stopPropagation()
+    workspace.onFocus(group.id)
+    setMenuPosition(null)
+    setSelectionMenu({ x: Math.min(event.clientX, window.innerWidth - 235), y: event.clientY })
+  }
+
+  /** One action over every selected tab: close (to the archive, with the usual work guard and
+   *  undo), open them together in a window, or move them as one. */
+  const runBulk = (action: BulkTabAction): void => {
+    const tabs = selectedTabs
+    if (tabs.length < 2) return
+    setSelection(EMPTY_SELECTION)
+    if (action.kind === 'close') { closeTabs(tabs); return }
+    if (action.kind === 'detach') { workspace.onDetachMany?.(group.id, tabs); return }
+    const current = workspaceRef.current
+    let focusedGroupId: string | undefined
+    flushSync(() => current.onLayout(layout => {
+      const result = applyBulkTabAction({ ...current.session, layout, maximizedGroupId: current.maximizedGroupId }, tabs.map(tab => tab.id), action)
+      focusedGroupId = result.focusedGroupId
+      return result.session.layout
+    }))
+    if (action.kind === 'split') current.onMaximize(null)
+    if (focusedGroupId) current.onFocus(focusedGroupId)
+  }
+  const otherPanes = listGroups(workspace.layout.root).filter(item => item.id !== group.id).map(item => ({ groupId: item.id, label: `the pane with “${(item.tabs.find(tab => tab.id === item.activeTabId) ?? item.tabs[0])?.title ?? 'tabs'}”` }))
 
   const showGroupMenu = (event: React.MouseEvent, tabGroupId: string): void => {
     event.preventDefault()
@@ -529,6 +572,7 @@ function PaneGroup({
       applied.result = result
       return result.session.layout
     }))
+    if (applied.closed.length) void window.conductor.tabArchive?.record(current.session.id, applied.closed).catch(() => undefined)
     for (const closed of applied.closed) {
       current.onClosed(closed)
       closePlacedTab(closed, message => window.dispatchEvent(new CustomEvent('conductor:toast', { detail: message })))
@@ -639,6 +683,7 @@ function PaneGroup({
         setClosingTabIds(current => { const next = new Set(current); next.delete(tab.id); return next })
         if (applied.closed) {
           currentWorkspace.onClosed(applied.closed)
+          void window.conductor.tabArchive?.record(requestedSessionId, [applied.closed]).catch(() => undefined)
           // A tab placed on another machine is closed there too; only the owner closing a tab does
           // this, never a tab moving between groups or windows, which also goes through closeTab.
           closePlacedTab(applied.closed, message => window.dispatchEvent(new CustomEvent('conductor:toast', { detail: message })))
@@ -703,10 +748,18 @@ function PaneGroup({
         data-control-agent-id={tab.resourceId}
         {...(dropSlot ? { 'data-drop-slot-id': tab.id, ...(hiddenBefore.get(tab.id) ? { 'data-drop-span': 1 + hiddenBefore.get(tab.id)! } : {}) } : {})}
         data-clarity-status={clarity?.statusByTab.get(tab.id)}
-        className={`pane-tab ${tab.id === mainTabId ? 'clarity-main' : ''} ${tab.id === activeTab.id ? 'active' : ''} ${tabPhase === 'waiting_input' ? 'needs-attention' : ''} ${openingTabIds.has(tab.id) ? 'opening' : ''} ${spotlight?.tabId === tab.id ? 'spotlight' : ''} ${closingTabIds.has(tab.id) ? 'closing' : ''} ${newTabs.has(tab.id) && tab.id !== activeTab.id ? 'is-new' : ''} ${isSourceGroup && dragging!.tab.id === tab.id ? 'drag-lifted' : ''}`}
+        aria-selected={bulk ? selection.ids.has(tab.id) : undefined}
+        className={`pane-tab ${bulk && selection.ids.has(tab.id) ? 'multi-selected' : ''} ${tab.id === mainTabId ? 'clarity-main' : ''} ${tab.id === activeTab.id ? 'active' : ''} ${tabPhase === 'waiting_input' ? 'needs-attention' : ''} ${openingTabIds.has(tab.id) ? 'opening' : ''} ${spotlight?.tabId === tab.id ? 'spotlight' : ''} ${closingTabIds.has(tab.id) ? 'closing' : ''} ${newTabs.has(tab.id) && tab.id !== activeTab.id ? 'is-new' : ''} ${isSourceGroup && dragging!.tab.id === tab.id ? 'drag-lifted' : ''}`}
         style={{ marginLeft: gapHere ? dragging!.width : undefined }}
-        onClick={() => workspace.onLayout(layout => markTabsSeen(activateTab(layout, group.id, tab.id), [tab.id, activeTab.id]))}
-        onContextMenu={event => showContextMenu(event, tab)}
+        onClick={(event) => {
+          if (event.ctrlKey || event.metaKey || event.shiftKey) {
+            setSelection(current => selectionClick(stripOrder, pruneSelection(current, stripOrder), tab.id, activeTab.id, { ctrl: event.ctrlKey || event.metaKey, shift: event.shiftKey }))
+            return
+          }
+          setSelection(EMPTY_SELECTION)
+          workspace.onLayout(layout => markTabsSeen(activateTab(layout, group.id, tab.id), [tab.id, activeTab.id]))
+        }}
+        onContextMenu={event => bulk && selection.ids.has(tab.id) ? showSelectionMenu(event) : showContextMenu(event, tab)}
         onPointerDown={(event) => {
           if (event.button !== 1) return
           event.preventDefault()
@@ -716,7 +769,7 @@ function PaneGroup({
         onAuxClick={(event) => event.preventDefault()}
         data-autoscroll="off"
         draggable
-        onDragStart={(event) => beginDrag(event, tab)}
+        onDragStart={(event) => beginDrag(event, tab, undefined, bulk && selection.ids.has(tab.id) ? selectedTabs : undefined)}
       >
         {tab.kind === 'agent' ? <ProviderIcon provider={String(tab.state?.provider ?? 'codex')} model={tab.state?.model as string | undefined} size={14} /> : <Icon size={13} strokeWidth={1.8} />}
         <span className="pane-tab-title" title={tab.title}>{stripLabels.get(tab.id) ?? tab.title}</span>
@@ -760,7 +813,11 @@ function PaneGroup({
           requestClose(activeTab)
         }}
       >
-        <div className="pane-tabs" ref={tabsRef}>
+        <div className="pane-tabs" ref={tabsRef} aria-multiselectable="true" onKeyDown={(event) => {
+          if ((event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === 'a') { event.preventDefault(); event.stopPropagation(); setSelection(selectAll(stripOrder)); return }
+          if (event.key === 'Escape' && selection.ids.size) { event.stopPropagation(); setSelection(EMPTY_SELECTION); return }
+          if (event.key === 'Delete' && bulk) { event.preventDefault(); runBulk({ kind: 'close' }) }
+        }}>
           {tabStripSlots(stripTabs === group.tabs ? group : { ...group, tabs: stripTabs }).map((slot) => {
             if (slot.kind === 'tab') {
               const coworkerGroup = coworkerPresentation.groupByTabId.get(slot.tab.id)
@@ -841,6 +898,7 @@ function PaneGroup({
             <Plus size={13} />
           </button>
         </div>
+        {bulk && <button type="button" className="pane-tabs-selection-count" title="Selected tabs: right-click one of them or click here for what to do with them; Esc clears" onClick={showSelectionMenu}>{selectedTabs.length} selected</button>}
         {(overflowIds.length > 0 || hiddenTabs.length > 0) && <button type="button" className="pane-overflow-button" aria-haspopup="menu" aria-expanded={Boolean(overflowMenu)}
           title={[overflowIds.length ? `${overflowIds.length} more tab${overflowIds.length === 1 ? '' : 's'}` : '', hiddenTabs.length ? `${hiddenTabs.length} finished tab${hiddenTabs.length === 1 ? '' : 's'} out of the way (sidebar: Done)` : ''].filter(Boolean).join('; ')}
           onClick={event => { const rect = event.currentTarget.getBoundingClientRect(); setOverflowMenu(current => current ? null : { x: Math.max(8, Math.min(rect.right - 260, window.innerWidth - 268)), y: rect.bottom + 3 }) }}>
@@ -896,6 +954,9 @@ function PaneGroup({
           current.onFocus(applied.result.focusedGroupId)
         }
       }} />}
+    {selectionMenu && bulk && <SelectionTabMenu x={selectionMenu.x} y={selectionMenu.y} count={selectedTabs.length} panes={otherPanes}
+      canSplit={selectedTabs.length < group.tabs.length} canDetach={Boolean(workspace.onDetachMany) && !selectedTabs.some(tab => tab.state?.anonymous === true)}
+      onAction={runBulk} onClear={() => setSelection(EMPTY_SELECTION)} onDismiss={() => setSelectionMenu(null)} />}
     {groupMenu && menuGroup && <TabGroupMenu x={groupMenu.x} y={groupMenu.y} group={menuGroup}
       tabCount={group.tabs.filter(tab => tab.tabGroupId === menuGroup.id).length}
       onDismiss={() => setGroupMenu(null)}
@@ -1140,6 +1201,20 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
       if (drag && !consumedRef.current && drag.groupTabIds) {
         // A rejected or off-window drop of a coworker group simply snaps back: there is no
         // cross-window payload for it to have landed anywhere else, and it never detaches.
+      } else if (drag && !consumedRef.current && drag.selection) {
+        const selected = drag.selection
+        if (event.dataTransfer?.dropEffect === 'move') {
+          // Another Conductor window took the whole selection.
+          const current = propsRef.current
+          current.onLayout(layout => selected.reduce((next, tab) => { const at = listGroups(next.root).find(group => group.tabs.some(item => item.id === tab.id)); return at ? closeTab(next, at.id, tab.id).layout : next }, layout))
+        } else {
+          void window.conductor.window.isCursorOutside().then((outsideWindow) => {
+            if (!outsideWindow) return
+            const current = propsRef.current
+            if (current.onDetachMany) current.onDetachMany(drag.sourceGroupId, selected)
+            else current.onDetach(drag.sourceGroupId, drag.tab)
+          })
+        }
       } else if (drag && !consumedRef.current) {
         if (event.dataTransfer?.dropEffect === 'move') {
           // Nothing in this window accepted the drop, yet it was accepted somewhere: another
@@ -1173,9 +1248,12 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
         const found = resolveDropTarget(event.clientX, event.clientY, drag.sourceGroupId, drag.tab.id)
         // A group drag only ever peels into its own pane at an edge - never a tab-bar reorder,
         // which single-tab semantics like "insert at index" don't extend to several tabs at once.
+        const selectionIds = drag.selection?.map(tab => tab.id)
         const resolved = drag.groupTabIds
           ? (found?.kind === 'canvas' ? found : null)
-          : found && tabDropLands(propsRef.current.layout, drag.sourceGroupId, drag.tab.id, found) ? found : null
+          : selectionIds
+            ? found && (found.kind === 'bar' || dockTabsAt(propsRef.current.layout, selectionIds, found.groupId, found.edge) !== propsRef.current.layout) ? found : null
+            : found && tabDropLands(propsRef.current.layout, drag.sourceGroupId, drag.tab.id, found) ? found : null
         latestTargetRef.current = resolved
         setDropTarget((current) => sameDropTarget(current, resolved) ? current : resolved)
         return
@@ -1205,6 +1283,12 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
           current.onLayout(layout => dockTabsBeside(layout, drag.sourceGroupId, groupTabIds, target.groupId, target.edge))
           current.onFocus(target.groupId)
           setSnapArrival({ groupId: target.groupId, edge: target.edge })
+        } else if (target && drag.selection) {
+          const current = propsRef.current
+          const ids = drag.selection.map(tab => tab.id)
+          current.onLayout(layout => target.kind === 'bar' ? moveTabsToBar(layout, ids, target.groupId, target.index, drag.tab.id) : dockTabsAt(layout, ids, target.groupId, target.edge))
+          current.onFocus(target.groupId)
+          if (target.kind === 'canvas') setSnapArrival({ groupId: target.groupId, edge: target.edge })
         } else if (target && !drag.groupTabIds) {
           const current = propsRef.current
           current.onLayout(layout => applyTabDrop(layout, drag.sourceGroupId, drag.tab.id, target))
@@ -1220,7 +1304,7 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
       if (payload && target) {
         event.preventDefault()
         const current = propsRef.current
-        current.onLayout(layout => insertForeignTab(layout, payload.tab, target))
+        current.onLayout(layout => payload.tabs ? insertForeignTabs(layout, payload.tabs, target) : insertForeignTab(layout, payload.tab, target))
         current.onFocus(target.groupId)
         if (target.kind === 'canvas') setSnapArrival({ groupId: target.groupId, edge: target.edge })
       }
@@ -1247,8 +1331,8 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
   }, [snapArrival])
 
   const dragActions: PaneDragActions = {
-    start: (sourceGroupId, tab, width, point, groupTabIds) => {
-      draggingRef.current = { sourceGroupId, tab, width, ...point, ...(groupTabIds ? { groupTabIds } : {}) }
+    start: (sourceGroupId, tab, width, point, groupTabIds, selection) => {
+      draggingRef.current = { sourceGroupId, tab, width, ...point, ...(groupTabIds ? { groupTabIds } : {}), ...(selection ? { selection } : {}) }
       consumedRef.current = false
       setDragging(draggingRef.current)
       if (props.maximizedGroupId) {
@@ -1288,7 +1372,7 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
           className="pane-drag-ghost"
           style={{ transform: `translate3d(${dragging.x + 14}px, ${dragging.y + 14}px, 0)` }}
         >
-          <DragIcon size={13} strokeWidth={1.8} /><span>{dragging.tab.title}</span>
+          <DragIcon size={13} strokeWidth={1.8} /><span>{dragging.selection ? `${dragging.selection.length} tabs` : dragging.tab.title}</span>
         </div>,
         document.body
       )}

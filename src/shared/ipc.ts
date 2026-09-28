@@ -53,6 +53,8 @@ export interface FileSearchOptions { showHidden?: boolean; activeProjectId?: str
 export interface ConductorBridge {
   sessionArchive: import('./session-archive').SessionArchiveBridge
   agentControl: import('./agent-control').AgentControlBridge
+  /** Every closed tab per workspace, and the "opened by" line (src/shared/tab-archive.ts). */
+  tabArchive: import('./tab-archive').TabArchiveBridge
   /** Workspace clarity (src/shared/workspace-clarity.ts). */
   workspaceClarity: {
     /** Wizard, handed-off and settled-at facts for these agent conversations. */
@@ -281,7 +283,8 @@ export interface ConductorBridge {
     isMaximized(): Promise<boolean>
     onMaximizedChange(callback: (maximized: boolean) => void): () => void
     isCursorOutside(): Promise<boolean>
-    detach(projectId: string, sessionId: string, tab: PaneTab, sourceLayout?: WorkspaceLayout, options?: { alwaysOnTop?: boolean }): Promise<DetachedWindowRecord>
+    /** extraTabs open in the same window after tab (a detached selection); pass the source layout without all of them. */
+    detach(projectId: string, sessionId: string, tab: PaneTab, sourceLayout?: WorkspaceLayout, options?: { alwaysOnTop?: boolean; extraTabs?: PaneTab[] }): Promise<DetachedWindowRecord>
     getDetached(id: string): Promise<{ record: DetachedWindowRecord; project: ProjectRecord; session: SessionRecord } | null>
     /** Every detached window of an open workspace, with its saved layout (the Ctrl+K tab index). */
     listDetached(): Promise<DetachedWindowRecord[]>

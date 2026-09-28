@@ -176,7 +176,7 @@ describe('agent-control request concurrency', () => {
 describe('control method classes', () => {
   it('classifies every method advertised by tools.list and keeps mutations out of the read lane', async () => {
     const advertised = [
-      'tools.list', 'app.state', 'projects.list', 'machines.list', 'models.list', 'tabs.list', 'tabs.open', 'tabs.focus', 'tabs.rename', 'tabs.split', 'tabs.detach', 'tabs.close',
+      'tools.list', 'app.state', 'projects.list', 'machines.list', 'models.list', 'tabs.list', 'tabs.open', 'tabs.focus', 'tabs.rename', 'tabs.split', 'tabs.detach', 'tabs.close', 'tabs.archive',
       'agents.list', 'agents.snapshot', 'agents.history', 'agents.artifact', 'agents.status', 'agents.compact', 'agents.configure', 'agents.grant', 'agents.submit', 'agents.steer', 'agents.interrupt', 'agents.resume', 'agents.supersede', 'agents.fork', 'agents.release', 'agents.handoff', 'agents.report', 'agents.finish',
       'files.list', 'files.read', 'files.write', 'files.open', 'tasks.list', 'tasks.update', 'memory.recall', 'memory.remember', 'memory.forget',
       'orchestration.snapshot', 'orchestration.tasks.create', 'orchestration.tasks.update', 'orchestration.routines.save', 'workspace.rename',

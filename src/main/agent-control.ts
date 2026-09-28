@@ -11,6 +11,7 @@ import { relative } from 'node:path'
 import type { AgentControlLink, AgentControlScope, AgentControlTab, AgentControlUiRequest, AgentFileChange } from '../shared/agent-control'
 import { conductorUri } from '../shared/agent-control'
 import { hasSessionWork } from './close-confirmation'
+import type { ArchiveResult } from '../shared/tab-archive'
 import { COWORKER_OPENED_PREFIX, FINISH_WAIT_MAX_SECONDS, type CoworkerAutoClose, type FinishTarget } from './coworker-autoclose'
 import { agentConfirmFailure } from './agent-confirm-broker'
 import { controlMethodFamily } from './control-method-classes'
@@ -310,7 +311,9 @@ const ownerSignatures: Record<string, string> = {
   'app.update.install': '({force?,resume?}) — owner credential or wizard tab only: quit, install the downloaded update and relaunch. Without force it first refuses, naming them, while any other tab in any project is mid-turn or has a live background task (a dead tab’s leftover staleBackgroundTasks do not count), and says what to wait for; once none is, the install goes ahead without a running-work confirmation. force:true installs regardless and cuts that work; force:false asks the owner (“Work is still running”). Unsaved editor drafts are kept for recovery. resume (owner credential only) names an open wizard tab to bring back and tell to continue, as if it had started the restart. This wizard tab, every wizard tab working or waiting on its coworkers, and the coworkers whose turns the restart cut are brought back and told to continue (as after any restart); an outside process waits for a new control-owner.json',
   'app.restart': '({force?}) — owner credential or wizard tab only: relaunch this Conductor (a downloaded update installs on the way out); force as above',
   'app.restart.request': '({reason}) — wizard tab only: ask the owner to restart when you cannot (or should not) restart yourself. The owner’s Restart to update control shows “Restart requested by <tab> — <reason>”, and the next launch, however the owner restarts, brings this tab back and tells it to continue, like a restart you started. Valid until the next launch or 24 h; a new request replaces the old one',
-  'app.quit.confirm': '({stopWork}) — owner credential or wizard tab only: answer the open “Work is still running” quit/restart dialog (app.state pendingQuitConfirmation shows it): stopWork:true stops the work and goes ahead, false cancels the quit or restart'
+  'app.quit.confirm': '({stopWork}) — owner credential or wizard tab only: answer the open “Work is still running” quit/restart dialog (app.state pendingQuitConfirmation shows it): stopWork:true stops the work and goes ahead, false cancels the quit or restart',
+  // The workspace archive's atomic close (src/main/tab-archive-eligibility.ts).
+  'tabs.archive': '({tabIds,projectId?,workspaceId?}) — owner credential or wizard tab only: close these tabs into their workspace archive (history kept; reopened from the Archive or Ctrl+K). A tab that is busy (a running turn, an approval or question, a limit wait, queued or steered messages, background tasks, a git.ship it started) or protected (the live wizard, a controller with open coworkers, a remote tab) is refused and named with its reason; nothing can start in a tab between its check and its close. Returns {archived:[{tabId,title}], refused:[{tabId,title,reason,message}]}'
 }
 const ownerMethods = new Set(Object.keys(ownerSignatures))
 /** The owner's authority, from either source: the credential file, or a wizard conversation. */
@@ -350,6 +353,8 @@ const strings = (value: unknown, key: string, count: number, length: number): st
 
 export interface AgentControlDependencies {
   database: ConductorDatabase
+  /** tabs.archive: the workspace archive's atomic close (TabArchiver). */
+  tabArchive?: { archive(projectId: string, sessionId: string, tabIds: string[]): Promise<ArchiveResult> }
   /** The app process itself, for the owner credential; absent outside the app. */
   host?: AgentControlHost
   sessions: StructuredSessions
@@ -2416,6 +2421,14 @@ export class AgentControl {
    *  the one sending the reply. */
   private async ownerCall(scope: AgentControlScope, method: string, args: Args): Promise<unknown> {
     const host = this.deps.host
+    if (method === 'tabs.archive') {
+      if (!this.deps.tabArchive) throw new Error('The tab archive is unavailable in this Conductor')
+      validateArgs('tabs.archive', args, ['tabIds', 'projectId', 'workspaceId'])
+      if (!Array.isArray(args.tabIds) || !args.tabIds.length || args.tabIds.length > 200 || args.tabIds.some(id => typeof id !== 'string' || !id || id.length > 160)) throw new ArgumentError('tabIds must be 1-200 tab ids from tabs.list')
+      const target = this.sibling(scope, args)
+      if (!target.projectId || !target.sessionId) throw new ArgumentError('Name the workspace: pass projectId and workspaceId (projects.list)')
+      return this.deps.tabArchive.archive(target.projectId, target.sessionId, args.tabIds as string[])
+    }
     if (method === 'projects.open') {
       if (!host?.openProject) throw new Error('Registering a project folder is unavailable in this Conductor')
       validateArgs('projects.open', args, ['path', 'name'])

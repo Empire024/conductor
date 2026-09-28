@@ -15,6 +15,7 @@ import { TitleBar } from './components/TitleBar'
 import { PaneWorkspace } from './layout/PaneWorkspace'
 import { CloseWorkConfirm } from './layout/CloseWorkConfirm'
 import { CommandPalette } from './components/CommandPalette'
+import { TabArchiveHost } from './components/TabArchiveDialog'
 import { guardTabClose, offerCloseUndo } from './layout/close-work-guard'
 import { activateTab, addTab, closeTab, findGroup, listGroups, stripWorkspaceUtilityTabs } from './layout/layout-operations'
 import { createPaneTab } from './panes/pane-factory'
@@ -475,6 +476,7 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
         </footer>
       )}
       {paletteOpen && <CommandPalette commands={[]} currentProjectId={bundle.project.id} currentDetachedId={detachedId} onClose={() => setPaletteOpen(false)} />}
+      <TabArchiveHost sessions={[bundle.session]} activeSessionId={bundle.session.id} />
       <CloseWorkConfirm />
     </div>
   )

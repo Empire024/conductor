@@ -3,6 +3,7 @@ import { readStoredIdentity } from '../shared/remote-control'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { StructuredAgentStore } from './structured-store'
+import { TabArchiveStore } from './tab-archive'
 import { anonymousConversations, isAnonymousTab, persistableClosedTabs, persistableLayout } from './local-models/anonymous'
 import { LOCAL_MACHINE_ID } from '../shared/remote-control'
 import type { SessionArchive, SessionArchiveResult } from '../shared/session-archive'
@@ -183,6 +184,8 @@ const serializeMemoryOrigin = (origin: MemoryOrigin | undefined): string | null 
 export class ConductorDatabase {
   private readonly db: DatabaseSync
   readonly structured: StructuredAgentStore
+  /** Every closed tab, per workspace (src/main/tab-archive.ts); fed by each write of a reopen list. */
+  readonly tabArchive: TabArchiveStore
   /** Anonymous local conversations (local-models/anonymous.ts) never reach SQLite: their settings,
    *  their agent row and the layouts that hold their tabs are kept here instead, and only the
    *  layout with those tabs left out is written. Process memory, so a restart restores none of it. */
@@ -376,6 +379,7 @@ export class ConductorDatabase {
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 3000; PRAGMA journal_size_limit = 67108864;')
     this.migrate()
     this.structured = new StructuredAgentStore(this.db, dirname(path))
+    this.tabArchive = new TabArchiveStore(this.db)
   }
 
   private migrate(): void {
@@ -944,13 +948,20 @@ export class ConductorDatabase {
     maximizedGroupId: string | null,
     closedTabs: PaneTab[]
   ): void {
-    this.db
+    const saved = this.db
       .prepare(
         `UPDATE sessions
          SET layout_json = ?, maximized_group_id = ?, closed_tabs_json = ?, updated_at = ?
          WHERE id = ? AND closed_at IS NULL`
       )
       .run(this.persistLayout(sessionId, layout), maximizedGroupId, JSON.stringify(persistableClosedTabs(closedTabs).slice(-20)), now(), sessionId)
+    // The reopen list keeps 20; the archive keeps every one of them (best-effort, never throws).
+    if (saved.changes) this.archiveClosed(sessionId, layout, closedTabs)
+  }
+
+  private archiveClosed(sessionId: string, layout: WorkspaceLayout, closedTabs: PaneTab[]): void {
+    try { this.tabArchive.record(sessionId, persistableClosedTabs(closedTabs), this.collectLayoutTabs(layout).map(tab => tab.id)) }
+    catch (error) { console.warn('Closed tabs could not be archived', error) }
   }
 
   getWorkspaceRecoveryState(): WorkspaceRecoveryState {
@@ -996,13 +1007,14 @@ export class ConductorDatabase {
     this.db.exec('BEGIN IMMEDIATE')
     try {
       for (const session of checkpoint.sessions) {
-        saveSession.run(
+        const saved = saveSession.run(
           this.persistLayout(session.id, session.layout),
           session.maximizedGroupId,
           JSON.stringify(persistableClosedTabs(session.closedTabs).slice(-20)),
           timestamp,
           session.id
         )
+        if (saved.changes) this.archiveClosed(session.id, session.layout, session.closedTabs)
       }
       saveSetting.run('activeProjectId', checkpoint.activeProjectId ?? '', timestamp)
       saveSetting.run('activeSessionId', checkpoint.activeSessionId && this.db.prepare('SELECT id FROM sessions WHERE id = ? AND closed_at IS NULL').get(checkpoint.activeSessionId) ? checkpoint.activeSessionId : '', timestamp)
@@ -1132,9 +1144,11 @@ export class ConductorDatabase {
     projectId: string,
     sessionId: string,
     tab: PaneTab,
-    sourceLayoutOverride?: WorkspaceLayout
+    sourceLayoutOverride?: WorkspaceLayout,
+    /** More tabs for the same window (a detached selection); requires sourceLayoutOverride. */
+    extraTabs: PaneTab[] = []
   ): DetachedWindowRecord {
-    if (isAnonymousTab(tab)) throw new Error('An anonymous conversation stays in its window: a detached window is restored after a restart, and it must not be')
+    if ([tab, ...extraTabs].some(isAnonymousTab)) throw new Error('An anonymous conversation stays in its window: a detached window is restored after a restart, and it must not be')
     const session = this.db
       .prepare('SELECT project_id, layout_json FROM sessions WHERE id = ?')
       .get(sessionId) as DbRow | undefined
@@ -1149,7 +1163,7 @@ export class ConductorDatabase {
       root: {
         type: 'group',
         id: makeId('group'),
-        tabs: [tab],
+        tabs: [tab, ...(sourceLayoutOverride ? extraTabs.filter(extra => extra.id !== tab.id) : [])],
         activeTabId: tab.id
       }
     }
@@ -1232,6 +1246,7 @@ export class ConductorDatabase {
           const nextClosedTabs = persistableClosedTabs([...retainedClosedTabs, ...tabs]).slice(-20)
           this.db.prepare('UPDATE sessions SET closed_tabs_json = ?, updated_at = ? WHERE id = ?')
             .run(JSON.stringify(nextClosedTabs), now(), record.sessionId)
+          try { this.tabArchive.record(record.sessionId, persistableClosedTabs(tabs)) } catch { /* best-effort */ }
         }
       }
       this.db.prepare('DELETE FROM detached_windows WHERE id = ?').run(id)

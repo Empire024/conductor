@@ -69,7 +69,9 @@ export async function handleAgentControlRequest(request: AgentControlUiRequest, 
   if (!group) throw new Error('The requested tab is no longer open.')
   if (request.action === 'tabs.focus-origin') {
     const agentSessionId = typeof request.params.agentSessionId === 'string' ? request.params.agentSessionId : ''
-    const retained = agentSessionId && [...session.closedTabs].reverse().find(candidate => candidate.kind === 'agent' && candidate.resourceId === agentSessionId)
+    // The reopen list keeps the last 20 closed tabs; the workspace archive keeps the rest.
+    const retained = agentSessionId && ([...session.closedTabs].reverse().find(candidate => candidate.kind === 'agent' && candidate.resourceId === agentSessionId)
+      || (await (typeof window === 'undefined' ? undefined : window.conductor?.tabArchive)?.list(session.id, agentSessionId, 5).catch(() => null))?.tabs.find(entry => entry.tab.kind === 'agent' && entry.tab.resourceId === agentSessionId)?.tab)
     if (!retained) throw new Error('The originating agent tab is no longer retained.')
     const layout = addTab(session.layout, group.id, retained)
     const next = { ...session, layout, maximizedGroupId: null, closedTabs: session.closedTabs.filter(candidate => candidate.id !== retained.id) }
@@ -131,12 +133,14 @@ export async function handleAgentControlRequest(request: AgentControlUiRequest, 
     if (!created?.id || !created.kind) throw new Error('A prepared tab is required.')
     const existing = groups.find(candidate => candidate.tabs.some(item => item.id === created.id))
     const focus = request.params.focus !== false
+    // A tab coming back from the archive leaves the reopen list too, so Ctrl+Shift+T cannot open it twice.
+    const closedTabs = session.closedTabs.some(item => item.id === created.id) ? session.closedTabs.filter(item => item.id !== created.id) : session.closedTabs
     if (existing) { group = existing; if (focus) next = { ...session, layout: activateTab(session.layout, existing.id, created.id), maximizedGroupId: null } }
     else {
       const added = addTab(session.layout, group.id, created)
       // Owner task assignment keeps its dialog alive until native submission
       // returns, including when Project tasks is itself the active pane tab.
-      next = { ...session, layout: focus ? added : activateTab(added, group.id, group.activeTabId), maximizedGroupId: focus ? null : session.maximizedGroupId }
+      next = { ...session, closedTabs, layout: focus ? added : activateTab(added, group.id, group.activeTabId), maximizedGroupId: focus ? null : session.maximizedGroupId }
       // Opened behind the owner's back (FX21): the strip marks it until the owner looks at it.
       if (!focus) markNewTab(created.id)
     }

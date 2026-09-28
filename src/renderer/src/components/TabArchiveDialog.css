@@ -1,0 +1,44 @@
+.tab-archive { width: min(620px, calc(100vw - 40px)); max-height: min(560px, calc(100vh - 150px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--surface-1); color: var(--text); box-shadow: 0 18px 50px #0008; }
+.tab-archive header { display: flex; align-items: center; gap: 7px; padding: 10px 12px 8px; color: var(--text-2); }
+.tab-archive header strong { color: var(--text); font-size: 13px; }
+.tab-archive header span { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-3); font-size: 11px; }
+.tab-archive-close { width: 24px; height: 24px; display: grid; place-items: center; border: 0; border-radius: 5px; background: transparent; color: var(--text-3); cursor: pointer; }
+.tab-archive-close:hover { background: var(--surface-hover); color: var(--text); }
+.tab-archive-search { margin: 0 12px 8px; display: flex; align-items: center; gap: 7px; padding: 0 9px; height: 30px; border: 1px solid var(--border-soft); border-radius: 7px; background: var(--surface-0); color: var(--text-3); }
+.tab-archive-search input { flex: 1 1 auto; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text); font-size: 12px; }
+.tab-archive-list { flex: 1 1 auto; min-height: 90px; overflow-y: auto; padding: 0 6px 6px; outline: 0; }
+.tab-archive-empty { margin: 22px 10px; color: var(--text-3); font-size: 12px; text-align: center; }
+.tab-archive-row { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto 24px 24px; align-items: center; gap: 7px; height: 30px; padding: 0 6px; border-radius: 6px; font-size: 12px; cursor: default; user-select: none; }
+.tab-archive-row:hover { background: var(--surface-hover); }
+.tab-archive-row.selected { background: color-mix(in srgb, var(--accent) 16%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent); }
+.tab-archive-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tab-archive-row small { color: var(--text-3); font-size: 10.5px; white-space: nowrap; }
+.tab-archive-row button { width: 24px; height: 22px; display: grid; place-items: center; border: 0; border-radius: 5px; background: transparent; color: var(--text-3); cursor: pointer; opacity: 0; }
+.tab-archive-row:hover button, .tab-archive-row.selected button, .tab-archive-row button:focus-visible { opacity: 1; }
+.tab-archive-row button:hover { background: var(--surface-0); color: var(--text); }
+.tab-archive-row button.danger:hover { color: var(--danger); }
+.tab-archive footer { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; padding: 8px 12px 10px; border-top: 1px solid var(--border-soft); }
+.tab-archive-hint { flex: 1 1 auto; color: var(--text-3); font-size: 11px; }
+.tab-archive footer button { height: 26px; display: inline-flex; align-items: center; gap: 5px; padding: 0 10px; border: 1px solid var(--border-soft); border-radius: 6px; background: transparent; color: var(--text-2); font-size: 11.5px; cursor: pointer; }
+.tab-archive footer button:hover:not(:disabled) { background: var(--surface-hover); color: var(--text); }
+.tab-archive footer button:disabled { opacity: .45; cursor: default; }
+.tab-archive footer button.danger:not(:disabled) { border-color: color-mix(in srgb, var(--danger) 45%, var(--border-soft)); }
+.tab-archive-confirm { flex: 1 1 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 7px; color: var(--text-2); font-size: 11.5px; }
+.tab-archive-confirm > span { flex: 1 1 260px; }
+.tab-archive-note { flex: 1 1 100%; color: var(--text-3); font-size: 10.5px; }
+/* Tab selection (layout/tab-selection.ts) in the strip and the sidebar. */
+.pane-tab.multi-selected { background: color-mix(in srgb, var(--accent) 16%, var(--surface-1)); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent); }
+.pane-tab.multi-selected .pane-tab-title { color: var(--text); }
+.session-tree .workspace-tab-row.multi-selected { background: color-mix(in srgb, var(--accent) 14%, transparent); box-shadow: inset 2px 0 var(--accent); }
+.pane-tabs-selection-count { flex: 0 0 auto; align-self: center; margin: 0 4px; padding: 1px 6px; border-radius: 9px; background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--text); font-size: 10px; white-space: nowrap; cursor: pointer; border: 0; }
+.session-tree .workspace-archive-link { width: auto; height: 20px; margin: 1px 3px 1px 0; padding: 0 6px; display: inline-flex; align-items: center; gap: 4px; border: 0; background: transparent; color: var(--text-3); font-size: 9.5px; cursor: pointer; }
+.session-tree .workspace-archive-link:hover, .session-tree .workspace-archive-link:focus-visible { color: var(--text); background: var(--surface-hover); }
+.session-tree .workspace-selection-bar { margin: 2px 3px; padding: 3px 5px; display: flex; align-items: center; gap: 5px; border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border-soft)); border-radius: 6px; color: var(--text-2); font-size: 9.5px; }
+.session-tree .workspace-selection-bar span { flex: 1 1 auto; }
+.session-tree .workspace-selection-bar button { width: auto; height: 18px; padding: 0 6px; border: 1px solid var(--border-soft); border-radius: 5px; background: transparent; color: var(--text-2); font-size: 9px; cursor: pointer; }
+.session-tree .workspace-selection-bar button:hover { color: var(--text); background: var(--surface-hover); }
+/* The "continued from" / "opened by" line that starts a tab an agent opened. */
+.sa-lineage-line { display: flex; align-items: center; gap: 6px; margin: 4px 0 10px; padding: 5px 9px; border: 1px dashed var(--border-soft); border-radius: 7px; color: var(--text-3); font-size: 11.5px; }
+.sa-lineage-line button { min-width: 0; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0; border: 0; background: transparent; color: var(--accent); font: inherit; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.sa-lineage-line button:hover { color: var(--text); }
+.sa-lineage-line small { color: var(--text-3); font-size: 10.5px; }

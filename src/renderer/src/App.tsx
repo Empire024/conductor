@@ -36,6 +36,8 @@ import { applyTabGroupAction, applyWorkspaceTabAction, type WorkspaceTabAction }
 import { closePlacedTab } from './layout/machine-placement'
 import { CloseWorkConfirm } from './layout/CloseWorkConfirm'
 import { guardTabClose, offerCloseUndo, type WorkingTab } from './layout/close-work-guard'
+import { applyBulkTabAction, placeTabs, type BulkTabAction } from './layout/tab-selection'
+import { FORGET_CLOSED_EVENT, openTabArchive, TabArchiveHost } from './components/TabArchiveDialog'
 import type { TabGroupAction } from './layout/tab-groups'
 import {
   activateTab,
@@ -1188,6 +1190,51 @@ export function App(): React.JSX.Element {
     void window.conductor.window.detach(activeProject.id, activeSession.id, result.closed, result.layout, options)
   }, [activeProject, activeSession, setLayout])
 
+  /** A selection of a pane's tabs opened together in one new window. */
+  const detachTabs = useCallback((groupId: string, tabs: PaneTab[]): void => {
+    if (!activeProject || !activeSession || !tabs.length) return
+    const result = applyBulkTabAction(activeSession, tabs.map(tab => tab.id), { kind: 'detach' })
+    const [first, ...rest] = result.removed
+    if (!first) return
+    setLayout(result.session.layout)
+    void window.conductor.window.detach(activeProject.id, activeSession.id, first, result.session.layout, { extraTabs: rest })
+      .catch((reason: unknown) => setToast(reason instanceof Error ? reason.message : String(reason)))
+  }, [activeProject, activeSession, setLayout])
+
+  /** The sidebar's bulk actions over a selection of one workspace's tabs (layout/tab-selection.ts). */
+  const sidebarBulkAction = useCallback(async (sessionId: string, tabIds: string[], action: BulkTabAction): Promise<void> => {
+    const session = sessionsRef.current.find(item => item.id === sessionId)
+    if (!session) return
+    const tabs = placeTabs(session.layout, tabIds).flatMap(({ groupId, tabId }) => findGroup(session.layout.root, groupId)?.tabs.filter(tab => tab.id === tabId) ?? [])
+    if (tabs.length < 2) return
+    const working = action.kind === 'close' ? await guardTabClose(tabs, phaseOfTab) : []
+    if (!working) return
+    try {
+      const latest = sessionsRef.current.find(item => item.id === sessionId) ?? session
+      const result = applyBulkTabAction(latest, tabIds, action)
+      const [first, ...rest] = result.removed
+      if (action.kind === 'detach' && first) await window.conductor.window.detach(session.projectId, session.id, first, result.session.layout, { extraTabs: rest })
+      if (action.kind === 'close') {
+        for (const tab of result.removed) closePlacedTab(tab, setToast)
+        void window.conductor.tabArchive.record(sessionId, result.removed).catch(() => undefined)
+      }
+      setSessions(current => current.map(item => item.id === sessionId ? result.session : item))
+      if (action.kind !== 'detach') { selectSession(result.session); if (result.focusedGroupId) setFocusedGroupId(result.focusedGroupId); setUtilityPanel(null) }
+      if (action.kind === 'close' && result.focusedGroupId !== undefined) offerUndo(working, sessionId, result.focusedGroupId, result.removed.map(tab => tab.id))
+    } catch (reason) { setToast(reason instanceof Error ? reason.message : String(reason)) }
+  }, [selectSession, offerUndo, phaseOfTab])
+
+  // A tab deleted for good from the archive leaves the reopen list this window holds.
+  useEffect(() => {
+    const forget = (event: Event): void => {
+      const detail = (event as CustomEvent<{ sessionId: string; tabIds: string[] }>).detail
+      if (!detail) return
+      setSessions(current => current.map(session => session.id === detail.sessionId && session.closedTabs.some(tab => detail.tabIds.includes(tab.id)) ? { ...session, closedTabs: session.closedTabs.filter(tab => !detail.tabIds.includes(tab.id)) } : session))
+    }
+    window.addEventListener(FORGET_CLOSED_EVENT, forget)
+    return () => window.removeEventListener(FORGET_CLOSED_EVENT, forget)
+  }, [])
+
   const closingGroupConfirmed = useRef(false)
   const sidebarTabAction = useCallback(async (sessionId: string, groupId: string, tabId: string, action: WorkspaceTabAction): Promise<void> => {
     const session = sessions.find(item => item.id === sessionId)
@@ -1292,6 +1339,7 @@ export function App(): React.JSX.Element {
     { id: 'split-grok', label: 'Split Grok right', detail: 'Create and launch in one action', category: 'Agents', icon: 'agent', run: () => splitFocused('right', makeTab('agent', 'grok')) },
     { id: 'split-terminal', label: 'Split PowerShell below', detail: 'Create and launch in one action', category: 'Tools', icon: 'terminal', run: () => splitFocused('below', makeTab('terminal')) },
     { id: 'reopen', label: 'Reopen closed tab', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift T', run: reopenClosed },
+    { id: 'tab-archive', label: 'Closed tabs archive', detail: 'Every tab closed in this workspace: search, reopen, delete for good', category: 'Layout', icon: 'layout', run: () => openTabArchive() },
     { id: 'next-tab', label: 'Next tab', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Tab', run: () => cycleFocusedTab(1) },
     { id: 'previous-tab', label: 'Previous tab', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift Tab', run: () => cycleFocusedTab(-1) },
     { id: 'grow-tab', label: 'Grow tab area', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift →', run: () => nudgeFocusedGroup('right') },
@@ -1526,6 +1574,7 @@ export function App(): React.JSX.Element {
           onRemoveProject={removeProject}
           onTabAction={(sessionId, groupId, tabId, action) => void sidebarTabAction(sessionId, groupId, tabId, action)}
           onTabGroupAction={sidebarTabGroupAction}
+          onTabBulkAction={(sessionId, tabIds, action) => void sidebarBulkAction(sessionId, tabIds, action)}
           onRevealProject={(path) => void window.conductor.projects.reveal(path)}
           onNewSession={() => void newSession()}
           onCloseSession={(id) => void closeSession(id)}
@@ -1602,6 +1651,7 @@ export function App(): React.JSX.Element {
                           onMaximize={setMaximized}
                           onClosed={rememberClosed}
                           onDetach={detachTab}
+                          onDetachMany={detachTabs}
                           canReopen={activeSession.closedTabs.length > 0}
                           onReopen={reopenClosed}
                           onRestoreClosed={(groupId, tabIds) => restoreClosedTabs(activeSession.id, groupId, tabIds)}
@@ -1739,6 +1789,7 @@ export function App(): React.JSX.Element {
         {updateState.currentVersion && <AppVersionButton state={updateState} onCheck={checkForUpdates} />}
       </footer>
       {paletteOpen && activeSession && <CommandPalette commands={commands} currentProjectId={activeProjectId} onClose={() => setPaletteOpen(false)} />}
+      <TabArchiveHost sessions={sessions} activeSessionId={activeSessionId} />
       {settingsOpen && (
         <SettingsPanel
           settings={appSettings}

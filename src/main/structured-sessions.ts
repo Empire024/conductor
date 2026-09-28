@@ -227,6 +227,15 @@ export class StructuredSessions {
   setPromptDispatchAuthorityGuard(guard: (authority: PromptDispatchAuthority, spec: AgentSpec) => void): void {
     this.promptDispatchAuthorityGuard = guard
   }
+  /** Conversations whose tab is being closed into the archive (tab-archive-eligibility.ts): set
+   *  before the last eligibility check, held through the close, released on a refusal, a failed
+   *  close or a reopen. While set, no prompt reaches the runtime: submit, steer, queue,
+   *  steerOrStart, steerAccepted, the queue drain, limit continuation and retries all pass
+   *  assertPromptDispatchAuthority, which refuses, so a message is refused rather than lost. */
+  private readonly archiving = new Set<string>()
+  beginArchive(id: string): void { this.archiving.add(id) }
+  endArchive(id: string): void { this.archiving.delete(id) }
+  isArchiving(id: string): boolean { return this.archiving.has(id) }
   private live = new Map<string, LiveSession>()
   private pending: AgentEvent[] = []
   /** The latest status per session since the last flush - `recordActivityPhase` can fire many
@@ -1060,6 +1069,7 @@ export class StructuredSessions {
     return authority
   }
   private assertPromptDispatchAuthority(origin: PromptOrigin | undefined, spec: AgentSpec): void {
+    if (this.archiving.has(spec.id)) throw new Error('The tab is being archived; no message was sent')
     const authority = origin?.authority
     if (!authority) return
     if (authority.kind !== 'remote-peer'

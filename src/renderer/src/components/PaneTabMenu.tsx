@@ -1,6 +1,8 @@
 import { useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { ChevronsLeftRight, Copy, ExternalLink, FolderPlus, Maximize2, Minus, PanelBottom, PanelLeft, PanelRight, PanelTop, PictureInPicture2, Pin, PinOff, Plus, TimerReset, Trash2, Undo2, X } from 'lucide-react'
+import { Archive, ArrowRightLeft, ChevronsLeftRight, Copy, ExternalLink, FolderPlus, Maximize2, Minus, PanelBottom, PanelLeft, PanelRight, PanelTop, PictureInPicture2, Pin, PinOff, Plus, TimerReset, Trash2, Undo2, X } from 'lucide-react'
+import type { BulkTabAction } from '../layout/tab-selection'
+import { openTabArchive } from './TabArchiveDialog'
 import type { PaneTab, TabGroup, TabGroupColor } from '../../../shared/models'
 import { TAB_GROUP_COLORS } from '../../../shared/models'
 import { tabPinned } from '../../../shared/workspace-clarity'
@@ -94,9 +96,33 @@ export function PaneTabMenu({ x, y, tab, maximized, continuation, canReopen, gro
       <button role="menuitem" onClick={() => run('pin')}>{tabPinned(tab) ? <PinOff size={13} /> : <Pin size={13} />} {tabPinned(tab) ? 'Unpin tab' : 'Pin tab'}</button>
       {tab.kind === 'agent' && <button role="menuitem" onClick={() => run('continuation')}><TimerReset size={13} /> {continuation ? 'Disable' : 'Enable'} limit continuation</button>}
       <button role="menuitem" disabled={!canReopen} onClick={() => run('reopen')}><Undo2 size={13} /> Retrieve closed tab</button>
+      <button role="menuitem" onClick={() => { onDismiss(); openTabArchive() }}><Archive size={13} /> Closed tabs archive…</button>
       <div role="separator" />
       {isCoworkerController && <button role="menuitem" onClick={() => run('close-tab-only')}><X size={13} /> Close this tab only</button>}
       <button role="menuitem" className="danger" onClick={() => run('close')}><X size={13} /> {isCoworkerController ? 'Close tab group' : 'Close tab'}</button>
+    </MenuShell>
+  )
+}
+
+/** The menu of a selection of two or more tabs (layout/tab-selection.ts): what Explorer offers for
+ *  selected files, in tab terms. `panes` are the other panes the tabs can move into. */
+export function SelectionTabMenu({ x, y, count, panes, canSplit, canDetach, onAction, onClear, onDismiss }: {
+  x: number; y: number; count: number
+  panes: Array<{ groupId: string; label: string }>
+  canSplit: boolean; canDetach: boolean
+  onAction(action: BulkTabAction): void; onClear(): void; onDismiss(): void
+}): React.JSX.Element {
+  const run = (action: BulkTabAction): void => { onDismiss(); onAction(action) }
+  return (
+    <MenuShell x={x} y={y} label={`${count} selected tabs`} ignoreSelector=".pane-menu-button" onDismiss={onDismiss}>
+      <div className="context-menu-label">{count} tabs selected</div>
+      {panes.map(pane => <button key={pane.groupId} role="menuitem" onClick={() => run({ kind: 'move', groupId: pane.groupId })}><ArrowRightLeft size={13} /> Move to {pane.label}</button>)}
+      <button role="menuitem" disabled={!canSplit} onClick={() => run({ kind: 'split', edge: 'right' })}><PanelRight size={13} /> Move to a new pane</button>
+      <button role="menuitem" onClick={() => run({ kind: 'new-tab-group' })}><FolderPlus size={13} /> Add {count} tabs to new group</button>
+      {canDetach && <button role="menuitem" onClick={() => run({ kind: 'detach' })}><ExternalLink size={13} /> Open {count} tabs as a window</button>}
+      <div role="separator" />
+      <button role="menuitem" onClick={() => { onDismiss(); onClear() }}><Minus size={13} /> Clear selection <kbd>Esc</kbd></button>
+      <button role="menuitem" className="danger" onClick={() => run({ kind: 'close' })}><Archive size={13} /> Close {count} tabs <small>to archive</small></button>
     </MenuShell>
   )
 }

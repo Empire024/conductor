@@ -34,6 +34,16 @@ const bridge: ConductorBridge = {
     activateResource: (kind, id) => ipcRenderer.invoke('session-archive:activate-resource', kind, id),
     onChanged: callback => subscribe('session-archive:changed', callback)
   },
+  tabArchive: {
+    list: (sessionId, query, limit) => ipcRenderer.invoke('tab-archive:list', sessionId, query, limit),
+    search: (query, limit) => ipcRenderer.invoke('tab-archive:search', query, limit),
+    reopen: (sessionId, tabIds) => ipcRenderer.invoke('tab-archive:reopen', sessionId, tabIds),
+    remove: (sessionId, tabIds) => ipcRenderer.invoke('tab-archive:remove', sessionId, tabIds),
+    record: (sessionId, tabs) => ipcRenderer.invoke('tab-archive:record', sessionId, tabs),
+    archive: (projectId, sessionId, tabIds) => ipcRenderer.invoke('tab-archive:archive', projectId, sessionId, tabIds),
+    lineage: agentSessionId => ipcRenderer.invoke('tab-archive:lineage', agentSessionId),
+    onChanged: callback => subscribe('tab-archive:changed', callback)
+  },
   workspaceClarity: {
     facts: agentSessionIds => ipcRenderer.invoke('workspace:tab-facts', agentSessionIds),
     closeFinished: (projectId, sessionId, tabIds) => ipcRenderer.invoke('workspace:close-finished', projectId, sessionId, tabIds)

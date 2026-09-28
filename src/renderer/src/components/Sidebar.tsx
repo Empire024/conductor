@@ -4,6 +4,7 @@ import { WorkspaceTabList, WorkspaceTabToggle } from './WorkspaceTabList'
 import { RemoveProjectDialog } from './RemoveProjectDialog'
 import { ProcessStatusSummary } from './ProcessStatusSummary'
 import type { TabGroupAction } from '../layout/tab-groups'
+import type { BulkTabAction } from '../layout/tab-selection'
 import type { WorkspaceTabAction } from '../layout/workspace-tab-actions'
 import type { ProjectActivityStatus, SessionActivityStatus } from '../attention'
 import { displayActivityStatus } from '../attention'
@@ -67,6 +68,8 @@ interface SidebarProps {
   onRemoveProject(id: string): Promise<void>
   onTabAction(sessionId: string, groupId: string, tabId: string, action: WorkspaceTabAction): void
   onTabGroupAction(sessionId: string, groupId: string, tabId: string, action: TabGroupAction): void
+  /** A selection of two or more of a workspace's tabs (layout/tab-selection.ts). */
+  onTabBulkAction?(sessionId: string, tabIds: string[], action: BulkTabAction): void
   onRevealProject(path: string): void
   onCloseSession(id: string): void
   onRenameSession(id: string, name: string): void
@@ -473,7 +476,7 @@ ${project.path} (on ${project.remote!.machineName})` : project.path}
                         </button>
                         <button className="sidebar-session-close" aria-label={'Close ' + session.name} title={'Close ' + session.name} onClick={() => props.onCloseSession(session.id)}><X size={11} /></button>
                         </div>
-                        <WorkspaceTabList session={session} active={session.id === props.activeSessionId} expanded={tabListOverrides[session.id] ?? session.id === props.activeSessionId} activityPhases={props.activityPhases} onAction={(groupId, tabId, action) => props.onTabAction(session.id, groupId, tabId, action)} onGroupAction={(groupId, tabId, action) => props.onTabGroupAction(session.id, groupId, tabId, action)} />
+                        <WorkspaceTabList session={session} active={session.id === props.activeSessionId} expanded={tabListOverrides[session.id] ?? session.id === props.activeSessionId} activityPhases={props.activityPhases} onAction={(groupId, tabId, action) => props.onTabAction(session.id, groupId, tabId, action)} onGroupAction={(groupId, tabId, action) => props.onTabGroupAction(session.id, groupId, tabId, action)} onBulkAction={props.onTabBulkAction ? (tabIds, action) => props.onTabBulkAction!(session.id, tabIds, action) : undefined} />
                         </Fragment>
                       )})}
                       <button className="new-session" onClick={props.onNewSession}>
