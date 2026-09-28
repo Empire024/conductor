@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { autoModeDenialItemId, type AutoModeDenial } from '../../shared/auto-mode-denial'
 import { describeGrantRequest } from '../../shared/permission-grants'
 import type { Json } from '../../shared/structured-agent'
+import { AgentControlServer } from '../agent-control-server'
 import { callPermissions } from './control'
 import { CONDUCTOR_MCP_TOOLS, ConductorMcpServer } from './control-mcp'
 import { PermissionGrants, type PermissionGrantPorts, type SavedPermissionGrants } from './service'
@@ -249,6 +250,63 @@ describe('the conductor MCP server', () => {
       server.release(tab)
       expect((await post({ jsonrpc: '2.0', id: 5, method: 'tools/list' })).status).toBe(401)
     } finally { server.close() }
+  })
+
+  it('calls any app-control method through the HTTP endpoint\'s pipeline, refusing with the text HTTP answers', async () => {
+    const listing = { 'tools.list': '({brief?,prefix?})', 'agents.status': '({agentSessionId})' }
+    const control = {
+      authorize: vi.fn(() => ({ id: tab, projectId: 'project', sessionId: 'workspace', provider: 'claude', title: 'Worker', cwd })),
+      ownerScope: vi.fn(),
+      prepareActivity: vi.fn(() => undefined),
+      recordActivity: vi.fn(),
+      // Owner-only as AgentControl.call decides it: from the scope, never from the arguments.
+      call: vi.fn(async (scope: { agentSessionId: string; owner?: boolean; wizard?: boolean }, method: string, args: Record<string, unknown>) => {
+        if (method === 'tools.list') return args.brief ? listing : { ...listing, full: true }
+        if (method === 'app.restart' && !scope.owner && !scope.wizard) throw new Error('app.restart is for the owner credential or a wizard tab; ask the owner with app.restart.request({reason}).')
+        if (method === 'tabs.close') throw new Error('Tab is closed')
+        return { method, args }
+      })
+    }
+    const http = new AgentControlServer(control as never, false)
+    await http.start()
+    const mcp = new ConductorMcpServer((scope, method, args, options) => options?.generic ? http.invoke(scope, method, args) : control.call(scope, method, args), false)
+    await mcp.start()
+    try {
+      const spec = { id: tab, projectId: 'project', sessionId: 'workspace', provider: 'claude' as const, title: 'Worker', cwd }
+      const { readFileSync } = await import('node:fs')
+      const config = JSON.parse(readFileSync(mcp.configure(spec), 'utf8')) as { mcpServers: { conductor: { url: string; headers: { Authorization: string } } } }
+      type ToolResult = { result: { isError?: boolean; content: Array<{ text: string }>; structuredContent?: unknown } }
+      const tool = async (args: Record<string, unknown>): Promise<ToolResult['result']> => (await (await fetch(config.mcpServers.conductor.url, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: config.mcpServers.conductor.headers.Authorization }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'control', arguments: args } }) })).json() as ToolResult).result
+      const briefing = http.briefing(spec as never)
+      expect(briefing).toContain('control({method,args})')
+      const endpoint = briefing.match(/POST (http:\/\/127\.0\.0\.1:\d+\/control)/)![1]!, token = briefing.match(/Bearer ([a-f0-9]{64})/)![1]!
+      const overHttp = async (method: string, args: Record<string, unknown> = {}) => await (await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ method, args }) })).json() as { result?: unknown; error?: string }
+
+      const listed = await tool({ method: 'tools.list', args: { brief: true } })
+      expect(listed.isError).toBeUndefined()
+      expect(JSON.parse(listed.content[0]!.text)).toEqual(listing)
+      // One copy of a large result, not a second one as structuredContent.
+      expect(listed.structuredContent).toBeUndefined()
+      // args sent as a JSON string, as models often do, is the same call.
+      expect(JSON.parse((await tool({ method: 'tools.list', args: '{"brief":true}' })).content[0]!.text)).toEqual(listing)
+      expect(control.call).toHaveBeenCalledWith({ projectId: 'project', sessionId: 'workspace', agentSessionId: tab }, 'tools.list', { brief: true })
+
+      // A refused mutation and an owner-only method: the same text the HTTP endpoint answers in its 400 body.
+      for (const [method, args] of [['tabs.close', { tabId: 'tab_1' }], ['app.restart', {}]] as const) {
+        const refused = await tool({ method, args })
+        expect(refused.isError).toBe(true)
+        expect(refused.content[0]!.text).toBe((await overHttp(method, args)).error)
+      }
+      expect((await tool({ method: 'app.restart' })).content[0]!.text).toContain('owner credential or a wizard tab')
+      // Recorded in the timelines exactly as an HTTP call is (control-activity.ts).
+      expect(control.recordActivity).toHaveBeenCalledWith({ projectId: 'project', sessionId: 'workspace', agentSessionId: tab }, 'tabs.close', { tabId: 'tab_1' }, expect.objectContaining({ error: 'Tab is closed' }))
+      expect(control.authorize).toHaveBeenCalled()
+
+      const noMethod = await tool({ args: {} })
+      expect(noMethod).toMatchObject({ isError: true, content: [{ text: expect.stringContaining('control needs method') }] })
+      const badArgs = await tool({ method: 'agents.status', args: '[1' })
+      expect(badArgs).toMatchObject({ isError: true, content: [{ text: expect.stringContaining('tools.list({prefix:"agents."})') }] })
+    } finally { mcp.close(); http.close() }
   })
 })
 

@@ -33,6 +33,13 @@ describe('approval session rule classes', () => {
     expect(commandClass({ tool: 'Grep', arguments: { pattern: 'x' }, paths: [], boundary: 'workspace-write' })).toBe('tool:Grep')
     expect(commandClass({ tool: 'WebFetch', arguments: { url: 'https://docs.example.com/a' }, paths: [], boundary: 'workspace-write' })).toBe('fetch:docs.example.com')
   })
+  it('classes the conductor control tool by the method it calls', () => {
+    const control = (args: Record<string, unknown>): ClassifiedAction => ({ tool: 'mcp__conductor__control', arguments: args as never, paths: [], boundary: 'workspace-write' })
+    expect(commandClass(control({ method: 'tools.list', args: { brief: true } }))).toBe('mcp:mcp__conductor__control:tools.list')
+    expect(commandClass(control({ method: 'tabs.close', args: { tabId: 'tab_1' } }))).toBe('mcp:mcp__conductor__control:tabs.close')
+    expect(commandClass(control({}))).toBeUndefined()
+    expect(commandClass({ tool: 'mcp__conductor__send_message', arguments: { text: 'hi' }, paths: [], boundary: 'workspace-write' })).toBe('mcp:mcp__conductor__send_message')
+  })
   it('reads Codex commands through the Windows PowerShell wrapper', () => {
     expect(commandText({ command: '"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command \'npm test\'' })).toBe('npm test')
     expect(commandText({ command: ['git', 'status'] })).toBe('git status')

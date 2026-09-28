@@ -58,7 +58,13 @@ export function commandClass(action: ClassifiedAction): string | undefined {
     const described = describeGrantRequest({ tool: 'WebFetch', input, cwd })
     return described.host ? 'fetch:' + described.host.toLowerCase() : undefined
   }
-  if (action.tool.startsWith('mcp__')) return describeGrantRequest({ tool: action.tool, input, cwd }).class === 'local' ? 'mcp:' + action.tool : undefined
+  if (action.tool.startsWith('mcp__')) {
+    if (describeGrantRequest({ tool: action.tool, input, cwd }).class !== 'local') return undefined
+    // The conductor `control` tool reaches every app-control method, so an approved tools.list
+    // must not cover a later tabs.close: its class is the method it calls.
+    if (action.tool === 'mcp__conductor__control') return typeof input.method === 'string' && input.method ? `mcp:${action.tool}:${input.method}` : undefined
+    return 'mcp:' + action.tool
+  }
   const command = commandText(input)
   if (!command) return undefined
   const shell = action.tool === 'PowerShell' ? 'PowerShell' : 'Bash'

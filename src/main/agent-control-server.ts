@@ -42,6 +42,7 @@ export interface ControlEndpointFile {
 
 const OWNER_KEY = '\0owner'
 const MAX_IN_FLIGHT_PER_SESSION = 8
+const BUSY = `This session already has ${MAX_IN_FLIGHT_PER_SESSION} control requests in progress`
 /** Conversations whose credential is remembered across launches; the oldest go first. */
 const MAX_KEPT_CREDENTIALS = 2000
 
@@ -197,7 +198,10 @@ export class AgentControlServer {
         this.saveKept()
       }
     }
-    return `Conductor app control: a first-party local JSON protocol is available for this project/workspace. POST ${this.endpoint} with Authorization: Bearer ${credential.token}, Content-Type: application/json, body {"method":"tools.list","args":{"brief":true}} to list methods; tools.list({prefix:"agents."}) gives full signatures for one family. Prefer the conductor MCP tools when you have them. From a shell use curl.exe -s; a refused call is HTTP 400 whose JSON body {"error":"..."} says what to do next, and Invoke-RestMethod hides it unless you catch it: try { Invoke-RestMethod ... } catch { $_.ErrorDetails.Message }. Do not expose the authorization value or copy it to another tab. app.state gives stable tab/file URIs, models.list gives actual choices, router.start({prompt}) opens a visible router; router.dispatch({tasks:[{title,prompt,provider,model}]}) opens visible coworkers. Use these visible native tabs when delegating to another provider; do not launch nested codex or claude CLI processes. Native turns and approvals remain visible in their tabs. git.ship({message,paths?}) runs tests, build and a local commit on the host (publish:true, only when asked, also pushes and builds the release); never escalate the sandbox for git; files.write compares expectedContent and streams disk changes to the UI; tasks.update preserves checklist markers. Your control scope is your registered project and workspace. You cannot control yourself or your ancestors; to reach your controller use report (agents.report) or send_message. projects.list names the other projects the owner has open in this window: you may read one with files.list/files.read({projectId}) and hand work to it with tabs.open({projectId}) or router.dispatch, then steer that tab; you cannot write into another project's files directly. Destructive actions ask the owner; never blindly retry a mutation after a transport timeout. Use these tools only for the user's requested work.${this.machineNote?.(spec) ? ' ' + this.machineNote(spec) : ''}`
+    // Claude tabs get the conductor MCP server (permission-grants/control-mcp.ts): its `control`
+    // tool is the same call without a shell, quoting or a token on a command line.
+    const mcp = spec.provider === 'claude' ? 'Call it with the conductor MCP tool control({method,args}), e.g. control({method:"tools.list",args:{brief:true}}): same scope and rules, no shell and no token on a command line, and a refusal comes back as text that says what to do next. For scripts, or if that tool is missing: ' : ''
+    return `Conductor app control: a first-party local JSON protocol is available for this project/workspace. ${mcp}POST ${this.endpoint} with Authorization: Bearer ${credential.token}, Content-Type: application/json, body {"method":"tools.list","args":{"brief":true}} to list methods; tools.list({prefix:"agents."}) gives full signatures for one family. From a shell use curl.exe -s; a refused call is HTTP 400 whose JSON body {"error":"..."} says what to do next, and Invoke-RestMethod hides it unless you catch it: try { Invoke-RestMethod ... } catch { $_.ErrorDetails.Message }. Do not expose the authorization value or copy it to another tab. app.state gives stable tab/file URIs, models.list gives actual choices, router.start({prompt}) opens a visible router; router.dispatch({tasks:[{title,prompt,provider,model}]}) opens visible coworkers. Use these visible native tabs when delegating to another provider; do not launch nested codex or claude CLI processes. Native turns and approvals remain visible in their tabs. git.ship({message,paths?}) runs tests, build and a local commit on the host (publish:true, only when asked, also pushes and builds the release); never escalate the sandbox for git; files.write compares expectedContent and streams disk changes to the UI; tasks.update preserves checklist markers. Your control scope is your registered project and workspace. You cannot control yourself or your ancestors; to reach your controller use report (agents.report) or send_message. projects.list names the other projects the owner has open in this window: you may read one with files.list/files.read({projectId}) and hand work to it with tabs.open({projectId}) or router.dispatch, then steer that tab; you cannot write into another project's files directly. Destructive actions ask the owner; never blindly retry a mutation after a transport timeout. Use these tools only for the user's requested work.${this.machineNote?.(spec) ? ' ' + this.machineNote(spec) : ''}`
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -219,9 +223,7 @@ export class AgentControlServer {
     // method family (control-method-classes.ts), so a long git.ship never holds up tabs.open,
     // while the bounded request count prevents one credential from monopolising the server.
     const key = owner ? OWNER_KEY : credential!.scope.agentSessionId
-    const inFlight = this.inFlight.get(key) ?? 0
-    if (inFlight >= MAX_IN_FLIGHT_PER_SESSION) { reply(429, { error: `This session already has ${MAX_IN_FLIGHT_PER_SESSION} control requests in progress` }); request.resume(); return }
-    this.inFlight.set(key, inFlight + 1)
+    if (!this.enter(key)) { reply(429, { error: BUSY }); request.resume(); return }
     try {
       const chunks: Buffer[] = []
       let size = 0
@@ -235,35 +237,59 @@ export class AgentControlServer {
       // The owner names the project and workspace per call; a conversation's scope is fixed
       // when its credential is issued and nothing in the body can move it.
       const scope = owner ? this.control.ownerScope(input.scope) : credential!.scope
-      // Every answered call is shown in the timelines it concerns (control-activity.ts), on the
-      // Conductor side only: nothing is added to any prompt.
-      const call = async (): Promise<unknown> => {
-        this.control.authorize(scope)
-        // Resolved before the call: a close leaves no tab to name afterwards.
-        const prepared = this.control.prepareActivity?.(scope, input.method as string, input.args ?? {})
-        try {
-          const result = await this.control.call(scope, input.method as string, input.args ?? {})
-          this.control.recordActivity?.(scope, input.method as string, input.args ?? {}, { result, prepared })
-          return result
-        } catch (error) {
-          this.control.recordActivity?.(scope, input.method as string, input.args ?? {}, { error: error instanceof Error ? error.message : String(error), prepared })
-          throw error
-        }
-      }
-      const result = controlMethodClass(input.method) === 'read'
-        ? await call()
-        : await this.withMutationLock(`${key}\0${controlMethodFamily(input.method) ?? 'other'}`, call)
-      if (input.method === 'tools.list' && result && typeof result === 'object' && !Array.isArray(result)) {
-        const unclassified = Object.keys(result).filter(method => !controlMethodClass(method))
-        if (unclassified.length) throw new Error(`Unclassified control methods: ${unclassified.join(', ')}`)
-      }
-      reply(200, { result })
+      reply(200, { result: await this.run(key, scope, input.method, input.args ?? {}) })
     } catch (error) { reply(400, { error: error instanceof Error ? error.message : 'Control request failed' }) }
-    finally {
-      const remaining = (this.inFlight.get(key) ?? 1) - 1
-      if (remaining > 0) this.inFlight.set(key, remaining)
-      else this.inFlight.delete(key)
+    finally { this.leave(key) }
+  }
+
+  /** One call exactly as a conversation's credential makes it over HTTP: the same in-flight cap,
+   *  scope check, per-family mutation order and timeline activity. The conductor MCP `control`
+   *  tool calls this (permission-grants/control-mcp.ts), so moving a call off the shell changes
+   *  nothing about what it may do; a refusal throws the text HTTP answers as `{error}`. */
+  async invoke(scope: AgentControlScope, method: string, args: unknown = {}): Promise<unknown> {
+    if (typeof method !== 'string' || !method || method.length > 100) throw new Error('Provide a method and args object')
+    const key = scope.owner ? OWNER_KEY : scope.agentSessionId
+    if (!this.enter(key)) throw new Error(BUSY)
+    try { return await this.run(key, scope, method, args) } finally { this.leave(key) }
+  }
+
+  private enter(key: string): boolean {
+    const inFlight = this.inFlight.get(key) ?? 0
+    if (inFlight >= MAX_IN_FLIGHT_PER_SESSION) return false
+    this.inFlight.set(key, inFlight + 1)
+    return true
+  }
+
+  private leave(key: string): void {
+    const remaining = (this.inFlight.get(key) ?? 1) - 1
+    if (remaining > 0) this.inFlight.set(key, remaining)
+    else this.inFlight.delete(key)
+  }
+
+  private async run(key: string, scope: AgentControlScope, method: string, args: unknown): Promise<unknown> {
+    // Every answered call is shown in the timelines it concerns (control-activity.ts), on the
+    // Conductor side only: nothing is added to any prompt.
+    const call = async (): Promise<unknown> => {
+      this.control.authorize(scope)
+      // Resolved before the call: a close leaves no tab to name afterwards.
+      const prepared = this.control.prepareActivity?.(scope, method, args)
+      try {
+        const result = await this.control.call(scope, method, args)
+        this.control.recordActivity?.(scope, method, args, { result, prepared })
+        return result
+      } catch (error) {
+        this.control.recordActivity?.(scope, method, args, { error: error instanceof Error ? error.message : String(error), prepared })
+        throw error
+      }
     }
+    const result = controlMethodClass(method) === 'read'
+      ? await call()
+      : await this.withMutationLock(`${key}\0${controlMethodFamily(method) ?? 'other'}`, call)
+    if (method === 'tools.list' && result && typeof result === 'object' && !Array.isArray(result)) {
+      const unclassified = Object.keys(result).filter(name => !controlMethodClass(name))
+      if (unclassified.length) throw new Error(`Unclassified control methods: ${unclassified.join(', ')}`)
+    }
+    return result
   }
 
   private async withMutationLock<T>(key: string, call: () => Promise<T>): Promise<T> {

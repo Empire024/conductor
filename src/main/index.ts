@@ -2887,8 +2887,9 @@ app.whenReady().then(async () => {
     .catch(error => { console.warn('Local assist is unavailable', error); return undefined })
   control.setLocalAssist(localAssist)
   // One narrow owner approval for a classifier-refused call, and the `conductor` MCP tools for
-  // tab messaging (src/main/permission-grants, docs/permissions-classifier.md).
-  permissionGrants = await startPermissionGrants({ sessions: agents.structured, store: database.structured, control: (scope, method, args) => control.call(scope, method, args), publish, announce: notification => phoneAccess?.announce(notification), workspaces: database })
+  // tab messaging (src/main/permission-grants, docs/permissions-classifier.md). Its generic
+  // `control` tool runs through the HTTP endpoint's own pipeline (AgentControlServer.invoke).
+  permissionGrants = await startPermissionGrants({ sessions: agents.structured, store: database.structured, control: (scope, method, args, options) => options?.generic && agentControlServer ? agentControlServer.invoke(scope, method, args) : control.call(scope, method, args), publish, announce: notification => phoneAccess?.announce(notification), workspaces: database })
     .catch(error => { console.warn('Permission grants are unavailable', error); return undefined })
   if (permissionGrants) control.setPermissionGrants(permissionGrants.grants)
   // Model intelligence (docs/model-routing.md): registry refresh, routing, outcome capture and the

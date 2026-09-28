@@ -11,10 +11,12 @@ const PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26']
 const MAX_BODY = 256 * 1024
 
 export interface ControlScope { projectId: string; sessionId: string; agentSessionId: string }
-/** AgentControl.call with the conversation's own scope: the same authority rules as over HTTP. */
-export type ControlCall = (scope: ControlScope, method: string, args: Record<string, unknown>) => Promise<unknown>
+/** AgentControl.call with the conversation's own scope: the same authority rules as over HTTP.
+ *  `generic` marks a call from the `control` tool, which index.ts runs through the HTTP endpoint's
+ *  own pipeline (AgentControlServer.invoke: in-flight cap, per-family order, timeline activity). */
+export type ControlCall = (scope: ControlScope, method: string, args: Record<string, unknown>, options?: { generic?: boolean }) => Promise<unknown>
 
-interface Tool { name: string; description: string; inputSchema: Record<string, unknown>; method: string; args(input: Record<string, unknown>): Record<string, unknown> }
+interface Tool { name: string; description: string; inputSchema: Record<string, unknown>; method: string; args(input: Record<string, unknown>): Record<string, unknown>; generic?: true }
 const pick = (input: Record<string, unknown>, keys: string[]): Record<string, unknown> => Object.fromEntries(keys.filter(key => input[key] !== undefined).map(key => [key, input[key]]))
 
 /**
@@ -30,7 +32,24 @@ const pick = (input: Record<string, unknown>, keys: string[]): Record<string, un
 const addressee = (input: Record<string, unknown>): Record<string, unknown> =>
   input.agentSessionId === undefined && input.projectId !== undefined ? { projectId: input.projectId } : { agentSessionId: input.agentSessionId }
 
+/** The `control` tool's method, checked as the HTTP endpoint checks it. */
+const controlMethod = (input: Record<string, unknown>): string => {
+  if (typeof input.method !== 'string' || !input.method || input.method.length > 100) throw new Error('control needs method, an app-control method name such as "tools.list" or "agents.status", and args, an object: control({method:"agents.status",args:{agentSessionId:"agent_..."}})')
+  return input.method
+}
+/** Its args: an object, or the same object sent as a JSON string, which models often do. */
+const controlArgs = (input: Record<string, unknown>): Record<string, unknown> => {
+  let args = input.args
+  if (typeof args === 'string') { try { args = args.trim() ? JSON.parse(args) : {} } catch { /* refused below */ } }
+  if (args === undefined || args === null) return {}
+  if (typeof args !== 'object' || Array.isArray(args)) throw new Error(`control args must be a JSON object of ${String(input.method)}'s arguments, e.g. {"agentSessionId":"agent_..."}; tools.list({prefix:"${String(input.method).split('.')[0]}."}) gives its signature`)
+  return args as Record<string, unknown>
+}
+
 export const CONDUCTOR_MCP_TOOLS: Tool[] = [
+  { name: 'control', method: '', generic: true, args: controlArgs,
+    description: 'Call any Conductor app-control method (tools.list, agents.*, tabs.*, git.ship, ...) without a shell; same scope and rules as the HTTP protocol. Refusals come back as text that says what to do next. tools.list({brief:true}) lists every method with its arguments; tools.list({prefix:"agents."}) gives one family\'s full signatures.',
+    inputSchema: { type: 'object', properties: { method: { type: 'string', maxLength: 100, description: 'App-control method, e.g. "agents.status"' }, args: { type: 'object', description: 'The method\'s arguments', additionalProperties: true } }, required: ['method'], additionalProperties: false } },
   { name: 'send_message', method: 'agents.steer', args: input => ({ ...addressee(input), prompt: input.text }),
     description: 'Send a text message to another Conductor tab you control or coordinate with, including your own controller (agents.steer): steered into its running turn, or starting one if it is idle. To your controller or an ancestor it is delivered as a report. Address another project instead with projectId (from projects.list) and no agentSessionId: the message goes to that project\'s active wizard, which replies to you, and the result names it. Only delivers text; changes no setting and runs nothing.',
     inputSchema: { type: 'object', properties: { agentSessionId: { type: 'string' }, projectId: { type: 'string' }, text: { type: 'string', maxLength: 20000 } }, required: ['text'], additionalProperties: false } },
@@ -159,7 +178,7 @@ export class ConductorMcpServer {
         protocolVersion: PROTOCOL_VERSIONS.includes(requested) ? requested : PROTOCOL_VERSIONS[0],
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: CONDUCTOR_MCP_SERVER_NAME, title: 'Conductor', version: '1' },
-        instructions: 'Message other Conductor tabs (send_message, submit_task, report, handoff) with these tools instead of posting to app control from a shell, and ask the owner for one refused call with request_permission.'
+        instructions: 'Call any Conductor app-control method with control({method,args}) instead of posting to app control from a shell. Message other Conductor tabs with send_message, submit_task, report and handoff, and ask the owner for one refused call with request_permission.'
       } }
     }
     if (message.method === 'ping') return { ...envelope, result: {} }
@@ -170,8 +189,13 @@ export class ConductorMcpServer {
       if (!tool) return { ...envelope, error: { code: -32602, message: `Unknown Conductor tool: ${name || '(none)'}` } }
       const input = params.arguments && typeof params.arguments === 'object' && !Array.isArray(params.arguments) ? params.arguments as Record<string, unknown> : {}
       try {
-        const result = await this.call(credential.scope, tool.method, tool.args(input))
+        const result = tool.generic
+          ? await this.call(credential.scope, controlMethod(input), tool.args(input), { generic: true })
+          : await this.call(credential.scope, tool.method, tool.args(input))
         if (this.credentials.get(credential.scope.agentSessionId) !== credential) throw new Error('Conductor access was revoked while the tool was running')
+        // Any method's result as its JSON text alone: a tools.list is tens of KB, so it is not
+        // sent a second time as structuredContent.
+        if (tool.generic) return { ...envelope, result: { content: [{ type: 'text', text: JSON.stringify(result ?? null) }] } }
         const structured = result && typeof result === 'object' && !Array.isArray(result) ? result as Record<string, unknown> : { result }
         return { ...envelope, result: { content: [{ type: 'text', text: JSON.stringify(structured) }], structuredContent: structured } }
       } catch (error) { return { ...envelope, result: { isError: true, content: [{ type: 'text', text: error instanceof Error ? error.message : 'Conductor tool failed' }] } } }
