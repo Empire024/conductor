@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { isValidElement, type ReactElement, type ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { grantAnswerable, liveGrantStatus, PermissionGrantCard, type GrantCardRequest } from './PermissionGrantCard'
+import { grantAnswerable, liveGrantStatus, PermissionGrantCard, retryWaiting, type GrantCardRequest } from './PermissionGrantCard'
 
 const request: GrantCardRequest = {
   tool: 'Bash', action: 'Run a command', resource: 'ssh -i key root@192.0.2.10 bash -s < app/prod/fix-pool.sh', host: '192.0.2.10', class: 'external',
@@ -87,5 +87,21 @@ describe('permission grant card', () => {
     const [revoke] = buttons(card)
     ;(revoke!.props.onClick as () => void)()
     expect(onRevoke).toHaveBeenCalledTimes(1)
+  })
+
+  it('offers "Interrupt and retry" only while the approved retry waits behind a running turn (H06)', () => {
+    const grant = { id: 'g', agentSessionId: 'a', requestId: 'r', rule: request.rule!, scope: 'once' as const, class: 'external' as const, tool: 'Bash', resource: request.resource, grantedAt: 'now', decidedBy: 'owner' as const, delivery: 'live' as const }
+    const waiting = { requests: [], grants: [grant], waiting: [{ agentSessionId: 'a', grantIds: ['g'], rules: [grant.rule], since: 'now' }] }
+    expect(retryWaiting(waiting, grant)).toBe(true)
+    expect(retryWaiting({ ...waiting, waiting: undefined }, grant)).toBe(false)
+    expect(retryWaiting(waiting, { ...grant, agentSessionId: 'b' })).toBe(false)
+    const onInterrupt = vi.fn()
+    const card = PermissionGrantCard({ request, status: 'approved-once', grant, onRevoke: () => {}, onInterrupt })
+    expect(renderToStaticMarkup(card)).toContain('The retry is queued behind a turn that is still running.')
+    const interrupt = buttons(card).find(button => button.props.className === 'sa-grant-interrupt')!
+    expect(interrupt.props.children).toBe('Interrupt and retry')
+    ;(interrupt.props.onClick as () => void)()
+    expect(onInterrupt).toHaveBeenCalledTimes(1)
+    expect(renderToStaticMarkup(PermissionGrantCard({ request, status: 'approved-once', grant }))).not.toContain('Interrupt and retry')
   })
 })

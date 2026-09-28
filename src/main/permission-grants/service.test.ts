@@ -234,7 +234,7 @@ describe('the conductor MCP server', () => {
     await server.start()
     try {
       const file = server.configure({ id: tab, projectId: 'project', sessionId: 'workspace', provider: 'claude' })
-      expect(server.configure({ id: 'agent_codex', projectId: 'project', sessionId: 'workspace', provider: 'codex' })).toBe('')
+      expect(server.configure({ id: 'agent_local', projectId: 'project', sessionId: 'workspace', provider: 'local' })).toBe('')
       const { readFileSync } = await import('node:fs')
       const config = JSON.parse(readFileSync(file, 'utf8')) as { mcpServers: { conductor: { url: string; headers: { Authorization: string } } } }
       const post = (body: unknown, authorization = config.mcpServers.conductor.headers.Authorization) => fetch(config.mcpServers.conductor.url, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: authorization }, body: JSON.stringify(body) })
@@ -700,8 +700,37 @@ describe('an approval reaches a conversation whose turn is still running (H06)',
     h.advance(119_000); h.grants.sweep()
     expect(waitingNotices(h)).toEqual([])
     h.advance(2000); h.grants.sweep(); h.advance(60_000); h.grants.sweep()
-    expect(waitingNotices(h)).toEqual([expect.objectContaining({ id: tab, message: expect.stringMatching(/queued behind a turn that has run 12 min \(last tool: Bash\)\. Press Esc in this tab/) })])
+    expect(waitingNotices(h)).toEqual([expect.objectContaining({ id: tab, message: expect.stringMatching(/queued behind a turn that has run 12 min \(last tool: Bash\)\. Use "Interrupt and retry" on its approval card, or press Esc in this tab/) })])
     expect(h.ports.interrupt).not.toHaveBeenCalled()
+  })
+
+  it('offers the owner "Interrupt and retry" after the notice, and interrupts with the queue expedited', async () => {
+    const h = timed()
+    const { grant } = await h.grants.decide(tab, h.deny('toolu_i', 'Bash', { command: ssh }, 'Production Reads'), 'approve-once', 'owner')
+    expect(h.grants.state().waiting).toBeUndefined()
+    h.advance(121_000); h.grants.sweep()
+    expect(h.grants.state().waiting).toEqual([{ agentSessionId: tab, grantIds: [grant!.id], rules: [grant!.rule], since: '2026-09-28T15:00:00.000Z' }])
+    await h.grants.interruptForRetry(tab, grant!.id)
+    expect(h.ports.interrupt).toHaveBeenCalledWith(tab)
+    expect(h.grants.state().waiting).toBeUndefined()
+    expect(waitingNotices(h).at(-1)).toMatchObject({ message: expect.stringMatching(/you interrupted that turn, so the retry runs now/) })
+    // The retry started: a second click says so instead of interrupting the next turn.
+    h.waiting.clear()
+    await expect(h.grants.interruptForRetry(tab, grant!.id)).rejects.toThrow(/no longer waiting/)
+    expect(h.ports.interrupt).toHaveBeenCalledTimes(1)
+  })
+
+  it('offers the card action again when the interrupt fails, and withdraws the offer when the retry runs', async () => {
+    const interrupt = vi.fn(async () => { throw new Error('runtime offline') })
+    const h = timed({ interrupt })
+    const { grant } = await h.grants.decide(tab, h.deny('toolu_f', 'Bash', { command: ssh }, 'Production Reads'), 'approve-once', 'wizard')
+    h.advance(121_000); h.grants.sweep(); await settle()
+    expect(waitingNotices(h).at(-1)).toMatchObject({ message: expect.stringMatching(/could not interrupt it \(runtime offline\)\. Use "Interrupt and retry"/) })
+    expect(h.grants.state().waiting).toHaveLength(1)
+    await expect(h.grants.interruptForRetry(tab, grant!.id)).rejects.toThrow('runtime offline')
+    expect(h.grants.state().waiting).toHaveLength(1)
+    h.waiting.clear(); h.grants.sweep()
+    expect(h.grants.state().waiting).toBeUndefined()
   })
 
   it('interrupts the turn once when a wizard approved and the retry has waited 2 min', async () => {

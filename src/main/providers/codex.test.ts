@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { CodexAdapter, CODEX_PROTOCOL_BASELINE, codexChanges, codexDiffCounts, codexInput, codexLaunchArguments, validateCodexLiveConfiguration, codexLiveSkillOverrides } from './codex'
 import { JsonLineTransport } from './transport'
-import { SteeringUnavailableError } from './adapter'
+import { SteeringUnavailableError, type AdapterOptions } from './adapter'
 import type { AdapterEvent, AgentEvent, Json, SessionSettings } from '../../shared/structured-agent'
 import { replayAgentEvents } from '../../shared/structured-agent-reducer'
 import type { ConfigReadResponse } from './generated/codex/v2/ConfigReadResponse'
@@ -16,12 +16,12 @@ const settings: SessionSettings = { permission: 'default', plan: false }
 const cleanup: Array<() => Promise<void>> = []
 afterEach(async () => { for (const clean of cleanup.splice(0)) await clean() })
 
-function create(extraEnvironment: NodeJS.ProcessEnv = {}, nativeSessionId?: string, requestTimeoutMs = 3000, sessionSettings: SessionSettings = settings, mcpConfig?: string) {
+function create(extraEnvironment: NodeJS.ProcessEnv = {}, nativeSessionId?: string, requestTimeoutMs = 3000, sessionSettings: SessionSettings = settings, mcpConfig?: string, extraOptions: Partial<AdapterOptions> = {}) {
   const cwd = mkdtempSync(path.join(tmpdir(), 'conductor-codex-'))
   const events: AdapterEvent[] = []
   const sent: Json[] = []
   let closed = true
-  const adapter = new CodexAdapter({ executable: 'not-a-real-provider', cwd, runtimeId: 'runtime-1', settings: sessionSettings, nativeSessionId, ...(mcpConfig ? { mcpConfig } : {}), environment: { ...process.env, ...extraEnvironment }, emit: event => events.push(event) }, {
+  const adapter = new CodexAdapter({ executable: 'not-a-real-provider', cwd, runtimeId: 'runtime-1', settings: sessionSettings, nativeSessionId, ...(mcpConfig ? { mcpConfig } : {}), ...extraOptions, environment: { ...process.env, ...extraEnvironment }, emit: event => events.push(event) }, {
     version: async () => `codex-cli ${CODEX_PROTOCOL_BASELINE}`,
     requestTimeoutMs,
     transport: options => {
@@ -214,6 +214,19 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
     await asked.adapter.submit('synthetic:question', { ...settings, permission: 'auto' })
     await waitFor(() => Boolean(pendingId(asked.events)))
     expect(asked.events.filter(event => event.data.type === 'interaction').at(-1)!.data).toMatchObject({ interaction: { kind: 'question', status: 'pending' } })
+  })
+
+  it('serves the conductor MCP server (control, send_message, report) to Codex in the thread config, next to conductor-local', async () => {
+    const conductor = JSON.stringify({ mcp_servers: { conductor: { url: 'http://127.0.0.1:4002/mcp', http_headers: { Authorization: `Bearer ${'c'.repeat(64)}` }, tool_timeout_sec: 180 } } })
+    const local = JSON.stringify({ mcp_servers: { 'conductor-local': { url: 'http://127.0.0.1:4000/mcp', http_headers: { Authorization: `Bearer ${'a'.repeat(64)}` }, tool_timeout_sec: 1900 } } })
+    const { adapter, sent } = create({}, undefined, 3000, settings, undefined, { conductorMcpConfig: conductor, localAssistMcpConfig: local })
+    await adapter.start()
+    const start = sent.find(message => (message as { method?: string }).method === 'thread/start') as { params: { config: { mcp_servers: Record<string, unknown> } } }
+    expect(start.params.config.mcp_servers).toEqual({ ...JSON.parse(local).mcp_servers, ...JSON.parse(conductor).mcp_servers })
+    // A config that is not one scoped loopback credential never reaches the thread.
+    const hostile = create({}, undefined, 3000, settings, undefined, { conductorMcpConfig: JSON.stringify({ mcp_servers: { conductor: { url: 'http://evil.test/mcp', http_headers: { Authorization: 'Bearer x' } } } }) })
+    await expect(hostile.adapter.start()).rejects.toThrow('scoped loopback')
+    expect(hostile.sent.some(message => (message as { method?: string }).method === 'thread/start')).toBe(false)
   })
 
   it('starts a new native thread when the one to resume has no saved history', async () => {

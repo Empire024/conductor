@@ -51,7 +51,7 @@ export function usePermissionGrants(): PermissionGrantsState {
  * what kind of resource, and the single rule approving hands this conversation. Kept free of
  * pane imports; the actions are props so it renders in a plain unit test.
  */
-export function PermissionGrantCard({ request, status, grant, busy, error, onDecide, onRevoke, onSwitchToEdit }: {
+export function PermissionGrantCard({ request, status, grant, busy, error, onDecide, onRevoke, onSwitchToEdit, onInterrupt }: {
   request: GrantCardRequest
   status: GrantStatus
   grant?: PermissionGrant
@@ -60,6 +60,8 @@ export function PermissionGrantCard({ request, status, grant, busy, error, onDec
   onDecide?(decision: GrantDecision): void
   onRevoke?(): void
   onSwitchToEdit?(): void
+  /** The approved retry has waited behind a running turn past the waiting notice (H06). */
+  onInterrupt?(): void
 }): React.JSX.Element {
   const pending = status === 'pending'
   return <section className={'sa-interaction sa-grant-card' + (pending ? ' needs-attention' : '')} role={pending ? 'alert' : undefined} aria-label={'Permission: ' + request.action} data-grant-status={status} data-grant-class={request.class}>
@@ -86,6 +88,10 @@ export function PermissionGrantCard({ request, status, grant, busy, error, onDec
     </div>}
     {!pending && <p className="sa-grant-status">{STATUS_WORDS[status]}{grant ? ` · ${grant.delivery === 'live' ? 'in force now' : grant.delivery === 'restart' ? 'applies when the conversation restarts' : 'applies when the conversation starts'}` : ''}
       {grant && onRevoke && <button type="button" className="sa-grant-revoke" disabled={busy} onClick={onRevoke}>Revoke</button>}</p>}
+    {!pending && onInterrupt && <div className="sa-interaction-actions sa-grant-waiting">
+      <span className="sa-muted">The retry is queued behind a turn that is still running.</span>
+      <button type="button" className="sa-grant-interrupt" disabled={busy} onClick={onInterrupt} title="Stops the running turn; the queued retry then runs at once">Interrupt and retry</button>
+    </div>}
     {error && <p className="sa-error" role="alert">{error}</p>}
   </section>
 }
@@ -130,5 +136,12 @@ export function LivePermissionGrantCard({ agentSessionId, requestId, request, in
   return <PermissionGrantCard request={request} status={status} grant={grant} busy={busy} error={error}
     onDecide={answerable && bridge ? decision => act(() => bridge.decide(agentSessionId, requestId, decision)) : undefined}
     onRevoke={grant && bridge ? () => act(() => bridge.revoke(agentSessionId, grant.id)) : undefined}
-    onSwitchToEdit={interactive ? onSwitchToEdit : undefined} />
+    onSwitchToEdit={interactive ? onSwitchToEdit : undefined}
+    onInterrupt={grant && bridge && retryWaiting(state, grant) ? () => act(() => bridge.interrupt(agentSessionId, grant.id)) : undefined} />
+}
+
+/** Whether this grant's approved retry waits behind a running turn past the waiting notice, so the
+ *  card offers "Interrupt and retry". */
+export function retryWaiting(state: PermissionGrantsState, grant: Pick<PermissionGrant, 'agentSessionId' | 'id'>): boolean {
+  return Boolean(state.waiting?.some(entry => entry.agentSessionId === grant.agentSessionId && entry.grantIds.includes(grant.id)))
 }

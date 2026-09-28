@@ -569,6 +569,9 @@ export class DeliveryService {
 
   private async execute(active: Active): Promise<void> {
     const signal = active.controller.signal
+    // A failed stage settles the run at once; its killed sibling still has to exit before the
+    // next queued delivery resets the worktree it runs in.
+    let draining: Promise<unknown> | null = null
     try {
       let plan!: Plan
       await this.stage(active, 'preflight', async () => { const checked = await this.preflight(active); plan = checked.plan; return checked.detail })
@@ -579,22 +582,43 @@ export class DeliveryService {
         ['test', this.testCommands(plan), plan.testSkip],
         ['build', this.buildCommands(plan, verifyAt), plan.buildSkip]
       ] as const
-      const running: Promise<void>[] = []
+      // Test and build run side by side, and the first failing command stops every other one: a
+      // build that fails in seconds must not wait out the full test suite.
+      const verifying = new AbortController()
+      const stopVerifying = (): void => verifying.abort()
+      signal.addEventListener('abort', stopVerifying, { once: true })
+      const running: { id: DeliveryStageId; done: Promise<void> }[] = []
       for (const [id, commands, skip] of verification) {
         if (!commands.length) { this.skip(active, id, skip); continue }
-        running.push(this.stage(active, id, async stage => {
-          const results = await Promise.all(commands.map(async ({ command, args, env }) => ({ command, args, result: await this.command(active, stage, command, args, verifyAt, VERIFY_TIMEOUT_MS, { CI: '1', ...env }) })))
-          const failed = results.find(entry => entry.result.code !== 0)
-          if (failed) {
+        running.push({ id, done: this.stage(active, id, async stage => {
+          await Promise.all(commands.map(async ({ command, args, env }) => {
+            const result = await this.command(active, stage, command, args, verifyAt, VERIFY_TIMEOUT_MS, { CI: '1', ...env }, verifying.signal)
+            if (result.code === 0) return
             const what = id === 'test' ? 'Tests failed' : 'The build failed'
-            throw new StageFailure(`${what} (${[failed.command, ...failed.args].join(' ')}, exit ${failed.result.code ?? 'none'})${where}. Nothing was committed or pushed.\n${failureLines(failed.result.lines).join('\n')}`)
-          }
-          return `${results.map(entry => [entry.command, ...entry.args].join(' ')).join(' + ')} passed${where}.`
-        }))
+            throw new StageFailure(`${what} (${[command, ...args].join(' ')}, exit ${result.code ?? 'none'})${where}. Nothing was committed or pushed.\n${failureLines(result.lines).join('\n')}`)
+          }))
+          return `${commands.map(entry => [entry.command, ...entry.args].join(' ')).join(' + ')} passed${where}.`
+        }) })
       }
-      const verified = await Promise.allSettled(running)
-      const failure = verified.find((result): result is PromiseRejectedResult => result.status === 'rejected')
-      if (failure) throw failure.reason
+      const failure = await new Promise<{ id: DeliveryStageId; error: unknown } | null>(resolvePromise => {
+        let left = running.length
+        if (!left) resolvePromise(null)
+        for (const { id, done } of running) done.then(() => { if (--left === 0) resolvePromise(null) }, error => resolvePromise({ id, error }))
+      })
+      signal.removeEventListener('abort', stopVerifying)
+      if (failure) {
+        verifying.abort()
+        draining = Promise.allSettled(running.map(entry => entry.done))
+        if (failure.error instanceof StageFailure && !active.finished) {
+          const now = this.deps.now().toISOString()
+          for (const { id } of running) {
+            const stage = this.stageOf(active.run, id)
+            if (id === failure.id || stage.state !== 'running') continue
+            Object.assign(stage, { state: 'skipped', finishedAt: now, detail: `Cancelled: ${failure.id === 'test' ? 'the tests' : 'the build'} failed.` })
+          }
+        }
+        throw failure.error
+      }
       if (!plan.commitNeeded) this.skip(active, 'commit', 'No changes to commit; pushing the local commits that are ahead of the remote.')
       else await this.stage(active, 'commit', stage => this.commit(active, stage, plan))
       if (!plan.publish) {
@@ -614,6 +638,8 @@ export class DeliveryService {
       if (signal.aborted || error instanceof Cancelled) this.finalize(active, 'cancelled', 'Cancelled by request.', active.pushed)
       else if (error instanceof StageFailure) this.finalize(active, error.outcome, error.message)
       else this.finalize(active, 'failed', `Delivery stopped unexpectedly: ${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      if (draining) await draining
     }
   }
 

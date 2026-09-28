@@ -130,6 +130,9 @@ interface Delivery {
   sending: boolean
   headsUp: 'no' | 'sending' | 'done'
   noticed: boolean
+  /** The owner's card offers "Interrupt and retry" (state().waiting): the waiting notice went out
+   *  and nothing interrupted the turn yet. */
+  offered: boolean
 }
 /** A denial card whose only "reason" is that the server-side classifier gave no verdict. */
 const outageCard = (request: Pick<PermissionGrantRequest, 'source' | 'category'>): boolean => request.source === 'denial' && isClassifierOutage(request.category)
@@ -322,11 +325,44 @@ export class PermissionGrants {
 
   state(): PermissionGrantsState {
     const settled = [...this.settled].flatMap(([agentSessionId, statuses]) => [...statuses].map(([id, status]) => ({ agentSessionId, id, status })))
+    const waiting = [...this.deliveries.values()].filter(delivery => delivery.offered)
+      .map(({ agentSessionId, grantIds, rules, since }) => ({ agentSessionId, grantIds: [...grantIds], rules: [...rules], since: new Date(since).toISOString() }))
     return {
       requests: [...this.requests].flatMap(([agentSessionId, requests]) => [...requests.values()].map(request => ({ ...request, agentSessionId }))),
       grants: [...this.grants.values()].flat(),
-      ...(settled.length ? { settled } : {})
+      ...(settled.length ? { settled } : {}),
+      ...(waiting.length ? { waiting } : {})
     }
+  }
+
+  /** The owner's "Interrupt and retry" on a grant card: stops the turn the approved retry waits
+   *  behind, with the queue expedited, as a wizard approver's interrupt does (follow). */
+  async interruptForRetry(agentSessionId: string, grantId: string): Promise<void> {
+    const found = [...this.deliveries].find(([, delivery]) => delivery.agentSessionId === agentSessionId && delivery.grantIds.includes(grantId))
+    if (!found || !found[1].handed || !this.ports.retryQueued?.(agentSessionId, found[1].text)) {
+      if (found) this.endDelivery(found[0], found[1])
+      throw new Error('The approved retry is no longer waiting: it already ran, or its grant ended.')
+    }
+    if (!this.ports.interrupt) throw new Error('This conversation cannot be interrupted from here; press Esc in its tab.')
+    const [, delivery] = found
+    const itemId = `grant-waiting:${delivery.grantIds[0]}`
+    delivery.noticed = true
+    delivery.offered = false
+    this.changed()
+    try {
+      await this.ports.interrupt(agentSessionId)
+    } catch (error) {
+      delivery.offered = true
+      this.changed()
+      throw error
+    }
+    this.ports.notice(agentSessionId, `The approved call ${delivery.rules.join(', ')} waited behind a running turn; you interrupted that turn, so the retry runs now as a message of its own.`, { permissionGrantWaiting: { rules: delivery.rules, interrupted: true } }, itemId)
+  }
+
+  /** A delivery is over; the owner's card stops offering its interrupt. */
+  private endDelivery(key: string, delivery: Delivery): void {
+    this.deliveries.delete(key)
+    if (delivery.offered) { delivery.offered = false; this.changed() }
   }
 
   list(agentSessionId: string): { requests: PermissionGrantRequest[]; grants: PermissionGrant[] } {
@@ -436,7 +472,7 @@ export class PermissionGrants {
     const key = `${agentSessionId}\n${text}`
     const delivery: Delivery = {
       agentSessionId, text, rules: granted.map(grant => grant.rule), grantIds: granted.map(grant => grant.id), approver,
-      since: this.clock(), handed: false, attempts: 0, lastAttempt: 0, sending: false, headsUp: 'no', noticed: false
+      since: this.clock(), handed: false, attempts: 0, lastAttempt: 0, sending: false, headsUp: 'no', noticed: false, offered: false
     }
     this.deliveries.set(key, delivery)
     return this.hand(key, delivery)
@@ -470,7 +506,7 @@ export class PermissionGrants {
   private follow(key: string, delivery: Delivery): void {
     const { agentSessionId, text } = delivery
     // Its grants ended (spent, revoked, moved on by a handoff, tab closed): nothing to deliver.
-    if (!delivery.grantIds.some(id => this.retries.get(id) === text)) { this.deliveries.delete(key); return }
+    if (!delivery.grantIds.some(id => this.retries.get(id) === text)) { this.endDelivery(key, delivery); return }
     const phase = this.ports.phase(agentSessionId) ?? ''
     const now = this.clock()
     if (!delivery.handed) {
@@ -478,7 +514,7 @@ export class PermissionGrants {
       return
     }
     // It started (or went at once to an idle conversation): the classifier judges from here.
-    if (!this.ports.retryQueued?.(agentSessionId, text)) { this.deliveries.delete(key); return }
+    if (!this.ports.retryQueued?.(agentSessionId, text)) { this.endDelivery(key, delivery); return }
     const waited = now - delivery.since
     if (waited >= RETRY_STALE_MS) { this.withdrawStale(key, delivery, waited); return }
     if (!ACTIVE_PHASES.has(phase)) return
@@ -497,17 +533,20 @@ export class PermissionGrants {
     if (delivery.approver === 'wizard' && this.ports.interrupt) {
       this.ports.notice(agentSessionId, `The approved call ${rules} waited behind ${running}. A wizard tab approved it, so Conductor interrupted that turn; the retry runs now as a message of its own.`, { permissionGrantWaiting: { rules: delivery.rules, interrupted: true } }, itemId)
       void this.ports.interrupt(agentSessionId).catch(error => {
-        this.ports.notice(agentSessionId, `The approved call ${rules} is queued behind ${running}, and Conductor could not interrupt it (${error instanceof Error ? error.message : 'interrupt failed'}). Press Esc in this tab to interrupt it; the retry then runs at once.`, { permissionGrantWaiting: { rules: delivery.rules, interrupted: false } }, itemId)
+        this.ports.notice(agentSessionId, `The approved call ${rules} is queued behind ${running}, and Conductor could not interrupt it (${error instanceof Error ? error.message : 'interrupt failed'}). Use "Interrupt and retry" on its approval card, or press Esc in this tab; the retry then runs at once.`, { permissionGrantWaiting: { rules: delivery.rules, interrupted: false } }, itemId)
+        if (this.deliveries.get(key) === delivery) { delivery.offered = true; this.changed() }
       })
       return
     }
-    this.ports.notice(agentSessionId, `The approved call ${rules} is queued behind ${running}. Press Esc in this tab to interrupt the turn: the queued retry then runs at once as a message of its own (the Stop button keeps it held above the composer instead).`, { permissionGrantWaiting: { rules: delivery.rules, interrupted: false } }, itemId)
+    this.ports.notice(agentSessionId, `The approved call ${rules} is queued behind ${running}. Use "Interrupt and retry" on its approval card, or press Esc in this tab, to interrupt the turn: the queued retry then runs at once as a message of its own (the Stop button keeps it held above the composer instead).`, { permissionGrantWaiting: { rules: delivery.rules, interrupted: false } }, itemId)
+    delivery.offered = true
+    this.changed()
   }
 
   /** An approval turn that waited RETRY_STALE_MS behind a running turn is taken back out of the
    *  queue and its grants end: a "retry it now" that late is no longer about the current work. */
   private withdrawStale(key: string, delivery: Delivery, waited: number): void {
-    this.deliveries.delete(key)
+    this.endDelivery(key, delivery)
     if (!this.ports.unqueue?.(delivery.agentSessionId, delivery.text)) return
     const { agentSessionId } = delivery
     const held = this.grants.get(agentSessionId) ?? []

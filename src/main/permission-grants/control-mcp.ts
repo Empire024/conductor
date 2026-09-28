@@ -9,6 +9,9 @@ import type { AgentSpec } from '../../shared/models'
 export const CONDUCTOR_MCP_SERVER_NAME = 'conductor'
 const PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26']
 const MAX_BODY = 256 * 1024
+/** Codex stops waiting for an MCP tool after 60 s by default; git.ship.status({waitSeconds:100})
+ *  and agents.finish({waitSeconds}) legitimately take longer, so it gets the server's own limit. */
+export const CONDUCTOR_TOOL_TIMEOUT_SEC = 180
 
 export interface ControlScope { projectId: string; sessionId: string; agentSessionId: string }
 /** AgentControl.call with the conversation's own scope: the same authority rules as over HTTP.
@@ -16,7 +19,9 @@ export interface ControlScope { projectId: string; sessionId: string; agentSessi
  *  own pipeline (AgentControlServer.invoke: in-flight cap, per-family order, timeline activity). */
 export type ControlCall = (scope: ControlScope, method: string, args: Record<string, unknown>, options?: { generic?: boolean }) => Promise<unknown>
 
-interface Tool { name: string; description: string; inputSchema: Record<string, unknown>; method: string; args(input: Record<string, unknown>): Record<string, unknown>; generic?: true }
+/** claudeOnly: a permission request becomes a rule for Claude Code's classifier; Codex asks the owner
+ *  through its own approval cards, so those tools are neither listed for nor callable by it. */
+interface Tool { name: string; description: string; inputSchema: Record<string, unknown>; method: string; args(input: Record<string, unknown>): Record<string, unknown>; generic?: true; claudeOnly?: true }
 const pick = (input: Record<string, unknown>, keys: string[]): Record<string, unknown> => Object.fromEntries(keys.filter(key => input[key] !== undefined).map(key => [key, input[key]]))
 
 /**
@@ -57,20 +62,22 @@ export const CONDUCTOR_MCP_TOOLS: Tool[] = [
     description: 'Start a new turn in a coworker tab you control with this prompt (agents.submit), with that tab\'s own settings. With projectId (another project, from projects.list) and no agentSessionId it goes to that project\'s active wizard as a message, or opens a tab there when it has none.',
     inputSchema: { type: 'object', properties: { agentSessionId: { type: 'string' }, projectId: { type: 'string' }, text: { type: 'string', maxLength: 20000 } }, required: ['text'], additionalProperties: false } },
   { name: 'report', method: 'agents.report', args: input => pick(input, ['text']),
-    description: 'Report up to 2000 characters to the conversation that opened this tab (your controller), as agents.report does.',
-    inputSchema: { type: 'object', properties: { text: { type: 'string', maxLength: 2000 } }, required: ['text'], additionalProperties: false } },
+    description: 'Report to the conversation that opened this tab (your controller), as agents.report does. It never refuses a long report: up to 2000 characters go inline and the rest is kept as an artifact the controller can read, so send it once rather than shortening and resending it.',
+    inputSchema: { type: 'object', properties: { text: { type: 'string', maxLength: 20000 } }, required: ['text'], additionalProperties: false } },
   { name: 'handoff', method: 'agents.handoff', args: input => pick(input, ['handoff', 'title', 'successor', 'provider', 'model', 'effort']),
     description: 'Hand your own remaining work to a fresh tab (agents.handoff): handoff holds the six sections of docs/token-thrift-policy.md; successor:true for a wizard or controller continuing itself; provider/model/effort from models.list continue on another model.',
     inputSchema: { type: 'object', properties: { handoff: { type: 'string' }, title: { type: 'string' }, successor: { type: 'boolean' }, provider: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' } }, required: ['handoff'], additionalProperties: false } },
-  { name: 'request_permission', method: 'permissions.request', args: input => pick(input, ['tool', 'command', 'path', 'url', 'reason', 'rollback']),
+  { name: 'request_permission', method: 'permissions.request', claudeOnly: true, args: input => pick(input, ['tool', 'command', 'path', 'url', 'reason', 'rollback']),
     description: 'Ask the owner for exactly one call the auto-mode classifier refused or would refuse (permissions.request). Give command (Bash; tool "PowerShell" for PowerShell), path (Write; tool "Edit" for Edit) or url (WebFetch), the reason, and a rollback if it changes something. The owner answers one card; you are then told "[Conductor] approved: <rule>; retry it now" and run exactly that call, or that it was denied.',
     inputSchema: { type: 'object', properties: { tool: { type: 'string', enum: ['Bash', 'PowerShell', 'Write', 'Edit', 'WebFetch'] }, command: { type: 'string' }, path: { type: 'string' }, url: { type: 'string' }, reason: { type: 'string' }, rollback: { type: 'string' } }, required: ['reason'], additionalProperties: false } },
-  { name: 'list_permissions', method: 'permissions.list', args: () => ({}),
+  { name: 'list_permissions', method: 'permissions.list', claudeOnly: true, args: () => ({}),
     description: 'Your open permission requests and live grants.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false } }
 ]
 
-interface Credential { token: string; scope: ControlScope; file?: string }
+type McpProvider = 'claude' | 'codex'
+interface Credential { token: string; scope: ControlScope; provider: McpProvider; file?: string }
+const offered = (provider: McpProvider): Tool[] => provider === 'claude' ? CONDUCTOR_MCP_TOOLS : CONDUCTOR_MCP_TOOLS.filter(tool => !tool.claudeOnly)
 const sameToken = (offered: string, expected: string): boolean => {
   const a = Buffer.from(offered), b = Buffer.from(expected)
   return a.length === b.length && timingSafeEqual(a, b)
@@ -112,16 +119,21 @@ export class ConductorMcpServer {
     this.endpoint = `http://${this.authority}/mcp`
   }
 
-  /** A config file path for one Claude conversation, or '' when unavailable. */
+  /** A config file path for one Claude or Codex conversation (each in its provider's own form), or
+   *  '' when unavailable. Codex takes it as a thread config next to conductor-local and the browser
+   *  (providers/codex.ts; its merge with the CLI's own servers was probed on codex-cli 0.155.1). */
   configure(spec: Pick<AgentSpec, 'id' | 'projectId' | 'sessionId' | 'provider'>): string {
-    if (!this.endpoint || this.disabled || spec.provider !== 'claude') return ''
+    if (!this.endpoint || this.disabled || (spec.provider !== 'claude' && spec.provider !== 'codex')) return ''
     let credential = this.credentials.get(spec.id)
-    if (!credential || credential.scope.projectId !== spec.projectId || credential.scope.sessionId !== spec.sessionId) {
+    if (!credential || credential.scope.projectId !== spec.projectId || credential.scope.sessionId !== spec.sessionId || credential.provider !== spec.provider) {
       this.discard(credential)
-      credential = { token: randomBytes(32).toString('hex'), scope: { projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id } }
+      credential = { token: randomBytes(32).toString('hex'), scope: { projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id }, provider: spec.provider }
       this.credentials.set(spec.id, credential)
     }
-    const configuration = JSON.stringify({ mcpServers: { [CONDUCTOR_MCP_SERVER_NAME]: { type: 'http', url: this.endpoint, headers: { Authorization: `Bearer ${credential.token}` } } } })
+    const authorization = `Bearer ${credential.token}`
+    const configuration = JSON.stringify(spec.provider === 'claude'
+      ? { mcpServers: { [CONDUCTOR_MCP_SERVER_NAME]: { type: 'http', url: this.endpoint, headers: { Authorization: authorization } } } }
+      : { mcp_servers: { [CONDUCTOR_MCP_SERVER_NAME]: { url: this.endpoint, http_headers: { Authorization: authorization }, tool_timeout_sec: CONDUCTOR_TOOL_TIMEOUT_SEC } } })
     try {
       if (!this.configDirectory) this.configDirectory = mkdtempSync(join(tmpdir(), 'conductor-control-mcp-'))
       const file = join(this.configDirectory, `${spec.id.replace(/[^a-zA-Z0-9_-]/g, '')}.json`)
@@ -178,15 +190,16 @@ export class ConductorMcpServer {
         protocolVersion: PROTOCOL_VERSIONS.includes(requested) ? requested : PROTOCOL_VERSIONS[0],
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: CONDUCTOR_MCP_SERVER_NAME, title: 'Conductor', version: '1' },
-        instructions: 'Call any Conductor app-control method with control({method,args}) instead of posting to app control from a shell. Message other Conductor tabs with send_message, submit_task, report and handoff, and ask the owner for one refused call with request_permission.'
+        instructions: 'Call any Conductor app-control method with control({method,args}) instead of posting to app control from a shell. Message other Conductor tabs with send_message, submit_task, report and handoff' + (credential.provider === 'claude' ? ', and ask the owner for one refused call with request_permission.' : '.')
       } }
     }
     if (message.method === 'ping') return { ...envelope, result: {} }
-    if (message.method === 'tools/list') return { ...envelope, result: { tools: CONDUCTOR_MCP_TOOLS.map(tool => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema })) } }
+    if (message.method === 'tools/list') return { ...envelope, result: { tools: offered(credential.provider).map(tool => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema })) } }
     if (message.method === 'tools/call') {
       const name = typeof params.name === 'string' ? params.name : ''
       const tool = CONDUCTOR_MCP_TOOLS.find(candidate => candidate.name === name)
       if (!tool) return { ...envelope, error: { code: -32602, message: `Unknown Conductor tool: ${name || '(none)'}` } }
+      if (tool.claudeOnly && credential.provider !== 'claude') return { ...envelope, result: { isError: true, content: [{ type: 'text', text: `${name} is for Claude conversations, whose auto-mode classifier refuses calls; a ${credential.provider} command that needs the owner raises its own approval card in this tab, so run the call itself. Tools here: ${offered(credential.provider).map(candidate => candidate.name).join(', ')}.` }] } }
       const input = params.arguments && typeof params.arguments === 'object' && !Array.isArray(params.arguments) ? params.arguments as Record<string, unknown> : {}
       try {
         const result = tool.generic

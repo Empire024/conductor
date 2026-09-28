@@ -376,6 +376,17 @@ Files: `src/main/permission-grants/control-mcp.ts`, `src/main/providers/codex.ts
 `service.test.ts` and the codex adapter test (`mcp_servers.conductor` present).
 Owner decision: a new tool surface for Codex.
 
+Done (batch 5, not yet shipped): offline probe on codex-cli 0.155.1 (initialize, config/read,
+thread/start, mcpServerStatus/list; no model turn): a thread config whose `mcp_servers` holds
+`conductor` and `conductor-local` starts both ready beside the CLI's own servers, with the bearer
+header, a matching Host and no Origin, so ConductorMcpServer's checks pass unchanged.
+`ConductorMcpServer.configure` mints Codex's form (`mcp_servers.conductor`, `http_headers`,
+`tool_timeout_sec: 180` because Codex's default 60 s is shorter than git.ship.status waits);
+`codexConductorThreadConfig` (local-assist/mcp-config.ts) validates it and the adapter merges and
+relays it like conductor-local; structured-sessions passes it to Codex (not the permission grants).
+A Codex credential's tools/list leaves out request_permission/list_permissions and a call to them is
+refused with the tools it has. The `report` tool takes 20000 characters (H08).
+
 ### H15 Error-text pass (S)
 
 Use Part 2 of `.conductor-scratch/gap-sweep/code-findings.md` as the checklist (about 50 strings

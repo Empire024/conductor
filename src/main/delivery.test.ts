@@ -360,6 +360,49 @@ describe('DeliveryService pipeline', () => {
     expect((await h.service.wait('p1', started.id, 5000)).state).toBe('delivered')
   })
 
+  it('settles at once when the build fails, killing the still-running tests', async () => {
+    let testKilled = false, testExited: () => void = () => {}
+    const h = harness({ replies: {
+      'npx vitest run': options => new Promise<Reply>(resolve => {
+        options.signal.addEventListener('abort', () => { testKilled = true; testExited = () => resolve({ code: null }) })
+      }),
+      'npx tsc --noEmit': { code: 2, lines: ['src/a.ts(1,1): error TS2322: nope'] }
+    } })
+    const started = h.service.ship('p1', h.root, { message: 'Fail fast', publish: false }, { kind: 'owner' })
+    // Settles while the killed test process tree is still exiting.
+    const run = await h.service.wait('p1', started.id, 5000)
+    expect(run.state).toBe('failed')
+    expect(testKilled).toBe(true)
+    expect(run.error).toMatch(/^The build failed \(npx tsc --noEmit/)
+    expect(stageStates(run)).toMatchObject({ test: 'skipped', build: 'failed', commit: 'pending' })
+    expect(run.stages.find(stage => stage.id === 'test')!.detail).toBe('Cancelled: the build failed.')
+    expect(h.ran('git commit')).toBe(false)
+    // A queued delivery waits for the killed tree to exit before it reuses the worktree.
+    h.replies['npx tsc --noEmit'] = {}
+    h.replies['npx vitest run'] = {}
+    const next = h.service.ship('p1', h.root, { message: 'Next', publish: false }, { kind: 'owner' }, { queue: true })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(h.service.current('p1')!.id).not.toBe(next.id)
+    testExited()
+    expect((await h.service.wait('p1', next.id, 5000)).state).toBe('delivered')
+  })
+
+  it('fails the tests without waiting for a slow build, and names the cancelled build', async () => {
+    let buildKilled = 0
+    const hang = (options: DeliveryRunOptions) => new Promise<Reply>(resolve => options.signal.addEventListener('abort', () => { buildKilled++; resolve({ code: null }) }))
+    const h = harness({ replies: {
+      'npx vitest run': { code: 1, lines: [' FAIL  src/a.test.ts > adds'] },
+      'npx tsc --noEmit': hang,
+      'npx electron-vite build': hang
+    } })
+    const run = await h.ship({ message: 'x', publish: false })
+    expect(run.state).toBe('failed')
+    expect(buildKilled).toBe(2)
+    expect(run.error).toMatch(/^Tests failed/)
+    expect(stageStates(run)).toMatchObject({ test: 'failed', build: 'skipped' })
+    expect(run.stages.find(stage => stage.id === 'build')!.detail).toBe('Cancelled: the tests failed.')
+  })
+
   it('resets and reuses one isolated worktree across deliveries', async () => {
     const h = harness({ replies: { 'git status --porcelain=v1 -z --untracked-files=all': { stdout: ' M src/a.ts\0 M other/agent.ts\0' } } })
     expect((await h.ship({ message: 'First', paths: ['src/a.ts'], publish: false })).state).toBe('delivered')

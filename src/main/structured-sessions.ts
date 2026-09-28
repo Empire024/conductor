@@ -354,6 +354,8 @@ export class StructuredSessions {
       settings: settingsForRuntime(state.settings, runtimeId),
       mcpConfig: this.isApprovalReviewer(id) || live.spec.provider === 'local' || !state.settings.browserMcp ? '' : this.mcp?.configure(live.spec) ?? '',
       localAssistMcpConfig: this.isApprovalReviewer(id) ? '' : this.localAssist?.configure(live.spec) ?? '',
+      // Codex gets the conductor tools too (control, send_message, report, ...); permission grants stay Claude's.
+      ...(live.spec.provider === 'codex' && !this.isApprovalReviewer(id) ? { conductorMcpConfig: this.conductorMcp?.configure(live.spec) ?? '' } : {}),
       ...(live.spec.provider === 'claude' && !this.isApprovalReviewer(id) ? {
         conductorMcpConfig: this.conductorMcp?.configure(live.spec) ?? '',
         ...(this.permissionGrants ? { permissionGrants: this.permissionGrants.adapterPort(id) } : {})

@@ -70,6 +70,9 @@ export interface PermissionGrantsState {
   /** Answers given before the app restarted, for requests no longer held: a card from before the
    *  restart shows its answer instead of asking again or reading Expired. Absent when none. */
   settled?: Array<{ agentSessionId: string; id: string; status: GrantStatus }>
+  /** Approved retries still queued behind a running turn past the waiting notice (H06): the card
+   *  offers "Interrupt and retry" for these grants. Absent when none. */
+  waiting?: Array<{ agentSessionId: string; grantIds: string[]; rules: string[]; since: string }>
 }
 
 export interface PermissionGrantDecisionResult {
@@ -82,6 +85,8 @@ export interface PermissionGrantsBridge {
   state(): Promise<PermissionGrantsState>
   decide(agentSessionId: string, requestId: string, decision: GrantDecision): Promise<PermissionGrantDecisionResult>
   revoke(agentSessionId: string, grantId: string): Promise<boolean>
+  /** Interrupts the turn an approved retry waits behind, so the retry runs at once. */
+  interrupt(agentSessionId: string, grantId: string): Promise<void>
   onChanged(callback: (state: PermissionGrantsState) => void): () => void
 }
 

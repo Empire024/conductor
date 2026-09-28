@@ -205,9 +205,10 @@ describe('control briefing', () => {
     const briefing = server.briefing(spec)
     for (const text of ['ErrorDetails', 'curl.exe', 'publish:true', 'agents.report', '"brief":true']) expect(briefing).toContain(text)
     expect(briefing).not.toContain('push, release check')
-    expect(briefing.replace(/[a-f0-9]{64}/, '').length).toBeLessThan(2100)
-    // Only Claude tabs have the conductor MCP server, so only they are sent to its control tool first.
-    expect(briefing).not.toContain('control({method,args})')
+    expect(server.briefing({ ...spec, provider: 'local' }).replace(/[a-f0-9]{64}/, '').length).toBeLessThan(2100)
+    // Claude and Codex tabs have the conductor MCP server, so only they are sent to its control tool first.
+    expect(briefing).toMatch(/Call it with the conductor MCP tool control\(\{method,args\}\)/)
+    expect(server.briefing({ ...spec, provider: 'local' })).not.toContain('control({method,args})')
     expect(server.briefing({ ...spec, provider: 'claude' })).toMatch(/available for this project\/workspace\. Call it with the conductor MCP tool control\(\{method,args\}\)/)
   })
 })

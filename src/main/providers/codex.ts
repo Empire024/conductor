@@ -30,7 +30,7 @@ import type { ThreadForkResponse } from './generated/codex/v2/ThreadForkResponse
 import type { ThreadGoalGetResponse } from './generated/codex/v2/ThreadGoalGetResponse'
 import type { SkillsListResponse } from './generated/codex/v2/SkillsListResponse'
 import { BROWSER_MCP_SERVER_NAME } from '../../shared/browser-mcp'
-import { codexLocalAssistThreadConfig, mergeCodexMcpConfigs } from '../local-assist/mcp-config'
+import { codexConductorThreadConfig, codexLocalAssistThreadConfig, mergeCodexMcpConfigs } from '../local-assist/mcp-config'
 import { canonicalAction } from '../approval-review'
 
 export const CODEX_PROTOCOL_BASELINE = '0.155.1'
@@ -363,7 +363,7 @@ export class CodexAdapter implements ProviderAdapter {
     restoreAdapterState(this, detachment.state)
     this.disposed = false
     // The App Server still calls the relay it was given; its routes now lead to this app's servers.
-    if (this.mcpRelayed) await relayMcpConfigs(currentRuntimeHost(), this.relayKey, [this.options.mcpConfig, this.options.localAssistMcpConfig], error => this.relayNotice(error))
+    if (this.mcpRelayed) await relayMcpConfigs(currentRuntimeHost(), this.relayKey, [this.options.mcpConfig, this.options.localAssistMcpConfig, this.options.conductorMcpConfig], error => this.relayNotice(error))
     this.transport = this.createTransport(detachment.transport)
     this.transport.start()
     // The store closed this conversation's open work when it loaded (an app that stopped is
@@ -403,10 +403,10 @@ export class CodexAdapter implements ProviderAdapter {
       // runtime host calls them through the host's relay, whose address never changes. The app's own
       // configs are validated first, then the relayed ones again below.
       const host = currentRuntimeHost()
-      const own = [codexBrowserMcpThreadConfig(this.options.mcpConfig) ? this.options.mcpConfig : undefined, codexLocalAssistThreadConfig(this.options.localAssistMcpConfig) ? this.options.localAssistMcpConfig : undefined]
+      const own = [codexBrowserMcpThreadConfig(this.options.mcpConfig) ? this.options.mcpConfig : undefined, codexLocalAssistThreadConfig(this.options.localAssistMcpConfig) ? this.options.localAssistMcpConfig : undefined, codexConductorThreadConfig(this.options.conductorMcpConfig) ? this.options.conductorMcpConfig : undefined]
       const mcp = this.transport.detachable && relaysMcp(host) && own.some(Boolean) ? await relayMcpConfigs(host, this.relayKey, own, error => this.relayNotice(error)) : own
       this.mcpRelayed = mcp.some((config, index) => config !== own[index])
-      let threadConfig = mergeCodexMcpConfigs(codexBrowserMcpThreadConfig(mcp[0]), codexLocalAssistThreadConfig(mcp[1]))
+      let threadConfig = mergeCodexMcpConfigs(codexBrowserMcpThreadConfig(mcp[0]), codexLocalAssistThreadConfig(mcp[1]), codexConductorThreadConfig(mcp[2]))
       if (liveEnvironment.CONDUCTOR_LIVE_TESTS === '1') {
         if (threadConfig) throw new Error('Codex live isolation cannot enable the Conductor browser MCP')
         const requirements = await this.request<ConfigRequirementsReadResponse>('configRequirements/read')

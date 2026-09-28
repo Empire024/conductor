@@ -30,7 +30,7 @@ export interface GrantStore {
   snapshot(id: string): Pick<SessionProjection, 'items' | 'phase' | 'settings' | 'queuedPrompts'> | null | undefined
 }
 
-export const permissionGrantsIpcChannels = ['permission-grants:state', 'permission-grants:decide', 'permission-grants:revoke'] as const
+export const permissionGrantsIpcChannels = ['permission-grants:state', 'permission-grants:decide', 'permission-grants:revoke', 'permission-grants:interrupt'] as const
 /** Phases in which a message can only follow the turn (StructuredSessions.queue) or be steered into it. */
 const TURN_UNDER_WAY = new Set(['starting', 'running', 'waiting_input', 'waiting_approval'])
 /** Phases in which a steered message reaches the running turn itself (StructuredSessions.followup). */
@@ -121,6 +121,8 @@ export async function startPermissionGrants(deps: {
     ...grantDelivery(deps.sessions, deps.store),
     phone: (id, title, body) => { void deps.announce?.({ id: randomUUID(), kind: 'attention', sessionId: id, title, body, at: new Date().toISOString(), url: `/#/session/${encodeURIComponent(id)}` }) },
     changed: (state: PermissionGrantsState) => deps.publish('permission-grants:changed', state),
+    // A parked smoke (scripts/smoke-grant-interrupt.mjs) reaches the waiting notice in seconds.
+    ...(process.env.CONDUCTOR_TEST_USER_DATA && Number(process.env.CONDUCTOR_TEST_GRANT_NOTICE_MS) > 0 ? { retryNoticeMs: Number(process.env.CONDUCTOR_TEST_GRANT_NOTICE_MS) } : {}),
     ...(deps.workspaces ? { tabOpen: (id: string) => tabOpen(deps.workspaces!, spec(id), id) } : {})
   })
   // Before any runtime reattaches or resumes (index.ts starts this first), so a waiting card, a
@@ -206,6 +208,11 @@ export function registerPermissionGrantsIpc(service: () => PermissionGrants | un
     authorize(event)
     if (typeof agentSessionId !== 'string' || typeof grantId !== 'string') throw new Error('Invalid grant')
     return grants().revoke(agentSessionId, grantId)
+  })
+  ipcMain.handle('permission-grants:interrupt', (event, agentSessionId: unknown, grantId: unknown) => {
+    authorize(event)
+    if (typeof agentSessionId !== 'string' || typeof grantId !== 'string') throw new Error('Invalid grant')
+    return grants().interruptForRetry(agentSessionId, grantId)
   })
   return () => { for (const channel of permissionGrantsIpcChannels) ipcMain.removeHandler(channel) }
 }
