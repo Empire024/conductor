@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Json, SessionProjection, TimelineItem } from '../shared/structured-agent'
-import { APP_CONTROL_HISTORY_KEY, CONTROL_ROW_ACTION_LIMIT, controlActivityOf, controlledByOf, latestControlAction } from '../shared/control-activity'
+import { AGENT_MESSAGE_TEXT_LIMIT, APP_CONTROL_HISTORY_KEY, CONTROL_ROW_ACTION_LIMIT, agentMessageOf, controlActivityOf, controlledByOf, isControlActivityNotice, latestControlAction } from '../shared/control-activity'
 import { ControlActivityRecorder, READ_FLUSH_MS } from './control-activity'
 
 // conductor-task:44a4ba26-0ec7-4d40-a1d9-c2634b3b7206
@@ -32,6 +32,32 @@ function fixture() {
 }
 
 describe('control activity recorder', () => {
+  it('shows each message a conversation sent in its own timeline, never in a model-visible form', () => {
+    const f = fixture()
+    const sent = () => f.notices.filter(notice => notice.id === 'controller' && !notice.itemId).map(notice => agentMessageOf({ type: 'notice', message: notice.message, payload: notice.payload }))
+    f.recorder.record({ scope: f.scope, method: 'agents.steer', args: { agentSessionId: 'fx7', prompt: 'Check the build' }, result: { agentSessionId: 'fx7', tabId: 'tab-7', delivery: 'steered' } })
+    f.recorder.record({ scope: f.scope, method: 'router.dispatch', args: { tasks: [{ title: 'A', prompt: 'brief A' }, { title: 'B', prompt: 'brief B' }] }, result: [{ agentSessionId: 'fx9', tabId: 'tab-9' }, { agentSessionId: 'fx10', tabId: 'tab-10', error: 'refused' }] })
+    f.recorder.record({ scope: f.scope, method: 'agents.submit', args: { agentSessionId: 'fx7', prompt: 'x'.repeat(AGENT_MESSAGE_TEXT_LIMIT + 10) }, error: 'busy' })
+    f.recorder.record({ scope: { ...f.scope, agentSessionId: 'fx7' }, method: 'agents.report', args: { text: 'done' }, result: { agentSessionId: 'controller', delivery: 'started' } })
+    expect(sent()).toMatchObject([
+      { method: 'agents.steer', text: 'Check the build', delivery: 'steered', to: { agentSessionId: 'fx7', tabId: 'tab-7', title: 'FX7' } },
+      { method: 'router.dispatch', text: 'brief A', to: { agentSessionId: 'fx9', title: 'FX9' } }
+    ])
+    const report = f.notices.find(notice => notice.id === 'fx7')!
+    expect(agentMessageOf({ type: 'notice', message: report.message, payload: report.payload })).toMatchObject({ method: 'agents.report', text: 'done', to: { agentSessionId: 'controller', title: 'Swarm' } })
+    // agents.snapshot and agents.history drop these, so a controller never reads them back.
+    expect(isControlActivityNotice({ type: 'notice', message: report.message, payload: report.payload })).toBe(true)
+  })
+
+  it('keeps a bounded excerpt of a long message and its full length', () => {
+    const f = fixture()
+    f.recorder.record({ scope: f.scope, method: 'agents.submit', args: { agentSessionId: 'fx9', prompt: 'y'.repeat(AGENT_MESSAGE_TEXT_LIMIT + 10) }, result: { agentSessionId: 'fx9' } })
+    const notice = f.notices.find(entry => entry.id === 'controller' && !entry.itemId)!
+    expect(agentMessageOf({ type: 'notice', message: notice.message, payload: notice.payload })).toMatchObject({ characters: AGENT_MESSAGE_TEXT_LIMIT + 10 })
+    expect(agentMessageOf({ type: 'notice', message: notice.message, payload: notice.payload })!.text).toHaveLength(AGENT_MESSAGE_TEXT_LIMIT)
+    expect(notice.message).toBe('Sent to FX9 (agents.submit)')
+  })
+
   it('keeps one chip row per turn for the caller and tells each opened tab who opened it', () => {
     const f = fixture()
     f.recorder.record({ scope: f.scope, method: 'tabs.open', args: { title: 'FX9' }, result: { id: 'tab-9', resourceId: 'fx9', title: 'FX9' } })

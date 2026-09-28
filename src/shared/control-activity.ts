@@ -8,6 +8,12 @@ import type { AgentEventData, TimelineItem } from './structured-agent'
  */
 export const CONTROL_ACTIVITY_KEY = 'controlActivity'
 export const CONTROLLED_BY_KEY = 'controlledBy'
+/** A message this conversation sent another one through app control (agents.submit/steer/report,
+ *  handoff, router.dispatch, tabs.open with a prompt): a notice in the sender's own timeline. The
+ *  receiver already records it as a user turn with `origin`, so the text is kept for the owner only. */
+export const AGENT_MESSAGE_KEY = 'agentMessage'
+/** Most characters of a sent message the sender's notice keeps; the receiver holds the whole text. */
+export const AGENT_MESSAGE_TEXT_LIMIT = 4000
 export const CONTROL_ACTIVITY_ITEM_PREFIX = 'control-activity:'
 /** Settings key of the bounded app-wide history (restart, update install, rollback...). */
 export const APP_CONTROL_HISTORY_KEY = 'control-activity:app-history'
@@ -32,6 +38,8 @@ export interface ControlAction {
 }
 export interface ControlActivity { actions: ControlAction[]; reads: number; readMethods: Record<string, number>; dropped: number }
 export interface ControlledBy { agentSessionId: string | null; tabId?: string; title: string; method: string; verb: string; at: string }
+export interface AgentMessageRecipient { agentSessionId: string; tabId?: string; title: string; projectId?: string }
+export interface AgentMessage { method: string; to: AgentMessageRecipient; text: string; characters: number; at: string; delivery?: string }
 export interface AppControlEntry { method: string; label: string; at: string; by: { agentSessionId: string | null; title: string }; failed?: boolean }
 
 const record = (value: unknown): Record<string, unknown> | null => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
@@ -59,11 +67,23 @@ export function controlledByOf(data: AgentEventData): ControlledBy | null {
   }
 }
 
+export function agentMessageOf(data: AgentEventData): AgentMessage | null {
+  if (data.type !== 'notice') return null
+  const value = record(record(data.payload)?.[AGENT_MESSAGE_KEY])
+  const to = record(value?.to)
+  if (!value || !to || typeof to.agentSessionId !== 'string' || typeof value.text !== 'string' || typeof value.method !== 'string') return null
+  return {
+    method: value.method, text: value.text, characters: typeof value.characters === 'number' ? value.characters : value.text.length, at: typeof value.at === 'string' ? value.at : '',
+    to: { agentSessionId: to.agentSessionId, title: typeof to.title === 'string' ? to.title : 'another tab', ...(typeof to.tabId === 'string' ? { tabId: to.tabId } : {}), ...(typeof to.projectId === 'string' ? { projectId: to.projectId } : {}) },
+    ...(typeof value.delivery === 'string' ? { delivery: value.delivery } : {})
+  }
+}
+
 /** A Conductor-side control record, which a controller reading this timeline has no use for. */
 export function isControlActivityNotice(data: AgentEventData): boolean {
   if (data.type !== 'notice') return false
   const payload = record(data.payload)
-  return Boolean(payload && (payload[CONTROL_ACTIVITY_KEY] !== undefined || payload[CONTROLLED_BY_KEY] !== undefined))
+  return Boolean(payload && (payload[CONTROL_ACTIVITY_KEY] !== undefined || payload[CONTROLLED_BY_KEY] !== undefined || payload[AGENT_MESSAGE_KEY] !== undefined))
 }
 
 /** The chip text of a ship: `git.ship → 634b1fa` once the commit is known. */

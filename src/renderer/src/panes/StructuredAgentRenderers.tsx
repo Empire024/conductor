@@ -6,7 +6,7 @@ import { createPortal } from 'react-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { DiffEditor, type DiffOnMount } from '@monaco-editor/react'
-import { ArrowDown, ArrowUp, Check, ChevronDown, ChevronRight, ChevronUp, Copy, FileCode2, Link2, Maximize2, X } from 'lucide-react'
+import { ArrowDown, ArrowUp, Check, ChevronDown, ChevronRight, ChevronUp, Copy, FileCode2, Maximize2, X } from 'lucide-react'
 import type { ContextAttachment, AgentEventData, DiffArtifact, FileChange, InputQuestion, Json, PendingInteraction, TimelineItem } from '../../../shared/structured-agent'
 import { stripMemoryDirectives } from '../../../shared/memory-directive'
 import { languageForPath, SyntaxCode } from './SyntaxCode'
@@ -28,7 +28,9 @@ import { localStopOf } from '../../../shared/local-stop'
 import { localEnergyOf } from '../../../shared/local-energy'
 import { LocalEnergyNotice } from './LocalEnergyCard'
 import { LocalStopCard } from './LocalStopCard'
-import { controlActivityOf, controlledByOf } from '../../../shared/control-activity'
+import { agentMessageOf, controlActivityOf, controlledByOf } from '../../../shared/control-activity'
+import { conversationLabel, conversationRefRemarkPlugin, currentConversationDirectory, findConversationRefs, mentionsConversationId, refreshConversationDirectory, resolveConversationRef, useConversationDirectory } from '../conversation-directory'
+import { AgentMessageCard, LinkedText, mcpAgentMessageOf, receivedMessagePeer } from './AgentMessageCards'
 import { ControlActivityRow, ControlledByNotice } from '../components/ControlActivity'
 import './StructuredAgentActivity.css'
 import './StructuredFileLinkMenu.css'
@@ -194,7 +196,14 @@ export const StructuredMarkdown = memo(function StructuredMarkdown({ text, cwd, 
   const [menu, setMenu] = useState<{ target: ResolvedFileLink; x: number; y: number } | null>(null)
   const projects = useFileLinkProjectRoots()
   const verifiedPlainFileLinks = useVerifiedPlainFileLinks(text, cwd, projectId, projects, machineId)
-  const markdownPlugins = useMemo(() => [remarkGfm, plainFileLinkRemarkPlugin(verifiedPlainFileLinks, cwd, projectId, projects, machineId)], [verifiedPlainFileLinks, cwd, projectId, projects, machineId])
+  // Ids of open tabs become links (conversation-directory.ts). The plugin keeps its identity until
+  // what this message links to changes, so a directory update does not re-parse every message.
+  const directory = useConversationDirectory()
+  const refs = useMemo(() => findConversationRefs(text, directory), [text, directory])
+  const refSignature = refs.map(ref => ref.raw + '' + conversationLabel(ref.entry, projectId)).join('')
+  const linkedDirectory = useMemo(() => directory, [refSignature])
+  useEffect(() => { if (!refs.length && mentionsConversationId(text)) void refreshConversationDirectory() }, [text, refs.length])
+  const markdownPlugins = useMemo(() => [remarkGfm, plainFileLinkRemarkPlugin(verifiedPlainFileLinks, cwd, projectId, projects, machineId), conversationRefRemarkPlugin(linkedDirectory, projectId)], [verifiedPlainFileLinks, cwd, projectId, projects, machineId, linkedDirectory])
   useEffect(() => {
     if (!menu) return
     const close = (): void => setMenu(null)
@@ -232,9 +241,12 @@ export const StructuredMarkdown = memo(function StructuredMarkdown({ text, cwd, 
   // again. The link handlers read only cwd, projectId, projects, machineId, onOpenFile and setters.
   const urlTransform = useCallback((url: string): string => safeConductorLink(url) || safeExternalLink(url) || resolveFileLinkTarget(url, cwd, projects, machineId) ? url : '', [cwd, projects, machineId])
   const components = useMemo<MarkdownComponents>(() => ({
-    a: ({ href, children }) => {
+    a: ({ href, children, className, title }) => {
       if (!href) return <span>{children}</span>
       const internal = safeConductorLink(href)
+      // A link to an open tab names it on hover, with its project when that is another one.
+      const conversation = internal ? resolveConversationRef(currentConversationDirectory(), href) : null
+      if (conversation) return <a href="#" className={className ?? 'sa-conversation-ref'} title={title ?? 'Show ' + conversationLabel(conversation, projectId)} onClick={(event) => { event.preventDefault(); void window.conductor.agentControl.openUri(href).catch(reason => setLinkError(reason instanceof Error ? reason.message : String(reason))) }}>{children}</a>
       const external = safeExternalLink(href)
       const target = external || internal ? null : resolveFileLinkTarget(href, cwd, projects, machineId)
       const sibling = Boolean(target?.projectId && target.projectId !== projectId)
@@ -380,7 +392,7 @@ function ToolCard({ item, expanded, onExpand, onOpenFile, sessionId, cwd }: Acti
   const outputLanguage = typeof sourcePath === 'string' ? languageForPath(sourcePath) : undefined
   return <section className={'sa-tool sa-tool-' + presentation.kind} aria-label={tool.name + ': ' + status}>
     <header><button className="sa-tool-heading" aria-expanded={expanded} onClick={() => onExpand(item.id)}>{expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}<strong>{tool.name}</strong><span>{presentation.title !== tool.name ? presentation.title : ''}</span></button><small className={'sa-status status-' + status}>{status.replaceAll('_', ' ')}</small></header>
-    {preview && <p className="sa-tool-preview"><b>OUT</b> {preview}</p>}
+    {preview && <p className="sa-tool-preview"><b>OUT</b> <LinkedText text={preview} /></p>}
     {expanded && <>
       <div className="sa-io"><span>IN</span><div>{presentation.cwd && <small className="sa-cwd">{presentation.cwd}</small>}{presentation.kind === 'custom' || presentation.kind === 'edit' ? <details><summary>Inspect tool input</summary>{input}</details> : input}{presentation.path && (() => { const { icon: PathIcon, colorClass } = fileTypeStyle(presentation.path!); return <button className="sa-file-link" onClick={(event) => openAgentFile(event, cwd, presentation.path!, onOpenFile)}><PathIcon size={12} className={colorClass} />{presentation.path}</button> })()}</div></div>
       <div className="sa-io sa-output"><span>OUT</span><div>{tool.output !== undefined ? <OutputPreview value={tool.output} artifactId={tool.outputArtifactId} sessionId={sessionId} language={outputLanguage} /> : <span className="sa-muted">{status === 'preparing' ? 'Preparing…' : status === 'awaiting_approval' ? 'Awaiting approval.' : status === 'running' ? 'Running…' : 'No output.'}</span>}{tool.stderr && <><small className="sa-stream-name">stderr</small><OutputPreview value={tool.stderr} sessionId={sessionId} /></>}</div></div>
@@ -574,8 +586,13 @@ export const StructuredActivity = memo(function StructuredActivity(props: Activi
   let body: ReactNode
   switch (data.type) {
     // "You" is reserved for what the owner actually sent; a coordinated prompt names its tab.
-    case 'text': { const origin = data.origin; body = <>{data.role === 'user' && (origin ? <button type="button" className="sa-role sa-role-coordinated" title={'Show ' + origin.label + ' tab'} aria-label={'Show ' + origin.label + ' tab'} onClick={() => props.onFocusOrigin?.(origin)}><Link2 size={11} />{origin.label}</button> : <span className="sa-role">You</span>)}<MessageText data={data} cwd={props.cwd} projectId={props.projectId} machineId={props.machineId} onOpenFile={props.onOpenFile} />{Boolean(data.attachments?.length) && <div className="sa-message-attachments" aria-label="Attached context">{data.attachments?.map(attachment => attachment.kind === 'image' && props.projectId && props.onInspectAttachment ? <button key={attachment.id} className="sa-sent-image" aria-label={'View image ' + attachment.name} title={'View ' + attachment.name} onClick={() => props.onInspectAttachment?.(attachment)}><PromptImageThumbnail projectId={props.projectId} attachment={attachment} /><span>{attachment.name}</span></button> : attachment.path ? <button key={attachment.id} className="sa-file-link" title={attachment.name} onClick={event => openAgentFile(event, props.cwd, attachment.path!, props.onOpenFile)}>{attachmentIcon(attachment.name)}{attachment.name}{attachment.startLine ? ':' + attachment.startLine : ''}</button> : <span key={attachment.id}>{attachmentIcon(attachment.name)}{attachment.name}</span>)}</div>}</>; break }
-    case 'tool': body = <ToolCard {...props} />; break
+    case 'text': { const peer = receivedMessagePeer(data); const message = <MessageText data={data} cwd={props.cwd} projectId={props.projectId} machineId={props.machineId} onOpenFile={props.onOpenFile} />; body = <>{data.role === 'user' && !peer && <span className="sa-role">You</span>}{peer ? <AgentMessageCard direction="received" peer={peer} text={data.text} projectId={props.projectId} onFocusOrigin={props.onFocusOrigin}>{message}</AgentMessageCard> : message}{Boolean(data.attachments?.length) && <div className="sa-message-attachments" aria-label="Attached context">{data.attachments?.map(attachment => attachment.kind === 'image' && props.projectId && props.onInspectAttachment ? <button key={attachment.id} className="sa-sent-image" aria-label={'View image ' + attachment.name} title={'View ' + attachment.name} onClick={() => props.onInspectAttachment?.(attachment)}><PromptImageThumbnail projectId={props.projectId} attachment={attachment} /><span>{attachment.name}</span></button> : attachment.path ? <button key={attachment.id} className="sa-file-link" title={attachment.name} onClick={event => openAgentFile(event, props.cwd, attachment.path!, props.onOpenFile)}>{attachmentIcon(attachment.name)}{attachment.name}{attachment.startLine ? ':' + attachment.startLine : ''}</button> : <span key={attachment.id}>{attachmentIcon(attachment.name)}{attachment.name}</span>)}</div>}</>; break }
+    case 'tool': {
+      // A Conductor messaging tool reads as the message it sent; the call itself stays inside.
+      const sent = mcpAgentMessageOf(data)
+      body = sent ? <AgentMessageCard direction="sent" peer={sent.to} text={sent.text} method={sent.method} projectId={props.projectId} onFocusOrigin={props.onFocusOrigin}><StructuredMarkdown text={sent.text} cwd={props.cwd} projectId={props.projectId} machineId={props.machineId} onOpenFile={props.onOpenFile} /><ToolCard {...props} /></AgentMessageCard> : <ToolCard {...props} />
+      break
+    }
     case 'interaction': body = <InteractionCard {...props} />; break
     case 'changes': body = <section className="sa-changes" aria-label="File changes">{data.changes.map((change, index) => <div className="sa-file-change" key={change.path + '-' + index}>
       <header><button className="sa-file-link" onClick={(event) => openAgentFile(event, props.cwd, change.path, props.onOpenFile)}>{attachmentIcon(change.path)}<code>{change.oldPath ? change.oldPath + ' → ' : ''}{change.path}</code></button><span className="sa-diff-count">{change.additions !== undefined && <b>+{change.additions}</b>}{change.deletions !== undefined && <em>−{change.deletions}</em>}</span><small>{change.status}</small></header>
@@ -594,8 +611,9 @@ export const StructuredActivity = memo(function StructuredActivity(props: Activi
       const energy = localEnergyOf(data); if (energy) { body = <LocalEnergyNotice reading={energy} />; break }
       const control = controlActivityOf(data); if (control) { body = <ControlActivityRow activity={control} onFocusAgent={props.onFocusOrigin} />; break }
       const driven = controlledByOf(data); if (driven) { body = <ControlledByNotice driven={driven} onFocusAgent={props.onFocusOrigin} />; break }
+      const sent = agentMessageOf(data); if (sent) { body = <AgentMessageCard direction="sent" peer={sent.to} text={sent.text} method={sent.method} characters={sent.characters} projectId={props.projectId} onFocusOrigin={props.onFocusOrigin}><StructuredMarkdown text={sent.text} cwd={props.cwd} projectId={props.projectId} machineId={props.machineId} onOpenFile={props.onOpenFile} /></AgentMessageCard>; break }
     }
-      body = <div className="sa-notice">{data.message}{data.outputArtifactId && <OutputPreview sessionId={props.sessionId} artifactId={data.outputArtifactId} value="Saved terminal output from before structured integration. Native conversation identity was not recorded." />}</div>; break
+      body = <div className="sa-notice"><LinkedText text={data.message} projectId={props.projectId} />{data.outputArtifactId && <OutputPreview sessionId={props.sessionId} artifactId={data.outputArtifactId} value="Saved terminal output from before structured integration. Native conversation identity was not recorded." />}</div>; break
     case 'review': body = <p className="sa-muted">{data.outcome === 'kept' ? 'Edit marked reviewed.' : 'Edit reverted.'}</p>; break
     case 'usage': return null
     case 'session': return null

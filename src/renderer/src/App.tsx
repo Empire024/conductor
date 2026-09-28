@@ -29,6 +29,7 @@ import { requiredMachineId } from './layout/machine-placement'
 import { SessionBar } from './components/SessionBar'
 import { EmptyState } from './components/EmptyState'
 import { CommandPalette, type PaletteCommand } from './components/CommandPalette'
+import { setLiveWorkspaces } from './conversation-directory'
 import { SettingsPanel } from './components/SettingsPanel'
 import { PaneWorkspace } from './layout/PaneWorkspace'
 import { applyTabGroupAction, applyWorkspaceTabAction, type WorkspaceTabAction } from './layout/workspace-tab-actions'
@@ -1267,6 +1268,9 @@ export function App(): React.JSX.Element {
     })
   }), [activeProjectId, sessions, offerUndo])
 
+  // Ids in conversations and the palette resolve against this window's own, newest layouts.
+  useEffect(() => { setLiveWorkspaces(activeProjectId, sessions.filter(session => session.projectId === activeProjectId), projects) }, [activeProjectId, sessions, projects])
+
   const commands = useMemo<PaletteCommand[]>(() => [
     { id: 'open-claude', label: 'Open Claude Code', detail: 'Open in the focused tab group', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then C', run: () => openInFocused('agent', 'claude') },
     { id: 'open-codex', label: 'Open Codex', detail: 'Open in the focused tab group', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then X', run: () => openInFocused('agent', 'codex') },
@@ -1734,7 +1738,7 @@ export function App(): React.JSX.Element {
         <SystemPerformanceChip />
         {updateState.currentVersion && <AppVersionButton state={updateState} onCheck={checkForUpdates} />}
       </footer>
-      {paletteOpen && activeSession && <CommandPalette commands={commands} onClose={() => setPaletteOpen(false)} />}
+      {paletteOpen && activeSession && <CommandPalette commands={commands} currentProjectId={activeProjectId} onClose={() => setPaletteOpen(false)} />}
       {settingsOpen && (
         <SettingsPanel
           settings={appSettings}

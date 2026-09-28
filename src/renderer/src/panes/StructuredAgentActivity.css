@@ -14,3 +14,21 @@
 .sa-question-answers { margin: 0; display: flex; flex-direction: column; gap: 6px; }
 .sa-question-answers dt { font-size: 11px; color: var(--text); }
 .sa-question-answers dd { margin: 2px 0 0; font-size: 10.5px; color: var(--text-2); overflow-wrap: anywhere; }
+
+/* Tab-to-tab messages (AgentMessageCards.tsx): one compact line until opened, distinct from the
+   owner's own turns and from tool rows. */
+.sa-agent-message { border: 1px solid var(--border-soft); border-left: 3px solid var(--accent-muted); border-radius: 7px; background: var(--surface-1); margin: 2px 0; }
+.sa-agent-message-received { border-left-color: var(--accent); }
+.sa-agent-message > summary { display: flex; align-items: baseline; gap: 10px; padding: 5px 9px; cursor: pointer; list-style: none; min-width: 0; font-size: 11px; }
+.sa-agent-message > summary::-webkit-details-marker { display: none; }
+.sa-agent-message-head { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; color: var(--text-2); white-space: nowrap; }
+.sa-agent-message-head small { color: var(--text-3, var(--text-2)); opacity: 0.8; font-size: 10px; }
+.sa-agent-message-head .sa-role-coordinated { padding: 0 !important; }
+.sa-agent-message-preview { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
+.sa-agent-message[open] .sa-agent-message-preview { display: none; }
+.sa-agent-message-body { padding: 4px 10px 8px; border-top: 1px solid var(--border-soft); }
+.sa-agent-message-body > .sa-markdown { border: 0 !important; padding: 0 !important; background: none !important; }
+.sa-agent-message-body > .sa-tool { margin-top: 6px; }
+.sa-conversation-link { border: 0; background: none; cursor: pointer; font: inherit; }
+.sa-conversation-ref { color: var(--accent-muted); text-decoration: underline dotted; text-underline-offset: 3px; cursor: pointer; }
+.sa-conversation-ref:hover { text-decoration-style: solid; }

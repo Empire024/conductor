@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Bot, Braces, ChevronRight, FolderTree, Monitor, PanelsTopLeft, Search, Terminal } from 'lucide-react'
+import { focusDirectoryEntry, matchConversationTabs, refreshConversationDirectory, useConversationDirectory, type DirectoryEntry } from '../conversation-directory'
 
 export interface PaletteCommand {
   id: string
@@ -20,22 +21,43 @@ const icons = {
   code: Braces
 }
 
+/** A tab found by id or title, as a palette entry that jumps to it (switching project/workspace). */
+export function tabCommand(entry: DirectoryEntry, currentProjectId: string | null): PaletteCommand {
+  const foreign = entry.projectId !== currentProjectId
+  return {
+    id: 'tab:' + entry.tabId,
+    label: foreign ? `${entry.title} (${entry.projectName})` : entry.title,
+    detail: [foreign ? entry.projectName : null, entry.workspaceName, entry.agentSessionId ?? entry.tabId].filter(Boolean).join(' · '),
+    category: 'Tabs',
+    icon: entry.kind === 'agent' ? 'agent' : entry.kind === 'terminal' ? 'terminal' : entry.kind === 'browser' ? 'browser' : 'layout',
+    run: () => { void focusDirectoryEntry(entry).catch((reason: unknown) => console.warn('The tab could not be shown', reason)) }
+  }
+}
+
 export function CommandPalette({
   commands,
+  currentProjectId,
   onClose
 }: {
   commands: PaletteCommand[]
+  /** Set to search every open tab in the window by agent id, tab id or title as well. */
+  currentProjectId?: string | null
   onClose(): void
 }): React.JSX.Element {
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState(0)
   const inputRef = useRef<HTMLInputElement>(null)
+  const directory = useConversationDirectory()
+  const searchTabs = currentProjectId !== undefined
   const filtered = useMemo(() => {
     const q = query.toLowerCase().trim()
-    return q ? commands.filter((item) => `${item.label} ${item.category}`.toLowerCase().includes(q)) : commands
-  }, [commands, query])
+    const matching = q ? commands.filter((item) => `${item.label} ${item.category}`.toLowerCase().includes(q)) : commands
+    return searchTabs && q ? [...matching, ...matchConversationTabs(directory, q).map(entry => tabCommand(entry, currentProjectId ?? null))] : matching
+  }, [commands, query, directory, searchTabs, currentProjectId])
 
   useEffect(() => inputRef.current?.focus(), [])
+  // Tabs opened in another project since the last read are found too.
+  useEffect(() => { if (searchTabs) void refreshConversationDirectory(true) }, [searchTabs])
   useEffect(() => setSelected(0), [query])
 
   const execute = (index: number): void => {
@@ -66,7 +88,7 @@ export function CommandPalette({
               }
               if (event.key === 'Enter') execute(selected)
             }}
-            placeholder="Type a command or open a tool..."
+            placeholder={searchTabs ? 'Type a command, a tab name or an agent id...' : 'Type a command or open a tool...'}
           />
           <kbd>ESC</kbd>
         </div>

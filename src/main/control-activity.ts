@@ -1,8 +1,8 @@
 import type { AgentControlScope } from '../shared/agent-control'
 import type { Json, SessionProjection } from '../shared/structured-agent'
 import {
-  APP_CONTROL_HISTORY_KEY, APP_CONTROL_HISTORY_LIMIT, CONTROL_ACTIVITY_ITEM_PREFIX, CONTROL_ACTIVITY_KEY, CONTROL_ROW_ACTION_LIMIT, CONTROLLED_BY_KEY,
-  controlActivityOf, controlActivitySummary, type AppControlEntry, type ControlAction, type ControlActionKind, type ControlActivity, type ControlledBy, type ControlTarget
+  AGENT_MESSAGE_KEY, AGENT_MESSAGE_TEXT_LIMIT, APP_CONTROL_HISTORY_KEY, APP_CONTROL_HISTORY_LIMIT, CONTROL_ACTIVITY_ITEM_PREFIX, CONTROL_ACTIVITY_KEY, CONTROL_ROW_ACTION_LIMIT, CONTROLLED_BY_KEY,
+  controlActivityOf, controlActivitySummary, type AgentMessage, type AppControlEntry, type ControlAction, type ControlActionKind, type ControlActivity, type ControlledBy, type ControlTarget
 } from '../shared/control-activity'
 import { controlMethodClass } from './control-method-classes'
 import { anonymousConversations } from './local-models/anonymous'
@@ -162,6 +162,8 @@ export class ControlActivityRecorder {
     }
     const described = this.describeCall(call, at)
     const { by, byTitle } = this.caller(call.scope)
+    // The sender's half of a tab-to-tab message; the receiver shows it as a turn with its origin.
+    if (caller && !call.error) for (const message of this.sentMessages(call, caller, at)) this.deps.notice(caller, `Sent to ${message.to.title} (${message.method})`, { [AGENT_MESSAGE_KEY]: message as unknown as Json })
     if (caller && described.actions.length) {
       const row = this.row(caller)
       for (const action of described.actions) row.activity.actions.push(action)
@@ -185,6 +187,32 @@ export class ControlActivityRecorder {
       const history = this.appHistory()
       for (const action of appWide) history.push({ method: action.method, label: action.label, at, by: { agentSessionId: caller ?? null, title: byTitle }, ...(action.failed ? { failed: true } : {}) })
       this.deps.setSetting(APP_CONTROL_HISTORY_KEY, JSON.stringify(history.slice(-APP_CONTROL_HISTORY_LIMIT)))
+    }
+  }
+
+  /** What one successful call delivered to other conversations, for the sender's own timeline. */
+  private sentMessages(call: ControlCall, caller: string, at: string): AgentMessage[] {
+    const args = object(call.args), result = object(call.result)
+    const one = (agentSessionId: string | undefined, text: string | undefined, fallback: { tabId?: string; title?: string; delivery?: string } = {}): AgentMessage[] => {
+      if (!agentSessionId || !text || agentSessionId === caller) return []
+      const found = this.deps.describe({ agentSessionId })
+      const tabId = found?.tabId ?? fallback.tabId
+      const title = anonymousConversations.has(agentSessionId) ? 'an anonymous local conversation' : found?.title ?? fallback.title ?? 'another tab'
+      return [{ method: call.method, text: text.slice(0, AGENT_MESSAGE_TEXT_LIMIT), characters: text.length, at, to: { agentSessionId, ...(tabId ? { tabId } : {}), title, ...(str(result.projectId) ? { projectId: str(result.projectId) } : {}) }, ...(fallback.delivery ? { delivery: fallback.delivery } : {}) }]
+    }
+    switch (call.method) {
+      case 'agents.submit': case 'agents.steer': return one(str(args.agentSessionId), str(args.prompt), { tabId: str(result.tabId), delivery: str(result.delivery) })
+      case 'agents.report': return one(str(result.agentSessionId), str(args.text), { delivery: str(result.delivery) })
+      case 'agents.handoff': return one(str(result.agentSessionId), str(args.handoff), { tabId: str(result.tabId), title: str(result.title) })
+      case 'tabs.open': return result.submitted === true ? one(str(result.resourceId), str(args.prompt), { tabId: str(result.id), title: str(result.title) }) : []
+      case 'router.dispatch': {
+        const tasks = Array.isArray(args.tasks) ? args.tasks : [], results = Array.isArray(call.result) ? call.result : []
+        return results.flatMap((entry, index) => {
+          const worker = object(entry), task = object(tasks[index])
+          return worker.error === undefined ? one(str(worker.agentSessionId), str(task.prompt), { tabId: str(worker.tabId), title: str(task.title) }) : []
+        })
+      }
+      default: return []
     }
   }
 
