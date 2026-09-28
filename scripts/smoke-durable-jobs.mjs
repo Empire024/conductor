@@ -8,7 +8,9 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
 import { acceptanceFailures, auditSoak } from './lib/durable-attempt-audit.mjs'
+import { captureJobOutput, isolationProblems, readJobFile } from './lib/durable-job-output.mjs'
 import { stopDurableSmokeServer } from './lib/stop-durable-smoke-server.mjs'
+import { sanitizeText } from './run-local-acceptance.mjs'
 import { assertBuildHash, identityOf, listProcesses, newInstance, registerPlaywrightRoots, safeClose, sameIdentity, startTracking, terminateIdentity } from './verify-kit.mjs'
 
 // End-to-end check of durable local-model jobs in the built app (docs/durable-jobs.md). The app
@@ -91,7 +93,8 @@ const observe = (label, data = {}) => {
 const projectPath = join(root, 'project')
 await mkdir(projectPath, { recursive: true })
 await writeFile(join(projectPath, 'README.md'), '# Durable job smoke\n')
-await writeFile(join(projectPath, 'notes.txt'), 'first line\n')
+const INITIAL_NOTES = 'first line\n'
+await writeFile(join(projectPath, 'notes.txt'), INITIAL_NOTES)
 // --fixture=crossref: six ~1,100-line modules that call into each other, so summarising and
 // cross-referencing them cannot fit one 32,768-token context and the job has to advance through
 // several fresh ones.
@@ -124,11 +127,17 @@ if (fixture === 'index') {
     await writeFile(join(projectPath, 'inputs', name), lines.join('\n') + '\n')
   }
 }
-/** What a correct run of the fixture leaves in the project, checked against the fixture's own
- *  construction (not against the model's claims). Returns the list of problems; empty is correct. */
-const outputProblems = async () => {
-  const read = async path => { try { return await readFile(join(projectPath, path), 'utf8') } catch { return null } }
+/** What a correct run of the fixture leaves, checked against the fixture's own construction (not
+ *  against the model's claims), read from the job's committed conductor-job/<id> branch - how the
+ *  owner receives it - with the owner's checkout required untouched. Returns the list of problems;
+ *  empty is correct. A missing branch or file is a problem naming which one. */
+const outputProblems = async jobId => {
   const problems = []
+  const read = async path => {
+    const { text, missing } = await readJobFile(projectPath, jobId, path)
+    if (missing && !problems.includes(`missing: ${missing}`)) problems.push(`missing: ${missing}`)
+    return text
+  }
   if (fixture === 'crossref') {
     for (const name of MODULES) if (!(await read(`notes/${name}.md`))?.trim()) problems.push(`notes/${name}.md missing or empty`)
     const table = (await read('CROSSREF.md')) ?? ''
@@ -145,7 +154,11 @@ const outputProblems = async () => {
     if (lines.length !== expected.length) problems.push(`INDEX.md has ${lines.length} lines, expected ${expected.length}`)
     const wrong = expected.findIndex((line, i) => lines[i] !== line)
     if (wrong >= 0) problems.push(`INDEX.md line ${wrong + 1} is ${JSON.stringify(lines[wrong] ?? null)}, expected ${JSON.stringify(expected[wrong])}`)
-  } else if (!/(^|\n)durable smoke\s*$/.test((await read('notes.txt')) ?? '')) problems.push('notes.txt does not end with the line durable smoke')
+  } else {
+    const notes = await read('notes.txt')
+    if (notes !== null && !/(^|\n)durable smoke\s*$/.test(notes)) problems.push('notes.txt does not end with the line durable smoke')
+  }
+  problems.push(...await isolationProblems(projectPath, { initialCommit, initialNotes: INITIAL_NOTES }))
   return problems
 }
 /** Clears the fixture's outputs so each soak iteration's content is its own work. */
@@ -154,6 +167,7 @@ const clearOutputs = async () => {
 }
 const git = (...args) => execFileSync('git', args, { cwd: projectPath, stdio: 'pipe' }).toString().trim()
 git('init', '-q', '-b', 'main'); git('-c', 'user.email=smoke@example.invalid', '-c', 'user.name=Smoke', 'add', '.'); git('-c', 'user.email=smoke@example.invalid', '-c', 'user.name=Smoke', 'commit', '-q', '-m', 'Initial')
+const initialCommit = git('rev-parse', 'HEAD')
 
 /** Electron processes (main, GPU, renderer, utility) still running on this run's profile. */
 const profileProcesses = () => {
@@ -262,6 +276,14 @@ const call = async (method, args = {}, { expectError = false } = {}) => {
   return body.result
 }
 const status = jobId => call('jobs.status', { jobId })
+/** The judged output of a failed acceptance check, sanitized like every other artifact, with each
+ *  stage's final summary from the job's report. Never throws: a failed capture is itself recorded. */
+const captureFailedOutput = async jobId => {
+  let stageSummaries
+  try { stageSummaries = (await call('jobs.report', { jobId })).results } catch (error) { stageSummaries = { error: String(error?.message ?? error).slice(0, 300) } }
+  try { return await captureJobOutput({ projectPath, jobId, dir: join(output, 'job-output', jobId), sanitize: text => sanitizeText(text, [owner?.token]), stageSummaries }) }
+  catch (error) { return { captureError: String(error?.message ?? error).slice(0, 300) } }
+}
 /** Every event of a job, paged to the end. `complete` only when the pages ran out on their own and
  *  the first event is the job's creation: a last-N slice is never proof of a whole ledger. */
 const allEvents = async (jobId, maxPages = 500) => {
@@ -465,7 +487,7 @@ try {
       totalRetries += settled.counters.retries
       totalRecoveries += settled.counters.recoveries
       if (settled.status === 'completed') totalCompleted++
-      const problems = settled.status === 'completed' ? await outputProblems() : null
+      const problems = settled.status === 'completed' ? await outputProblems(soakJob.id) : null
       if (problems && !problems.length) verifiedCompletions++
       // The whole ledger, paged, with the blocked stage taken from structured state: the audit
       // judges each stage's charged versus credited attempts, not any credit anywhere in the job.
@@ -574,10 +596,14 @@ try {
   // A recovery run is only accepted when that same job finished its work correctly: a report for
   // blocked or cancelled work, or a completion with wrong output, is not a recovery.
   if (acceptanceRun) {
-    const problems = final.status === 'completed' ? await outputProblems() : null
+    const problems = final.status === 'completed' ? await outputProblems(job.id) : null
     const failures = acceptanceFailures({ jobId: job.id, final, problems })
     observe(flag('acceptance') ? 'control run outcome' : 'fault run outcome', { jobId: job.id, status: final.status, statusReason: final.statusReason ?? null, outputProblems: problems, failures })
-    assert.deepEqual(failures, [], `acceptance run did not prove a completed, correct job: ${failures.join('; ')}`)
+    // A failure keeps what was judged: both copies of the checked files, the branch and the stage
+    // summaries under artifacts/durable-jobs/job-output/<jobId>/, and their last lines in FAILED.
+    const jobOutput = failures.length ? await captureFailedOutput(job.id) : null
+    try { assert.deepEqual(failures, [], `acceptance run did not prove a completed, correct job: ${failures.join('; ')}`) }
+    catch (error) { throw Object.assign(error, { jobOutput }) }
   }
   const report = await call('jobs.report', { jobId: job.id })
   assert.ok(existsSync(report.reportPath), 'report.md was not written')
@@ -638,7 +664,7 @@ try {
   if (error?.skipped) observe(flag('approval-gate') ? 'approval gate scenario done; main job skipped' : flag('blocked-restart') ? 'blocked restart scenario done; main job skipped' : 'extras skipped (--extras=none)')
   else {
     failed = error
-    observe('FAILED', { message: String(error?.message ?? error).slice(0, 800) })
+    observe('FAILED', { message: String(error?.message ?? error).slice(0, 800), ...(error?.jobOutput ? { jobOutput: error.jobOutput } : {}) })
   }
 } finally {
   clearTimeout(watchdog)
