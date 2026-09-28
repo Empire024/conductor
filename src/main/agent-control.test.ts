@@ -84,7 +84,10 @@ function fixture(aliasedRoot = false, permissionsByProvider?: Partial<Record<Str
     status: vi.fn(async (projectId: string) => ({ projectId, available: true, reason: null, branch: 'main', upstream: 'origin/main', ahead: 0, behind: 0, head: null, headSubject: null, files: [], github: null, releaseWorkflow: false, checkedAt: '' })),
     current: vi.fn((): typeof shipped | null => null),
     ship: vi.fn((projectId: string, _cwd: string, request: { message: string; paths?: string[] }) => ({ ...shipped, projectId, message: request.message, paths: request.paths ?? null })),
-    wait: vi.fn(async () => ({ ...shipped, state: 'delivered' as const, releaseTag: 'v1.0.1' }))
+    wait: vi.fn(async () => ({ ...shipped, state: 'delivered' as const, releaseTag: 'v1.0.1' })),
+    find: vi.fn((): typeof shipped | null => null),
+    latestBy: vi.fn((): typeof shipped | null => null),
+    queuePosition: vi.fn((): { position: number; behind: string } | null => null)
   }
   const deps = { database, sessions, orchestration, collaboration, backlogs, ui, confirm, fileChanged, localUpdates, delivery, providers: () => providers }
   const control = new AgentControl(deps)
@@ -211,7 +214,7 @@ describe('authorized native app control', () => {
     const f = fixture()
     expect(await f.control.call(f.scope, 'git.status')).toMatchObject({ branch: 'main', available: true })
     expect(await f.control.call(f.scope, 'git.ship', { message: 'Fix it', paths: ['src/a.ts'] })).toMatchObject({ state: 'running', paths: ['src/a.ts'] })
-    expect(f.delivery.ship).toHaveBeenCalledWith(f.project.id, f.project.path, { message: 'Fix it', paths: ['src/a.ts'] }, { kind: 'agent', agentSessionId: f.spec.id, title: f.spec.title })
+    expect(f.delivery.ship).toHaveBeenCalledWith(f.project.id, f.project.path, { message: 'Fix it', paths: ['src/a.ts'] }, { kind: 'agent', agentSessionId: f.spec.id, title: f.spec.title }, { queue: true })
     expect(f.confirm).not.toHaveBeenCalled()
     // Waiting long-polls the run, capped below the control server's request timeout.
     expect(await f.control.call(f.scope, 'git.ship', { message: 'Again', waitSeconds: 500 })).toMatchObject({ state: 'delivered', releaseTag: 'v1.0.1' })
@@ -2056,11 +2059,11 @@ describe('control catalog and dispatch repairs', () => {
     expect(catalog['git.ship']).toContain('publish: true')
     expect(catalog['git.ship']).not.toContain('then it waits for the release the push triggers')
     await f.control.call(f.scope, 'git.ship', { message: 'Local' })
-    expect(f.delivery.ship).toHaveBeenLastCalledWith(f.project.id, f.project.path, { message: 'Local' }, expect.anything())
+    expect(f.delivery.ship).toHaveBeenLastCalledWith(f.project.id, f.project.path, { message: 'Local' }, expect.anything(), { queue: true })
     await f.control.call(f.scope, 'git.ship', { message: 'Release', publish: true })
-    expect(f.delivery.ship).toHaveBeenLastCalledWith(f.project.id, f.project.path, { message: 'Release', publish: true }, expect.anything())
+    expect(f.delivery.ship).toHaveBeenLastCalledWith(f.project.id, f.project.path, { message: 'Release', publish: true }, expect.anything(), { queue: true })
     await f.control.call(f.scope, 'git.ship', { message: 'Still local', publish: false })
-    expect(f.delivery.ship).toHaveBeenLastCalledWith(f.project.id, f.project.path, { message: 'Still local' }, expect.anything())
+    expect(f.delivery.ship).toHaveBeenLastCalledWith(f.project.id, f.project.path, { message: 'Still local' }, expect.anything(), { queue: true })
     const local: AgentSpec = { ...f.spec, id: 'local-worker', provider: 'local', title: 'Local worker' }
     f.sessions.ensure(local)
     openAgentTab(f, local.id, 'local-tab')
@@ -2069,6 +2072,42 @@ describe('control catalog and dispatch repairs', () => {
     await expect(f.control.call({ ...f.scope, agentSessionId: local.id }, 'git.ship', { message: 'Release', publish: true })).rejects.toThrow('declined')
     expect(f.confirm).toHaveBeenLastCalledWith(expect.anything(), 'Local worker wants to test, build and commit this project, push it and publish its release.')
     expect(f.delivery.ship).toHaveBeenCalledTimes(3)
+  })
+
+  it('queues a busy git.ship, reads any recent run by runId, and returns logs only for running or failed stages', async () => {
+    const f = fixture()
+    const lines = (count: number): string[] => Array.from({ length: count }, (_, index) => `line ${index}`)
+    const stage = (id: string, state: string, log: string[]) => ({ id, label: id, state, startedAt: '', finishedAt: '', detail: '', log })
+    const run = {
+      id: 'run-2', projectId: f.project.id, state: 'running', requestedBy: { kind: 'agent', agentSessionId: f.spec.id, title: f.spec.title }, message: 'Second', paths: null,
+      startedAt: '', finishedAt: null, commit: null, releaseTag: null, releaseUrl: null, workflowRunUrl: null, error: null,
+      stages: [stage('preflight', 'passed', lines(3)), stage('test', 'failed', lines(30)), stage('build', 'passed', lines(40)), stage('commit', 'running', lines(20)), stage('push', 'skipped', []), stage('release', 'pending', [])]
+    }
+    type Viewed = { id: string; runId?: string; status?: string; behind?: string; position?: number; note?: string; stages: Array<{ id: string; log?: string[] }> }
+    f.delivery.ship.mockReturnValueOnce(run as never)
+    f.delivery.queuePosition.mockReturnValueOnce({ position: 1, behind: 'run-1' })
+    const queued = await f.control.call(f.scope, 'git.ship', { message: 'Second' }) as Viewed
+    expect(queued).toMatchObject({ id: 'run-2', runId: 'run-2', status: 'queued', behind: 'run-1', position: 1 })
+    expect(queued.note).toMatch(/^Queued behind run-1 \(position 1\); it starts by itself.*git\.ship\.status\(\{runId:"run-2",waitSeconds:100\}\)/)
+    const logs = Object.fromEntries(queued.stages.map(entry => [entry.id, entry.log]))
+    expect(logs).toEqual({ preflight: undefined, test: lines(30).slice(-15), build: undefined, commit: lines(20).slice(-15), push: undefined, release: undefined })
+    expect(queued.stages.find(entry => entry.id === 'build')).not.toHaveProperty('log')
+    // The service keeps the full log for the panel; only the control result is trimmed.
+    expect(run.stages[2]!.log).toHaveLength(40)
+
+    f.delivery.find.mockReturnValueOnce({ ...run, state: 'delivered' } as never)
+    expect(await f.control.call(f.scope, 'git.ship.status', { runId: 'run-2' })).toMatchObject({ id: 'run-2', state: 'delivered' })
+    expect(f.delivery.find).toHaveBeenLastCalledWith(f.project.id, 'run-2')
+    await expect(f.control.call(f.scope, 'git.ship.status', { runId: 'run-9' })).rejects.toThrow(/No delivery run-9 is known for this project; Conductor keeps the last 10 runs/)
+    // No runId: the caller's own newest run, not the project's.
+    f.delivery.latestBy.mockReturnValueOnce(run as never)
+    expect(await f.control.call(f.scope, 'git.ship.status')).toMatchObject({ id: 'run-2' })
+    expect(f.delivery.latestBy).toHaveBeenLastCalledWith(f.project.id, { kind: 'agent', agentSessionId: f.spec.id, title: f.spec.title })
+    f.delivery.current.mockReturnValueOnce({ ...run, id: 'run-3', requestedBy: { kind: 'agent', agentSessionId: 'other', title: 'Worker B' } } as never)
+    expect(await f.control.call(f.scope, 'git.ship.status')).toMatchObject({ id: 'run-3', note: expect.stringMatching(/You have not shipped in this project.*requested by "Worker B"/) })
+    const catalog = await f.control.call(f.scope, 'tools.list') as Record<string, string>
+    expect(catalog['git.ship']).toContain('queued, never refused')
+    expect(catalog['git.ship.status']).toContain('last 10 runs')
   })
 
   it('says jobs.pause interrupts the running stage at once', async () => {
@@ -2597,5 +2636,32 @@ describe('FX21: agent-opened tabs never steal the owner’s focus', () => {
     const tab = f.control.tabs(owner).at(-1)!
     await f.control.call(owner, 'tabs.focus', { tabId: tab.id })
     expect(focuses(f).at(-1)?.params).not.toHaveProperty('whenIdle')
+  })
+})
+
+describe('agents.list({load:true}) for a smoke load check', () => {
+  it('lists every agent tab of every co-open project and workspace, compactly, and refuses a paired caller', async () => {
+    const f = fixture(), other = sibling(f)
+    const room = f.database.createSession(f.project.id, 'Second room')
+    agentIn(f, f.project.id, room.id, 'same-project-elsewhere')
+    const controller = agentIn(f, other.project.id, other.workspace.id, 'theme-controller')
+    const coworker = await f.control.call(controller, 'tabs.open', { provider: 'claude', title: 'Theme coworker' }) as AgentControlTab
+    type Entry = { tabId: string; agentSessionId: string; projectId: string; workspaceId: string; crossProject: boolean; phase: string | null }
+    const listed = await f.control.call(f.scope, 'agents.list', { load: true }) as Entry[]
+    const own = listed.find(entry => entry.agentSessionId === f.spec.id)!
+    expect(Object.keys(own).sort()).toEqual(['agentSessionId', 'backgroundTasks', 'crossProject', 'phase', 'projectId', 'provider', 'tabId', 'title', 'workspaceId'])
+    expect(own).toMatchObject({ tabId: f.rootTab.id, projectId: f.project.id, workspaceId: f.workspace.id, crossProject: false, backgroundTasks: 0 })
+    expect(listed.find(entry => entry.agentSessionId === 'same-project-elsewhere')).toMatchObject({ projectId: f.project.id, workspaceId: room.id, crossProject: false })
+    expect(listed.find(entry => entry.agentSessionId === 'theme-controller')).toMatchObject({ projectId: other.project.id, crossProject: true })
+    // A coworker another agent controls is load too, although the plain list hides it.
+    expect(listed.find(entry => entry.agentSessionId === coworker.resourceId)).toMatchObject({ projectId: other.project.id, crossProject: true })
+    expect((await f.control.call(f.scope, 'agents.list') as Entry[]).map(entry => entry.agentSessionId)).not.toContain(coworker.resourceId)
+    await expect(f.control.call(f.scope, 'agents.list', { load: 'yes' })).rejects.toThrow('agents.list load must be true or false')
+    const current = f.database.getSession(f.workspace.id)!
+    if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+    const tab = current.layout.root.tabs.find(candidate => candidate.id === f.rootTab.id)!
+    tab.state = { ...tab.state, remotePeerId: 'peer-1', remoteMachineName: 'Render Desktop' }
+    f.database.saveSession(f.workspace.id, current.layout, null, [])
+    await expect(f.control.call(f.scope, 'agents.list', { load: true })).rejects.toThrow(/driven by a paired machine/)
   })
 })

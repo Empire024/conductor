@@ -563,7 +563,7 @@ function controlServer(routes) {
   const calls = []
   const fetchImpl = async (url, init) => {
     const request = JSON.parse(init.body)
-    calls.push({ url, method: request.method, scope: request.scope ?? null, auth: init.headers.Authorization })
+    calls.push({ url, method: request.method, args: request.args, scope: request.scope ?? null, auth: init.headers.Authorization })
     const answer = routes[request.method]?.(request.scope) ?? { status: 404, body: { error: 'unknown' } }
     return { status: answer.status ?? 200, json: async () => { if (answer.raw) throw new Error('bad json'); return answer.body } }
   }
@@ -585,7 +585,7 @@ const listing = [
 test('midTurnTabs makes one agents.list call and splits this project, approval waits and other projects', async () => {
   const server = controlServer({ 'agents.list': () => ok(listing) })
   const result = await midTurnTabs({ control: { endpoint: ENDPOINT, token: TOKEN }, fetchImpl: server.fetchImpl })
-  assert.deepEqual(server.calls.map(call => call.method), ['agents.list'])
+  assert.deepEqual(server.calls.map(call => [call.method, call.args]), [['agents.list', { load: true }]])
   assert.ok(server.calls.every(call => call.url === ENDPOINT && call.auth === `Bearer ${TOKEN}`))
   assert.equal(result.projectId, 'p1')
   assert.equal(result.count, 3)
@@ -595,6 +595,25 @@ test('midTurnTabs makes one agents.list call and splits this project, approval w
   const scoped = controlServer({ 'agents.list': () => ok(listing) })
   assert.equal((await midTurnTabs({ control: { endpoint: ENDPOINT, token: TOKEN, projectId: 'p2', workspaceId: 'w3' }, fetchImpl: scoped.fetchImpl })).count, 1)
   assert.deepEqual(scoped.calls[0].scope, { projectId: 'p2', workspaceId: 'w3' })
+})
+
+test('midTurnTabs reads the load list: this project\'s other workspaces count, other projects stay INFO', async () => {
+  // agents.list({load:true}): every tab of every co-open project, crossProject only for another project.
+  const load = [
+    { tabId: 't1', agentSessionId: 'agent_me', title: 'Caller', provider: 'claude', phase: 'running', projectId: 'p1', workspaceId: 'w1', crossProject: false, backgroundTasks: 0 },
+    { tabId: 't2', agentSessionId: 'agent_other_ws', title: 'Other workspace', provider: 'codex', phase: 'running', projectId: 'p1', workspaceId: 'w2', crossProject: false, backgroundTasks: 0 },
+    { tabId: 't3', agentSessionId: 'agent_coworker_elsewhere', title: 'Haftheme coworker', provider: 'claude', phase: 'running', projectId: 'p2', workspaceId: 'w3', crossProject: true, backgroundTasks: 0 }
+  ]
+  const server = controlServer({ 'agents.list': () => ok(load) })
+  const result = await midTurnTabs({ control: { endpoint: ENDPOINT, token: TOKEN }, fetchImpl: server.fetchImpl })
+  assert.equal(server.calls.length, 1)
+  assert.equal(result.projectId, 'p1')
+  assert.deepEqual(result.tabs.map(tab => [tab.agentSessionId, tab.workspaceId]), [['agent_me', 'w1'], ['agent_other_ws', 'w2']])
+  assert.deepEqual(result.elsewhere.map(tab => tab.agentSessionId), ['agent_coworker_elsewhere'])
+  const verdict = judgeLoad({ inventory: { ok: true }, lock: { held: false }, cpuPercent: 5, gpuPercent: 1, llama: [], midTurn: result }, { machineCpuPercent: 30, gpuPercent: 40 }, { callerId: 'agent_me' })
+  assert.equal(verdict.quiet, false)
+  assert.match(verdict.reasons.join(' '), /"Other workspace" \(agent_other_ws, running, project p1\)/)
+  assert.doesNotMatch(verdict.reasons.join(' '), /agent_coworker_elsewhere/)
 })
 
 test('judgeLoad counts only this project\'s working tabs and names the blocking ones with the way out', async () => {

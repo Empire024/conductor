@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AdapterEvent, AgentEvent, Json, SessionSettings } from '../../shared/structured-agent'
 import { replayAgentEvents } from '../../shared/structured-agent-reducer'
 import { autoModeDenialOf } from '../../shared/auto-mode-denial'
-import { ClaudeAdapter, CLAUDE_COMPATIBILITY, claudeCompatibility } from './claude'
+import { ClaudeAdapter, CLAUDE_COMPATIBILITY, claudeCompatibility, claudeHookHealth, HOOK_FREE_READ_TOOLS, PRE_TOOL_USE_MATCHER, resetClaudeHookHealth } from './claude'
 import { JsonLineDecoder, JsonLineTransport, type TransportOptions } from './transport'
 import { SteeringUnavailableError, type AdapterOptions } from './adapter'
 import { resolve, join } from 'node:path'
@@ -1368,5 +1368,65 @@ describe('owner permission grants (src/main/permission-grants)', () => {
     // it files the card, which then joins the approved request instead of asking again.
     expect(denied).toHaveBeenCalledWith('auto-denial:again',expect.objectContaining({ tool: 'Bash', rule: `Bash(${command})` }))
     expect(refused.mock.invocationCallOrder[0]).toBeLessThan(denied.mock.invocationCallOrder[0]!)
+  })
+})
+
+describe('Conductor tool hook health (harness gap H16)', () => {
+  afterEach(() => resetClaudeHookHealth())
+  const initializeHooks = (f: ReturnType<typeof fixture>) => (f.transport.sent.find(message => (message as { request?: { subtype?: string } }).request?.subtype === 'initialize') as { request: { hooks: Record<string, Array<{ matcher?: string; timeout?: number }>> } }).request.hooks
+
+  it('keeps read-only tools out of the PreToolUse matcher, so an unreachable hook host cannot refuse them, and holds every other tool', async () => {
+    const f = fixture(); await f.adapter.start()
+    const [before] = initializeHooks(f).PreToolUse!
+    expect(before!.matcher).toBe(PRE_TOOL_USE_MATCHER)
+    const hooked = new RegExp(PRE_TOOL_USE_MATCHER)
+    for (const read of ['Read', 'Glob', 'Grep', 'LS', 'NotebookRead', 'mcp__conductor-local__local_ask', 'mcp__conductor-local__summarize_file', 'mcp__conductor-browser__browser_snapshot', 'mcp__conductor-browser__browser_screenshot', 'mcp__conductor-browser__browser_console']) expect(hooked.test(read), read).toBe(false)
+    for (const tool of ['Bash', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'WebFetch', 'Agent', 'ReadMcpResourceTool', 'Reader', 'mcp__conductor__control', 'mcp__conductor-local__run_and_summarize', 'mcp__conductor-browser__browser_click', 'mcp__conductor-browser__browser_evaluate', 'mcp__other__Read']) expect(hooked.test(tool), tool).toBe(true)
+    expect(HOOK_FREE_READ_TOOLS).toHaveLength(10)
+    // The after-hooks still see every call (approve-once grants are spent there), and a CLI this
+    // app started waits past Conductor's own 15 s budget, so a late answer is Conductor's refusal.
+    expect(initializeHooks(f).PostToolUse).toEqual([{ hookCallbackIds: ['conductor_after'], timeout: 20 }])
+  })
+
+  it('times every hook answer for app.state', async () => {
+    const f = fixture(); await f.adapter.start()
+    f.transport.receive(hook('timed', 'conductor_before', 'tool', 'Bash', { command: 'npm test' }))
+    await flush()
+    expect(claudeHookHealth()).toMatchObject({ unreachable: false, answered: 1, failures: 0, slow: 0, lastFailureAt: null })
+  })
+
+  it('shows calls refused for want of a hook answer as one notice per runtime, flags app.state and marks the payload for the next briefing', async () => {
+    const f = fixture(); await f.adapter.start(); await f.adapter.submit('Synthetic', settings)
+    for (const id of ['toolu_h1', 'toolu_h2']) {
+      f.transport.receive(toolUse(id, 'Bash', { command: 'npm test' }))
+      f.transport.receive({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, is_error: true, content: 'PreToolUse hook did not respond before its timeout (host client may be unreachable). The tool call was not executed; other configured hooks may not have completed.' }] } })
+    }
+    f.transport.receive({ type: 'result', subtype: 'success', is_error: false, result: 'Done', usage: {}, modelUsage: {} })
+    await f.adapter.submit('Again', settings)
+    f.transport.receive(toolUse('toolu_h3', 'Edit', { file_path: 'a.txt' }))
+    f.transport.receive({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_h3', is_error: true, content: 'PreToolUse hook failed with an unexpected error. The tool call was not executed; other configured hooks may not have completed.' }] } })
+    await flush()
+    const notices = f.projection().items.filter(item => item.data.type === 'notice' && (item.data.payload as { hookUnreachable?: unknown } | undefined)?.hookUnreachable)
+    expect(notices).toHaveLength(1)
+    expect(notices[0]!.data).toMatchObject({ payload: { hookUnreachable: { tool: 'Edit', count: 3 } }, message: expect.stringMatching(/unreachable.*refused Edit and 2 more calls.*Read-only tools \(Read, Glob, Grep, LS/) })
+    expect(f.projection().items.some(item => autoModeDenialOf(item.data))).toBe(false)
+    expect(claudeHookHealth()).toMatchObject({ unreachable: true, failures: 3, lastFailure: expect.stringMatching(/^PreToolUse hook failed/) })
+    expect(claudeHookHealth(Date.now() + 11 * 60_000).unreachable).toBe(false)
+  })
+
+  it('keeps one classifier-outage notice per runtime across turns, counting the latest turn', async () => {
+    const f = fixture(); await f.adapter.start()
+    for (const [turn, ids] of [['one', ['toolu_c1', 'toolu_c2']], ['two', ['toolu_c3']]] as const) {
+      await f.adapter.submit(turn, settings)
+      for (const id of ids) {
+        f.transport.receive(toolUse(id, 'Bash', { command: 'npm test' }))
+        f.transport.receive({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, is_error: true, content: 'The server-side auto mode classifier gave no verdict (error), so auto mode cannot determine the safety of Bash.' }] } })
+      }
+      f.transport.receive({ type: 'result', subtype: 'success', is_error: false, result: 'Done', usage: {}, modelUsage: {} })
+      await flush()
+    }
+    const notices = f.projection().items.filter(item => item.data.type === 'notice' && (item.data.payload as { classifierUnavailable?: unknown } | undefined)?.classifierUnavailable)
+    expect(notices).toHaveLength(1)
+    expect(notices[0]!.data).toMatchObject({ payload: { classifierUnavailable: { toolUseId: 'toolu_c3', count: 1 } } })
   })
 })

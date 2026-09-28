@@ -7,7 +7,7 @@ import { ConductorDatabase } from './database'
 import { MEMORY_PROTOCOL } from './memory'
 import type { CoworkerBriefingOptions } from './agent-collaboration-store'
 import { COWORKER_OPENED_PREFIX } from './coworker-autoclose'
-import { CONTEXT_RESET, FINISH_HINT, MEMORY_HEADING, LOCAL_ASSIST_HINT, SHELL_HYGIENE_HINT, TurnBriefings, handoffNudge, SUCCESSION_HINT, SUCCESSION_PERCENT, SUCCESSION_TURNS, successionNudge, coworkerHint } from './turn-briefing'
+import { CONTEXT_RESET, OUTAGE_NUDGES, FINISH_HINT, MEMORY_HEADING, LOCAL_ASSIST_HINT, SHELL_HYGIENE_HINT, TurnBriefings, handoffNudge, SUCCESSION_HINT, SUCCESSION_PERCENT, SUCCESSION_TURNS, successionNudge, coworkerHint } from './turn-briefing'
 
 const roots: string[] = [], databases: ConductorDatabase[] = []
 afterEach(() => {
@@ -365,5 +365,44 @@ describe('telling a main brain when to pass itself on', () => {
   it('points a main brain at the successor form of the ordinary context-band nudge', () => {
     expect(handoffNudge(60, true)).toContain('agents.handoff({handoff, successor:true})')
     expect(handoffNudge(60)).not.toContain('successor')
+  })
+})
+
+describe('outage nudges (harness gap H16)', () => {
+  const outage = (kind: 'classifierUnavailable' | 'hookUnreachable') => ({ type: 'notice' as const, message: 'outage', payload: { [kind]: { tool: 'Bash', count: 1 } } })
+
+  it('tells the next message once per runtime what to do about a classifier outage or an unreachable hook', () => {
+    const f = fixture()
+    f.briefings.compose(f.spec, 'Start the work', 'item-1', '')
+    f.starting('runtime-1')
+    // Nothing happened: no nudge.
+    expect(f.briefings.compose(f.spec, 'Continue', 'item-2', 'runtime-1')).not.toContain('Retry')
+    // An outage notice is updated in place many times; the next message carries its rule once.
+    for (let i = 0; i < 3; i++) f.briefings.observe(f.spec, { runtimeId: 'runtime-1', data: outage('classifierUnavailable') })
+    const told = f.briefings.compose(f.spec, 'Continue', 'item-3', 'runtime-1')
+    expect(told.split(OUTAGE_NUDGES.classifierUnavailable)).toHaveLength(2)
+    expect(told).toContain('Retry the same call in 60 s; if it is still refused after 3 tries, request_permission for it.')
+    // A second outage in the same runtime is not news; a different kind is.
+    f.briefings.observe(f.spec, { runtimeId: 'runtime-1', data: outage('classifierUnavailable') })
+    f.briefings.observe(f.spec, { runtimeId: 'runtime-1', data: outage('hookUnreachable') })
+    const next = f.briefings.compose(f.spec, 'Continue', 'item-4', 'runtime-1')
+    expect(next).not.toContain(OUTAGE_NUDGES.classifierUnavailable)
+    expect(next).toContain(OUTAGE_NUDGES.hookUnreachable)
+    // A compaction forgets it, so the rule is sent again with the next outage.
+    f.briefings.observe(f.spec, { runtimeId: 'runtime-1', data: { type: 'notice', message: 'compacted', payload: { [CONTEXT_RESET]: true } } })
+    f.briefings.observe(f.spec, { runtimeId: 'runtime-1', data: outage('classifierUnavailable') })
+    expect(f.briefings.compose(f.spec, 'Continue', 'item-5', 'runtime-1')).toContain(OUTAGE_NUDGES.classifierUnavailable)
+  })
+
+  it('remembers across an app restart that a resumed session was already told', () => {
+    const native = { id: 'native-1' }
+    const f = fixture('claude', native)
+    f.briefings.compose(f.spec, 'Start the work', 'item-1', 'runtime-1')
+    f.briefings.observe(f.spec, { runtimeId: 'runtime-1', data: outage('hookUnreachable') })
+    expect(f.briefings.compose(f.spec, 'Continue', 'item-2', 'runtime-1')).toContain(OUTAGE_NUDGES.hookUnreachable)
+    const next = f.launch()
+    // The outage is seen before the new launch has sent this conversation anything.
+    next.observe(f.spec, { runtimeId: 'runtime-2', data: outage('hookUnreachable') })
+    expect(next.compose(f.spec, 'Continue', 'item-3', 'runtime-2')).not.toContain(OUTAGE_NUDGES.hookUnreachable)
   })
 })

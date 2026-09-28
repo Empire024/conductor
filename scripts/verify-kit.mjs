@@ -1047,10 +1047,12 @@ export function suppliedControl(env = process.env) {
   return { endpoint, token, ...(projectId ? { projectId } : {}), ...(workspaceId ? { workspaceId } : {}) }
 }
 
-/** Mid-turn tabs from one agents.list call through the caller's own supplied credential. A
- *  conversation credential is bound to its own workspace (the server ignores a request scope), and
- *  its list also carries the tabs it may reach elsewhere, marked crossProject - even a same-project
- *  tab in another workspace - so the caller's project is decided by projectId, not by that flag.
+/** Mid-turn tabs from one agents.list({load:true}) call through the caller's own supplied
+ *  credential: every agent tab in every workspace of every project co-open in the window, so the
+ *  caller's project counts its other workspaces too. A conversation credential is bound to its own
+ *  workspace (the server ignores a request scope); an older build ignores load and answers its plain
+ *  list, where crossProject also marks same-project tabs elsewhere, so the caller's project is
+ *  decided by projectId, not by that flag.
  *  count/tabs: this project's tabs in MID_TURN_PHASES; waiting: this project's tabs waiting on an
  *  approval; elsewhere: other projects' active tabs. The last two are INFO for judgeLoad. A missing
  *  credential or a refused or malformed answer is count null (unknown, so not quiet), never zero.
@@ -1059,7 +1061,7 @@ export async function midTurnTabs({ control = suppliedControl(), fetchImpl = fet
   if (!control) return { count: null, tabs: [], waiting: [], elsewhere: [], note: 'no supplied control credential (CONDUCTOR_CONTROL_ENDPOINT / CONDUCTOR_CONTROL_TOKEN); the owner credential is never used' }
   const scope = control.projectId ? { projectId: control.projectId, ...(control.workspaceId ? { workspaceId: control.workspaceId } : {}) } : undefined
   try {
-    const response = await fetchImpl(control.endpoint, { method: 'POST', headers: { Authorization: `Bearer ${control.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ method: 'agents.list', args: {}, ...(scope ? { scope } : {}) }), signal: AbortSignal.timeout(timeoutMs) })
+    const response = await fetchImpl(control.endpoint, { method: 'POST', headers: { Authorization: `Bearer ${control.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ method: 'agents.list', args: { load: true }, ...(scope ? { scope } : {}) }), signal: AbortSignal.timeout(timeoutMs) })
     let body
     try { body = await response.json() } catch { throw new Error(`agents.list -> ${response.status} (unreadable body)`) }
     if (response.status !== 200 || body?.error) throw new Error(`agents.list -> ${response.status}`)

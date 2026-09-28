@@ -38,6 +38,7 @@ import { ApprovalReviews } from './approval-review'
 import { sinceCursor, supervise } from './agent-supervision'
 import { CoworkerRecovery } from './coworker-recovery'
 import { displaySessionPhase } from '../shared/project-activity'
+import { claudeHookHealth } from './providers/claude'
 import { localStopOf } from '../shared/local-stop.ts'
 import { summarizeContext, summarizeUsage } from '../shared/usage-accounting'
 import { normaliseContract } from './local-models/completion.ts'
@@ -177,7 +178,7 @@ const toolSignatures = {
   'tabs.split': '({tabId,direction:"horizontal"|"vertical",projectId?,workspaceId?})',
   'tabs.detach': '({tabId,projectId?,workspaceId?})',
   'tabs.close': '({tabId,projectId?,workspaceId?}) — closes settled agent tabs with history retained; other tabs and active work require owner confirmation; never closes the caller or its ancestors; a coworker this caller controls in a sibling project closes under the same rule and its control link is released',
-  'agents.list': '() — visible native sessions plus live orphans in this workspace (orphaned:true, tabId:null; agents.resume reopens them), with observedAt, workspace/tab IDs, phase and lastActivityAt (phase "viewing" with backgroundTasks N: the turn ended but background tasks it started still run and the agent continues when they finish - not done), coworkers this caller dispatched that finished and closed their tab, in any project (finished:true, tabId:null; agents.steer reopens one and starts a turn), including tabs this caller controls in a sibling project (controlled:true) and sibling-project tabs nobody controls (controlled:false); an uncontrolled one may be read with agents.snapshot/status/history and steered with submit/steer/interrupt, and submit/steer take control of it; a controlled one answers every agents.* and tabs.* method as a coworker in this workspace does',
+  'agents.list': '({load?}) — load:true instead returns a compact read-only list (tabId, agentSessionId, title, provider, phase, projectId, workspaceId, crossProject, backgroundTasks) of every agent tab in every workspace of every project co-open in this window, for a smoke\'s load check; refused for a conversation a paired machine drives. Without it: visible native sessions plus live orphans in this workspace (orphaned:true, tabId:null; agents.resume reopens them), with observedAt, workspace/tab IDs, phase and lastActivityAt (phase "viewing" with backgroundTasks N: the turn ended but background tasks it started still run and the agent continues when they finish - not done), coworkers this caller dispatched that finished and closed their tab, in any project (finished:true, tabId:null; agents.steer reopens one and starts a turn), including tabs this caller controls in a sibling project (controlled:true) and sibling-project tabs nobody controls (controlled:false); an uncontrolled one may be read with agents.snapshot/status/history and steered with submit/steer/interrupt, and submit/steer take control of it; a controlled one answers every agents.* and tabs.* method as a coworker in this workspace does',
   'agents.snapshot': '({agentSessionId}) — agentSessionId is required and must be one listed by agents.list; observed native state, pending/running tools and recent output/results; refresh to verify older briefing intents',
   'agents.history': '({agentSessionId,afterSequence?}) — incremental native events',
   'agents.artifact': '({agentSessionId,artifactId}) — the full text of a tool output the history only carries a tail of (the outputArtifactId on a tool event), up to 2 MiB',
@@ -212,8 +213,8 @@ const toolSignatures = {
   'app.update': '() — build this Conductor checkout and publish it to the installed app’s local update feed, the same work as `npm run update:local`; returns at once, so poll app.update.status. A native coworker in Auto builds without asking; below Auto, and for a local model, the owner confirms each build unless a non-local coworker has pre-authorized this conversation with app.update.authorize. No installer is ever run: the app offers “Update pending” and the owner (or a wizard tab) installs it',
   'app.update.status': '() — state, version, log tail and result of the local update build',
   'git.status': '() — branch, ahead/behind, head and changed files of this project’s repository, and whether a release workflow is verified after a push',
-  'git.ship': '({message,paths?,publish?,mac?,waitSeconds?}) — deliver finished work in one call. Conductor freezes changed paths as Git blobs, verifies that snapshot with parallel tests/build, and commits those exact blobs as a local commit on the host with the owner’s credentials; later disk edits stay uncommitted and are reported. Nothing is pushed or released unless publish: true — for the owner, a wizard tab or a controller publishing a finished batch, never a dispatched coworker — also pushes, starts the release workflow (with the Mac build unless mac: false) and checks its Windows and Mac assets. Never escalate your sandbox for git/gh or run these steps yourself. Returns the run; waitSeconds (max 100) blocks until it settles or that time passes, then keep polling git.ship.status',
-  'git.ship.status': '({runId?,waitSeconds?}) — the running or latest delivery of this project: each stage with its log tail, commit, release tag and error; waitSeconds (max 100) long-polls until the run settles',
+  'git.ship': '({message,paths?,publish?,mac?,waitSeconds?}) — deliver finished work in one call. Conductor freezes changed paths as Git blobs, verifies that snapshot with parallel tests/build, and commits those exact blobs as a local commit on the host with the owner’s credentials; later disk edits stay uncommitted and are reported. Nothing is pushed or released unless publish: true — for the owner, a wizard tab or a controller publishing a finished batch, never a dispatched coworker — also pushes, starts the release workflow (with the Mac build unless mac: false) and checks its Windows and Mac assets. Never escalate your sandbox for git/gh or run these steps yourself. Returns the run; waitSeconds (max 100) blocks until it settles or that time passes, then keep polling git.ship.status. A ship while another delivery of this project runs is queued, never refused: it returns status:"queued" with runId, behind (the run ahead of it) and position, starts by itself when that settles, and runs its own preflight then. Only a running or failed stage carries its log (last 15 lines)',
+  'git.ship.status': '({runId?,waitSeconds?}) — your own most recent delivery in this project (the project\'s latest, with a note, if you have none); runId reads any of the project\'s last 10 runs, queued, running or finished: each stage (log only for a running or failed stage, last 15 lines), commit, release tag and error, and status:"queued" with behind and position while it waits its turn; waitSeconds (max 100) long-polls until the run settles',
   'local.servers': '() — the local model (llama.cpp) servers running on this machine: model, pid, port, start time, whether this Conductor started them, and which conversations of this project use each and whether one is mid-turn. The machine holds one at a time; this is where to look before starting or stopping one',
   'local.stop': '({model?,pid?,force?}) — stop one running local model server this Conductor started, named by model or pid (both from local.servers), in one call. Refused while a turn is using it unless force:true, which asks the owner first (a wizard tab is the owner) and fails that turn; a server Conductor did not start is never stopped. The next local turn starts its server again',
   'usage.limits': '({provider?}) — zero-turn read of the newest account allowance each provider reported: per provider and bucket (Claude five_hour, seven_day and model windows such as Fable weekly; Codex primary/secondary per limit bucket with its credits), usedPercent, resetsAt, windowMinutes, observedAt with its age and the conversation that reported it. A window whose resetsAt has passed says state "reset" (its current use is unknown until the provider reports again); a provider that reported nothing, or does not report an allowance at all (Grok), says status "unknown" and why. Figures are the provider’s own; nothing is estimated. Also carries localSavings: the conductor-local MCP tools\' (run_and_summarize, local_ask, summarize_file) measured frontier-token savings over the last 7 days — calls, modelCalls, localInputTokens/localOutputTokens and tokensSaved — or null where local assist is not wired',
@@ -239,11 +240,17 @@ type ProjectWizard = { agentSessionId: string; title: string; workspaceId: strin
 /** The conversations that handed a wizard work from another project, which it may reply to. */
 const HANDED_IN_PREFIX = 'agentControlHandedIn:'
 
+/** One agent tab in agents.list({load:true}). */
+type LoadListEntry = { tabId: string; agentSessionId: string; title: string; provider: unknown; phase: string | null; projectId: string; workspaceId: string; crossProject: boolean; backgroundTasks: number }
+
 export interface DeliveryControl {
   status(projectId: string, cwd: string): Promise<RepositoryStatus>
   current(projectId: string): DeliveryRun | null
-  ship(projectId: string, cwd: string, request: { message: string; paths?: string[]; publish?: boolean; mac?: boolean }, requestedBy: DeliveryRequester): DeliveryRun
+  ship(projectId: string, cwd: string, request: { message: string; paths?: string[]; publish?: boolean; mac?: boolean }, requestedBy: DeliveryRequester, options?: { queue?: boolean }): DeliveryRun
   wait(projectId: string, runId: string, timeoutMs: number): Promise<DeliveryRun>
+  find(projectId: string, runId: string): DeliveryRun | null
+  latestBy(projectId: string, requester: DeliveryRequester): DeliveryRun | null
+  queuePosition(projectId: string, runId: string): { position: number; behind: string } | null
 }
 
 /** What the owner credential may do to the app itself: register a folder as a project, drive the
@@ -994,6 +1001,26 @@ export class AgentControl {
     return found
   }
 
+  /** agents.list({load:true}): every agent tab in every project co-open in this window, every
+   *  workspace included, compact and read-only, so a smoke's load check sees the same project's
+   *  other workspaces and can tell other projects (crossProject) apart as INFO. Control is not
+   *  implied: steering still goes through target(). A paired machine's conversation is refused, as
+   *  every other cross-project read is. */
+  private loadList(scope: AgentControlScope): LoadListEntry[] {
+    if (this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)?.state?.remotePeerId) throw new Error('This conversation is driven by a paired machine and stays inside the project shared with it; agents.list({load:true}) reads every co-open project, so use agents.list() instead')
+    const found: LoadListEntry[] = []
+    for (const project of this.deps.database.listProjects()) {
+      for (const workspace of this.deps.database.listSessions(project.id)) {
+        for (const tab of this.tabs({ projectId: project.id, sessionId: workspace.id, agentSessionId: scope.agentSessionId })) {
+          if (tab.kind !== 'agent' || !tab.resourceId) continue
+          const state = this.deps.database.structured.snapshot(tab.resourceId)
+          found.push({ tabId: tab.id, agentSessionId: tab.resourceId, title: tab.title, provider: tab.state?.provider, phase: state ? displaySessionPhase(state.phase, state.backgroundTasks) : null, projectId: project.id, workspaceId: workspace.id, crossProject: project.id !== scope.projectId, backgroundTasks: state?.backgroundTasks ?? 0 })
+        }
+      }
+    }
+    return found
+  }
+
   /** Resolves an optional projectId/workspaceId onto a co-open project. Omitting both always
    *  means the caller's own workspace, so every existing call keeps its exact meaning. */
   private sibling(scope: AgentControlScope, args: Args): AgentControlScope {
@@ -1292,7 +1319,7 @@ export class AgentControl {
     }
     if (method === 'local.servers' || method === 'local.stop') return this.localServers(scope, source, method, args)
     if (scope.owner && !scope.projectId) throw new Error(`${method} needs a project: none is open in this Conductor yet. Register one with projects.open({path}) and pass its id as scope.projectId`)
-    if (method === 'app.state') return { observedAt: new Date().toISOString(), projectId: scope.projectId, workspaceId: scope.sessionId, project: database.getProject(scope.projectId), workspace: database.getSession(scope.sessionId), tabs: this.tabs(scope), relationships: this.listLinks(scope.projectId, scope.sessionId).map(link => ({ agentSessionId: link.targetAgentSessionId, controllerAgentSessionId: link.controllerAgentSessionId })), machineId: this.callerMachineId(scope), machines: this.machines(), projects: this.projects(scope), ...(sovereign(scope) ? { owner: scope.owner === true, wizard: scope.wizard === true, appVersion: this.deps.host?.version ?? null, pid: this.deps.host?.pid ?? null, updates: this.deps.host?.updates?.state() ?? null, restartRequest: this.deps.host?.restartRequest?.() ?? null, pendingQuitConfirmation: this.deps.host?.stopConfirmation?.pending() ?? null } : {}) }
+    if (method === 'app.state') return { observedAt: new Date().toISOString(), projectId: scope.projectId, workspaceId: scope.sessionId, project: database.getProject(scope.projectId), workspace: database.getSession(scope.sessionId), tabs: this.tabs(scope), relationships: this.listLinks(scope.projectId, scope.sessionId).map(link => ({ agentSessionId: link.targetAgentSessionId, controllerAgentSessionId: link.controllerAgentSessionId })), machineId: this.callerMachineId(scope), machines: this.machines(), projects: this.projects(scope), ...(sovereign(scope) ? { owner: scope.owner === true, wizard: scope.wizard === true, appVersion: this.deps.host?.version ?? null, pid: this.deps.host?.pid ?? null, updates: this.deps.host?.updates?.state() ?? null, restartRequest: this.deps.host?.restartRequest?.() ?? null, pendingQuitConfirmation: this.deps.host?.stopConfirmation?.pending() ?? null, claudeHooks: claudeHookHealth() } : {}) }
     if (method === 'machines.list') {
       // Whether this computer comes back by itself after a reboot (feature always-on-machines).
       const readiness = await this.deps.localReadiness?.().catch(() => null) ?? null
@@ -1343,6 +1370,8 @@ export class AgentControl {
       return this.handoff(scope, args)
     }
     if (method === 'agents.list') {
+      if (args.load !== undefined && typeof args.load !== 'boolean') throw new Error('agents.list load must be true or false')
+      if (args.load === true) return this.loadList(scope)
       const observedAt = new Date().toISOString()
       const tabs = this.tabs(scope).filter(tab => tab.kind === 'agent')
       const own = tabs.map(tab => {
@@ -2035,12 +2064,33 @@ export class AgentControl {
       return Math.min(args.waitSeconds, 100) * 1000
     }
     const settle = async (run: DeliveryRun | null): Promise<DeliveryRun | null> => run && run.state === 'running' && wait() ? delivery.wait(scope.projectId, run.id, wait()) : run
+    // The panel keeps every stage's full log; a caller gets only what it can act on: the last
+    // lines of a running or failed stage, never a passed build's asset list.
+    const view = (run: DeliveryRun, note?: string): Record<string, unknown> => {
+      const queued = delivery.queuePosition(scope.projectId, run.id)
+      const stages = run.stages.map(({ log, ...stage }) => stage.state === 'running' || stage.state === 'failed' ? { ...stage, log: log.slice(-15) } : stage)
+      const queueNote = queued ? `Queued behind ${queued.behind} (position ${queued.position}); it starts by itself when that delivery settles and verifies the tree as it is then. Poll git.ship.status({runId:"${run.id}",waitSeconds:100}).` : undefined
+      const notes = [note, queueNote].filter(Boolean).join(' ')
+      return { ...run, stages, ...(queued ? { runId: run.id, status: 'queued', behind: queued.behind, position: queued.position } : {}), ...(notes ? { note: notes } : {}) }
+    }
     if (method === 'git.status') return delivery.status(scope.projectId, source.cwd)
     if (method === 'git.ship.status') {
       if (Object.keys(args).some(key => !['runId', 'waitSeconds'].includes(key))) throw new Error('git.ship.status accepts only runId and waitSeconds')
-      const run = delivery.current(scope.projectId)
-      if (args.runId !== undefined && run?.id !== text(args, 'runId', 160)) throw new Error('That delivery is no longer the latest one for this project')
-      return await settle(run) ?? { state: 'idle', note: 'No delivery has run for this project since Conductor started.' }
+      let run: DeliveryRun | null, note: string | undefined
+      if (args.runId !== undefined) {
+        const runId = text(args, 'runId', 160)
+        run = delivery.find(scope.projectId, runId)
+        if (!run) throw new Error(`No delivery ${runId} is known for this project; Conductor keeps the last 10 runs of each project since it started. Call git.ship.status({}) for your own most recent one`)
+      } else {
+        // The caller's own newest run, not whichever delivery of the project happens to be latest.
+        run = delivery.latestBy(scope.projectId, scope.owner ? { kind: 'owner' } : { kind: 'agent', agentSessionId: scope.agentSessionId, title: source.title })
+        if (!run) {
+          run = delivery.current(scope.projectId)
+          if (run) note = `You have not shipped in this project since Conductor started; this is the project's latest delivery, requested by ${run.requestedBy.kind === 'agent' ? `"${run.requestedBy.title}"` : 'the owner'}.`
+        }
+      }
+      const settled = await settle(run)
+      return settled ? view(settled, note) : { state: 'idle', note: 'No delivery has run for this project since Conductor started.' }
     }
     if (method !== 'git.ship') throw new Error('Unknown control method; use tools.list')
     if (Object.keys(args).some(key => !['message', 'paths', 'publish', 'mac', 'waitSeconds'].includes(key))) throw new Error('git.ship accepts only message, paths, publish, mac and waitSeconds')
@@ -2058,8 +2108,9 @@ export class AgentControl {
     const publish = args.publish === true
     if (source.provider === 'local') await this.ask(scope, publish ? `${source.title} wants to test, build and commit this project, push it and publish its release.` : `${source.title} wants to test, build and commit this project on this machine (no push, no release).`, 'deliver this project')
     this.authorize(scope)
-    const run = delivery.ship(scope.projectId, source.cwd, { message, ...(paths ? { paths } : {}), ...(publish ? { publish } : {}), ...(publish && args.mac === false ? { mac: false } : {}) }, scope.owner ? { kind: 'owner' } : { kind: 'agent', agentSessionId: scope.agentSessionId, title: source.title })
-    return settle(run)
+    // A second ship while another delivery of this project runs is queued behind it, never refused.
+    const run = delivery.ship(scope.projectId, source.cwd, { message, ...(paths ? { paths } : {}), ...(publish ? { publish } : {}), ...(publish && args.mac === false ? { mac: false } : {}) }, scope.owner ? { kind: 'owner' } : { kind: 'agent', agentSessionId: scope.agentSessionId, title: source.title }, { queue: true })
+    return view((await settle(run))!)
   }
 
   /**

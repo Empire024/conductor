@@ -133,7 +133,14 @@ its stdio, which the host already relays and buffers; its MCP tools (the browser
 - Hooks: a hosted Claude CLI registers its hooks with a 900 s timeout instead of 15 s, so a hook
   sent while no app runs (an update install, then the new process's slow first minute: 45 s + 55 s
   on 2026-09-25) waits in the host for the next app instead of failing every tool call of the turn.
-  The adapter still answers within 15 s itself, or fails the hook (the tool is not run).
+  The adapter still answers within 15 s itself, or fails the hook (the tool is not run); a CLI the
+  app started waits 20 s, so a late answer is Conductor's refusal and not the CLI's "host client
+  may be unreachable". Read-only tools (Read, Glob, Grep, LS, NotebookRead and the Conductor MCP
+  tools annotated readOnlyHint) are left out of the PreToolUse matcher (`PRE_TOOL_USE_MATCHER` in
+  providers/claude.ts, harness gap H16), so they never wait for the hook and keep working while it
+  is unreachable; every other tool stays fail-closed. A refusal for want of a hook answer shows one
+  notice per runtime, the next message tells the agent to retry, and app.state's `claudeHooks`
+  (owner and wizard scope) carries `unreachable`, round-trip times and the last failure.
 - Approvals have no provider-side timeout; the reattached adapter restates them and the answer
   goes out through the host.
 - MCP: the host runs a loopback HTTP relay (`runtime-host/relay.ts`). An adapter whose process is

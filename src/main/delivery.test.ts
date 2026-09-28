@@ -493,6 +493,62 @@ describe('DeliveryService pipeline', () => {
     expect((await h.service.wait('p1', first.id, 5000)).state).toBe('delivered')
   })
 
+  it('queues a second delivery behind the running one and keeps both readable by runId', async () => {
+    let release!: () => void
+    let tests = 0
+    const h = harness({ replies: { 'npx vitest run': () => ++tests === 1 ? new Promise<Reply>(resolve => { release = () => resolve({}) }) : {} } })
+    const agent = { kind: 'agent' as const, agentSessionId: 's1', title: 'Worker A' }
+    const first = h.service.ship('p1', h.root, { message: 'one' }, { kind: 'owner' }, { queue: true })
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+    const second = h.service.ship('p1', h.root, { message: 'two' }, agent, { queue: true })
+    const third = h.service.ship('p1', h.root, { message: 'three' }, agent, { queue: true })
+    expect(second.state).toBe('running')
+    expect(second.stages[0]!).toMatchObject({ state: 'pending', detail: `Queued behind ${first.id}; starts by itself when that delivery settles.` })
+    expect(h.service.queuePosition('p1', second.id)).toEqual({ position: 1, behind: first.id })
+    expect(h.service.queuePosition('p1', third.id)).toEqual({ position: 2, behind: second.id })
+    expect(h.service.current('p1')!.id).toBe(first.id)
+    expect(h.service.latestBy('p1', agent)!.id).toBe(third.id)
+    expect(h.service.latestBy('p1', { kind: 'owner' })!.id).toBe(first.id)
+    // Another project on the same folder is still refused outright.
+    expect(() => h.service.ship('p2', h.root, { message: 'x' }, { kind: 'owner' }, { queue: true })).toThrow(/already running for this folder/)
+    release()
+    const done = await h.service.wait('p1', third.id, 5000)
+    expect(done.state).toBe('delivered')
+    // The superseded runs still answer with their own final state.
+    expect((await h.service.wait('p1', first.id, 0)).state).toBe('delivered')
+    expect(h.service.find('p1', second.id)).toMatchObject({ state: 'delivered', message: 'two' })
+    expect(h.service.find('p1', second.id)!.stages[0]!.detail).not.toMatch(/Queued/)
+    expect(h.service.queuePosition('p1', second.id)).toBeNull()
+    expect(tests).toBe(3)
+    expect(h.calls.filter(call => call.args[0] === 'commit')).toHaveLength(3)
+  })
+
+  it('reports a queued run whose own preflight fails on that run alone', async () => {
+    let release!: () => void
+    let tests = 0
+    const h = harness({ replies: { 'npx vitest run': () => ++tests === 1 ? new Promise<Reply>(resolve => { release = () => resolve({}) }) : {} } })
+    const first = h.service.ship('p1', h.root, { message: 'one' }, { kind: 'owner' }, { queue: true })
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+    const second = h.service.ship('p1', h.root, { message: 'two', paths: ['src/missing.ts'] }, { kind: 'owner' }, { queue: true })
+    release()
+    const failed = await h.service.wait('p1', second.id, 5000)
+    expect(failed.state).toBe('failed')
+    expect(failed.error).toMatch(/no changes to deliver: src\/missing\.ts/)
+    expect(failed.stages[0]!.state).toBe('failed')
+    expect(h.service.find('p1', first.id)!.state).toBe('delivered')
+  })
+
+  it('keeps the last ten runs per project and names an unknown one', async () => {
+    const h = harness()
+    const ids: string[] = []
+    for (let index = 0; index < 12; index++) ids.push((await h.ship({ message: `run ${index}`, publish: false })).id)
+    expect(h.service.find('p1', ids[0]!)).toBeNull()
+    expect(h.service.find('p1', ids[1]!)).toBeNull()
+    expect(h.service.find('p1', ids[2]!)!.message).toBe('run 2')
+    await expect(h.service.wait('p1', ids[0]!, 0)).rejects.toThrow(/No delivery .* is known for this project; Conductor keeps the last 10 runs/)
+    expect((await h.service.wait('p1', ids[11]!, 0)).state).toBe('delivered')
+  })
+
   it('refuses paths that escape the repository', async () => {
     for (const path of ['../outside.ts', 'C:\\Windows\\x', '/etc/passwd', 'src/../../x']) {
       const h = harness()

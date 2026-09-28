@@ -56,6 +56,15 @@ export const FINISH_HINT = 'When your work is delivered and reported, end with a
 export const coworkerHint = (controller: { id: string; title?: string }): string =>
   `You are a coworker of ${controller.title ? `"${controller.title}" (${controller.id})` : controller.id}. Report results with report (agents.report({text}), up to 2000 characters); send_message to ${controller.id} reaches it too. ${FINISH_HINT}`
 
+/** Claude Code refusals that are outages, not verdicts (harness gap H16). An adapter marks the
+ *  notice it posts with one of these payload keys; the next message then carries the matching
+ *  nudge, once per runtime, so the agent retries instead of stopping or handing the call to the owner. */
+export const OUTAGE_NUDGES = {
+  classifierUnavailable: 'Claude\'s auto-mode classifier is unavailable; this is transient. Retry the same call in 60 s; if it is still refused after 3 tries, request_permission for it.',
+  hookUnreachable: 'Conductor\'s tool hook was unreachable for a while (the app restarting or stalled), so Claude Code refused tool calls without judging them. Retry the refused calls now; reads never wait for the hook. If they are refused again the same way, report it to your controller instead of working around it.'
+} as const
+type OutageKind = keyof typeof OUTAGE_NUDGES
+
 /** Context bands at which a conversation is told, once each per runtime, to hand its remaining
  *  work to a fresh tab. Two bands, not one threshold: docs/token-thrift-policy.md shows the
  *  payback varies by model and cache ratio, so the first is a prompt to plan and the second a
@@ -114,6 +123,8 @@ interface Ledger {
   nudgedBand: number
   /** Whether this runtime has been told when a main brain hands off to a successor. */
   successionHinted: boolean
+  /** The outage nudges this runtime has had (OUTAGE_NUDGES). */
+  outagesNudged: Set<OutageKind>
 }
 
 /** Providers whose resumed session reloads its whole transcript, so a new process on the same
@@ -133,6 +144,7 @@ interface StoredLedger {
   leases: Array<[string, SentLease]>
   nudgedBand: number
   successionHinted: boolean
+  outagesNudged?: OutageKind[]
 }
 
 const digest = (text: string): string | undefined => text ? createHash('sha256').update(text).digest('hex').slice(0, 16) : undefined
@@ -175,7 +187,7 @@ export class TurnBriefings {
     // (local-models/briefing.ts).
     if (local) return memory
     const coworkers = this.coworkers(spec, ledger)
-    const text = [memory, staticDue ? MEMORY_PROTOCOL : '', coworkers, staticDue ? projectTaskBriefing(spec) : '', staticDue ? [this.deps.machine?.() ?? '', LOCAL_ASSIST_PROVIDERS.has(spec.provider) ? LOCAL_ASSIST_HINT : '', spec.provider === 'claude' ? PERMISSION_GRANT_HINT : '', spec.provider === 'claude' ? SHELL_HYGIENE_HINT : ''].filter(Boolean).join(' ') : '', staticDue ? control : '', staticDue ? this.coworkerHint(spec) : '', this.successionHint(ledger, context), this.succession(spec.id, context) || this.nudge(ledger, context)].filter(Boolean).join('\n\n')
+    const text = [memory, staticDue ? MEMORY_PROTOCOL : '', coworkers, staticDue ? projectTaskBriefing(spec) : '', staticDue ? [this.deps.machine?.() ?? '', LOCAL_ASSIST_PROVIDERS.has(spec.provider) ? LOCAL_ASSIST_HINT : '', spec.provider === 'claude' ? PERMISSION_GRANT_HINT : '', spec.provider === 'claude' ? SHELL_HYGIENE_HINT : ''].filter(Boolean).join(' ') : '', staticDue ? control : '', staticDue ? this.coworkerHint(spec) : '', this.successionHint(ledger, context), this.succession(spec.id, context) || this.nudge(ledger, context), this.outageNudges(spec.id, ledger)].filter(Boolean).join('\n\n')
     this.save(spec, ledger)
     return text
   }
@@ -225,12 +237,33 @@ export class TurnBriefings {
     return handoffNudge(Math.round(percent), context?.mainBrain === true)
   }
 
+  /** Outages seen since the conversation's last message, by conversation. Kept apart from the
+   *  ledger, which does not exist yet for a conversation this launch has not sent to. */
+  private readonly outages = new Map<string, Set<OutageKind>>()
+
+  /** Once per runtime per kind: an outage lasts many calls, and the rule does not change. */
+  private outageNudges(id: string, ledger: Ledger): string {
+    const seen = this.outages.get(id)
+    if (!seen) return ''
+    this.outages.delete(id)
+    const due = [...seen].filter(kind => !ledger.outagesNudged.has(kind))
+    for (const kind of due) ledger.outagesNudged.add(kind)
+    return due.map(kind => OUTAGE_NUDGES[kind]).join(' ')
+  }
+
   /** Watches a conversation for the two moments its runtime forgets: another provider session
-   *  and a compaction. */
+   *  and a compaction; and for the outages the next message has to explain. */
   observe(spec: AgentSpec, event: Pick<AgentEvent, 'runtimeId' | 'data'> & Partial<Pick<AgentEvent, 'nativeSessionId'>>): void {
+    const { data } = event
+    if (data.type === 'notice' && data.payload && typeof data.payload === 'object' && !Array.isArray(data.payload)) {
+      const payload = data.payload
+      for (const kind of Object.keys(OUTAGE_NUDGES) as OutageKind[]) if (payload[kind] && this.ledgers.get(spec.id)?.outagesNudged.has(kind) !== true) {
+        const seen = this.outages.get(spec.id) ?? new Set<OutageKind>()
+        this.outages.set(spec.id, seen.add(kind))
+      }
+    }
     const ledger = this.ledgers.get(spec.id)
     if (!ledger) return
-    const { data } = event
     if (data.type === 'session') {
       if (data.phase === 'starting' && event.runtimeId) {
         // The first prompt was composed before its process existed; this is that process.
@@ -252,12 +285,12 @@ export class TurnBriefings {
     }
   }
 
-  forget(agentSessionId: string): void { this.ledgers.delete(agentSessionId); this.succeeded.delete(agentSessionId) }
+  forget(agentSessionId: string): void { this.ledgers.delete(agentSessionId); this.succeeded.delete(agentSessionId); this.outages.delete(agentSessionId) }
 
   private ledger(spec: AgentSpec, runtimeId: string): Ledger {
     let ledger = this.ledgers.get(spec.id) ?? this.restore(spec, runtimeId)
     // A new ledger describes the provider session the conversation resumes, if it names one yet.
-    if (!ledger) ledger = { runtimeId, nativeSessionId: this.nativeSession(spec), staticSent: false, guidanceSent: false, memoryIds: new Set(), leases: new Map(), nudgedBand: 0, successionHinted: false }
+    if (!ledger) ledger = { runtimeId, nativeSessionId: this.nativeSession(spec), staticSent: false, guidanceSent: false, memoryIds: new Set(), leases: new Map(), nudgedBand: 0, successionHinted: false, outagesNudged: new Set() }
     else if (runtimeId && ledger.runtimeId && ledger.runtimeId !== runtimeId) this.newRuntime(spec, ledger, runtimeId, this.nativeSession(spec))
     else if (runtimeId) ledger.runtimeId = runtimeId
     this.ledgers.set(spec.id, ledger)
@@ -285,6 +318,7 @@ export class TurnBriefings {
     ledger.leases.clear()
     ledger.nudgedBand = 0
     ledger.successionHinted = false
+    ledger.outagesNudged.clear()
   }
 
   /** The ledger of a resumable conversation this app launch has not seen yet, if it was kept for
@@ -299,7 +333,8 @@ export class TurnBriefings {
       return {
         runtimeId, nativeSessionId: stored.nativeSessionId, staticSent: stored.staticSent === true, controlDigest: stored.controlDigest, guidanceSent: stored.guidanceSent === true,
         memoryIds: new Set(stored.memoryIds ?? []), coworkerSince: stored.coworkerSince, leases: new Map(stored.leases ?? []),
-        nudgedBand: Number(stored.nudgedBand) || 0, successionHinted: stored.successionHinted === true
+        nudgedBand: Number(stored.nudgedBand) || 0, successionHinted: stored.successionHinted === true,
+        outagesNudged: new Set((stored.outagesNudged ?? []).filter(kind => kind in OUTAGE_NUDGES))
       }
     } catch { return undefined /* An unreadable ledger only means the briefing is sent again. */ }
   }
@@ -308,7 +343,8 @@ export class TurnBriefings {
     if (!RESUMABLE_PROVIDERS.has(spec.provider) || !ledger.nativeSessionId || !this.deps.database.setSetting) return
     const stored: StoredLedger = {
       nativeSessionId: ledger.nativeSessionId, staticSent: ledger.staticSent, controlDigest: ledger.controlDigest, guidanceSent: ledger.guidanceSent,
-      memoryIds: [...ledger.memoryIds], coworkerSince: ledger.coworkerSince, leases: [...ledger.leases], nudgedBand: ledger.nudgedBand, successionHinted: ledger.successionHinted
+      memoryIds: [...ledger.memoryIds], coworkerSince: ledger.coworkerSince, leases: [...ledger.leases], nudgedBand: ledger.nudgedBand, successionHinted: ledger.successionHinted,
+      ...(ledger.outagesNudged.size ? { outagesNudged: [...ledger.outagesNudged] } : {})
     }
     try { this.deps.database.setSetting(BRIEFING_LEDGER_PREFIX + spec.id, JSON.stringify(stored)) }
     catch { /* The ledger saves briefing bytes; it never blocks a message. */ }

@@ -47,6 +47,8 @@ const DEFAULT_ASSETS = ['.exe', '.exe.blockmap', 'latest.yml']
 /** What an installed Mac app updates from (mac-zip-updater.ts reads latest-mac.yml and the zip). */
 const MAC_ASSETS = ['.dmg', '-mac.zip', '-mac.zip.blockmap', 'latest-mac.yml']
 const EMIT_INTERVAL_MS = 250
+/** Runs kept per project for wait() and status by runId: queued and running ones are never dropped. */
+const HISTORY_RUNS = 10
 
 // ---------------------------------------------------------------------------------------------
 // Host process helpers. Copied from local-update-build.ts rather than shared: inside a packaged
@@ -285,6 +287,8 @@ interface Active {
   settle: () => void
 }
 
+interface Queued { run: DeliveryRun; root: string; settle: () => void }
+
 interface Plan {
   root: string
   config: DeliveryConfig
@@ -361,6 +365,10 @@ export class DeliveryService {
   private readonly deps: DeliveryDependencies
   private readonly latest = new Map<string, DeliveryRun>()
   private readonly active = new Map<string, Active>()
+  /** Deliveries accepted while another of the same project ran; they start FIFO. */
+  private readonly queues = new Map<string, Queued[]>()
+  /** The last HISTORY_RUNS runs of each project, oldest first, queued ones included. */
+  private readonly history = new Map<string, DeliveryRun[]>()
   private readonly done = new Map<string, Promise<void>>()
   private readonly listeners = new Set<(run: DeliveryRun) => void>()
   private readonly emitTimers = new Map<string, NodeJS.Timeout>()
@@ -388,6 +396,28 @@ export class DeliveryService {
   current(projectId: string): DeliveryRun | null {
     const run = this.latest.get(projectId)
     return run ? snapshot(run) : null
+  }
+
+  /** One of the project's last HISTORY_RUNS runs, queued, running or finished. */
+  find(projectId: string, runId: string): DeliveryRun | null {
+    const run = this.history.get(projectId)?.find(entry => entry.id === runId)
+    return run ? snapshot(run) : null
+  }
+
+  /** The newest of the project's remembered runs this requester asked for. */
+  latestBy(projectId: string, requester: DeliveryRequester): DeliveryRun | null {
+    const same = (entry: DeliveryRequester): boolean => requester.kind === 'owner' ? entry.kind === 'owner' : entry.kind === 'agent' && entry.agentSessionId === requester.agentSessionId
+    const run = [...(this.history.get(projectId) ?? [])].reverse().find(entry => same(entry.requestedBy))
+    return run ? snapshot(run) : null
+  }
+
+  /** Where a queued run waits: 1 is next, behind is the run directly ahead of it. Null once it started. */
+  queuePosition(projectId: string, runId: string): { position: number; behind: string } | null {
+    const queue = this.queues.get(projectId) ?? []
+    const index = queue.findIndex(entry => entry.run.id === runId)
+    if (index < 0) return null
+    const behind = index ? queue[index - 1]!.run.id : this.active.get(projectId)?.run.id
+    return behind ? { position: index + 1, behind } : null
   }
 
   async status(projectId: string, cwd: string): Promise<RepositoryStatus> {
@@ -434,14 +464,19 @@ export class DeliveryService {
     }
   }
 
-  ship(projectId: string, cwd: string, request: { message: string; paths?: string[]; publish?: boolean; mac?: boolean }, requestedBy: DeliveryRequester): DeliveryRun {
+  /** queue: true accepts a delivery while another of this project runs; it waits its turn and runs
+   *  its own preflight when it starts, so it verifies the tree as it is then. Without it (the
+   *  Source control panel) a busy project refuses. Another project on the same folder always does. */
+  ship(projectId: string, cwd: string, request: { message: string; paths?: string[]; publish?: boolean; mac?: boolean }, requestedBy: DeliveryRequester, options: { queue?: boolean } = {}): DeliveryRun {
     const root = resolve(cwd)
     const key = process.platform === 'win32' ? root.toLowerCase() : root
     for (const [id, active] of this.active) {
       const activeKey = process.platform === 'win32' ? active.root.toLowerCase() : active.root
+      if (id === projectId && options.queue) continue
       if (id === projectId || activeKey === key) {
+        const by = active.run.requestedBy.kind === 'agent' ? ` (requested by "${active.run.requestedBy.title}")` : ' (requested by the owner)'
         throw new Error(active.run.state === 'running'
-          ? `Delivery ${active.run.id} is already running for this ${id === projectId ? 'project' : 'folder'}; wait for it or cancel it first.`
+          ? `Delivery ${active.run.id}${by} is already running for this ${id === projectId ? 'project' : 'folder'}; nothing was started. Wait for it to settle, then deliver again.`
           : `Delivery ${active.run.id} was cancelled and is still stopping its last command; try again in a moment.`)
       }
     }
@@ -459,18 +494,58 @@ export class DeliveryService {
     }
     let settle = (): void => {}
     this.done.set(run.id, new Promise<void>(resolvePromise => { settle = resolvePromise }))
+    this.remember(projectId, run)
+    const queue = this.queues.get(projectId) ?? []
+    const ahead = queue.at(-1)?.run ?? this.active.get(projectId)?.run
+    if (ahead) {
+      // Not emitted until it starts: the Source control panel keeps showing the run in progress.
+      this.stageOf(run, 'preflight').detail = `Queued behind ${ahead.id}; starts by itself when that delivery settles.`
+      queue.push({ run, root, settle })
+      this.queues.set(projectId, queue)
+      return snapshot(run)
+    }
+    this.start(projectId, run, root, settle)
+    return snapshot(run)
+  }
+
+  private start(projectId: string, run: DeliveryRun, root: string, settle: () => void): void {
     const active: Active = { run, root, controller: new AbortController(), finished: false, pushed: false, settle }
     this.active.set(projectId, active)
     this.latest.set(projectId, run)
     this.emit(run)
     void this.execute(active).catch(error => this.finalize(active, 'failed', `Delivery crashed: ${error instanceof Error ? error.message : String(error)}`))
-      .finally(() => { if (this.active.get(projectId) === active) this.active.delete(projectId) })
-    return snapshot(run)
+      .finally(() => {
+        if (this.active.get(projectId) === active) this.active.delete(projectId)
+        this.startNext(projectId)
+      })
+  }
+
+  private startNext(projectId: string): void {
+    if (this.active.has(projectId)) return
+    const queue = this.queues.get(projectId)
+    const next = queue?.shift()
+    if (!queue?.length) this.queues.delete(projectId)
+    if (!next) return
+    next.run.startedAt = this.deps.now().toISOString()
+    this.stageOf(next.run, 'preflight').detail = ''
+    this.start(projectId, next.run, next.root, next.settle)
+  }
+
+  private remember(projectId: string, run: DeliveryRun): void {
+    const runs = this.history.get(projectId) ?? []
+    runs.push(run)
+    while (runs.length > HISTORY_RUNS) {
+      const index = runs.findIndex(entry => entry.state !== 'running')
+      if (index < 0) break
+      this.done.delete(runs[index]!.id)
+      runs.splice(index, 1)
+    }
+    this.history.set(projectId, runs)
   }
 
   async wait(projectId: string, runId: string, timeoutMs: number): Promise<DeliveryRun> {
-    const run = this.latest.get(projectId)
-    if (!run || run.id !== runId) throw new Error(`No delivery ${runId} is known for this project.`)
+    const run = this.history.get(projectId)?.find(entry => entry.id === runId)
+    if (!run) throw new Error(`No delivery ${runId} is known for this project; Conductor keeps the last ${HISTORY_RUNS} runs of each project since it started.`)
     if (run.state === 'running') {
       let timer: NodeJS.Timeout | undefined
       await Promise.race([this.done.get(runId), new Promise<void>(resolvePromise => { timer = setTimeout(resolvePromise, Math.max(0, timeoutMs)); timer.unref?.() })])

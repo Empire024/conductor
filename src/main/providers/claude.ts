@@ -10,6 +10,9 @@ import { privateConfigFile, relayMcpConfigs, relaysMcp, removeConfigFiles } from
 import { PROVIDER_SAFEGUARD_REFUSAL, settingsForRuntime } from '../../shared/structured-agent'
 import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, classifierOutageMessage, classifierOutagePayload, classifierOutageStoppedTurn, hookDenialReason, isClassifierOutage, parseAutoModeDenialReason, type DenialGrantRequest } from '../../shared/auto-mode-denial'
 import { callMatchesRule, describeGrantRequest } from '../../shared/permission-grants'
+import { BROWSER_MCP_SERVER_NAME, BROWSER_TOOLS } from '../../shared/browser-mcp'
+import { LOCAL_ASSIST_MCP_SERVER_NAME } from '../local-assist/contract'
+import { LOCAL_ASSIST_TOOLS } from '../local-assist/tools'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 
 /** The local CLI bridge is checked against the official CLI/extension 2.1.278: the 2026-09-21
@@ -64,6 +67,58 @@ const HOOK_ANSWER_MS = 15_000
  *  15 s, and the CLI then refuses every tool call of the turn; the host holds the request until the
  *  next app answers it (docs/runtime-host.md). A running app still answers within HOOK_ANSWER_MS. */
 const HOSTED_HOOK_TIMEOUT_SEC = 900
+/** A CLI started by this app waits a little longer than Conductor's own budget, so a late answer
+ *  is Conductor's refusal (and is counted as one) rather than the CLI's "host client may be unreachable". */
+const HOOK_TIMEOUT_SEC = HOOK_ANSWER_MS / 1000 + 5
+/** A hook answer slower than this is logged: every tool call of the turn waits on it. */
+const HOOK_SLOW_MS = 2_000
+/** How long a hook failure keeps app.state's claudeHooks.unreachable set. */
+const HOOK_UNREACHABLE_WINDOW_MS = 10 * 60_000
+
+/** Tools Conductor's PreToolUse hook never holds (harness gap H16, owner decision: fail open for
+ *  reads). Claude Code refuses a call whose PreToolUse hook does not answer in time, and while the
+ *  app restarts, stalls or is gone nothing answers, so every call of the turn was refused. A read
+ *  has nothing for the hook to decide: only edits are snapshotted, and a read changes nothing the
+ *  approval gate protects. So these are left out of the hook's matcher and keep working when the
+ *  hook host is unreachable; every other tool still waits for Conductor and is refused without it.
+ *  The MCP entries are the tools Conductor's own servers annotate readOnlyHint, nothing broader. */
+export const HOOK_FREE_READ_TOOLS: readonly string[] = [
+  'Read', 'Glob', 'Grep', 'LS', 'NotebookRead',
+  ...LOCAL_ASSIST_TOOLS.filter(tool => tool.annotations?.readOnlyHint).map(tool => `mcp__${LOCAL_ASSIST_MCP_SERVER_NAME}__${tool.name}`),
+  ...BROWSER_TOOLS.filter(tool => tool.annotations?.readOnlyHint).map(tool => `mcp__${BROWSER_MCP_SERVER_NAME}__${tool.name}`)
+]
+/** Claude Code tests a hook matcher that is not a plain `A|B` list as a JavaScript RegExp against
+ *  the tool name (and its legacy aliases, none of which name a read): every tool but those. */
+export const PRE_TOOL_USE_MATCHER = `^(?!(?:${HOOK_FREE_READ_TOOLS.map(name => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})$)`
+const HOOK_LATE = 'Conductor did not answer the tool hook in time; the tool was not run'
+/** The tool_result wording of a call refused because its PreToolUse hook was not answered: Claude Code's own, or Conductor's late answer. */
+const HOOK_UNANSWERED_RESULT =/PreToolUse hook did not respond before its timeout|PreToolUse hook failed with an unexpected error|Conductor did not answer the tool hook in time/i
+
+/** How Conductor's tool hooks have been answered in this app process, for app.state. */
+const hookHealth = { answered: 0, slow: 0, maxMs: 0, lastMs: 0, totalMs: 0, failures: 0, lastFailureAt: 0, lastFailure: '' }
+export function claudeHookHealth(now = Date.now()): { unreachable: boolean; answered: number; slow: number; averageMs: number; maxMs: number; lastMs: number; failures: number; lastFailureAt: string | null; lastFailure: string | null } {
+  return {
+    unreachable: hookHealth.lastFailureAt > 0 && now - hookHealth.lastFailureAt < HOOK_UNREACHABLE_WINDOW_MS,
+    answered: hookHealth.answered, slow: hookHealth.slow, averageMs: hookHealth.answered ? Math.round(hookHealth.totalMs / hookHealth.answered) : 0,
+    maxMs: hookHealth.maxMs, lastMs: hookHealth.lastMs, failures: hookHealth.failures,
+    lastFailureAt: hookHealth.lastFailureAt ? new Date(hookHealth.lastFailureAt).toISOString() : null, lastFailure: hookHealth.lastFailure || null
+  }
+}
+/** For tests: forget what earlier adapters recorded. */
+export function resetClaudeHookHealth(): void { Object.assign(hookHealth, { answered: 0, slow: 0, maxMs: 0, lastMs: 0, totalMs: 0, failures: 0, lastFailureAt: 0, lastFailure: '' }) }
+function recordHookAnswer(ms: number, callback: string, tool: string): void {
+  hookHealth.answered++; hookHealth.totalMs += ms; hookHealth.lastMs = ms; hookHealth.maxMs = Math.max(hookHealth.maxMs, ms)
+  if (ms < HOOK_SLOW_MS) return
+  hookHealth.slow++
+  console.warn(`Conductor answered Claude's ${callback} hook for ${tool} in ${ms} ms`)
+}
+function recordHookFailure(detail: string): void {
+  hookHealth.failures++; hookHealth.lastFailureAt = Date.now(); hookHealth.lastFailure = detail.slice(0, 200)
+}
+/** What the owner sees, once per runtime and updated in place, when tool calls were refused
+ *  because Conductor's hook was not answered. */
+export const hookUnreachableMessage = (tool: string, count: number): string =>
+  `Conductor did not answer Claude Code's tool hook in time (the app was restarting, stalled or unreachable), so Claude Code refused ${tool}${count > 1 ? ` and ${count - 1} more call${count > 2 ? 's' : ''} this session` : ''}. Read-only tools (${HOOK_FREE_READ_TOOLS.slice(0, 4).join(', ')} and read-only Conductor MCP tools) do not wait for the hook; the rest work again once Conductor answers. The agent is told to retry them with its next message.`
 interface Dependencies { createTransport?(options: TransportOptions): Transport; version?(executable: string): Promise<string> }
 interface Tool { name: string; input: Json; parentId?: string; status: 'preparing' | 'running' | 'awaiting_approval' | 'completed' | 'failed' | 'rejected' | 'interrupted'; detached?: boolean; captured?: boolean }
 interface Block { id: string; kind: string; input: string; text: string }
@@ -111,7 +166,9 @@ export class ClaudeAdapter implements ProviderAdapter {
   /** Tool calls the CLI's own auto-mode classifier refused, by tool_use_id (../../shared/auto-mode-denial.ts). */
   private autoModeDenials = new Map<string, { tool: string; reason: string; parentId?: string; confirmed?: boolean; request?: DenialGrantRequest }>()
   /** Classifier outages of the current turn, shown as one notice item (classifier-unavailable:<turn>), never as a card. */
-  private classifierOutages?: { key: string; count: number; toolUseIds: Set<string>; stopped: boolean }
+  private classifierOutages?: { key: string; noticeTurn?: string; turn: string; count: number; toolUseIds: Set<string>; stopped: boolean }
+  /** Tool calls refused because Conductor's PreToolUse hook went unanswered, shown as one notice item per runtime. */
+  private hookOutages?: { noticeTurn?: string; count: number; toolUseIds: Set<string> }
   /** The --settings file carrying owner-granted rules at launch (src/main/permission-grants). */
   private grantSettingsFile?: string
   private streams = new Map<string, { messageId: string; blocks: Map<number, Block>; textBlocks: number }>()
@@ -238,9 +295,9 @@ export class ClaudeAdapter implements ProviderAdapter {
     this.emit({ data: { type: 'session', phase: 'starting', capabilities: this.capabilities } })
     this.transport.start()
     try {
-      const timeout = this.transport.detachable ? HOSTED_HOOK_TIMEOUT_SEC : HOOK_ANSWER_MS / 1000
+      const timeout = this.transport.detachable ? HOSTED_HOOK_TIMEOUT_SEC : HOOK_TIMEOUT_SEC
       const initialized = await this.control({ subtype: 'initialize', hooks: {
-        PreToolUse: [{ hookCallbackIds: ['conductor_before'], timeout }],
+        PreToolUse: [{ matcher: PRE_TOOL_USE_MATCHER, hookCallbackIds: ['conductor_before'], timeout }],
         PostToolUse: [{ hookCallbackIds: ['conductor_after'], timeout }],
         PostToolUseFailure: [{ hookCallbackIds: ['conductor_failed'], timeout }],
         // The classifier's own record of a refusal, with the exact tool input (claude 2.1.282).
@@ -980,6 +1037,7 @@ export class ClaudeAdapter implements ProviderAdapter {
   private noteAutoModeDenial(toolUseId: string, output: string): void {
     const reason = parseAutoModeDenialReason(output)
     if (reason && isClassifierOutage(reason) || !reason && CLASSIFIER_OUTAGE_RESULT.test(output)) { this.classifierOutage(toolUseId, undefined, reason ?? 'Classifier unavailable', { method: 'tool_result/classifier_unavailable', payload: { tool_use_id: toolUseId } }); return }
+    if (!reason && HOOK_UNANSWERED_RESULT.test(output)) { this.hookOutage(toolUseId, output); return }
     if (!reason || this.autoModeDenials.has(toolUseId)) return
     const tool = this.tools.get(toolUseId)
     const granted = tool ? (this.options.permissionGrants?.rules() ?? []).find(entry => callMatchesRule(entry.rule, tool.name, tool.input, this.options.cwd)) : undefined
@@ -1003,16 +1061,31 @@ export class ClaudeAdapter implements ProviderAdapter {
    *  grant request and no attention. The turn gets one notice item, updated in place per call. The
    *  hook answers retry (the CLI then tells the agent it may retry the call, on top of its own "issue
    *  it again once" wording); after its circuit breaker has stopped the turn nothing is retried and
-   *  Conductor starts nothing, so an outage cannot become a loop. */
+   *  Conductor starts nothing, so an outage cannot become a loop. One notice per runtime, not per
+   *  turn or call (harness gap H16); its count and "stopped" describe the latest turn it reached. */
   private classifierOutage(toolUseId: string, name: string | undefined, reason: string, native: { method: string; payload: Json }): ObjectValue | undefined {
-    const key = this.turnId ?? toolUseId
-    const outage = this.classifierOutages?.key === key ? this.classifierOutages : this.classifierOutages = { key, count: 0, toolUseIds: new Set<string>(), stopped: false }
+    const turn = this.turnId ?? toolUseId
+    const outage = this.classifierOutages ??= { key: this.options.runtimeId || turn, noticeTurn: this.turnId, turn, count: 0, toolUseIds: new Set<string>(), stopped: false }
+    if (outage.turn !== turn) Object.assign(outage, { turn, count: 0, toolUseIds: new Set<string>(), stopped: false })
     if (!outage.toolUseIds.has(toolUseId)) { outage.toolUseIds.add(toolUseId); outage.count++ }
+    const key = outage.key
     const stopped = classifierOutageStoppedTurn(reason)
     outage.stopped ||= stopped
     const tool = name ?? this.tools.get(toolUseId)?.name ?? 'a tool'
-    this.emit({ itemId: `classifier-unavailable:${key}`, data: { type: 'notice', message: classifierOutageMessage({ tool, reason, stopped: outage.stopped, count: outage.count }), payload: classifierOutagePayload({ tool, reason, toolUseId, stopped: outage.stopped, count: outage.count }) }, native })
+    this.emit({ itemId: `classifier-unavailable:${key}`, turnId: outage.noticeTurn, data: { type: 'notice', message: classifierOutageMessage({ tool, reason, stopped: outage.stopped, count: outage.count }), payload: classifierOutagePayload({ tool, reason, toolUseId, stopped: outage.stopped, count: outage.count }) }, native })
     return stopped ? undefined : { hookSpecificOutput: { hookEventName: 'PermissionDenied', retry: true } }
+  }
+  /** Claude Code refused a call because Conductor's PreToolUse hook went unanswered: the host was
+   *  unreachable, not the call unsafe. One notice item per runtime, updated in place; its payload
+   *  also tells the next briefing to have the agent retry (turn-briefing.ts), and app.state's
+   *  claudeHooks tells a wizard. */
+  private hookOutage(toolUseId: string, output: string): void {
+    const outage = this.hookOutages ??= { noticeTurn: this.turnId, count: 0, toolUseIds: new Set<string>() }
+    if (outage.toolUseIds.has(toolUseId)) return
+    outage.toolUseIds.add(toolUseId); outage.count++
+    recordHookFailure(output)
+    const tool = this.tools.get(toolUseId)?.name ?? 'a tool'
+    this.emit({ itemId: `hook-unreachable:${this.options.runtimeId || toolUseId}`, turnId: outage.noticeTurn, data: { type: 'notice', message: hookUnreachableMessage(tool, outage.count), payload: { hookUnreachable: { tool, toolUseId, count: outage.count } } }, native: { method: 'tool_result/hook_unreachable', payload: { tool_use_id: toolUseId, reason: output.slice(0, 400) } } })
   }
   private recordAutoModeDenial(toolUseId: string, reason: string, call: { name: string; input: ObjectValue } | undefined, native: { method: string; payload: Json }): void {
     const tool = this.tools.get(toolUseId), name = call?.name ?? tool?.name
@@ -1053,9 +1126,13 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (this.requests.has(id) || this.hookRequests.has(id)) return
     if (request.subtype === 'hook_callback') {
       this.hookRequests.add(id)
-      try { const result = await within(this.hook(request), HOOK_ANSWER_MS, 'Conductor did not answer the tool hook in time; the tool was not run'); if (!this.disposed && this.transport?.connected) this.reply(id, result ?? {}) }
-      catch (error) { if (this.transport?.connected) this.replyError(id, error instanceof Error ? error.message : 'Conductor hook failed') }
-      finally { this.hookRequests.delete(id) }
+      const started = Date.now(), callback = string(request.callback_id) ?? 'unknown', tool = string(object(request.input).tool_name) ?? 'a tool'
+      try { const result = await within(this.hook(request), HOOK_ANSWER_MS, HOOK_LATE); if (!this.disposed && this.transport?.connected) this.reply(id, result ?? {}) }
+      catch (error) {
+        if (error instanceof Error && error.message === HOOK_LATE) recordHookFailure(`${callback} for ${tool}: ${HOOK_LATE}`)
+        if (this.transport?.connected) this.replyError(id, error instanceof Error ? error.message : 'Conductor hook failed')
+      }
+      finally { this.hookRequests.delete(id); recordHookAnswer(Date.now() - started, callback, tool) }
       return
     }
     if (request.subtype !== 'can_use_tool') {

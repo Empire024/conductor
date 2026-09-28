@@ -407,6 +407,19 @@ Desired:
    Bypass" verdicts came from (a bearer token in a command line looks like a bypass).
 Files: `src/main/providers/claude.ts`, `src/main/turn-briefing.ts`, tests.
 
+Done (batch 4, not yet shipped): PreToolUse registers `matcher: PRE_TOOL_USE_MATCHER`, a regex
+that leaves out Read, Glob, Grep, LS, NotebookRead and the readOnlyHint tools of conductor-local
+and conductor-browser (checked against the 2.1.282 matcher: non-list matchers are `new RegExp`,
+and no legacy alias names a read), so reads never wait for the hook; the rest stay fail-closed.
+The approval gate's durable-denial fence no longer sees those five MCP reads (it already let the
+built-in reads through). A CLI the app started waits 20 s against Conductor's 15 s budget. Every
+hook answer is timed (slow ones over 2 s logged); `app.state.claudeHooks` (owner/wizard scope,
+assembled in `src/main/agent-control.ts`) reports `unreachable` (a failure in the last 10 min),
+counts, average/max/last ms and the last failure. Claude Code's "PreToolUse hook did not respond"
+/ "failed with an unexpected error" results become one `hookUnreachable` notice per runtime; the
+classifier-outage notice is also one per runtime now. `OUTAGE_NUDGES` in turn-briefing.ts adds the
+retry rule to the next message once per runtime per kind (ledger `outagesNudged`, persisted).
+
 ### H17 Mask the control token everywhere in the journal (S)
 
 Root cause: `structured-store.ts:17-21` `sanitizeDiagnostic` masks `Bearer <x>`, `sk-`/`gh` keys and
