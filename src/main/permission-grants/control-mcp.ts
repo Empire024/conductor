@@ -26,13 +26,17 @@ const pick = (input: Record<string, unknown>, keys: string[]): Record<string, un
  * Whether the claude CLI's classifier still reviews MCP calls is recorded in
  * docs/permissions-classifier.md.
  */
+/** A message names one conversation, or another project whose wizard receives it (agent-control handIn). */
+const addressee = (input: Record<string, unknown>): Record<string, unknown> =>
+  input.agentSessionId === undefined && input.projectId !== undefined ? { projectId: input.projectId } : { agentSessionId: input.agentSessionId }
+
 export const CONDUCTOR_MCP_TOOLS: Tool[] = [
-  { name: 'send_message', method: 'agents.steer', args: input => ({ agentSessionId: input.agentSessionId, prompt: input.text }),
-    description: 'Send a text message to another Conductor tab you control or coordinate with (agents.steer): steered into its running turn, or starting one if it is idle. Only delivers text; changes no setting and runs nothing.',
-    inputSchema: { type: 'object', properties: { agentSessionId: { type: 'string' }, text: { type: 'string', maxLength: 20000 } }, required: ['agentSessionId', 'text'], additionalProperties: false } },
-  { name: 'submit_task', method: 'agents.submit', args: input => ({ agentSessionId: input.agentSessionId, prompt: input.text }),
-    description: 'Start a new turn in a coworker tab you control with this prompt (agents.submit), with that tab\'s own settings.',
-    inputSchema: { type: 'object', properties: { agentSessionId: { type: 'string' }, text: { type: 'string', maxLength: 20000 } }, required: ['agentSessionId', 'text'], additionalProperties: false } },
+  { name: 'send_message', method: 'agents.steer', args: input => ({ ...addressee(input), prompt: input.text }),
+    description: 'Send a text message to another Conductor tab you control or coordinate with (agents.steer): steered into its running turn, or starting one if it is idle. Address another project instead with projectId (from projects.list) and no agentSessionId: the message goes to that project\'s active wizard, which replies to you, and the result names it. Only delivers text; changes no setting and runs nothing.',
+    inputSchema: { type: 'object', properties: { agentSessionId: { type: 'string' }, projectId: { type: 'string' }, text: { type: 'string', maxLength: 20000 } }, required: ['text'], additionalProperties: false } },
+  { name: 'submit_task', method: 'agents.submit', args: input => ({ ...addressee(input), prompt: input.text }),
+    description: 'Start a new turn in a coworker tab you control with this prompt (agents.submit), with that tab\'s own settings. With projectId (another project, from projects.list) and no agentSessionId it goes to that project\'s active wizard as a message, or opens a tab there when it has none.',
+    inputSchema: { type: 'object', properties: { agentSessionId: { type: 'string' }, projectId: { type: 'string' }, text: { type: 'string', maxLength: 20000 } }, required: ['text'], additionalProperties: false } },
   { name: 'report', method: 'agents.report', args: input => pick(input, ['text']),
     description: 'Report up to 2000 characters to the conversation that opened this tab (your controller), as agents.report does.',
     inputSchema: { type: 'object', properties: { text: { type: 'string', maxLength: 2000 } }, required: ['text'], additionalProperties: false } },

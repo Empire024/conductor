@@ -962,6 +962,83 @@ describe('projects open side by side in one window', () => {
   })
 })
 
+describe('cross-project work goes to the target project’s wizard', () => {
+  type Delivered = { deliveredTo: { agentSessionId: string; title: string; projectId: string; workspaceId: string }; delivery: string; note: string }
+  /** Haftheme, co-opened beside this project, with its own wizard tab (the wand on Astra). */
+  const withWizard = () => {
+    const f = fixture(), other = sibling(f, 'Haftheme')
+    const wizard = agentIn(f, other.project.id, other.workspace.id, 'theme-wizard')
+    const state = f.database.structured.snapshot(wizard.agentSessionId)!
+    f.database.structured.update(wizard.agentSessionId, { settings: { ...state.settings, wizard: true, model: 'gpt-6-astra', permission: 'accept-edits' } })
+    const agentTabs = () => f.control.tabs({ projectId: other.project.id, sessionId: other.workspace.id, agentSessionId: '' }).filter(tab => tab.kind === 'agent').map(tab => tab.resourceId)
+    return { f, other, wizard, agentTabs }
+  }
+
+  it('lists each project’s active wizards in projects.list', async () => {
+    const { f, other, wizard } = withWizard()
+    const listed = await f.control.call(f.scope, 'projects.list') as Array<{ id: string; wizards: Array<Record<string, unknown>> }>
+    expect(listed.find(project => project.id === other.project.id)?.wizards).toEqual([{ agentSessionId: wizard.agentSessionId, title: 'theme-wizard', workspaceId: other.workspace.id, workspaceName: other.workspace.name, phase: expect.any(String) }])
+    expect(listed.find(project => project.id === f.project.id)?.wizards).toEqual([])
+  })
+
+  it('delivers tabs.open, router.dispatch and a project-addressed message to that wizard, opens no tab and takes no control', async () => {
+    const { f, other, wizard, agentTabs } = withWizard()
+    const before = agentTabs(), tasks = f.orchestration.listTasks(f.project.id).length
+    const handed = await f.control.call(f.scope, 'tabs.open', { projectId: other.project.id, provider: 'claude', title: 'FIX: steer delivery', prompt: 'Steering into running turns is lost' }) as Delivered
+    expect(handed).toMatchObject({ deliveredTo: { agentSessionId: wizard.agentSessionId, title: 'theme-wizard', projectId: other.project.id, workspaceId: other.workspace.id }, delivery: 'started' })
+    expect(handed.note).toMatch(/No tab was opened/)
+    expect(agentTabs()).toEqual(before)
+    const received = f.submissions.at(-1)!.prompt
+    expect(received).toContain(`[From Controller (${f.spec.id}, project Control project)] FIX: steer delivery`)
+    expect(received).toContain('Steering into running turns is lost')
+    // The wizard stays nobody's coworker: steering it again from outside is a message, not control.
+    expect(f.control.listLinks(other.project.id, other.workspace.id)).toEqual([])
+    await expect(f.control.call(f.scope, 'agents.steer', { agentSessionId: wizard.agentSessionId, prompt: 'One more detail' })).resolves.toMatchObject({ deliveredTo: { agentSessionId: wizard.agentSessionId } })
+    expect(f.control.listLinks(other.project.id, other.workspace.id)).toEqual([])
+    const dispatched = await f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Integrate', prompt: 'Wire the asset in', projectId: other.project.id }] }) as Array<Delivered & { accepted: boolean }>
+    expect(dispatched[0]).toMatchObject({ accepted: true, deliveredTo: { agentSessionId: wizard.agentSessionId } })
+    expect(f.orchestration.listTasks(f.project.id)).toHaveLength(tasks)
+    expect(f.submissions.at(-1)!.prompt).toContain('Integrate\n\nWire the asset in')
+    // send_message / submit_task addressed to the project rather than a conversation.
+    for (const method of ['agents.steer', 'agents.submit']) await expect(f.control.call(f.scope, method, { projectId: other.project.id, prompt: 'Status?' })).resolves.toMatchObject({ deliveredTo: { agentSessionId: wizard.agentSessionId } })
+    expect(f.submissions.at(-1)!.prompt).toContain(`project Control project)] Status?`)
+    await expect(f.control.call(f.scope, 'agents.steer', { projectId: f.project.id, prompt: 'x' })).rejects.toThrow(/requires agentSessionId/)
+    expect(agentTabs()).toEqual(before)
+    // Without a prompt there is nothing to hand over, so it says how.
+    await expect(f.control.call(f.scope, 'tabs.open', { projectId: other.project.id, provider: 'claude' })).rejects.toThrow(/active wizard of that project/)
+    // The wizard answers the conversation that handed it work, across projects and without taking it over.
+    const reply = await f.control.call(wizard, 'agents.steer', { agentSessionId: f.spec.id, prompt: 'Fixed in 1a2b3c' })
+    expect(reply).toMatchObject({ agentSessionId: f.spec.id, reply: true, controlled: false })
+    expect(f.submissions.at(-1)!.prompt).toContain('Fixed in 1a2b3c')
+    expect(f.control.listLinks(f.project.id, f.workspace.id).map(link => link.targetAgentSessionId)).not.toContain(f.spec.id)
+  })
+
+  it('opens the caller’s own tab when it names a workspace or passes direct:true', async () => {
+    const { f, other, wizard, agentTabs } = withWizard()
+    const explicit = await f.control.call(f.scope, 'tabs.open', { projectId: other.project.id, workspaceId: other.workspace.id, provider: 'claude', title: 'Explicit', prompt: 'Work here' }) as AgentControlTab & { projectId: string; submitted: boolean }
+    expect(explicit).toMatchObject({ projectId: other.project.id, submitted: true })
+    const direct = await f.control.call(f.scope, 'tabs.open', { projectId: other.project.id, provider: 'claude', title: 'Direct', direct: true }) as AgentControlTab & { projectId: string; workspaceId: string }
+    expect(direct).toMatchObject({ projectId: other.project.id, workspaceId: other.workspace.id })
+    expect(agentTabs()).toEqual(expect.arrayContaining([wizard.agentSessionId, explicit.resourceId, direct.resourceId]))
+    const dispatched = await f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Own worker', prompt: 'Do it', projectId: other.project.id, direct: true }] }) as Array<{ agentSessionId: string; accepted: boolean }>
+    expect(dispatched[0]).toMatchObject({ accepted: true })
+    expect(agentTabs()).toContain(dispatched[0]!.agentSessionId)
+    await expect(f.control.call(f.scope, 'tabs.open', { projectId: other.project.id, direct: 'yes' })).rejects.toThrow(/direct must be true or false/)
+  })
+
+  it('without a wizard opens the tab in the workspace of that project’s root controller', async () => {
+    const f = fixture(), other = sibling(f, 'Haftheme')
+    const room = f.database.createSession(other.project.id, 'Controller room')
+    const controller = agentIn(f, other.project.id, room.id, 'theme-controller')
+    await f.control.call(controller, 'tabs.open', { provider: 'claude', title: 'Its coworker' })
+    const opened = await f.control.call(f.scope, 'tabs.open', { projectId: other.project.id, provider: 'claude', title: 'Handed over', prompt: 'Please fix' }) as AgentControlTab & { projectId: string; workspaceId: string; submitted: boolean }
+    expect(opened).toMatchObject({ projectId: other.project.id, workspaceId: room.id, submitted: true })
+    // direct:true keeps today's placement in the project's first workspace.
+    const direct = await f.control.call(f.scope, 'tabs.open', { projectId: other.project.id, provider: 'claude', direct: true }) as { workspaceId: string }
+    expect(direct.workspaceId).toBe(other.workspace.id)
+  })
+})
+
 describe('steering an uncontrolled tab in a co-opened project', () => {
   type Listed = { agentSessionId?: string; projectId: string; crossProject?: boolean; controlled?: boolean }
   /** Astra, a coworker in a sibling project, reaching back to the owner's own tab here. */

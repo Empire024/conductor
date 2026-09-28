@@ -141,11 +141,11 @@ function handoffText(args: Args): string {
 const toolSignatures = {
   'tools.list': '() — discover these methods and arguments',
   'app.state': '() — current project, workspace, tabs, relationships, the machine each tab runs on, and the other projects open in this Conductor',
-  'projects.list': '() — every project open in this Conductor with its workspaces; a sibling project accepts projectId on tabs.list/tabs.open, files.list/read/open, tasks.list and router.dispatch tasks, and on tabs.focus/rename/split/detach/close for an agent tab this caller controls there',
+  'projects.list': '() — every project open in this Conductor with its workspaces and its active wizards (wizards: agentSessionId, title, workspaceId, workspaceName, phase; the wand tab that owns delivery and coordination there); cross-project work (tabs.open or a router.dispatch task with projectId, or agents.steer/agents.submit with {projectId,prompt} and no agentSessionId) goes to that wizard as a message rather than into a tab of its own; a sibling project accepts projectId on tabs.list/tabs.open, files.list/read/open, tasks.list and router.dispatch tasks, and on tabs.focus/rename/split/detach/close for an agent tab this caller controls there',
   'machines.list': '() — this machine and the paired machines that can run a tab, with the projects each one accepts, plus execution nodes (kind "node", or a peer\'s node facet) that run commands through nodes.run; the local machine carries readiness (whether it comes back unattended after a reboot, with the missing steps in words)',
   'models.list': '() — available providers and model-specific effort choices; discovered runtime models take precedence',
   'tabs.list': '({projectId?,workspaceId?}) — open tabs in this workspace, including detached windows, or in a sibling project from projects.list',
-  'tabs.open': '({kind?,provider?,model?,effort?,permission?,exactPermission?,title?,machineId?,projectId?,workspaceId?,repository?,research?,contract?,jobId?,focus?,prompt?,anonymous?}) — visible tab, opened in the background with a "new" mark so the owner’s active tab, caret and window stay put; focus:true brings it into view once the owner pauses typing; agent default kind, provider/model must be available; a Claude, Codex or Grok coworker opens on Auto (the highest mode the provider offers) unless the controller is itself read-only or planning; only with exactPermission: true — for an agent that cannot be trusted at all — does it open on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode, clamped to the controller’s autonomy and to what the provider offers; a local model has no Auto and opens on accept-edits or read-only as before; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list, and only the controller that opened such a tab may steer it; repository/research open a provider-local tab with its repository-writes and deep-research grants already on, under the agents.grant rules; contract ({allowedPaths?:string[],acceptance?:{command,timeoutSec?}}) opens a provider-local tab as a bounded coding task: the runtime refuses writes outside allowedPaths, runs the acceptance command itself after edits, and when it passes with only allowed paths changed tells the model to finish; kind "job" with jobId (from jobs.list) opens the view of that durable job in this workspace, and asking again returns the open one (focus:true brings it into view); prompt submits it as the new tab’s first turn exactly as agents.submit would (same path, same permission checks), and the result says submitted:true; anonymous:true (local models only) opens it as an anonymous conversation hidden from a kept controller’s history. A cloud tab (provider "cloud") takes its own narrower shape, see cloud.start. Any other key is rejected, naming it and the accepted keys',
+  'tabs.open': '({kind?,provider?,model?,effort?,permission?,exactPermission?,title?,machineId?,projectId?,workspaceId?,repository?,research?,contract?,jobId?,focus?,prompt?,anonymous?,direct?}) — visible tab, opened in the background with a "new" mark so the owner’s active tab, caret and window stay put; focus:true brings it into view once the owner pauses typing; agent default kind, provider/model must be available; a Claude, Codex or Grok coworker opens on Auto (the highest mode the provider offers) unless the controller is itself read-only or planning; only with exactPermission: true — for an agent that cannot be trusted at all — does it open on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode, clamped to the controller’s autonomy and to what the provider offers; a local model has no Auto and opens on accept-edits or read-only as before; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list: when that project has an active wizard (projects.list) and neither workspaceId nor direct:true is given, no tab opens and the prompt is delivered to the wizard as agents.steer would, prefixed with who sent it, and the result names it (deliveredTo {agentSessionId,title,projectId,workspaceId}, delivery "started"|"queued"); the wizard replies with send_message; with no wizard the tab opens in the workspace of that project’s most recently active root controller, else its first workspace; direct:true opens your own tab there as before; only the controller that opened such a tab may steer it; repository/research open a provider-local tab with its repository-writes and deep-research grants already on, under the agents.grant rules; contract ({allowedPaths?:string[],acceptance?:{command,timeoutSec?}}) opens a provider-local tab as a bounded coding task: the runtime refuses writes outside allowedPaths, runs the acceptance command itself after edits, and when it passes with only allowed paths changed tells the model to finish; kind "job" with jobId (from jobs.list) opens the view of that durable job in this workspace, and asking again returns the open one (focus:true brings it into view); prompt submits it as the new tab’s first turn exactly as agents.submit would (same path, same permission checks), and the result says submitted:true; anonymous:true (local models only) opens it as an anonymous conversation hidden from a kept controller’s history. A cloud tab (provider "cloud") takes its own narrower shape, see cloud.start. Any other key is rejected, naming it and the accepted keys',
   'tabs.focus': '({tabId,projectId?,workspaceId?}) — brings a tab into view once the owner pauses typing (deferred:true when it is still waiting); any tab of this workspace, or an agent tab this caller controls in a sibling project (agents.list controlled:true); the same holds for rename, split, detach and close',
   'tabs.rename': '({tabId,title,projectId?,workspaceId?})',
   'tabs.split': '({tabId,direction:"horizontal"|"vertical",projectId?,workspaceId?})',
@@ -202,12 +202,16 @@ const toolSignatures = {
   'loops.proposals': '({id?}) — proposals in this project, optionally filtered to one loop id, each with its status (pending, applied, rejected, reverted)',
   'app.update.authorize': '({agentSessionId,allowed?}) — let another visible conversation (typically a local model) run app.update without the owner dialog; only a non-local coworker may grant it, never to itself, and allowed:false revokes',
   'router.start': '({prompt,provider?,model?}) — create/reuse the project router definition, open its tab, dispatch the requested task',
-  'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,route?:{features?,constraints?},permission?,exactPermission?,projectTaskIds?:string[],projectId?,workspaceId?,repository?,research?,contract?}]}) - one to four visible coworkers with actual models/efforts; a task with route and no provider/model/effort lets the router choose them (features default to the prompt’s categorisation; constraints as models.route) and opens that choice exactly as if you had named it, returning decisionId and the route explanation (decisions.get, models.outcome); a native coworker opens on Auto, exactly as tabs.open does, and exactPermission: true keeps a lower mode for an agent that cannot be trusted at all; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance, and cannot be combined with projectId because a claim belongs to the project that owns it; repository/research open a provider-local worker with its grants already on, as tabs.open does; a worker whose prompt was refused before any turn has its tab closed and its task dropped (tabClosed: true, with the error)'
+  'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,route?:{features?,constraints?},permission?,exactPermission?,projectTaskIds?:string[],projectId?,workspaceId?,direct?,repository?,research?,contract?}]}) - one to four visible coworkers with actual models/efforts; a task with route and no provider/model/effort lets the router choose them (features default to the prompt’s categorisation; constraints as models.route) and opens that choice exactly as if you had named it, returning decisionId and the route explanation (decisions.get, models.outcome); a native coworker opens on Auto, exactly as tabs.open does, and exactPermission: true keeps a lower mode for an agent that cannot be trusted at all; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance, and cannot be combined with projectId because a claim belongs to the project that owns it; a task for another project with an active wizard goes to that wizard exactly as tabs.open does (result deliveredTo, no tab, no orchestration row) unless it names workspaceId or direct:true; repository/research open a provider-local worker with its grants already on, as tabs.open does; a worker whose prompt was refused before any turn has its tab closed and its task dropped (tabClosed: true, with the error)'
 } as const
 
 /** The methods a caller may point at another project the owner has open in this window. Writes
  *  stay out: a change to a sibling project is made by a tab that lives there and shows its work. */
 const crossProjectMethods: string[] = ['tabs.list', 'tabs.open', 'tabs.focus', 'tabs.rename', 'tabs.split', 'tabs.detach', 'tabs.close', 'files.list', 'files.read', 'files.open', 'tasks.list']
+/** A project's active wizard as projects.list names it; cross-project work is handed to it. */
+type ProjectWizard = { agentSessionId: string; title: string; workspaceId: string; workspaceName: string; phase: string | null }
+/** The conversations that handed a wizard work from another project, which it may reply to. */
+const HANDED_IN_PREFIX = 'agentControlHandedIn:'
 
 export interface DeliveryControl {
   status(projectId: string, cwd: string): Promise<RepositoryStatus>
@@ -752,12 +756,138 @@ export class AgentControl {
    * own arrangement, so an agent may look across at a sibling and hand work to it; this never
    * reaches past this window, and writing into a sibling still goes through a tab opened there.
    */
-  private projects(scope: AgentControlScope): Array<{ id: string; name: string; path: string; current: boolean; uri: string; workspaces: Array<{ id: string; name: string; uri: string; current: boolean }> }> {
+  private projects(scope: AgentControlScope): Array<{ id: string; name: string; path: string; current: boolean; uri: string; workspaces: Array<{ id: string; name: string; uri: string; current: boolean }>; wizards: ProjectWizard[] }> {
     return this.deps.database.listProjects().map(project => ({
       id: project.id, name: project.name, path: project.path, current: project.id === scope.projectId,
       uri: conductorUri(project.id, 'workspace', this.deps.database.listSessions(project.id)[0]?.id ?? ''),
-      workspaces: this.deps.database.listSessions(project.id).map(workspace => ({ id: workspace.id, name: workspace.name, uri: conductorUri(project.id, 'workspace', workspace.id), current: workspace.id === scope.sessionId }))
+      workspaces: this.deps.database.listSessions(project.id).map(workspace => ({ id: workspace.id, name: workspace.name, uri: conductorUri(project.id, 'workspace', workspace.id), current: workspace.id === scope.sessionId })),
+      wizards: this.wizardsOf(project.id).map(({ remote: _remote, lastActivityAt: _last, ...wizard }) => wizard)
     }))
+  }
+
+  /** A project's active wizard tabs (the wand on a frontier model), in every workspace, most
+   *  recently active first. Such a wizard owns delivery, coordination and the shared working tree
+   *  of its project, so work another project hands in goes to it (handIn). */
+  private wizardsOf(projectId: string): Array<ProjectWizard & { lastActivityAt: string; remote: boolean }> {
+    const { database } = this.deps, found: Array<ProjectWizard & { lastActivityAt: string; remote: boolean }> = []
+    for (const workspace of database.listSessions(projectId)) {
+      for (const tab of this.tabs({ projectId, sessionId: workspace.id, agentSessionId: '' })) {
+        if (tab.kind !== 'agent' || !tab.resourceId) continue
+        const state = database.structured.snapshot(tab.resourceId)
+        if (!state || !wizardActive(state.settings, typeof tab.state?.provider === 'string' ? tab.state.provider : undefined)) continue
+        const lastActivityAt = state.sequence ? database.structured.events(tab.resourceId, state.sequence - 1)[0]?.timestamp ?? '' : ''
+        found.push({ agentSessionId: tab.resourceId, title: tab.title, workspaceId: workspace.id, workspaceName: workspace.name, phase: displaySessionPhase(state.phase, state.backgroundTasks), lastActivityAt, remote: Boolean(tab.state?.remotePeerId) })
+      }
+    }
+    return found.sort((a, b) => b.lastActivityAt.localeCompare(a.lastActivityAt))
+  }
+
+  /** Where work handed to a project without a wizard opens: the workspace of that project's most
+   *  recently active root controller (a conversation nobody controls that controls live
+   *  coworkers), else undefined, meaning the project's first workspace as before. */
+  private controllerWorkspace(projectId: string): string | undefined {
+    const { database } = this.deps, controllers = new Set<string>(), roots: Array<{ id: string; workspaceId: string }> = []
+    for (const project of database.listProjects()) for (const workspace of database.listSessions(project.id)) {
+      for (const tab of this.tabs({ projectId: project.id, sessionId: workspace.id, agentSessionId: '' })) {
+        if (tab.kind !== 'agent' || !tab.resourceId) continue
+        const link = this.linkFor(tab.resourceId)
+        if (link) controllers.add(link.controllerAgentSessionId)
+        else if (project.id === projectId) roots.push({ id: tab.resourceId, workspaceId: workspace.id })
+      }
+    }
+    const lastActivity = (id: string): string => {
+      const sequence = database.structured.snapshot(id)?.sequence
+      return sequence ? database.structured.events(id, sequence - 1)[0]?.timestamp ?? '' : ''
+    }
+    return roots.filter(root => controllers.has(root.id)).sort((a, b) => lastActivity(b.id).localeCompare(lastActivity(a.id)))[0]?.workspaceId
+  }
+
+  /**
+   * Cross-project work goes through the target project's wizard. A tabs.open, router.dispatch
+   * task or project-addressed agents.steer/submit naming another project that has an active wizard
+   * is delivered to that wizard as a message, unless the caller named a workspace or passed
+   * direct:true; without a wizard it opens beside that project's controller. The owner credential
+   * places tabs where it says, and a sandboxed local model has no cross-project reach to route.
+   * Returns null when the call keeps its own path unchanged.
+   */
+  private handIn(scope: AgentControlScope, args: Args): { wizard: ProjectWizard } | { workspaceId: string } | null {
+    if (args.direct !== undefined && typeof args.direct !== 'boolean') throw new Error('direct must be true or false')
+    if (args.projectId === undefined || args.projectId === scope.projectId || args.workspaceId !== undefined || args.direct === true || scope.owner) return null
+    if ((args.kind ?? 'agent') !== 'agent' || args.provider === 'cloud') return null
+    if (this.deps.database.structured.spec<AgentSpec>(scope.agentSessionId)?.provider === 'local') return null
+    const projectId = text(args, 'projectId', 160)
+    if (!this.deps.database.getProject(projectId)) throw new Error('No project with that id is open in this Conductor; use projects.list')
+    if (this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)?.state?.remotePeerId) throw new Error('This conversation is driven by a paired machine and stays inside the project shared with it')
+    const wizard = this.wizardsOf(projectId).find(candidate => !candidate.remote && candidate.agentSessionId !== scope.agentSessionId)
+    if (wizard) return { wizard }
+    const workspaceId = this.controllerWorkspace(projectId)
+    return workspaceId ? { workspaceId } : null
+  }
+
+  /** Hands a prompt to another project's wizard as agents.steer would, without taking control of
+   *  it: prefixed with who sent it, and the sender is remembered so the wizard may reply to it
+   *  across projects (messagesAcross). */
+  private async deliverToWizard(scope: AgentControlScope, wizard: ProjectWizard, prompt: string): Promise<{ deliveredTo: { agentSessionId: string; title: string; projectId: string; workspaceId: string }; delivery: 'started' | 'queued'; phase: string | null; note: string }> {
+    const { database, sessions } = this.deps
+    const spec = database.structured.spec<AgentSpec>(wizard.agentSessionId), state = database.structured.snapshot(wizard.agentSessionId)
+    if (!spec || !state) throw new Error('That project’s wizard is no longer open; use projects.list')
+    const title = this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)?.title || database.structured.spec<AgentSpec>(scope.agentSessionId)?.title || 'Another Conductor tab'
+    const from = database.getProject(scope.projectId)?.name ?? 'another project', to = database.getProject(spec.projectId)?.name ?? 'the other project'
+    const message = `[From ${title} (${scope.agentSessionId}, project ${from})] ${prompt}\n\n(Handed to ${to}'s wizard instead of opening a tab there. Reply with send_message to ${scope.agentSessionId}.)`
+    this.rememberSender(wizard.agentSessionId, scope.agentSessionId)
+    const delivery = await sessions.steerOrStart(wizard.agentSessionId, message, state.settings, [], { agentSessionId: scope.agentSessionId, label: `${title} (${from})` })
+    return {
+      deliveredTo: { agentSessionId: wizard.agentSessionId, title: wizard.title, projectId: spec.projectId, workspaceId: spec.sessionId }, delivery, phase: database.structured.snapshot(wizard.agentSessionId)?.phase ?? null,
+      note: `No tab was opened: ${wizard.title} is the active wizard of ${to} and owns delivery and coordination there, so it has your message and replies to you with send_message. Follow up with agents.steer to ${wizard.agentSessionId}; pass direct:true (or a workspaceId) only if you really need a tab of your own there.`
+    }
+  }
+
+  /** The conversations that handed a wizard work across projects, which it may answer. */
+  private rememberSender(wizardId: string, senderId: string): void {
+    const senders = this.senders(wizardId).filter(id => id !== senderId)
+    this.deps.database.setSetting(HANDED_IN_PREFIX + wizardId, JSON.stringify([...senders.slice(-49), senderId]))
+  }
+  private senders(wizardId: string): string[] {
+    try {
+      const ids = JSON.parse(this.deps.database.getSetting(HANDED_IN_PREFIX + wizardId) || '[]') as unknown
+      return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : []
+    } catch { return [] }
+  }
+
+  /** agents.steer/submit that are messages between projects and take no control: to another
+   *  project's wizard (which must stay nobody's coworker), and from a wizard back to a
+   *  conversation that handed it work. Everything else keeps target()'s rules. */
+  private messagesAcross(scope: AgentControlScope, id: string): boolean {
+    const spec = this.deps.database.structured.spec<AgentSpec>(id)
+    if (!spec || scope.owner || spec.projectId === scope.projectId || this.linkFor(id)?.controllerAgentSessionId === scope.agentSessionId) return false
+    return this.senders(scope.agentSessionId).includes(id) || this.wizardsOf(spec.projectId).some(wizard => wizard.agentSessionId === id && !wizard.remote)
+  }
+
+  private async messageAcross(scope: AgentControlScope, method: string, args: Args): Promise<unknown> {
+    const { database, sessions } = this.deps
+    const id = text(args, 'agentSessionId', 160), prompt = text(args, 'prompt', MAX_PROMPT_CHARS)
+    const spec = database.structured.spec<AgentSpec>(id)!, state = database.structured.snapshot(id)
+    if (this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)?.state?.remotePeerId) throw new Error('This conversation is driven by a paired machine and stays inside the project shared with it')
+    const tab = this.tabs({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: scope.agentSessionId }).find(candidate => candidate.kind === 'agent' && candidate.resourceId === id)
+    if (!tab || !state) throw new Error('That conversation has no open tab in its project any more')
+    if (tab.state?.remotePeerId) throw new Error('That conversation is driven by a paired machine; only that machine steers it')
+    const wizard = this.wizardsOf(spec.projectId).find(candidate => candidate.agentSessionId === id)
+    if (wizard) return { ...await this.deliverToWizard(scope, wizard, prompt), agentSessionId: id, projectId: spec.projectId, workspaceId: spec.sessionId }
+    const title = this.tabs(scope).find(candidate => candidate.resourceId === scope.agentSessionId)?.title || 'Another Conductor tab'
+    const delivery = await sessions.steerOrStart(id, prompt, state.settings, [], { agentSessionId: scope.agentSessionId, label: `${title} (${database.getProject(scope.projectId)?.name ?? 'another project'})` })
+    return { agentSessionId: id, tabId: tab.id, uri: tab.uri, projectId: spec.projectId, workspaceId: spec.sessionId, phase: database.structured.snapshot(id)?.phase, delivery, reply: true, controlled: false, ...(method === 'agents.submit' ? { note: 'A reply across projects is steered like agents.steer and takes no control' } : {}) }
+  }
+
+  /** agents.steer/submit({projectId,prompt}) with no agentSessionId: a message to a project
+   *  rather than to one conversation, routed as tabs.open({projectId,prompt}) is. */
+  private async toProject(scope: AgentControlScope, source: AgentSpec, method: string, args: Args): Promise<unknown> {
+    const extra = Object.keys(args).filter(key => !['projectId', 'prompt', 'direct', 'sessionId'].includes(key))
+    if (extra.length) throw new Error(`${method} to a project accepts only projectId, prompt and direct; ${extra.join(', ')} is not an argument`)
+    if (args.projectId === scope.projectId) throw new Error(`${method} requires agentSessionId inside this project; projectId addresses another project’s wizard`)
+    const prompt = text(args, 'prompt', MAX_PROMPT_CHARS), route = this.handIn(scope, args)
+    if (route && 'wizard' in route) return this.deliverToWizard(scope, route.wizard, prompt)
+    const title = this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)?.title || source.title || 'Another project'
+    return this.callOpen(scope, source, { projectId: args.projectId, prompt, title: ('From ' + title).slice(0, 120), ...(route ? { workspaceId: route.workspaceId } : { direct: true }) })
   }
 
   /** The tabs outside its own workspace this caller may name: the ones it opened, so a handoff
@@ -936,6 +1066,14 @@ export class AgentControl {
       const extra = Object.keys(args).filter(key => !allowed.includes(key) && key !== 'sessionId')
       if (extra.length) throw new Error(`tabs.open accepts only ${allowed.join(', ')}; ${extra.join(', ')} is not an argument`)
       if (args.prompt !== undefined && (args.kind ?? 'agent') !== 'agent') throw new Error('prompt only starts a turn in an agent tab')
+      // Another project's work belongs to its wizard, or beside its controller (handIn).
+      const route = this.handIn(scope, args)
+      if (route && 'wizard' in route) {
+        if (args.prompt === undefined) throw new Error(`${route.wizard.title} (${route.wizard.agentSessionId}) is the active wizard of that project and takes work handed to it: pass the work as prompt and it is delivered to that wizard, or pass direct:true to open a tab of your own there`)
+        const prompt = text(args, 'prompt', MAX_PROMPT_CHARS)
+        return this.deliverToWizard(scope, route.wizard, args.title === undefined ? prompt : `${text(args, 'title', 120)}\n\n${prompt}`)
+      }
+      if (route) args = { ...args, workspaceId: route.workspaceId }
     }
     if (source.provider === 'local' && !scope.owner) return this.openLocalCoworker(scope, args)
     const opened = await this.open(scope, args)
@@ -1027,6 +1165,12 @@ export class AgentControl {
     // every call, never from anything the caller sends.
     if (!scope.owner && wizardActive(database.structured.snapshot(scope.agentSessionId)?.settings, source.provider)) scope = { ...scope, wizard: true }
     if (args.sessionId !== undefined && args.sessionId !== scope.sessionId) throw new Error('Requested scope differs from the authorized session')
+    // A message to another project (its wizard), or one between a wizard and a conversation that
+    // handed it work, is delivered without taking control (handIn, messagesAcross).
+    if ((method === 'agents.steer' || method === 'agents.submit') && source.provider !== 'local') {
+      if (args.agentSessionId === undefined && args.projectId !== undefined) return this.toProject(scope, source, method, args)
+      if (typeof args.agentSessionId === 'string' && this.messagesAcross(scope, args.agentSessionId)) return this.messageAcross(scope, method, args)
+    }
     // Naming another project is only meaningful for the methods that were opened to a sibling;
     // everywhere else it is still an attempt to act outside the authorized scope.
     if (args.projectId !== undefined && args.projectId !== scope.projectId && !crossProjectMethods.includes(method)) throw new Error('This method only runs in the authorized project. Use projects.list to see what else is open, and hand work to a sibling project with tabs.open({projectId}).')
@@ -1976,6 +2120,7 @@ export class AgentControl {
       // A checklist claim is owned by the project whose feature-list.md holds it, and only an
       // agent of that project can be seen to still hold it. Handing one across would strand it.
       if (ids.length && request.projectId !== undefined && request.projectId !== scope.projectId) throw new Error('A worker in another project cannot take this project’s task claims; dispatch it without projectTaskIds')
+      if (request.direct !== undefined && typeof request.direct !== 'boolean') throw new Error('direct must be true or false')
       return { ...request, projectTaskIds: ids as string[] }
     })
     if (seen.size && restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('A read-only or planning controller cannot assign project tasks')
@@ -1989,6 +2134,14 @@ export class AgentControl {
     const dispatcherAgentId = this.deps.orchestration.snapshot(scope.projectId).agents
       .find(agent => agent.role === 'conductor-router' || agent.role === 'auto-fixer')?.id ?? null
     for (const request of requests) {
+      // Another project's work belongs to its wizard, or beside its controller (handIn).
+      const handed = this.handIn(scope, request)
+      if (handed && 'wizard' in handed) {
+        try { results.push({ title: request.title, projectId: request.projectId, accepted: true, ...await this.deliverToWizard(scope, handed.wizard, `${String(request.title)}\n\n${String(request.prompt)}`) }) }
+        catch (error) { results.push({ title: request.title, projectId: request.projectId, accepted: false, deliveredTo: { agentSessionId: handed.wizard.agentSessionId, title: handed.wizard.title }, error: error instanceof Error ? error.message : String(error) }) }
+        continue
+      }
+      if (handed) request.workspaceId = handed.workspaceId
       const routed = request.route !== undefined ? await this.routeTask(scope, request) : undefined
       const routing = routed ? { decisionId: routed.decisionId, route: routed.explanation } : {}
       if (request.provider === 'cloud') {

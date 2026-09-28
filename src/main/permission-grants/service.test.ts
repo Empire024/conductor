@@ -237,9 +237,12 @@ describe('the conductor MCP server', () => {
       expect(listed.result.tools.map(tool => tool.name)).toEqual(CONDUCTOR_MCP_TOOLS.map(tool => tool.name))
       const sent = await (await post({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'send_message', arguments: { agentSessionId: 'agent_other', text: 'The permission path is fixed; resume the pool fix.' } } })).json() as { result: { structuredContent: unknown } }
       expect(sent.result.structuredContent).toEqual({ delivered: true })
+      // Addressed to another project rather than a conversation: its wizard receives it (agent-control handIn).
+      await post({ jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'send_message', arguments: { projectId: 'project_theme', text: 'Your wizard should fix the export.' } } })
       await post({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'request_permission', arguments: { command: ssh, reason: 'pool fix', rollback: 'restore backups' } } })
       expect(calls).toEqual([
         { scope: { projectId: 'project', sessionId: 'workspace', agentSessionId: tab }, method: 'agents.steer', args: { agentSessionId: 'agent_other', prompt: 'The permission path is fixed; resume the pool fix.' } },
+        { scope: { projectId: 'project', sessionId: 'workspace', agentSessionId: tab }, method: 'agents.steer', args: { projectId: 'project_theme', prompt: 'Your wizard should fix the export.' } },
         { scope: { projectId: 'project', sessionId: 'workspace', agentSessionId: tab }, method: 'permissions.request', args: { command: ssh, reason: 'pool fix', rollback: 'restore backups' } }
       ])
       expect((await post({ jsonrpc: '2.0', id: 4, method: 'tools/list' }, 'Bearer ' + '0'.repeat(64))).status).toBe(401)
