@@ -40,6 +40,10 @@ export const PERMISSION_GRANT_HINT = 'If Auto mode refuses a call you need, or w
  *  coworker left open keeps its CLI process alive for nothing. */
 export const FINISH_HINT = 'When your work is delivered and reported, end with agents.finish({}) so your tab and CLI are released.'
 
+/** Who a coworker reports to, and how, so it does not go looking for a way to reach its controller. */
+export const coworkerHint = (controller: { id: string; title?: string }): string =>
+  `You are a coworker of ${controller.title ? `"${controller.title}" (${controller.id})` : controller.id}. Report results with report (agents.report({text}), up to 2000 characters); send_message to ${controller.id} reaches it too. ${FINISH_HINT}`
+
 /** Context bands at which a conversation is told, once each per runtime, to hand its remaining
  *  work to a fresh tab. Two bands, not one threshold: docs/token-thrift-policy.md shows the
  *  payback varies by model and cache ratio, so the first is a prompt to plan and the second a
@@ -97,6 +101,8 @@ export interface TurnBriefingDependencies {
   database: Pick<ConductorDatabase, 'recall' | 'recordMemoryRecall' | 'forgetStaleMemories'> & Partial<Pick<ConductorDatabase, 'getSetting'>>
   coworkers?: (agentSessionId: string, options: CoworkerBriefingOptions) => string
   control?: (spec: AgentSpec) => string
+  /** The title of the conversation that opened a coworker, for its coworker hint. */
+  controller?: (agentSessionId: string) => { id: string; title: string } | null
   /** One line on what this computer can carry, so no project's agent overloads it. */
   machine?: () => string
   now?: () => string
@@ -123,11 +129,15 @@ export class TurnBriefings {
     // recalled memory lines travel, fenced ahead of the owner's words (local-models/briefing.ts).
     if (local) return memory
     const coworkers = this.coworkers(spec, ledger)
-    return [memory, staticDue ? MEMORY_PROTOCOL : '', coworkers, staticDue ? projectTaskBriefing(spec) : '', staticDue ? [this.deps.machine?.() ?? '', LOCAL_ASSIST_PROVIDERS.has(spec.provider) ? LOCAL_ASSIST_HINT : '', spec.provider === 'claude' ? PERMISSION_GRANT_HINT : ''].filter(Boolean).join(' ') : '', staticDue ? this.deps.control?.(spec) ?? '' : '', staticDue && this.coworker(spec) ? FINISH_HINT : '', this.successionHint(ledger, context), this.succession(spec.id, context) || this.nudge(ledger, context)].filter(Boolean).join('\n\n')
+    return [memory, staticDue ? MEMORY_PROTOCOL : '', coworkers, staticDue ? projectTaskBriefing(spec) : '', staticDue ? [this.deps.machine?.() ?? '', LOCAL_ASSIST_PROVIDERS.has(spec.provider) ? LOCAL_ASSIST_HINT : '', spec.provider === 'claude' ? PERMISSION_GRANT_HINT : ''].filter(Boolean).join(' ') : '', staticDue ? this.deps.control?.(spec) ?? '' : '', staticDue ? this.coworkerHint(spec) : '', this.successionHint(ledger, context), this.succession(spec.id, context) || this.nudge(ledger, context)].filter(Boolean).join('\n\n')
   }
 
-  private coworker(spec: AgentSpec): boolean {
-    try { return this.deps.database.getSetting?.(COWORKER_OPENED_PREFIX + spec.id) != null } catch { return false /* A hint never stops a message. */ }
+  private coworkerHint(spec: AgentSpec): string {
+    try {
+      const controllerId = this.deps.database.getSetting?.(COWORKER_OPENED_PREFIX + spec.id)
+      if (!controllerId) return ''
+      return coworkerHint(this.deps.controller?.(controllerId) ?? { id: controllerId })
+    } catch { return '' /* A hint never stops a message. */ }
   }
 
   /** Once per runtime, like the static briefing, but from the first message after the

@@ -107,6 +107,29 @@ const signatureKeys = (signature: string): string[] => {
   const body = signature.match(/^\(\{([^}]*)\}\)/)?.[1]
   return body ? body.split(',').filter(Boolean).map(part => (part.split(/[?:]/)[0] ?? '').trim()) : []
 }
+/** The argument list a signature opens with, without its description: tools.list({brief:true}). */
+const signatureArgs = (signature: string): string => {
+  if (!signature.startsWith('(')) return signature.split(/ [—-] /)[0]!.slice(0, 120)
+  for (let index = 0, depth = 0; index < signature.length; index++) {
+    if (signature[index] === '(') depth++
+    else if (signature[index] === ')' && --depth === 0) return signature.slice(0, index + 1)
+  }
+  return signature.slice(0, 120)
+}
+/** tools.list with no arguments is the whole catalog (tens of KB). brief gives every method with
+ *  its arguments only; prefix and methods give the full text of just those. */
+const filterSignatures = (all: Record<string, string>, args: Args): Record<string, string> => {
+  const extra = Object.keys(args).filter(key => !['brief', 'prefix', 'methods', 'sessionId'].includes(key))
+  if (extra.length) throw new Error(`tools.list accepts only brief, prefix, methods; ${extra.join(', ')} is not an argument`)
+  if (args.brief !== undefined && typeof args.brief !== 'boolean') throw new Error('tools.list brief must be true or false')
+  if (args.prefix !== undefined && (typeof args.prefix !== 'string' || !args.prefix)) throw new Error('tools.list prefix must be a non-empty string such as "git."')
+  if (args.methods !== undefined && (!Array.isArray(args.methods) || !args.methods.every(method => typeof method === 'string'))) throw new Error('tools.list methods must be an array of method names such as ["git.ship"]')
+  const named = args.methods as string[] | undefined, prefix = args.prefix as string | undefined
+  const unknown = named?.filter(method => !(method in all)) ?? []
+  if (unknown.length) throw new Error(`No control method ${unknown.join(', ')}; tools.list({brief:true}) names every method`)
+  const selected = Object.entries(all).filter(([method]) => (!named && !prefix) || named?.includes(method) || (prefix !== undefined && method.startsWith(prefix)))
+  return Object.fromEntries(args.brief === true ? selected.map(([method, signature]) => [method, signatureArgs(signature)]) : selected)
+}
 /** The sections docs/token-thrift-policy.md requires of a bounded handoff, in the order it
  *  states them. A receiver that opens on a handoff has no other context, so a missing section is
  *  refused by name rather than half-understood: "Owned files" absent is a worker about to edit
@@ -139,7 +162,7 @@ function handoffText(args: Args): string {
 }
 
 const toolSignatures = {
-  'tools.list': '() — discover these methods and arguments',
+  'tools.list': '({brief?,prefix?,methods?}) — discover these methods and arguments; brief:true lists every method with its arguments only (a few KB instead of the whole catalog), prefix:"git." or methods:["git.ship"] gives the full text of just those',
   'app.state': '() — current project, workspace, tabs, relationships, the machine each tab runs on, and the other projects open in this Conductor',
   'projects.list': '() — every project open in this Conductor with its workspaces and its active wizards (wizards: agentSessionId, title, workspaceId, workspaceName, phase; the wand tab that owns delivery and coordination there); cross-project work (tabs.open or a router.dispatch task with projectId, or agents.steer/agents.submit with {projectId,prompt} and no agentSessionId) goes to that wizard as a message rather than into a tab of its own; a sibling project accepts projectId on tabs.list/tabs.open, files.list/read/open, tasks.list and router.dispatch tasks, and on tabs.focus/rename/split/detach/close for an agent tab this caller controls there',
   'machines.list': '() — this machine and the paired machines that can run a tab, with the projects each one accepts, plus execution nodes (kind "node", or a peer\'s node facet) that run commands through nodes.run; the local machine carries readiness (whether it comes back unattended after a reboot, with the missing steps in words)',
@@ -492,6 +515,30 @@ export class AgentControl {
    *  snapshot: where it is, why it last stopped, what it changed. The stop figures come from the
    *  local runtime's own report on the timeline, so a controller sees the same numbers the owner
    *  does; a native CLI conversation reports what its events carry. */
+  /** The caller's controller, its controller, and so on up the chain of open links. */
+  private ancestorsOf(agentSessionId: string): string[] {
+    const chain: string[] = []
+    for (let cursor = agentSessionId;;) {
+      const parent = this.linkFor(cursor)?.controllerAgentSessionId
+      if (!parent || parent === agentSessionId || chain.includes(parent)) return chain
+      chain.push(parent); cursor = parent
+    }
+  }
+
+  /** A coworker's agents.steer (send_message) to its controller or an ancestor, delivered as
+   *  agents.report delivers one: labelled with the coworker, into or behind the running turn. */
+  private async reportTo(scope: AgentControlScope, toAgentSessionId: string, body: string): Promise<unknown> {
+    const { database, sessions } = this.deps
+    if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+    const state = database.structured.snapshot(toAgentSessionId)
+    if (!state) throw new Error('That controlling conversation is no longer open')
+    if (anonymousConversations.has(scope.agentSessionId) && !anonymousConversations.has(toAgentSessionId)) throw new Error('This conversation is anonymous and its controller keeps a history, so nothing of it may be reported there; the owner reads it in its tab')
+    const reporter = this.tabs(scope).find(candidate => candidate.resourceId === scope.agentSessionId)
+    const origin: PromptOrigin = { agentSessionId: scope.agentSessionId, label: reporter?.title || 'Coworker' }
+    const delivery = await sessions.steerOrStart(toAgentSessionId, body, state.settings, [], origin)
+    return { reportedTo: this.linkFor(scope.agentSessionId)?.controllerAgentSessionId === toAgentSessionId ? 'controller' : 'ancestor', agentSessionId: toAgentSessionId, delivery }
+  }
+
   private status(scope: AgentControlScope, tab: AgentControlTab, state: SessionProjection) {
     const items = [...state.items].sort((a, b) => (b.updatedSequence ?? b.sequence) - (a.updatedSequence ?? a.sequence))
     const stop = items.map(item => localStopOf(item.data)).find(Boolean)
@@ -576,7 +623,7 @@ export class AgentControl {
         if (!parent || ancestors.has(parent)) break
         ancestors.add(parent); cursor = parent
       }
-      if (ancestors.has(id)) throw new Error('An agent cannot control itself or an ancestor')
+      if (ancestors.has(id)) throw new Error('An agent cannot control itself or an ancestor; use send_message or report to reach it')
       // The owner drives any tab in the window, a coworker's included, exactly as from the UI.
       if (link && link.controllerAgentSessionId !== scope.agentSessionId && !sovereign(scope)) throw new Error('Another agent already controls this tab; its controller must release it first')
     }
@@ -1174,7 +1221,7 @@ export class AgentControl {
     // Naming another project is only meaningful for the methods that were opened to a sibling;
     // everywhere else it is still an attempt to act outside the authorized scope.
     if (args.projectId !== undefined && args.projectId !== scope.projectId && !crossProjectMethods.includes(method)) throw new Error('This method only runs in the authorized project. Use projects.list to see what else is open, and hand work to a sibling project with tabs.open({projectId}).')
-    if (method === 'tools.list') return { ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.cloud ? cloudSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(this.deps.ideaRuns ? ideaRunSignatures : {}), ...(this.deps.modelIntelligence ? modelSignatures : {}), ...(sovereign(scope) ? { ...ownerSignatures, ...WIZARD_APPROVAL_SIGNATURES } : {}), ...(this.deps.permissionGrants ? { ...PERMISSION_METHOD_SIGNATURES, ...(sovereign(scope) ? PERMISSION_OWNER_SIGNATURES : {}) } : {}) }
+    if (method === 'tools.list') return filterSignatures({ ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.cloud ? cloudSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(this.deps.ideaRuns ? ideaRunSignatures : {}), ...(this.deps.modelIntelligence ? modelSignatures : {}), ...(sovereign(scope) ? { ...ownerSignatures, ...WIZARD_APPROVAL_SIGNATURES } : {}), ...(this.deps.permissionGrants ? { ...PERMISSION_METHOD_SIGNATURES, ...(sovereign(scope) ? PERMISSION_OWNER_SIGNATURES : {}) } : {}) }, args)
     if (PERMISSION_METHODS.includes(method)) {
       if (!this.deps.permissionGrants) throw new Error('Permission grants are not available in this Conductor')
       return callPermissions(this.deps.permissionGrants, { agentSessionId: scope.agentSessionId, owner: scope.owner === true, wizard: scope.wizard === true }, method, args)
@@ -1210,6 +1257,12 @@ export class AgentControl {
     if (method === 'models.list') return this.withModelFacts(this.deps.cloud ? [...this.catalog(scope), cloudCatalogEntry(this.deps.cloud.available())] : this.catalog(scope))
     if (method === 'tabs.list') return this.tabs(this.sibling(scope, args))
     if (method === 'tabs.open') return this.callOpen(scope, source, args)
+    // A coworker's message to its controller, or to any ancestor, is a report and takes no
+    // control: send_message is agents.steer, and coworkers reach for it first.
+    if ((method === 'agents.steer' || method === 'agents.submit') && !scope.owner && typeof args.agentSessionId === 'string' && args.agentSessionId !== scope.agentSessionId && this.ancestorsOf(scope.agentSessionId).includes(args.agentSessionId)) {
+      if (method === 'agents.submit') throw new Error('An agent cannot start a turn in its controller or an ancestor; use send_message or report to reach it')
+      return this.reportTo(scope, args.agentSessionId, text(args, 'prompt', MAX_PROMPT_CHARS))
+    }
     // A local conversation steers and finishes only the local coworkers it opened (swarm.ts).
     if ((method === 'agents.steer' || method === 'agents.finish') && source.provider === 'local' && !scope.owner && args.agentSessionId !== undefined) {
       const id = String(args.agentSessionId)
@@ -1279,7 +1332,7 @@ export class AgentControl {
     }
     if (method.startsWith('agents.')) {
       if (typeof args.agentSessionId !== 'string' || !args.agentSessionId.trim()) throw new Error(method + ' requires agentSessionId: the exact id of a visible conversation, as returned by agents.list or app.state')
-      const id = text(args, 'agentSessionId', 160), mutate = !['agents.snapshot', 'agents.history', 'agents.artifact'].includes(method)
+      const id = text(args, 'agentSessionId', 160), mutate = !['agents.snapshot', 'agents.history', 'agents.status', 'agents.artifact'].includes(method)
       const reach = ['agents.snapshot', 'agents.history', 'agents.status', 'agents.artifact'].includes(method) ? 'read' : ['agents.submit', 'agents.steer', 'agents.interrupt'].includes(method) ? 'steer' : null
       const { tab, scope: target } = this.target(scope, id, mutate, reach, method === 'agents.resume'), state = database.structured.snapshot(id)!
       if (reach === 'read' && anonymousConversations.has(id) && !scope.owner && !anonymousConversations.has(scope.agentSessionId)) throw new Error('That conversation is anonymous: only the owner and anonymous conversations may read it, because anything read here would be kept in this conversation\'s history')
@@ -2179,7 +2232,7 @@ export class AgentControl {
         const coordination = tab.projectId === scope.projectId
           ? tab.state!.provider === 'local'
             ? '\n\nConductor orchestration task: ' + task.id + '. When finished, report concrete evidence, tests, and remaining limitations to your controller ' + scope.agentSessionId + '. Your controller updates the orchestration task. Deliver with git.ship({message, paths}) as a local commit only; never pass publish: true. Your controller publishes one release for the whole batch when it is done.'
-            : '\n\nConductor orchestration task: ' + task.id + '. Mark it done with orchestration.tasks.update only after finishing. Your controller is ' + scope.agentSessionId + '; coordinate through the provided app protocol. Deliver with git.ship({message, paths}) as a local commit only; never pass publish: true. Your controller publishes one release for the whole batch when it is done.'
+            : '\n\nConductor orchestration task: ' + task.id + '. Mark it done with orchestration.tasks.update only after finishing. Your controller is ' + scope.agentSessionId + '. Report to it with report (agents.report) when finished. Deliver with git.ship({message, paths}) as a local commit only; never pass publish: true. Your controller publishes one release for the whole batch when it is done.'
           : '\n\nThis work was handed to the ' + (this.deps.database.getProject(tab.projectId)?.name ?? 'this') + ' project by a coworker in ' + (this.deps.database.getProject(scope.projectId)?.name ?? 'another project') + '. You work only in this project; your controller is ' + scope.agentSessionId + ' and tracks the task on its own side, so report your result here rather than looking for its task board.'
         await this.call(scope, 'agents.submit', { agentSessionId: tab.resourceId, prompt: String(request.prompt) + ownership + coordination })
         accepted = true

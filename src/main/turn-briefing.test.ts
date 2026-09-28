@@ -7,7 +7,7 @@ import { ConductorDatabase } from './database'
 import { MEMORY_PROTOCOL } from './memory'
 import type { CoworkerBriefingOptions } from './agent-collaboration-store'
 import { COWORKER_OPENED_PREFIX } from './coworker-autoclose'
-import { CONTEXT_RESET, FINISH_HINT, MEMORY_HEADING, LOCAL_ASSIST_HINT, TurnBriefings, handoffNudge, SUCCESSION_HINT, SUCCESSION_PERCENT, SUCCESSION_TURNS, successionNudge } from './turn-briefing'
+import { CONTEXT_RESET, FINISH_HINT, MEMORY_HEADING, LOCAL_ASSIST_HINT, TurnBriefings, handoffNudge, SUCCESSION_HINT, SUCCESSION_PERCENT, SUCCESSION_TURNS, successionNudge, coworkerHint } from './turn-briefing'
 
 const roots: string[] = [], databases: ConductorDatabase[] = []
 afterEach(() => {
@@ -156,6 +156,22 @@ describe('what a native runtime is told, and how often', () => {
     expect(FINISH_HINT).toBe('When your work is delivered and reported, end with agents.finish({}) so your tab and CLI are released.')
     f.starting('runtime-1')
     expect(f.briefings.compose(f.spec, 'Again', 'item-2', 'runtime-1')).not.toContain(FINISH_HINT)
+  })
+
+  it('names the controller a coworker reports to, and how, once per runtime', () => {
+    const f = fixture()
+    const controller = vi.fn((id: string) => ({ id, title: 'Swarm lead' }))
+    const briefings = new TurnBriefings({ database: f.database, controller })
+    f.database.setSetting(COWORKER_OPENED_PREFIX + f.spec.id, 'agent-lead')
+    const first = briefings.compose(f.spec, 'Build it', 'item-1', '')
+    expect(first).toContain(coworkerHint({ id: 'agent-lead', title: 'Swarm lead' }))
+    expect(first).toContain('You are a coworker of "Swarm lead" (agent-lead). Report results with report (agents.report({text})')
+    expect(first).toContain('send_message to agent-lead')
+    expect(first).toContain(FINISH_HINT)
+    expect(controller).toHaveBeenCalledWith('agent-lead')
+    expect(briefings.compose(f.spec, 'Again', 'item-2', '')).not.toContain('coworker of')
+    // Without a title it still names the controller by id.
+    expect(coworkerHint({ id: 'agent-lead' })).toMatch(/^You are a coworker of agent-lead\. /)
   })
 
   it('gives a local model only its memory lines: no heading, no nudge, never a control credential', () => {

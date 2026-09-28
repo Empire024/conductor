@@ -224,7 +224,7 @@ export async function runAcceptance(argv, overrides = {}) {
     const { list } = await kit.listProcesses()
     const osServers = list.filter(entry => /^llama-server(\.exe)?$/i.test(entry.name)).map(entry => ({ pid: entry.pid, creationTime: entry.creationTime }))
     const load = await deps.loadCheck({ selfTabs: 2, record: false })
-    Object.assign(evidence.run, { schedulesBefore: schedules.map(s => ({ id: s.id, enabled: s.enabled, running: s.running })), serversBefore: { app: appServers.map(s => ({ model: s.model, pid: s.pid })), os: osServers }, load: { quiet: load?.quiet, cpu: load?.cpuPercent, gpu: load?.gpuPercent, reasons: load?.reasons, tabs: load?.midTurn?.tabs?.map(tab => tab.agentSessionId) } })
+    Object.assign(evidence.run, { schedulesBefore: schedules.map(s => ({ id: s.id, enabled: s.enabled, running: s.running })), serversBefore: { app: appServers.map(s => ({ model: s.model, pid: s.pid })), os: osServers }, load: { quiet: load?.quiet, cpu: load?.cpuPercent, gpu: load?.gpuPercent, reasons: load?.reasons, tabs: load?.midTurn?.tabs?.map(tab => tab.agentSessionId), info: load?.info ?? [] } })
     judgeAdmission({ appServers, osServers, load, schedules, allowed: [args.controller, args.executor] })
     evidence.save()
     validateSlot(deps.readSlot(), args, deps.now()) // immediately before spawn

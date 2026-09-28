@@ -196,3 +196,15 @@ describe('control activity recording', () => {
     ])
   })
 })
+
+describe('control briefing', () => {
+  it('tells a shell caller how to read a refusal and describes delivery as a local commit', async () => {
+    const server = new AgentControlServer({} as never, false)
+    servers.push(server)
+    await server.start()
+    const briefing = server.briefing(spec)
+    for (const text of ['ErrorDetails', 'curl.exe', 'publish:true', 'agents.report', '"brief":true']) expect(briefing).toContain(text)
+    expect(briefing).not.toContain('push, release check')
+    expect(briefing.replace(/[a-f0-9]{64}/, '').length).toBeLessThan(2100)
+  })
+})

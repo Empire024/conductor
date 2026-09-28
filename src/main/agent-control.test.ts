@@ -308,6 +308,45 @@ locked: [budget]
     expect(result).toEqual({ agentSessionId: f.scope.agentSessionId, delivery: 'started' })
     expect(f.submissions.at(-1)).toMatchObject({ prompt: 'UPDATE OK 1.2.3' })
   })
+  it('a coworker reaches its controller and ancestors with send_message (agents.steer) and reads them with agents.status', async () => {
+    const f = fixture()
+    const child = await f.control.call(f.scope, 'tabs.open', { title: 'Child worker' }) as AgentControlTab
+    const childScope = { ...f.scope, agentSessionId: child.resourceId! }
+    // Steering the controller is a report: labelled with the coworker, and no control is taken.
+    expect(await f.control.call(childScope, 'agents.steer', { agentSessionId: f.scope.agentSessionId, prompt: 'CHILD DONE abc123' })).toEqual({ reportedTo: 'controller', agentSessionId: f.scope.agentSessionId, delivery: 'started' })
+    expect(f.submissions.at(-1)).toMatchObject({ prompt: 'CHILD DONE abc123' })
+    expect(f.database.structured.snapshot(f.scope.agentSessionId)!.items).toEqual(expect.arrayContaining([expect.objectContaining({ data: expect.objectContaining({ type: 'text', role: 'user', text: 'CHILD DONE abc123' }) })]))
+    expect(f.control.listLinks(f.project.id, f.workspace.id).map(link => link.targetAgentSessionId)).toEqual([child.resourceId])
+    await expect(f.control.call(childScope, 'agents.submit', { agentSessionId: f.scope.agentSessionId, prompt: 'Take over' })).rejects.toThrow(/use send_message or report to reach it/)
+    await expect(f.control.call(childScope, 'agents.interrupt', { agentSessionId: f.scope.agentSessionId })).rejects.toThrow(/itself or an ancestor; use send_message or report/)
+    await expect(f.control.call(childScope, 'agents.steer', { agentSessionId: child.resourceId, prompt: 'Me' })).rejects.toThrow(/itself or an ancestor/)
+    // agents.status is a read: of the controller, and of a tab a third agent controls.
+    expect(await f.control.call(childScope, 'agents.status', { agentSessionId: f.scope.agentSessionId })).toMatchObject({ agentSessionId: f.scope.agentSessionId })
+    const stranger = agentIn(f, f.project.id, f.workspace.id, 'stranger')
+    expect(await f.control.call(stranger, 'agents.status', { agentSessionId: child.resourceId })).toMatchObject({ agentSessionId: child.resourceId })
+    await expect(f.control.call(stranger, 'agents.steer', { agentSessionId: child.resourceId, prompt: 'Mine now' })).rejects.toThrow(/Another agent already controls/)
+    // A grandchild reaches the root too.
+    const grandchild = await f.control.call(childScope, 'tabs.open', { title: 'Grandchild' }) as AgentControlTab
+    expect(await f.control.call({ ...f.scope, agentSessionId: grandchild.resourceId! }, 'agents.steer', { agentSessionId: f.scope.agentSessionId, prompt: 'From below' })).toMatchObject({ reportedTo: 'ancestor', agentSessionId: f.scope.agentSessionId })
+  })
+  it('tools.list filters to a brief catalog, a prefix or named methods', async () => {
+    const f = fixture()
+    const all = await f.control.call(f.scope, 'tools.list') as Record<string, string>
+    const brief = await f.control.call(f.scope, 'tools.list', { brief: true }) as Record<string, string>
+    expect(Object.keys(brief)).toEqual(Object.keys(all))
+    expect(JSON.stringify(brief).length).toBeLessThan(6000)
+    expect(JSON.stringify(all).length).toBeGreaterThan(JSON.stringify(brief).length * 4)
+    expect(brief['agents.report']).toBe('({text})')
+    expect(brief['agents.supersede']).toBe('({agentSessionId,by,reason})')
+    expect(Object.values(brief).every(signature => !signature.includes(' — '))).toBe(true)
+    const git = await f.control.call(f.scope, 'tools.list', { prefix: 'git.' }) as Record<string, string>
+    expect(Object.keys(git).length).toBeGreaterThan(0)
+    expect(Object.keys(git).every(method => method.startsWith('git.'))).toBe(true)
+    expect(git['git.ship']).toBe(all['git.ship'])
+    expect(await f.control.call(f.scope, 'tools.list', { methods: ['agents.report', 'tabs.open'] })).toEqual({ 'agents.report': all['agents.report'], 'tabs.open': all['tabs.open'] })
+    await expect(f.control.call(f.scope, 'tools.list', { brif: true })).rejects.toThrow(/accepts only brief, prefix, methods; brif is not an argument/)
+    await expect(f.control.call(f.scope, 'tools.list', { methods: ['agents.nope'] })).rejects.toThrow(/No control method agents.nope/)
+  })
   it('tabs.open submits a prompt as the new tab’s first turn, exactly as agents.submit would', async () => {
     const f = fixture()
     const opened = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', title: 'Prompted worker', prompt: 'Do the thing' }) as AgentControlTab & { submitted: boolean }
@@ -402,6 +441,7 @@ locked: [budget]
     expect(f.submissions.map(submission => submission.provider)).toEqual(['codex', 'claude'])
     expect(f.submissions[1]?.prompt).toContain(child.taskId)
     expect(f.submissions[1]?.prompt).toContain('Mark it done with orchestration.tasks.update only after finishing.')
+    expect(f.submissions[1]?.prompt).toContain('Your controller is ' + routerScope.agentSessionId + '. Report to it with report (agents.report) when finished.')
     expect(f.database.structured.snapshot(child.agentSessionId)?.items).toEqual(expect.arrayContaining([expect.objectContaining({ data: expect.objectContaining({ type: 'text', role: 'user' }) }), expect.objectContaining({ data: expect.objectContaining({ type: 'text', role: 'assistant', text: 'Native fixture result' }) })]))
     expect(f.control.listLinks(f.project.id, f.workspace.id)).toHaveLength(2)
     await expect(f.control.call({ ...f.scope, agentSessionId: child.agentSessionId }, 'agents.submit', { agentSessionId: f.scope.agentSessionId, prompt: 'Cycle' })).rejects.toThrow('ancestor')
@@ -1202,7 +1242,9 @@ describe('steering an uncontrolled tab in a co-opened project', () => {
     await expect(control.call(neighbour, 'agents.interrupt', { agentSessionId: 'worker' })).rejects.toThrow(/Another agent controls that tab/)
     // The coworker cannot turn round and control or close its controller.
     const worker = { projectId: f.project.id, sessionId: f.workspace.id, agentSessionId: 'worker' }
-    await expect(control.call(worker, 'agents.submit', { agentSessionId: 'astra', prompt: 'Stop me' })).rejects.toThrow(/itself or an ancestor/)
+    await expect(control.call(worker, 'agents.submit', { agentSessionId: 'astra', prompt: 'Stop me' })).rejects.toThrow(/controller or an ancestor; use send_message or report/)
+    // It still reaches its controller next door: agents.steer (send_message) is delivered as a report.
+    expect(await control.call(worker, 'agents.steer', { agentSessionId: 'astra', prompt: 'Worker done' })).toMatchObject({ reportedTo: 'controller', agentSessionId: 'astra' })
     await expect(control.call(worker, 'tabs.close', { tabId: 'tab-astra' })).rejects.toThrow(/outside this workspace or closed/)
     // Writing into the sibling project still goes through the tab that lives there.
     await expect(control.call(astra, 'files.write', { projectId: f.project.id, path: 'x.md', content: 'x', expectedContent: null })).rejects.toThrow(/only runs in the authorized project/)

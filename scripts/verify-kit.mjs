@@ -38,8 +38,10 @@ export const BUILD = join(REPO, 'out', 'main', 'index.js')
 export const CLOSE_BOUND_MS = 20_000
 /** agent-control-ui.ts: the renderer did not answer a UI action (usually: workspace not mounted yet). */
 export const ACK_TIMEOUT = /did not acknowledge/i
-/** SessionPhase values (src/shared/structured-agent.ts) in which a tab is mid-turn. */
-export const MID_TURN_PHASES = new Set(['starting', 'running', 'waiting_approval', 'interrupting'])
+/** SessionPhase values (src/shared/structured-agent.ts) in which a tab is mid-turn and so is load.
+ *  A tab waiting on an approval is waiting on the owner, not working: WAITING_PHASES is INFO only. */
+export const MID_TURN_PHASES = new Set(['starting', 'running', 'interrupting'])
+export const WAITING_PHASES = new Set(['waiting_approval'])
 /** The v3 vocabulary: NOT RUN always names its reason (owner, harness, lock, load, time-box...). */
 export const VERDICT = /^(PASS|FAIL|HUNG|INFO|LOAD|NOT RUN \([^)]+\))$/
 
@@ -286,8 +288,42 @@ export function readGateThresholds(source) {
   return { machineCpuPercent: number('machineCpuPercent'), gpuPercent: number('gpuPercent') }
 }
 
+/** Agent ids a smoke may ignore as load, from CONDUCTOR_LOAD_IGNORE_TABS (comma or space separated). */
+export function ignoredTabs(env = process.env) {
+  return String(env.CONDUCTOR_LOAD_IGNORE_TABS ?? '').split(/[\s,]+/).filter(Boolean)
+}
+
+const describeTab = tab => `"${tab.title ?? 'untitled'}" (${tab.agentSessionId}, ${tab.phase}${tab.projectId ? `, project ${tab.projectId}` : ''})`
+
+/** The mid-turn tabs that count as load and how many of them the caller may account for.
+ *  selfTabs is a number (the caller's own mid-turn tabs, itself included) or a list of agent ids
+ *  besides the caller that are its own; those, CONDUCTOR_LOAD_IGNORE_TABS and callerId are not
+ *  load. Other projects' turns count only with otherProjects:'count'; by default they are INFO,
+ *  since what they cost the machine is measured directly by CPU, GPU and llama /slots. */
+export function countedTurns(midTurn, { selfTabs = 1, otherProjects = 'info', ignoreTabs = [], callerId = null } = {}) {
+  const ignored = new Set([...(Array.isArray(selfTabs) ? selfTabs : []), ...ignoreTabs, ...(callerId ? [callerId] : [])])
+  const own = Array.isArray(midTurn?.tabs) ? midTurn.tabs : null
+  const elsewhere = otherProjects === 'count' ? (midTurn?.elsewhere ?? []).filter(tab => MID_TURN_PHASES.has(tab.phase)) : []
+  const tabs = [...(own ?? []), ...elsewhere].filter(tab => !ignored.has(tab.agentSessionId))
+  // A bare count (no tab list) can only be compared with a numeric allowance.
+  const count = own ? tabs.length : (midTurn?.count ?? 0) + elsewhere.length
+  // A known caller is already left out of `tabs`, so it takes no allowance of its own.
+  const callerShare = own && callerId ? 1 : 0
+  const allowance = Math.max(0, (Array.isArray(selfTabs) ? 1 : selfTabs) - callerShare)
+  return { tabs, count, allowance, callerKnown: callerShare === 1 }
+}
+
+/** What loadCheck saw but did not count: tabs waiting on an approval, other projects' turns. */
+export function loadInfo(midTurn, { otherProjects = 'info' } = {}) {
+  const info = []
+  if (midTurn?.waiting?.length) info.push(`waiting on an approval (not load): ${midTurn.waiting.map(describeTab).join(', ')}`)
+  const elsewhere = (midTurn?.elsewhere ?? []).filter(tab => otherProjects !== 'count' || !MID_TURN_PHASES.has(tab.phase))
+  if (elsewhere.length) info.push(`other projects (not load; loadCheck({otherProjects:'count'}) counts them): ${elsewhere.map(describeTab).join(', ')}`)
+  return info
+}
+
 /** Quiet or not, with every reason. Perf numbers only count on a quiet record (verify.md section 3.4). */
-export function judgeLoad(sample, thresholds, { selfTabs = 1 } = {}) {
+export function judgeLoad(sample, thresholds, { selfTabs = 1, otherProjects = 'info', ignoreTabs = [], callerId = null } = {}) {
   const reasons = []
   // Without a whole process inventory, llama-server and lock ancestry are unknown, not absent.
   if (sample.inventory?.ok !== true) reasons.push(`process inventory unavailable${sample.inventory?.error ? ` (${sample.inventory.error})` : ''}`)
@@ -302,7 +338,15 @@ export function judgeLoad(sample, thresholds, { selfTabs = 1 } = {}) {
     else if (server.busy == null) reasons.push(`llama-server pid ${server.pid} state unknown`)
   }
   if (sample.midTurn?.count == null) reasons.push(`mid-turn tabs unknown (${sample.midTurn?.note ?? 'no answer'})`)
-  else if (sample.midTurn.count > selfTabs) reasons.push(`${sample.midTurn.count - selfTabs} mid-turn tab(s) besides the caller`)
+  else {
+    const turns = countedTurns(sample.midTurn, { selfTabs, otherProjects, ignoreTabs, callerId })
+    if (turns.count > turns.allowance) {
+      const named = turns.tabs.length ? `: ${turns.tabs.map(describeTab).join(', ')}${turns.callerKnown || !turns.allowance ? '' : ' (the caller is one of these; leave it out)'}` : ''
+      const ids = turns.tabs.map(tab => tab.agentSessionId)
+      const next = ids.length ? ` Wait for them to settle and re-run, or, if they are yours, pass loadCheck({selfTabs:[${ids.map(id => `'${id}'`).join(',')}]}) or set CONDUCTOR_LOAD_IGNORE_TABS=${ids.join(',')}.` : ''
+      reasons.push(`${turns.count - turns.allowance} mid-turn tab(s) besides the caller${named}.${next}`)
+    }
+  }
   return { quiet: reasons.length === 0, reasons }
 }
 
@@ -1003,46 +1047,47 @@ export function suppliedControl(env = process.env) {
   return { endpoint, token, ...(projectId ? { projectId } : {}), ...(workspaceId ? { workspaceId } : {}) }
 }
 
-/** Mid-turn tabs across every project and workspace the app lists, read-only through the caller's
- *  own supplied credential. Anything short of a complete listing - no credential, a refused or
- *  malformed call, a project without a workspace list - is count null (unknown, so not quiet),
- *  never zero. Error notes carry the method and status only, never the token. */
+/** Mid-turn tabs from one agents.list call through the caller's own supplied credential. A
+ *  conversation credential is bound to its own workspace (the server ignores a request scope), and
+ *  its list also carries the tabs it may reach elsewhere, marked crossProject - even a same-project
+ *  tab in another workspace - so the caller's project is decided by projectId, not by that flag.
+ *  count/tabs: this project's tabs in MID_TURN_PHASES; waiting: this project's tabs waiting on an
+ *  approval; elsewhere: other projects' active tabs. The last two are INFO for judgeLoad. A missing
+ *  credential or a refused or malformed answer is count null (unknown, so not quiet), never zero.
+ *  Error notes carry the method and status only, never the token. */
 export async function midTurnTabs({ control = suppliedControl(), fetchImpl = fetch, timeoutMs = 5000 } = {}) {
-  if (!control) return { count: null, tabs: [], note: 'no supplied control credential (CONDUCTOR_CONTROL_ENDPOINT / CONDUCTOR_CONTROL_TOKEN); the owner credential is never used' }
-  const baseScope = control.projectId ? { projectId: control.projectId, ...(control.workspaceId ? { workspaceId: control.workspaceId } : {}) } : undefined
-  const ask = async (method, scope = baseScope) => {
-    const response = await fetchImpl(control.endpoint, { method: 'POST', headers: { Authorization: `Bearer ${control.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ method, args: {}, ...(scope ? { scope } : {}) }), signal: AbortSignal.timeout(timeoutMs) })
-    let body
-    try { body = await response.json() } catch { throw new Error(`${method} -> ${response.status} (unreadable body)`) }
-    if (response.status !== 200 || body?.error) throw new Error(`${method} -> ${response.status}`)
-    return body.result
-  }
+  if (!control) return { count: null, tabs: [], waiting: [], elsewhere: [], note: 'no supplied control credential (CONDUCTOR_CONTROL_ENDPOINT / CONDUCTOR_CONTROL_TOKEN); the owner credential is never used' }
+  const scope = control.projectId ? { projectId: control.projectId, ...(control.workspaceId ? { workspaceId: control.workspaceId } : {}) } : undefined
   try {
-    const projects = await ask('projects.list')
-    if (!Array.isArray(projects) || !projects.length) throw new Error('projects.list returned no project list')
-    const seen = new Map()
-    for (const project of projects) {
-      if (typeof project?.id !== 'string' || !Array.isArray(project.workspaces)) throw new Error(`project ${project?.id ?? '?'} has no workspace list`)
-      for (const workspace of project.workspaces) {
-        if (typeof workspace?.id !== 'string') throw new Error(`project ${project.id} lists a workspace without an id`)
-        const agents = await ask('agents.list', { projectId: project.id, workspaceId: workspace.id })
-        if (!Array.isArray(agents)) throw new Error(`agents.list for ${project.id}/${workspace.id} returned no list`)
-        for (const agent of agents) {
-          if (typeof agent?.agentSessionId !== 'string' || typeof agent.phase !== 'string') throw new Error(`agents.list for ${project.id}/${workspace.id} has an entry without id or phase`)
-          if (MID_TURN_PHASES.has(agent.phase)) seen.set(agent.agentSessionId, { agentSessionId: agent.agentSessionId, title: agent.title ?? null, phase: agent.phase })
-        }
-      }
+    const response = await fetchImpl(control.endpoint, { method: 'POST', headers: { Authorization: `Bearer ${control.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ method: 'agents.list', args: {}, ...(scope ? { scope } : {}) }), signal: AbortSignal.timeout(timeoutMs) })
+    let body
+    try { body = await response.json() } catch { throw new Error(`agents.list -> ${response.status} (unreadable body)`) }
+    if (response.status !== 200 || body?.error) throw new Error(`agents.list -> ${response.status}`)
+    const agents = body.result
+    if (!Array.isArray(agents)) throw new Error('agents.list returned no list')
+    for (const agent of agents) if (typeof agent?.agentSessionId !== 'string' || typeof agent.phase !== 'string') throw new Error('agents.list has an entry without id or phase')
+    const projectId = control.projectId ?? agents.find(agent => !agent.crossProject && typeof agent.projectId === 'string')?.projectId ?? null
+    const ownProject = agent => projectId && typeof agent.projectId === 'string' ? agent.projectId === projectId : !agent.crossProject
+    const tabs = new Map(), waiting = new Map(), elsewhere = new Map()
+    for (const agent of agents) {
+      const active = MID_TURN_PHASES.has(agent.phase), paused = WAITING_PHASES.has(agent.phase)
+      if (!active && !paused) continue
+      const entry = { agentSessionId: agent.agentSessionId, title: agent.title ?? null, phase: agent.phase, projectId: agent.projectId ?? null, workspaceId: agent.workspaceId ?? null }
+      if (!ownProject(agent)) elsewhere.set(entry.agentSessionId, entry)
+      else (active ? tabs : waiting).set(entry.agentSessionId, entry)
     }
-    return { count: seen.size, tabs: [...seen.values()], projects: projects.length }
-  } catch (error) { return { count: null, tabs: [], note: String(error?.message ?? error).split(control.token).join('[redacted]').slice(0, 300) } }
+    return { count: tabs.size, tabs: [...tabs.values()], waiting: [...waiting.values()], elsewhere: [...elsewhere.values()], projectId }
+  } catch (error) { return { count: null, tabs: [], waiting: [], elsewhere: [], note: String(error?.message ?? error).split(control.token).join('[redacted]').slice(0, 300) } }
 }
 
 /** Is the machine quiet enough for timings to count? Smoke-lock holder (the lock this smoke itself
  *  runs under is not load), whole-machine CPU over 1 s, GPU via nvidia-smi, llama-server /slots, and
- *  mid-turn tabs in the owner's app (selfTabs: how many of those are the caller's own, default 1).
- *  Thresholds are schedule-gate.ts's. Records a LOAD row unless record:false. Call it before
- *  launching, since the smoke's own app is load too. */
-export async function loadCheck({ selfTabs = 1, record: write = true, control = suppliedControl() } = {}) {
+ *  mid-turn tabs in the caller's project (see countedTurns for selfTabs, otherProjects and
+ *  CONDUCTOR_LOAD_IGNORE_TABS; CONDUCTOR_AGENT_ID, when set, is the caller). Tabs waiting on an
+ *  approval and other projects' turns are listed in `info`, not counted. Thresholds are
+ *  schedule-gate.ts's. Records a LOAD row unless record:false. Call it before launching, since the
+ *  smoke's own app is load too. */
+export async function loadCheck({ selfTabs = 1, otherProjects = 'info', callerId = process.env.CONDUCTOR_AGENT_ID || null, record: write = true, control = suppliedControl() } = {}) {
   const thresholds = gateThresholds()
   const cpuBefore = cpus(), cpuStarted = Date.now()
   let inventoryError = null
@@ -1064,8 +1109,10 @@ export async function loadCheck({ selfTabs = 1, record: write = true, control = 
   const midTurn = await midTurnTabs({ control })
   await sleep(Math.max(0, 1000 - (Date.now() - cpuStarted)))
   const sample = { at: new Date().toISOString(), inventory, lock, cpuPercent: cpuPercent(cpuBefore, cpus()), gpuPercent: gpus.length ? Math.max(...gpus) : null, llama, midTurn }
-  const verdict = judgeLoad(sample, thresholds, { selfTabs })
-  const result = { ...sample, thresholds, selfTabs, ...verdict }
-  if (write) record('load', 'LOAD', { quiet: verdict.quiet, cpu: sample.cpuPercent, gpu: sample.gpuPercent, lockHolder: lock.held ? (lock.self ? 'self' : lock.holder.pid) : null, llamaBusy: llama.filter(server => server.busy).length, midTurn: midTurn.count }, verdict.quiet ? 'quiet machine' : verdict.reasons.join('; '))
+  const ignoreTabs = ignoredTabs()
+  const verdict = judgeLoad(sample, thresholds, { selfTabs, otherProjects, ignoreTabs, callerId })
+  const info = loadInfo(midTurn, { otherProjects })
+  const result = { ...sample, thresholds, selfTabs, otherProjects, ignoreTabs, ...verdict, info }
+  if (write) record('load', 'LOAD', { quiet: verdict.quiet, cpu: sample.cpuPercent, gpu: sample.gpuPercent, lockHolder: lock.held ? (lock.self ? 'self' : lock.holder.pid) : null, llamaBusy: llama.filter(server => server.busy).length, midTurn: midTurn.count, waiting: midTurn.waiting?.length ?? 0, elsewhere: midTurn.elsewhere?.length ?? 0 }, [verdict.quiet ? 'quiet machine' : verdict.reasons.join('; '), ...info].join('; info: '))
   return result
 }

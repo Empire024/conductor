@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
-  REPO, VERDICT, ancestorsOf, cpuPercent, descendantsOf, formatRecordLine, identityOf, judgeLoad, leavesFirst, listProcesses, matchProcesses, midTurnTabs, newInstance, suppliedControl,
+  REPO, VERDICT, ancestorsOf, cpuPercent, descendantsOf, formatRecordLine, identityOf, ignoredTabs, judgeLoad, leavesFirst, listProcesses, loadInfo, matchProcesses, midTurnTabs, newInstance, suppliedControl,
   ownedTree, parseLlamaCommandLine, parseNvidiaSmi, parseProcessList, poll, readGateThresholds, registerRelaunch, registerRoot, retryAck, safeClose,
   sameProcesses, terminateIdentity, trackDescendants, withDeadline, commandHasArg, creationMs, startTracking, stopTracking, assertBuildHash, registerOwnChild,
   possibleDescendants
@@ -571,17 +571,65 @@ function controlServer(routes) {
 }
 const ok = result => ({ status: 200, body: { result } })
 
-test('midTurnTabs counts mid-turn tabs across every project and workspace through the supplied credential', async () => {
-  const server = controlServer({
-    'projects.list': () => ok([{ id: 'p1', workspaces: [{ id: 'w1' }, { id: 'w2' }] }, { id: 'p2', workspaces: [{ id: 'w3' }] }]),
-    'agents.list': scope => ok({ w1: [{ agentSessionId: 'a1', phase: 'running' }, { agentSessionId: 'a2', phase: 'idle' }], w2: [], w3: [{ agentSessionId: 'a3', phase: 'waiting_approval' }] }[scope.workspaceId])
-  })
-  const result = await midTurnTabs({ control: { endpoint: ENDPOINT, token: TOKEN, projectId: 'p1', workspaceId: 'w1' }, fetchImpl: server.fetchImpl })
-  assert.equal(result.count, 2)
-  assert.deepEqual(result.tabs.map(tab => tab.agentSessionId), ['a1', 'a3'])
+// What a conversation credential's agents.list answers: its own workspace, plus the tabs it may reach
+// elsewhere, all marked crossProject (a same-project tab in another workspace included).
+const listing = [
+  { agentSessionId: 'agent_me', title: 'Caller', phase: 'running', projectId: 'p1', workspaceId: 'w1' },
+  { agentSessionId: 'agent_a', title: 'Worker A', phase: 'running', projectId: 'p1', workspaceId: 'w1' },
+  { agentSessionId: 'agent_idle', title: 'Idle', phase: 'idle', projectId: 'p1', workspaceId: 'w1' },
+  { agentSessionId: 'agent_ask', title: 'Asking', phase: 'waiting_approval', projectId: 'p1', workspaceId: 'w1' },
+  { agentSessionId: 'agent_b', title: 'Worker B', phase: 'starting', projectId: 'p1', workspaceId: 'w2', crossProject: true, controlled: true },
+  { agentSessionId: 'agent_haft', title: 'Haftheme wizard', phase: 'running', projectId: 'p2', workspaceId: 'w3', crossProject: true, controlled: false }
+]
+
+test('midTurnTabs makes one agents.list call and splits this project, approval waits and other projects', async () => {
+  const server = controlServer({ 'agents.list': () => ok(listing) })
+  const result = await midTurnTabs({ control: { endpoint: ENDPOINT, token: TOKEN }, fetchImpl: server.fetchImpl })
+  assert.deepEqual(server.calls.map(call => call.method), ['agents.list'])
   assert.ok(server.calls.every(call => call.url === ENDPOINT && call.auth === `Bearer ${TOKEN}`))
-  assert.deepEqual(server.calls[0].scope, { projectId: 'p1', workspaceId: 'w1' })
-  assert.deepEqual(server.calls.slice(1).map(call => call.scope.workspaceId), ['w1', 'w2', 'w3'])
+  assert.equal(result.projectId, 'p1')
+  assert.equal(result.count, 3)
+  assert.deepEqual(result.tabs.map(tab => tab.agentSessionId), ['agent_me', 'agent_a', 'agent_b'])
+  assert.deepEqual(result.waiting.map(tab => tab.agentSessionId), ['agent_ask'])
+  assert.deepEqual(result.elsewhere.map(tab => [tab.agentSessionId, tab.projectId]), [['agent_haft', 'p2']])
+  const scoped = controlServer({ 'agents.list': () => ok(listing) })
+  assert.equal((await midTurnTabs({ control: { endpoint: ENDPOINT, token: TOKEN, projectId: 'p2', workspaceId: 'w3' }, fetchImpl: scoped.fetchImpl })).count, 1)
+  assert.deepEqual(scoped.calls[0].scope, { projectId: 'p2', workspaceId: 'w3' })
+})
+
+test('judgeLoad counts only this project\'s working tabs and names the blocking ones with the way out', async () => {
+  const thresholds = { machineCpuPercent: 30, gpuPercent: 40 }
+  const machine = { inventory: { ok: true }, lock: { held: false }, cpuPercent: 5, gpuPercent: 1, llama: [] }
+  const judge = async (entries, options) => judgeLoad({ ...machine, midTurn: await midTurnTabs({ control: { endpoint: ENDPOINT, token: TOKEN }, fetchImpl: controlServer({ 'agents.list': () => ok(entries) }).fetchImpl }) }, thresholds, options)
+  const [me, a, idle, ask, b, haft] = listing
+  // Another project's running wizard and a tab waiting on the owner are not load.
+  assert.deepEqual(await judge([me, idle, ask, haft]), { quiet: true, reasons: [] })
+  assert.equal((await judge([me, haft], { otherProjects: 'count' })).quiet, false)
+  // A same-project running tab blocks and is named with its id, phase, project and the overrides.
+  const blocked = await judge([me, a, b])
+  assert.equal(blocked.quiet, false)
+  assert.equal(blocked.reasons.length, 1)
+  assert.match(blocked.reasons[0], /^2 mid-turn tab\(s\) besides the caller: "Caller" \(agent_me, running, project p1\), "Worker A" \(agent_a, running, project p1\), "Worker B" \(agent_b, starting, project p1\) \(the caller is one of these; leave it out\)\./)
+  assert.match(blocked.reasons[0], /loadCheck\(\{selfTabs:\['agent_me','agent_a','agent_b'\]\}\) or set CONDUCTOR_LOAD_IGNORE_TABS=agent_me,agent_a,agent_b\.$/)
+  // A known caller is left out of the names; listed own tabs and the ignore list remove the rest.
+  const known = await judge([me, a, b], { callerId: 'agent_me' })
+  assert.match(known.reasons[0], /^2 mid-turn tab\(s\) besides the caller: "Worker A" [^;]*"Worker B" \(agent_b, starting, project p1\)\. Wait/)
+  assert.equal((await judge([me, a, b], { selfTabs: ['agent_a', 'agent_b'] })).quiet, true)
+  assert.equal((await judge([me, a, b], { selfTabs: ['agent_a'] })).quiet, false)
+  assert.equal((await judge([me, a, b], { ignoreTabs: ignoredTabs({ CONDUCTOR_LOAD_IGNORE_TABS: 'agent_a, agent_b' }) })).quiet, true)
+  assert.equal((await judge([me, a, b], { callerId: 'agent_me', selfTabs: ['agent_a', 'agent_b'] })).quiet, true)
+  assert.equal((await judge([me, a], { callerId: 'agent_me', selfTabs: 2 })).quiet, true)
+  assert.deepEqual(ignoredTabs({}), [])
+})
+
+test('loadInfo lists approval waits and other projects\' turns without counting them', async () => {
+  const midTurn = await midTurnTabs({ control: { endpoint: ENDPOINT, token: TOKEN }, fetchImpl: controlServer({ 'agents.list': () => ok(listing) }).fetchImpl })
+  const info = loadInfo(midTurn)
+  assert.equal(info.length, 2)
+  assert.match(info[0], /waiting on an approval \(not load\): "Asking" \(agent_ask, waiting_approval, project p1\)/)
+  assert.match(info[1], /other projects \(not load; .*"Haftheme wizard" \(agent_haft, running, project p2\)/)
+  assert.equal(loadInfo(midTurn, { otherProjects: 'count' }).length, 1)
+  assert.deepEqual(loadInfo({ count: 0, tabs: [] }), [])
 })
 
 test('midTurnTabs is unknown, never zero, without a credential or with any incomplete listing', async () => {
@@ -589,15 +637,12 @@ test('midTurnTabs is unknown, never zero, without a credential or with any incom
   assert.equal(none.count, null)
   assert.match(none.note, /owner credential is never used/)
   const control = { endpoint: ENDPOINT, token: TOKEN }
-  const projects = ok([{ id: 'p1', workspaces: [{ id: 'w1' }] }, { id: 'p2', workspaces: [{ id: 'w2' }] }])
   for (const [name, routes] of [
-    ['projects.list refused', { 'projects.list': () => ({ status: 403, body: { error: `denied for ${TOKEN}` } }) }],
-    ['no projects', { 'projects.list': () => ok([]) }],
-    ['project without workspace list', { 'projects.list': () => ok([{ id: 'p1' }]) }],
-    ['one workspace refused', { 'projects.list': () => projects, 'agents.list': scope => scope.projectId === 'p2' ? { status: 403, body: { error: 'cross-project' } } : ok([]) }],
-    ['agents.list not a list', { 'projects.list': () => projects, 'agents.list': () => ok({ agents: [] }) }],
-    ['agent without phase', { 'projects.list': () => projects, 'agents.list': () => ok([{ agentSessionId: 'a1' }]) }],
-    ['unreadable body', { 'projects.list': () => ({ status: 200, raw: true }) }]
+    ['agents.list refused', { 'agents.list': () => ({ status: 403, body: { error: `denied for ${TOKEN}` } }) }],
+    ['agents.list error body', { 'agents.list': () => ({ status: 200, body: { error: 'nope' } }) }],
+    ['agents.list not a list', { 'agents.list': () => ok({ agents: [] }) }],
+    ['agent without phase', { 'agents.list': () => ok([{ agentSessionId: 'a1' }]) }],
+    ['unreadable body', { 'agents.list': () => ({ status: 200, raw: true }) }]
   ]) {
     const result = await midTurnTabs({ control, fetchImpl: controlServer(routes).fetchImpl })
     assert.equal(result.count, null, name)

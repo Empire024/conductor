@@ -39,6 +39,7 @@ Conductor is a local desktop application for its owner. GitHub is used only as t
 - Never silently downgrade the approach. Switching from "read the real logs" to "guess from the theory I was given" is a change to the task and the owner decides it. Switching scratch directories is not.
 - When you do ask, make it cheap to answer: say what you were blocked on, why you need it, and the concrete ways to unblock you.
 - A denied call is not a reason to stop with nothing delivered. Finish everything that does not depend on the answer, then ask.
+- If `tools.list` lacks a method named in these docs, the installed build is older than the checkout: run `app.update` (or ask a wizard to) instead of working around it.
 
 ## Machine limits
 

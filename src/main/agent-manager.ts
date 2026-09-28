@@ -316,7 +316,9 @@ export class AgentManager {
     // CPU and RAM are known at once; the GPU line arrives when nvidia-smi has answered.
     let machine = describeMachine(baseMachineFacts())
     void detectMachine().then(facts => { machine = describeMachine(facts) }).catch(() => { /* CPU and RAM alone still say enough. */ })
-    this.briefings = new TurnBriefings({ database, coworkers: collaboration ? (id, options) => collaboration.briefingFor(id, options) : undefined, control: controlBriefing, machine: () => machine })
+    this.briefings = new TurnBriefings({ database, coworkers: collaboration ? (id, options) => collaboration.briefingFor(id, options) : undefined, control: controlBriefing,
+      controller: id => { const spec = database.structured.spec<AgentSpec>(id); return spec ? { id, title: spec.title } : null },
+      machine: () => machine })
     this.structured = new StructuredSessions(database, (provider) => providers[provider].resolveExecutable(), broadcast,
       undefined,
       (spec, prompt, itemId, runtimeId, context) => this.briefings.compose(spec, prompt, itemId, runtimeId, context),
