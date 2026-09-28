@@ -34,7 +34,9 @@ import { killTree } from './smoke-lock.mjs'
 // Chrome DevTools' Performance panel) and adds the top functions by self time to the results.
 // --trace records a devtools.timeline trace while typing and adds the renderer main thread's time by
 // trace event (Paint, Layout, UpdateLayoutTree, accessibility...), which is where "(program)" in a
-// CPU profile goes: browser work outside JavaScript.
+// CPU profile goes: browser work outside JavaScript. It also counts the elements each style recalc
+// touched and the objects each layout had to lay out, and names what invalidated them: a key that
+// restyles or relays the whole timeline shows up there as thousands per recalc.
 // --profile-main samples the Electron main process (Node's inspector) from just before the live turn
 // until typing ends, writes <label>-<tabs>-main.cpuprofile and adds its top functions: every input
 // event passes through main's UI thread, so a busy main process delays keys the renderer never saw.
@@ -45,10 +47,14 @@ import { killTree } from './smoke-lock.mjs'
 // characters) is spread across the stream. Default 20x60.
 // --burst=<events> (Claude only) types while the fixture replays "SYNTHETIC LONG <events>" at its full
 // speed (about 12,000 events a second), the worst case of a reconnect or a fast tool flood.
+// --background=<tabs>x<rate>x<seconds> (Claude only) is the owner's usual case: the long active
+// conversation sits idle while <tabs> inactive tabs (coworkers) each stream a live turn at <rate>
+// events a second for <seconds> s, and typing is spread across their streams. Default 3x20x60.
 // --floor first measures the same typing on an empty conversation at 1 tab, the floor p95 the
 // long-conversation rows are held to.
 // --assert exits non-zero when a row misses its target: while streaming p95 < 32 ms and no key over
-// 250 ms, during a burst no key over 1,000 ms, and at rest p95 within 5 ms of the floor (--floor).
+// 250 ms, during a burst no key over 1,000 ms, and at rest or with background streams p95 within
+// 5 ms of the floor (--floor) and, with background streams, no key over 100 ms.
 //
 // --load=launch,vitest types into one parked "owner" instance while test work runs next to it
 // (docs/perf/typing-under-load.md). Each round is a quiet typing window (the same-run floor) and
@@ -73,12 +79,14 @@ const args = Object.fromEntries(process.argv.slice(2).filter(arg => arg.startsWi
 const label = args.label ?? 'latest'
 const tabCounts = (args.tabs ?? '1,11,26').split(',').map(Number).filter(count => Number.isSafeInteger(count) && count > 0)
 const [streamRate, streamSeconds] = args.stream ? (args.stream === 'true' ? '20x60' : args.stream).split('x').map(Number) : []
+const [backgroundTabs, backgroundRate, backgroundSeconds] = args.background ? (args.background === 'true' ? '3x20x60' : args.background).split('x').map(Number) : []
 const burst = args.burst ? Number(args.burst === 'true' ? 20000 : args.burst) : 0
 const floor = args.floor === 'true'
 const assert = args.assert === 'true'
-const chars = Number(args.chars ?? (streamRate ? 200 : 300))
+const spreadSeconds = streamSeconds ?? backgroundSeconds
+const chars = Number(args.chars ?? (spreadSeconds ? 200 : 300))
 // Spread the keys over most of the stream, so they land throughout it rather than in its first seconds.
-const delay = Number(args.delay ?? (streamRate ? Math.floor(streamSeconds * 800 / chars) : 50))
+const delay = Number(args.delay ?? (spreadSeconds ? Math.floor(spreadSeconds * 800 / chars) : 50))
 const throttle = Number(args.throttle ?? 4)
 const prefill = Number(args.prefill ?? 0)
 const history = Number(args.history ?? 150)
@@ -86,7 +94,7 @@ const profile = args.profile === 'true'
 const trace = args.trace === 'true'
 const profileMain = args['profile-main'] === 'true'
 const css = args.css
-const provider = args.provider === 'claude' || streamRate || burst ? 'claude' : 'codex'
+const provider = args.provider === 'claude' || streamRate || burst || backgroundTabs ? 'claude' : 'codex'
 const events = Number(args.events ?? 3000)
 const livePrompt = streamRate ? `SYNTHETIC STREAM ${streamRate} ${streamSeconds}` : burst ? `SYNTHETIC LONG ${burst}` : ''
 const providerTitle = provider === 'claude' ? 'Claude' : 'Codex'
@@ -145,7 +153,7 @@ const initScript = () => {
   }
 }
 
-async function scenario(tabCount, { historyEvents = events, live = livePrompt } = {}) {
+async function scenario(tabCount, { historyEvents = events, live = livePrompt, background = backgroundTabs } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'conductor-perf-input-'))
   const env = { ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_USER_DATA: join(root, 'profile'), CONDUCTOR_PROJECTS_ROOT: join(root, 'projects'), CONDUCTOR_PERF_STREAM_HISTORY: String(history), CONDUCTOR_BACKGROUND_PRIORITY: '0', CONDUCTOR_TEST_FIXTURE_DIR: resolve('scripts/fixtures') }
   delete env.ELECTRON_RUN_AS_NODE
@@ -255,7 +263,7 @@ async function scenario(tabCount, { historyEvents = events, live = livePrompt } 
     const traceEvents = []
     if (trace) {
       cdp.on('Tracing.dataCollected', ({ value }) => traceEvents.push(...value))
-      await cdp.send('Tracing.start', { transferMode: 'ReportEvents', traceConfig: { includedCategories: ['devtools.timeline', 'disabled-by-default-devtools.timeline', 'blink', 'cc', 'accessibility', 'toplevel', 'v8', 'renderer.scheduler'] } })
+      await cdp.send('Tracing.start', { transferMode: 'ReportEvents', traceConfig: { includedCategories: ['devtools.timeline', 'disabled-by-default-devtools.timeline', 'disabled-by-default-devtools.timeline.invalidationTracking', 'blink.animations', 'devtools.timeline.animations', 'blink', 'cc', 'accessibility', 'toplevel', 'v8', 'renderer.scheduler'] } })
     }
     if (profile) {
       await cdp.send('Profiler.enable')
@@ -290,6 +298,23 @@ async function scenario(tabCount, { historyEvents = events, live = livePrompt } 
       // paced stream waits to see its turn running; a burst is typed into straight away.
       if (streamRate) await expect.poll(() => phase(activeId), { timeout: 30_000, intervals: [100] }).toBe('running')
     }
+    let backgroundTurns
+    if (background) {
+      // Coworkers' turns go straight through main, the way a dispatched tab's would, into tabs whose
+      // views are suspended; the owner types into the long conversation, which stays idle.
+      const streaming = ids.slice(1, 1 + backgroundTabs).map(id => 'agent-' + id)
+      if (streaming.length < backgroundTabs) throw new Error(`--background=${backgroundTabs}x...: needs --tabs of at least ${backgroundTabs + 1}`)
+      await page.evaluate(({ agents, prompt }) => {
+        const received = window.__inputPerfBackground = { events: 0, batches: 0 }
+        window.__inputPerfBackgroundOff = window.conductor.structured.onEvents(batch => {
+          const theirs = batch.filter(event => agents.includes(event.sessionId)).length
+          if (theirs) { received.events += theirs; received.batches++ }
+        })
+        return Promise.all(agents.map(agent => window.conductor.structured.snapshot(agent).then(state => window.conductor.structured.submit(agent, prompt, state.settings, []))))
+      }, { agents: streaming, prompt: `SYNTHETIC STREAM ${backgroundRate} ${backgroundSeconds}` })
+      for (const agent of streaming) await expect.poll(() => phase(agent), { timeout: 30_000, intervals: [100] }).toBe('running')
+      backgroundTurns = { agents: streaming }
+    }
     const before = (await cdp.send('Performance.getMetrics')).metrics
     const wallStart = Date.now()
     let typedText = typed
@@ -307,6 +332,10 @@ async function scenario(tabCount, { historyEvents = events, live = livePrompt } 
       }
     } else await page.keyboard.type(typed, { delay })
     const typingMs = Date.now() - wallStart
+    if (backgroundTurns) {
+      Object.assign(backgroundTurns, await page.evaluate(() => { window.__inputPerfBackgroundOff(); return window.__inputPerfBackground }))
+      backgroundTurns.phasesAfterTyping = await Promise.all(backgroundTurns.agents.map(phase))
+    }
     if (live) {
       liveTurn = await page.evaluate(() => { window.__inputPerfLiveOff(); const { events, batches, first, last } = window.__inputPerfLive; return { events, batches, perSecond: Number((events / Math.max(1, (last - first) / 1000)).toFixed(1)) } })
       liveTurn.prompt = live
@@ -362,7 +391,7 @@ async function scenario(tabCount, { historyEvents = events, live = livePrompt } 
     // What a suspended view costs: selecting another conversation and coming back to the long one,
     // timed from the click until its composer is usable and its timeline shows the latest reply.
     const switching = {}
-    if (tabCount > 1 && !live) {
+    if (tabCount > 1 && !live && !background) try {
       const select = async (id, ready) => {
         const started = Date.now()
         await page.locator(`.pane-tab[data-control-tab-id="pane-${id}"]`).click()
@@ -373,6 +402,9 @@ async function scenario(tabCount, { historyEvents = events, live = livePrompt } 
       switching.toShortConversationMs = await select(ids[1], () => expect(visible.locator('.structured-agent-pane')).toHaveAttribute('data-structured-session', 'agent-' + ids[1]))
       switching.backToLongConversationMs = await select(ids[0], () => expect(visible.getByText(provider === 'claude' ? /Synthetic long conversation:/ : /^Paragraph 50:/).first()).toBeVisible({ timeout: 30_000 }))
       switching.draftKept = (await composer().inputValue()) === expected
+    } catch (error) {
+      // A tab strip that changed shape must not throw away the typing numbers measured above.
+      switching.error = String(error.message ?? error).split(/\r?\n/)[0]
     }
     const latencies = collected.samples.map(sample => sample.painted - sample.start).sort((a, b) => a - b)
     const metric = (list, name) => list.find(entry => entry.name === name)?.value
@@ -381,11 +413,34 @@ async function scenario(tabCount, { historyEvents = events, live = livePrompt } 
     const slowEvents = collected.events.filter(entry => ['keydown', 'keypress', 'keyup', 'beforeinput', 'input'].includes(entry.name))
     const timelineItems = await page.evaluate(id => window.conductor.structured.snapshot(id).then(state => state?.items.length ?? 0), activeId)
     const renderedActivities = await visible.locator('[data-item-id]').count()
+    // What the rendered timeline carries into every frame: elements, and the ones Blink walks on
+    // each lifecycle whatever changed (paint layers from position/overflow/transform/opacity,
+    // images and inline SVGs).
+    const timelineCost = await page.evaluate(() => {
+      const timeline = [...document.querySelectorAll('.sa-timeline')].find(element => element.offsetParent !== null)
+      if (!timeline) return undefined
+      const counts = { elements: 0, positioned: 0, overflowClip: 0, transformOrOpacity: 0, images: 0, svgs: 0, contentVisibilityAuto: 0 }
+      const layerSources = {}
+      for (const element of timeline.querySelectorAll('*')) {
+        counts.elements++
+        if (element instanceof HTMLImageElement) counts.images++
+        if (element instanceof SVGSVGElement) counts.svgs++
+        const style = getComputedStyle(element)
+        const source = style.position !== 'static' ? 'position:' + style.position : style.overflowX !== 'visible' || style.overflowY !== 'visible' ? 'overflow' : style.transform !== 'none' || style.opacity !== '1' || style.willChange !== 'auto' || style.filter !== 'none' ? 'transform/opacity' : ''
+        if (style.position !== 'static') counts.positioned++
+        else if (source === 'overflow') counts.overflowClip++
+        else if (source) counts.transformOrOpacity++
+        if (style.contentVisibility === 'auto') counts.contentVisibilityAuto++
+        if (source) { const key = source + ' ' + element.tagName.toLowerCase() + (element.classList.length ? '.' + [...element.classList].slice(0, 2).join('.') : ''); layerSources[key] = (layerSources[key] ?? 0) + 1 }
+      }
+      return { ...counts, layerSources: Object.entries(layerSources).sort((a, b) => b[1] - a[1]).slice(0, 25) }
+    })
     return {
       tabs: tabCount,
       provider,
       timelineItems,
       renderedActivities,
+      timelineCost,
       inactiveTabs: tabCount - 1,
       mountedStructuredPanes: panes,
       typedChars: typedText.length,
@@ -419,6 +474,7 @@ async function scenario(tabCount, { historyEvents = events, live = livePrompt } 
       jsHeapUsedMb: round((metric(after, 'JSHeapUsedSize') ?? 0) / 1024 / 1024),
       switching,
       liveTurn,
+      backgroundTurns,
       mainHotspots,
       animations,
       hotspots,
@@ -432,7 +488,7 @@ async function scenario(tabCount, { historyEvents = events, live = livePrompt } 
   }
 }
 
-const results = { label, synthetic: true, recordedAt: new Date().toISOString(), config: { chars, delay, throttle, prefill, history, provider, events, css, live: livePrompt || undefined }, scenarios: [], failures: [] }
+const results = { label, synthetic: true, recordedAt: new Date().toISOString(), config: { chars, delay, throttle, prefill, history, provider, events, css, live: livePrompt || undefined, background: backgroundTabs ? { tabs: backgroundTabs, rate: backgroundRate, seconds: backgroundSeconds } : undefined }, scenarios: [], failures: [] }
 // What each row is held to under --assert (see the header).
 const misses = (result) => {
   const { p95, max } = result.inputToNextPaintMs
@@ -440,7 +496,10 @@ const misses = (result) => {
   if (!result.textIntact) missed.push('typed text was not intact')
   if (streamRate) { if (p95 >= 32) missed.push(`p95 ${p95} ms >= 32 ms while streaming`); if (max > 250) missed.push(`a key took ${max} ms > 250 ms while streaming`) }
   else if (burst) { if (max > 1000) missed.push(`input froze ${max} ms > 1000 ms during the burst`) }
-  else if (results.floor && p95 > results.floor.inputToNextPaintMs.p95 + 5) missed.push(`p95 ${p95} ms > floor ${results.floor.inputToNextPaintMs.p95} + 5 ms`)
+  else {
+    if (results.floor && p95 > results.floor.inputToNextPaintMs.p95 + 5) missed.push(`p95 ${p95} ms > floor ${results.floor.inputToNextPaintMs.p95} + 5 ms`)
+    if (backgroundTabs && max > 100) missed.push(`a key took ${max} ms > 100 ms while coworkers streamed`)
+  }
   return missed
 }
 try {
@@ -450,14 +509,14 @@ try {
     for (const row of results.load.summary) console.log(`${row.kind}: p95 ${row.p95.join(' / ')} (median ${row.medianP95}) · p99 ${row.p99.join(' / ')} (median ${row.medianP99}) · max ${row.max.join(' / ')} ms · machine CPU ${row.cpuPercent.join(' / ')}%${row.misses.length ? ' · MISSED: ' + row.misses.join(', ') : ''}`)
     if (assert && results.load.summary.some(row => row.misses.length)) process.exitCode = 1
   } else if (floor) {
-    results.floor = await scenario(1, { historyEvents: 4, live: '' })
+    results.floor = await scenario(1, { historyEvents: 4, live: '', background: 0 })
     console.log(`floor: empty ${provider} conversation, 1 tab: input->paint p50 ${results.floor.inputToNextPaintMs.p50} / p95 ${results.floor.inputToNextPaintMs.p95} / p99 ${results.floor.inputToNextPaintMs.p99} ms; commits ${results.floor.reactCommits}`)
   }
   if (!loads.length) for (const count of tabCounts) {
     const result = await scenario(count)
     result.misses = misses(result)
     results.scenarios.push(result)
-    console.log(`${provider}${provider === 'claude' ? ' ' + events + ' events' : ''}${livePrompt ? ' + ' + livePrompt + ' (' + JSON.stringify(result.liveTurn) + ')' : ''}, ${count} tab(s), ${result.timelineItems} items (${result.renderedActivities} rendered): input->paint p50 ${result.inputToNextPaintMs.p50} / p95 ${result.inputToNextPaintMs.p95} / p99 ${result.inputToNextPaintMs.p99} ms; longtasks ${result.longtasks.count} (${result.longtasks.totalMs} ms); commits ${result.reactCommits}; timeline mutations ${result.timelineMutations}; setItem ${result.localStorage.setItem}; getItem ${result.localStorage.getItem}; panes ${result.mountedStructuredPanes}; intact ${result.textIntact}; switch ${JSON.stringify(result.switching)}; max ${result.inputToNextPaintMs.max} ms${result.misses.length ? '; MISSED: ' + result.misses.join(', ') : ''}`)
+    console.log(`${provider}${provider === 'claude' ? ' ' + events + ' events' : ''}${livePrompt ? ' + ' + livePrompt + ' (' + JSON.stringify(result.liveTurn) + ')' : ''}${result.backgroundTurns ? ' + ' + backgroundTabs + ' background streams (' + result.backgroundTurns.events + ' events)' : ''}, ${count} tab(s), ${result.timelineItems} items (${result.renderedActivities} rendered): input->paint p50 ${result.inputToNextPaintMs.p50} / p95 ${result.inputToNextPaintMs.p95} / p99 ${result.inputToNextPaintMs.p99} ms; longtasks ${result.longtasks.count} (${result.longtasks.totalMs} ms); commits ${result.reactCommits}; timeline mutations ${result.timelineMutations}; setItem ${result.localStorage.setItem}; getItem ${result.localStorage.getItem}; panes ${result.mountedStructuredPanes}; intact ${result.textIntact}; switch ${JSON.stringify(result.switching)}; max ${result.inputToNextPaintMs.max} ms${result.misses.length ? '; MISSED: ' + result.misses.join(', ') : ''}`)
   }
   if (assert && results.scenarios.some(result => result.misses.length)) process.exitCode = 1
 } catch (error) {
@@ -679,7 +738,7 @@ function processTreePriorities(rootPid) {
 
 /** Main-thread time of the busiest renderer main thread (CrRendererMain) by trace event name: total (nested events
  *  included) and top-level only (children of a task), heaviest first. */
-function summarizeTrace(events, count = 30) {
+function summarizeTrace(events, count = 80) {
   const mains = new Set(events.filter(event => event.ph === 'M' && event.name === 'thread_name' && event.args?.name === 'CrRendererMain').map(event => event.pid + ':' + event.tid))
   const busy = new Map()
   for (const event of events) if (event.ph === 'X' && event.name === 'RunTask' && (!mains.size || mains.has(event.pid + ':' + event.tid))) { const key = event.pid + ':' + event.tid; busy.set(key, (busy.get(key) ?? 0) + (event.dur ?? 0)) }
@@ -694,7 +753,32 @@ function summarizeTrace(events, count = 30) {
     stack.push(event)
   }
   const top = map => [...map].sort((a, b) => b[1] - a[1]).slice(0, count).map(([name, ms]) => ({ name, ms: Number(ms.toFixed(1)) }))
-  return { runTaskMs: Number(((busy.get(main) ?? 0) / 1000).toFixed(1)), topLevel: top(topLevel), total: top(total) }
+  // How much of the document each style recalc and layout covered, per event.
+  const spread = values => { const sorted = [...values].sort((a, b) => a - b); return { count: sorted.length, total: sorted.reduce((sum, value) => sum + value, 0), p50: percentile(sorted, 50), p95: percentile(sorted, 95), max: sorted.at(-1) ?? 0 } }
+  const mine = events.filter(event => event.pid + ':' + event.tid === main)
+  const styleElements = spread(mine.filter(event => event.name === 'UpdateLayoutTree' && event.ph === 'X').map(event => event.args?.elementCount ?? 0))
+  const layouts = mine.filter(event => event.name === 'Layout' && event.args?.beginData)
+  const layoutObjects = { dirty: spread(layouts.map(event => event.args.beginData.dirtyObjects ?? 0)), total: spread(layouts.map(event => event.args.beginData.totalObjects ?? 0)) }
+  // Blink's invalidation tracking: which node and why, most frequent first.
+  const reasons = new Map()
+  for (const event of events) {
+    if (!/InvalidationTracking$/.test(event.name)) continue
+    const data = event.args?.data ?? {}
+    const key = event.name.replace('InvalidationTracking', '') + ' · ' + (data.nodeName ?? '?') + ' · ' + (data.reason ?? data.invalidationList?.map(entry => entry.classes?.join('.') || entry.id || entry.attribute || entry.tagName || '?').join(',') ?? data.changedClass ?? data.changedAttribute ?? data.changedPseudo ?? data.changedId ?? '')
+    reasons.set(key, (reasons.get(key) ?? 0) + 1)
+  }
+  const invalidations = [...reasons].sort((a, b) => b[1] - a[1]).slice(0, count).map(([name, n]) => ({ name, count: n }))
+  // Animations Chrome could not hand to the compositor run on the renderer's main thread every
+  // frame (style, and layout or paint): its own reasons, per animation name.
+  const animationRuns = new Map()
+  for (const event of events) {
+    if (event.name !== 'Animation' || !event.args?.data) continue
+    const data = event.args.data
+    const key = (data.name || data.id || '?') + (data.compositeFailed ? ' · not composited (reasons ' + data.compositeFailed + (data.unsupportedProperties?.length ? ': ' + data.unsupportedProperties.join(',') : '') + ')' : '')
+    if (data.compositeFailed !== undefined || data.name) animationRuns.set(key, (animationRuns.get(key) ?? 0) + 1)
+  }
+  const animations = [...animationRuns].sort((a, b) => b[1] - a[1]).slice(0, count).map(([name, n]) => ({ name, events: n }))
+  return { runTaskMs: Number(((busy.get(main) ?? 0) / 1000).toFixed(1)), topLevel: top(topLevel), total: top(total), styleElements, layoutObjects, invalidations, animations }
 }
 
 /** Self time per function across the sampled profile, heaviest first. */

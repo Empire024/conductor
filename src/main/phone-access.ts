@@ -836,7 +836,8 @@ export class PhoneAccessService {
   }
 
   private usageSummary(id: string, projection: SessionProjection): PhoneSessionSummary['usage'] {
-    this.collectUsage(id, projection, new Map())
+    // Only the cached summary is wanted here, not the windows: no provider catalog to label them with.
+    this.collectUsage(id, projection, new Map(), [])
     return this.usageCache.get(id)?.summary
   }
 

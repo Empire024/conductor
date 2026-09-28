@@ -1,4 +1,3 @@
-import { execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -16,6 +15,7 @@ import type {
 import { makeId } from '../shared/models'
 import type { ConductorDatabase } from './database'
 import { parseUsageLimitReset } from './usage-limit'
+import { cachedLookupOnPath } from './path-lookup'
 import { extendResizeActivitySuppression, normalizeAgentOutputSignal, shouldSignalAgentOutput } from './agent-activity'
 import type { AgentCollaborationRuntime } from './agent-collaboration-runtime'
 import { captureMemories, capturedMemoryKey } from './memory'
@@ -108,15 +108,10 @@ const findGrok = (): string | null => {
   return existsSync(installed) ? installed : null
 }
 
+/** Where a provider CLI is, without starting where.exe on main's thread (path-lookup.ts). */
 const findOnPath = (command: string, configured?: string): string | null => {
   if (configured?.trim()) return configured.trim()
-  try {
-    const finder = process.platform === 'win32' ? 'where.exe' : 'which'
-    const output = execFileSync(finder, [command], { encoding: 'utf8', windowsHide: true })
-    return output.split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? null
-  } catch {
-    return null
-  }
+  return cachedLookupOnPath(command)
 }
 
 const providers: Record<AgentProviderId, AgentProvider> = {

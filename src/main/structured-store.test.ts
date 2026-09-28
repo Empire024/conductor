@@ -3,7 +3,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { REDACTION_TARGETS, StructuredAgentStore, maskSecrets, redactSecretsChunk, registerSecretCheck, sanitizeDiagnostic } from './structured-store'
+import { CHECKPOINT_INTERVAL_MS, REDACTION_TARGETS, StructuredAgentStore, maskSecrets, redactSecretsChunk, registerSecretCheck, sanitizeDiagnostic } from './structured-store'
 import type { AgentEvent, AgentEventData } from '../shared/structured-agent'
 import { emptyProjection } from '../shared/structured-agent-reducer'
 
@@ -34,6 +34,32 @@ describe('structured SQLite journal and immutable artifacts', () => {
     const restored = new StructuredAgentStore(reopened, f.root).snapshot('two')!
     expect(restored.phase).toBe('disconnected')
     expect(restored.items.find(item => item.data.type === 'interaction')?.data).toMatchObject({ interaction: { status: 'pending' } })
+  })
+  // A streaming turn used to rewrite its whole projection snapshot (1-7 MB for the owner's long
+  // tabs) after every burst, on main, while the owner typed (typing-lag-long-conversation).
+  it('snapshots a streaming conversation at most once a second, at once when its phase moves, and loses nothing', () => {
+    vi.useFakeTimers({ now: 1_000_000 })
+    try {
+      const f = fixture()
+      const stored = (): number => JSON.parse((f.db.prepare('SELECT projection_json FROM structured_sessions WHERE id=?').get('one') as { projection_json: string }).projection_json).sequence
+      f.store.append(event(1, { type: 'session', phase: 'running' }))
+      f.store.checkpointSoon('one')
+      expect(stored()).toBe(1)
+      for (let sequence = 2; sequence <= 20; sequence++) { f.store.append(event(sequence, { type: 'text', role: 'assistant', text: 'streamed ' + sequence, mode: 'snapshot' })); f.store.checkpointSoon('one') }
+      expect(stored()).toBe(1)
+      // Whatever the snapshot lacks is in the journal: a restore right now still has every event.
+      const reader = new DatabaseSync(f.path); databases.push(reader)
+      expect(new StructuredAgentStore(reader, f.root).snapshot('one')?.sequence).toBe(20)
+      vi.advanceTimersByTime(CHECKPOINT_INTERVAL_MS)
+      expect(stored()).toBe(20)
+      f.store.append(event(21, { type: 'text', role: 'assistant', text: 'more', mode: 'snapshot' })); f.store.checkpointSoon('one')
+      expect(stored()).toBe(20)
+      f.store.append(event(22, { type: 'session', phase: 'completed' })); f.store.checkpointSoon('one')
+      expect(stored()).toBe(22)
+      f.store.append(event(23, { type: 'text', role: 'assistant', text: 'late', mode: 'snapshot' })); f.store.checkpointSoon('one')
+      f.store.flush()
+      expect(stored()).toBe(23)
+    } finally { vi.useRealTimers() }
   })
   it('hydrates imported projections only after their database rows exist', () => {
     const { db, store } = fixture()

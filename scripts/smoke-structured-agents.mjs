@@ -312,18 +312,19 @@ try {
     assert.equal(large.items.length, 2000)
     assert.equal(large.truncated, true)
     const renderedActivities = await page.locator('.sa-activity').count()
-    assert.ok(renderedActivities <= 250)
+    // The live end renders a small window (LIVE_WINDOW in StructuredAgentPane.tsx) plus its slack.
+    assert.ok(renderedActivities <= 110)
     const durationMs = Date.now() - started
     await page.evaluate(() => window.getSelection().removeAllRanges())
     // Clearing the selection at the bottom now resumes following output automatically.
     await expect(page.getByRole('button', { name: /New output · Jump to latest/ })).toHaveCount(0)
     await expect(page.locator('.sa-markdown p').last()).toContainText('Synthetic activity 2200')
     await page.getByRole('button', { name: /Show earlier activities/ }).click()
-    await expect(page.locator('.sa-activity')).toHaveCount(500)
+    await expect(page.locator('.sa-activity')).toHaveCount(310)
     await expect(page.locator('.sa-parent-label').first()).toBeAttached()
     await expect(page.getByRole('button', { name: /New output · Jump to latest/ })).toHaveCount(0)
     results.performance = { rawSyntheticActivities: 2200, retainedProjectionItems: large.items.length, initialRenderedActivities: renderedActivities, completionAndRenderMs: durationMs, postSelectionReleaseMs: Date.now() - releasedAt, syntheticBarrier: 'Raw fixture intentionally pauses after 500 rows until the UI selection is committed.', observed: 'One local Windows sample, including the intentional fixture barrier, raw process delivery, SQLite projection, polling, and React rendering; not a benchmark.' }
-    results.checks.push('2,200 raw synthetic activities retain 2,000 projected items and initially 250 DOM activities; selected text and its DOM identity remain while new rows arrive; new-output indication, automatic following after selection clears, earlier history and nested parent label verified')
+    results.checks.push('2,200 raw synthetic activities retain 2,000 projected items and initially at most 110 DOM activities (a 60-card live window plus slack); selected text and its DOM identity remain while new rows arrive; new-output indication, automatic following after selection clears, earlier history and nested parent label verified')
     await page.screenshot({ path: join(output, 'large-history.png'), fullPage: true })
     results.screenshots.push('artifacts/structured-agent-ui/' + provider + '/large-history.png')
   }

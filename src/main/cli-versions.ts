@@ -1,8 +1,9 @@
-import { execFile, execFileSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import { copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join, relative } from 'node:path'
 import type { CliPinState, PinnableCli, RestorePlan, RestorePlanCli, RestorePoint, RestoreScope } from '../shared/models'
+import { cachedLookupOnPath } from './path-lookup'
 
 /** FX20: Conductor never installs or changes the owner's CLIs. It keeps its own copies of the
  * Claude Code and Codex versions it has seen (hard links into the CLIs' own immutable version
@@ -44,10 +45,8 @@ export interface CliVersionStoreOptions {
 const findInstalled = (provider: PinnableCli): string | null => {
   const configured = process.env[ENV[provider]]?.trim()
   if (configured) return configured
-  try {
-    const output = execFileSync(process.platform === 'win32' ? 'where.exe' : 'which', [provider], { encoding: 'utf8', windowsHide: true, timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] })
-    return output.split(/\r?\n/).map(line => line.trim()).find(Boolean) ?? null
-  } catch { return null }
+  // In-process, not where.exe: a process start on main's thread delays every keystroke (path-lookup.ts).
+  return cachedLookupOnPath(provider)
 }
 const runVersion = (executable: string): Promise<string | null> => new Promise(resolve => {
   execFile(executable, ['--version'], { windowsHide: true, timeout: 15_000, maxBuffer: 16_384 }, (error, stdout) => resolve(error ? null : plainCliVersion(String(stdout))))

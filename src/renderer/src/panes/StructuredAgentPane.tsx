@@ -69,6 +69,11 @@ function storedExpansion(id: string): Record<string, boolean> {
 }
 /** How far the live window may outgrow its card limit before it sheds its oldest cards (visibleItems). */
 const WINDOW_SLACK = 50
+/** Cards rendered at the live end. Every rendered card is walked by each frame's layout, paint and
+ *  layerize whatever changed, so a keystroke in the composer cost about 6 ms more at 4x CPU with 250
+ *  cards than with none (scripts/perf-input.mjs, typing-lag-long-conversation). Scrolling up pages
+ *  earlier cards in as before, and coming back to the live end drops the window back to this. */
+const LIVE_WINDOW = 60
 const activePhases = new Set(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
 const displayPhase = (phase: string): string => phase === 'waiting_approval' ? 'Waiting for approval' : phase === 'waiting_input' ? 'Waiting for your answer' : phase.replaceAll('_', ' ')
 const historyTime = (timestamp?: string): string => {
@@ -194,7 +199,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const [newOutput, setNewOutput] = useState(false)
   const newOutputRef = useRef(newOutput); newOutputRef.current = newOutput
   const [dockedQuestions, setDockedQuestions] = useState<ReadonlySet<string>>(() => new Set())
-  const [visibleCount, setVisibleCount] = useState(250)
+  const [visibleCount, setVisibleCount] = useState(LIVE_WINDOW)
   const [readingWindow, setReadingWindow] = useState<TimelineItem[] | null>(null)
   const readingWindowRef = useRef(readingWindow); readingWindowRef.current = readingWindow
   const [pendingPromptScroll, setPendingPromptScroll] = useState<string | null>(null)
@@ -244,7 +249,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     setProjection(emptyProjection(activeId))
     setExpansion(storedExpansion(activeId))
     const view = restoredView.current?.activeId === activeId ? restoredView.current : null
-    setVisibleCount(view?.visibleCount ?? 250)
+    setVisibleCount(view && !view.nearBottom ? view.visibleCount : LIVE_WINDOW)
     setReadingWindow(null)
     setPendingPromptScroll(null)
     setDockedQuestions(new Set())
@@ -669,6 +674,14 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     return readingWindow.map((item) => latest.get(item.id) ?? item)
   }, [projection.items, conversationItems, visibleCount, readingWindow])
   useLayoutEffect(() => { lastVisibleItems.current = visibleItems }, [visibleItems])
+  // Back at the live end (the reading window let go), the history paged in to read it goes again,
+  // so typing never pays for how far back the owner once scrolled. Only on that transition: a
+  // restored view that was left scrolled up keeps the cards it was showing.
+  const wasReading = useRef(false)
+  useEffect(() => {
+    if (wasReading.current && !readingWindow) setVisibleCount(count => Math.min(count, LIVE_WINDOW))
+    wasReading.current = Boolean(readingWindow)
+  }, [readingWindow])
   useLayoutEffect(() => {
     const anchor = prependAnchor.current, element = timeline.current
     prependAnchor.current = null

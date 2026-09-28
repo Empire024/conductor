@@ -13,6 +13,13 @@ import { anonymousConversations } from './local-models/anonymous'
 /** Events beyond this many for a conversation live only in the durable transcript archive, never
  *  in the bounded journal `checkpoint` trims below it. */
 const JOURNAL_WINDOW = 20_000
+/** A streaming conversation's projection snapshot is rewritten at most this often. The snapshot is
+ *  the whole conversation as one JSON value (the owner's 1M-context tabs hold 1-7 MB), and writing
+ *  it after every burst of provider output meant a stringify and a multi-megabyte UPDATE on main
+ *  many times a second while a turn streamed, with every keystroke waiting behind them
+ *  (typing-lag-long-conversation). The journal still gets every event at once, and a restore
+ *  replays what came after the snapshot, so nothing is lost by a snapshot a second old. */
+export const CHECKPOINT_INTERVAL_MS = 1000
 
 /** Exact credentials a live server hands out (agent-control-server: the owner token and every
  *  conversation's control token). A 64-hex run anywhere in a stored string that one of these
@@ -156,6 +163,8 @@ export class StructuredAgentStore {
   private artifactBytes = 0
   private projections = new Map<string, SessionProjection>()
   private archiveTails = new Map<string, ArchiveTail>()
+  private checkpointed = new Map<string, { at: number; phase: SessionProjection['phase'] }>()
+  private checkpointTimers = new Map<string, NodeJS.Timeout>()
   /** Anonymous local conversations (local-models/anonymous.ts): spec and tool output held in
    *  memory only. Nothing keyed by one of these ids is ever written to SQLite or the artifact
    *  directory, and `forget` drops it all when the tab closes. */
@@ -401,9 +410,28 @@ export class StructuredAgentStore {
     this.archiveTails.set(id, tail)
     return tail
   }
+  /** Snapshots a conversation after a burst of journaled events: at once if its phase moved or the
+   *  last snapshot is older than CHECKPOINT_INTERVAL_MS, otherwise once that interval has passed.
+   *  Only for state the journal already holds; anything else goes through checkpoint(). */
+  checkpointSoon(id: string): void {
+    const last = this.checkpointed.get(id)
+    const since = Date.now() - (last?.at ?? Number.NEGATIVE_INFINITY)
+    if (since >= CHECKPOINT_INTERVAL_MS || last?.phase !== this.snapshot(id)?.phase) { this.checkpoint(id); return }
+    if (this.checkpointTimers.has(id)) return
+    const timer = setTimeout(() => {
+      this.checkpointTimers.delete(id)
+      // The database may have closed since (close() flushes first, which clears this timer).
+      try { this.checkpoint(id) } catch (error) { console.warn('A conversation snapshot could not be written; its journal still holds every event', error) }
+    }, CHECKPOINT_INTERVAL_MS - since)
+    timer.unref?.()
+    this.checkpointTimers.set(id, timer)
+  }
   checkpoint(id: string): void {
+    const pending = this.checkpointTimers.get(id)
+    if (pending) { clearTimeout(pending); this.checkpointTimers.delete(id) }
     const state = this.snapshot(id)
     if (!state || this.volatileSpecs.has(id)) return
+    this.checkpointed.set(id, { at: Date.now(), phase: state.phase })
     this.db.prepare('UPDATE structured_sessions SET projection_json=?, title=?, archived=? WHERE id=?').run(JSON.stringify(state), state.title, state.archived ? 1 : 0, id)
     // Snapshot anchors older history before compacting the bounded event journal.
     if (state.sequence > JOURNAL_WINDOW) this.trimJournal(id, state.sequence - JOURNAL_WINDOW)

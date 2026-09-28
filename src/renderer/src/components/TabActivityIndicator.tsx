@@ -41,7 +41,7 @@ export function TabActivityIndicator({ phase, title, spinEpoch, backgroundTasks 
     : phase === 'failed' ? <TriangleAlert className="tab-state-icon" aria-hidden="true" />
     : phase === 'disconnected' ? <Unplug className="tab-state-icon" aria-hidden="true" />
     : phase === 'stopped' ? <CircleStop className="tab-state-icon" aria-hidden="true" />
-    : <svg className="tab-ring" viewBox="0 0 18 18" aria-hidden="true"><circle cx="9" cy="9" r="6" style={spinPhaseStyle(spinEpoch)} /><path d="M5.7 9.2 8 11.4l4.5-5" /></svg>
+    : <svg className="tab-ring" viewBox="0 0 18 18" aria-hidden="true" style={spinPhaseStyle(spinEpoch)}><circle cx="9" cy="9" r="6" /><path d="M5.7 9.2 8 11.4l4.5-5" /></svg>
   return (
     <span className={`tab-activity ${phase}`} aria-label={`${title}: ${label}`} title={phase === 'idle' ? undefined : tooltip}>
       {glyph}

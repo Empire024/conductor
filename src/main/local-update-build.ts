@@ -1,6 +1,7 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import { createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync } from 'node:fs'
 import { basename, delimiter, dirname, join, resolve } from 'node:path'
+import { lowerSpawned } from './background-priority'
 import { RestorePointStore } from './restore-points'
 
 /** Where a candidate build is: making its worktree, copying node_modules into it, building,
@@ -334,6 +335,8 @@ export class LocalUpdateBuilder implements LocalUpdateBuildService {
   private run(command: string, args: string[], cwd: string, timeoutMs: number, options: { env?: NodeJS.ProcessEnv; onText?: (text: string) => void } = {}): Promise<number | null> {
     return new Promise(done => {
       const child = spawn(command, args, { cwd, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: options.env ?? process.env })
+      // The worktree copy, build, installer and smokes yield to the owner's own window.
+      lowerSpawned(child.pid, options.env ?? process.env)
       this.child = child
       const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs)
       timer.unref?.()

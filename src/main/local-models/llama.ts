@@ -5,6 +5,7 @@ import { appendFileSync, closeSync, existsSync, openSync, readFileSync, readdirS
 import { dirname, join } from 'node:path'
 import type { LocalModelConfig } from './config.ts'
 import { configPath, loadConfig, logsDir, modelFilePath, runDir, runFile } from './config.ts'
+import { lowerSpawned } from '../background-priority.ts'
 import { childEnvironment } from './paths.ts'
 import { writeChatTemplate } from './templates.ts'
 import { AdmissionRefusal, admissionRefusal, assertResourceHeadroom, runningLlamaProcesses, withAdmissionLock, type BlockingServer, type ServerProcess } from './resource-guard.ts'
@@ -731,6 +732,9 @@ async function startAdmittedServer(executable: string, model: LocalModelConfig, 
   child.on('error', error => { spawnError = error.message })
   child.unref()
   if (!child.pid) throw new Error('llama.cpp server failed to start')
+  // A model server's CPU threads (a MoE model's experts run there) yield to the owner's own window:
+  // a busy soak at normal priority tripled typing latency (docs/perf/typing-under-load.md).
+  lowerSpawned(child.pid)
   // Node holds the child's handle until it exits, so this pid cannot be reused while its identity is
   // read: the identity recorded here is the one every later stop must find again.
   const identity = await processControl.inspect(child.pid, 15_000)

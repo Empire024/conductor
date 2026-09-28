@@ -1,5 +1,7 @@
+import { getPriority, setPriority } from 'node:os'
 import { describe, expect, it } from 'vitest'
-import { BACKGROUND_PRIORITY, applyParkedPriority, lowerToBackground, parkedPriorityWanted, startParkedPriority, type PriorityPorts } from './background-priority'
+import { BACKGROUND_PRIORITY, applyParkedPriority, lowerSpawned, lowerToBackground, parkedPriorityWanted, startParkedPriority, type PriorityPorts } from './background-priority'
+import { spawnCommand } from './delivery'
 
 const fakePorts = (initial: Record<number, number>): PriorityPorts & { values: Record<number, number> } => {
   const values = { ...initial }
@@ -43,6 +45,32 @@ describe('parked instance priority (typing-lag-under-test-load)', () => {
     }
     expect(subscribed).toBe(false)
     expect(ports.values[process.pid]).toBe(0)
+  })
+
+  it('lowers a spawned build, test or model server unless CONDUCTOR_BACKGROUND_PRIORITY=0', () => {
+    const ports = fakePorts({ 21: 0, 22: 0 })
+    expect(lowerSpawned(21, {}, ports)).toBe(true)
+    expect(lowerSpawned(22, { CONDUCTOR_BACKGROUND_PRIORITY: '0' }, ports)).toBe(false)
+    expect(lowerSpawned(undefined, {}, ports)).toBe(false)
+    expect(ports.values).toEqual({ 21: BACKGROUND_PRIORITY, 22: 0 })
+  })
+
+  it('runs a delivery step below normal, and whatever that step spawns inherits it', async () => {
+    // The step reads its own priority and that of a child it starts, after lowerSpawned has run.
+    const script = "const os=require('os');setTimeout(()=>{const c=require('child_process').spawnSync(process.execPath,['-p','require(\"os\").getPriority()'],{encoding:'utf8'});console.log(os.getPriority()+' '+c.stdout.trim())},300)"
+    const lines: string[] = []
+    const env = { ...process.env }
+    delete env.CONDUCTOR_BACKGROUND_PRIORITY
+    // vitest.config.ts lowers the test run; the owner's Conductor, which runs delivery, is normal.
+    const before = getPriority()
+    try { setPriority(0) } catch { /* POSIX may refuse to raise a nice value: the check still holds */ }
+    try {
+      const { code, stdout } = await spawnCommand('node', ['-e', script], { cwd: process.cwd(), env, timeoutMs: 30_000, signal: new AbortController().signal, onLine: line => lines.push(line) })
+      expect(code, lines.join(' | ')).toBe(0)
+      expect(stdout.trim()).toBe(BACKGROUND_PRIORITY + ' ' + BACKGROUND_PRIORITY)
+    } finally {
+      try { setPriority(before) } catch { /* already there */ }
+    }
   })
 
   it('never wires Electron for the owner app or an opted-out stand-in', () => {

@@ -1591,7 +1591,12 @@ export class StructuredSessions {
     this.flushScheduled = false
     const events = this.pending.splice(0)
     if (events.length) this.database.structured.persist(events)
-    for (const id of new Set(events.map(event => event.sessionId))) this.database.structured.checkpoint(id)
+    // A streamed burst's snapshot may wait up to a second (the journal above already holds it); a
+    // burst that answers or asks something is snapshotted at once (structured-store checkpointSoon).
+    for (const id of new Set(events.map(event => event.sessionId))) {
+      if (events.some(event => event.sessionId === id && event.data.type === 'interaction')) this.database.structured.checkpoint(id)
+      else this.database.structured.checkpointSoon(id)
+    }
     const statuses = [...this.pendingStatus.values()]
     this.pendingStatus.clear()
     for (const entry of statuses) { this.database.setAgentStatus(entry.id, entry.status, entry.phase); this.broadcast('agent:status', entry) }

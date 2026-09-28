@@ -120,9 +120,16 @@ and `node_modules` events.
   keeps 2). Priority alone decides who runs first, not who shares a core: with a fork on every
   logical core, the owner's renderer shared its core's second thread with a test worker.
 
-Still at normal priority: commands an agent runs directly that are not vitest, electron-vite or a
-smoke (a bare `tsc`, `npm run package`). They run under the agent CLI, which the owner's Conductor
-starts at normal priority. Lowering the runtime host or the provider CLIs would cover them all.
+- Agent CLIs and the runtime host are lowered when they are spawned (`providers/transport.ts`,
+  `runtime-host/host.ts`), so a bare `tsc` or `npm run package` a coworker runs is below normal too.
+- Since 2026-09-28 (`lowerSpawned` in `src/main/background-priority.ts`), whatever the owner's own
+  Conductor starts for background work also starts below normal:
+  - `git.ship`'s steps (tests, typecheck, build, git; `delivery.ts`);
+  - `app.update`'s worktree copy, build, installer and smokes (`local-update-build.ts`);
+  - `run_and_summarize` commands (`local-assist/tools.ts`);
+  - the llama.cpp server (`local-models/llama.ts`).
+  `background-priority.test.ts` checks, with a real process, that a delivery step and the child it
+  spawns both run below normal.
 
 ### Process priorities, checked
 

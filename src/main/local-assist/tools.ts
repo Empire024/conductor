@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto'
 import { createWriteStream, mkdirSync } from 'node:fs'
 import { open, realpath, stat } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { lowerSpawned } from '../background-priority.ts'
 import { isSecretPath } from '../local-models/workspace.ts'
 import { GENERATION_TIMEOUT_MS, type LocalAssistTool, type LocalModelOutcome, type LocalModelRunner, type SavingsLedger } from './contract.ts'
 import { capLines, chunkLines, clip, failureLines, modelExcerpt, splitLines, stripAnsi, tailLines } from './digest.ts'
@@ -153,6 +154,8 @@ export const hostCommandRunner: CommandRunner = ({ command, cwd, logFile, timeou
   const log = createWriteStream(logFile)
   let outputChars = 0, timedOut = false, settled = false
   const child = spawn(command, { cwd, shell: true, windowsHide: true, env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1', CI: process.env.CI ?? '1' } })
+  // An agent's test or build run is background work next to the owner's typing.
+  lowerSpawned(child.pid)
   const write = (chunk: Buffer): void => { outputChars += chunk.length; log.write(chunk) }
   child.stdout?.on('data', write)
   child.stderr?.on('data', write)

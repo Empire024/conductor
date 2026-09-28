@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from 'node:path'
+import { lowerSpawned } from './background-priority'
 import { DELIVERY_STAGES, type DeliveryRequester, type DeliveryRun, type DeliveryStage, type DeliveryStageId, type DeliveryTestProgress, type RepositoryFile, type RepositoryStatus } from '../shared/delivery'
 
 export interface DeliveryRunOptions {
@@ -116,6 +117,8 @@ export function spawnCommand(command: string, args: string[], options: DeliveryR
     let child: ChildProcess
     try {
       child = spawn(file, argv, { cwd: options.cwd, env, shell, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+      // Tests, typecheck and build are background work: the owner keeps typing while they run.
+      lowerSpawned(child.pid, env)
     } catch (error) {
       options.onLine(`Could not start ${command}: ${error instanceof Error ? error.message : String(error)}`)
       resolvePromise({ code: null, stdout: '' }); return

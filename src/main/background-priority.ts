@@ -32,6 +32,17 @@ export function lowerToBackground(pids: Iterable<number>, ports: PriorityPorts =
   return lowered
 }
 
+/** A build, test run, smoke or model server Conductor starts on the owner's behalf runs below
+ *  normal from its first moment, and so does everything it spawns (Windows hands BELOW_NORMAL to a
+ *  child whose creator asks for nothing else; POSIX inherits nice): it uses every idle cycle but
+ *  the owner's own Conductor window comes first. Lowered right after spawn, before a Node or
+ *  PowerShell child has booted far enough to start children of its own.
+ *  CONDUCTOR_BACKGROUND_PRIORITY=0 keeps normal priority. Returns whether it lowered the process. */
+export function lowerSpawned(pid: number | undefined, env: NodeJS.ProcessEnv = process.env, ports: PriorityPorts = osPorts): boolean {
+  if (!pid || env.CONDUCTOR_BACKGROUND_PRIORITY === '0') return false
+  return lowerToBackground([pid], ports).length > 0
+}
+
 export interface ParkedPriorityOptions {
   parked: boolean
   env: NodeJS.ProcessEnv
