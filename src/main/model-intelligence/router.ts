@@ -162,12 +162,20 @@ export async function route(features: TaskFeatures, constraints: Partial<RouteCo
   }
   // Hard or risky work falls back to the strongest model elsewhere, never merely the next-best utility.
   const rank = (candidate: RouteCandidate) => Number(candidate.live.capabilityRank ?? 0)
+  const strongest = (list: RouteCandidate[]) => [...list].sort((a, b) => rank(b) - rank(a) || b.utility - a.utility)[0]
   const others = eligible.filter(candidate => candidate.key.provider !== selected.key.provider)
-  const fallback = (conservative(features) ? [...others].sort((a, b) => rank(b) - rank(a) || b.utility - a.utility)[0] : others[0]) ?? null
+  // Another provider survives an outage of this one, so it is preferred; only when none is eligible does the
+  // fallback stay on this provider, as its strongest other model.
+  const sameProvider = !others.length
+  const fallback = (sameProvider ? strongest(eligible.filter(candidate => candidate !== selected)) : conservative(features) ? strongest(others) : others[0]) ?? null
+  const otherProviders = [...new Set(candidates.map(candidate => candidate.key.provider).filter(provider => provider !== selected.key.provider))]
+  const whyNoOther = otherProviders.length ? otherProviders.map(provider => `${provider}: ${candidates.find(candidate => candidate.key.provider === provider)?.excluded ?? 'not eligible'}`).join('; ') : 'no other provider is offered'
   const escalation = eligible.filter(candidate => candidate !== selected && candidate.expectedSuccess > selected.expectedSuccess)
     .sort((a, b) => b.expectedSuccess - a.expectedSuccess || b.utility - a.utility)[0] ?? null
   const target = (candidate: RouteCandidate | null, reason: string): RouteTarget | null => candidate && { key: candidate.key, effort: candidate.effort, reason }
-  const fallbackTarget = fallback && target(fallback, conservative(features)
+  const fallbackTarget = fallback && target(fallback, sameProvider
+    ? `no other provider eligible (${whyNoOther}); same-provider fallback (capability rank ${rank(fallback)}, ${percent(fallback.expectedSuccess)} expected)`
+    : conservative(features)
     ? `strongest eligible model on another provider (capability rank ${rank(fallback)}, ${percent(fallback.expectedSuccess)} expected)`
     : `best eligible model on another provider (${percent(fallback.expectedSuccess)} expected, utility ${fallback.utility.toFixed(3)})`)
   const escalationTarget = escalation && target(escalation, `higher expected success on ${features.category}: ${percent(escalation.expectedSuccess)} against ${percent(selected.expectedSuccess)}`)

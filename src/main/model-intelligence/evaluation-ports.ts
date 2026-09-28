@@ -62,7 +62,19 @@ export function localRunPort(runnerFor: (modelId: string) => LocalModelRunner, b
 /** One evaluation turn on a cloud model (AgentControl.evaluationTurn): a native tab at the lowest effort.
  *  `maxTokens` is the job's budget: the turn is interrupted once its usage passes it, and a turn that
  *  fails, times out or reports no usage counts it as spent (a failure throws an EvaluationTurnError). */
-export type CloudTurn = (key: ModelKey, prompt: { system: string; user: string }, signal: AbortSignal, options?: { maxTokens?: number }) => Promise<{ answer: string; tokens: number | null; costUsd: number | null; durationMs: number; effort: string | null }>
+export type CloudTurn = (key: ModelKey, prompt: { system: string; user: string }, signal: AbortSignal, options?: { maxTokens?: number }) => Promise<{ answer: string; tokens: number | null; costUsd: number | null; durationMs: number; effort: string | null; /** The turn's whole input as reported (cache included), null when unreported. */ inputTokens?: number | null }>
+
+/** A cloud job's run with the turn's fixed input overhead, when the turn reported its input. */
+export type CloudRun = EvaluationRun & { overheadTokens?: number | null }
+/** Before a cloud turn has been measured: a native CLI turn carries about 39k tokens of fixed input
+ *  (system prompt, tools, project context) before the job itself (verification 2026-09-28, N9). */
+export const DEFAULT_FIXED_OVERHEAD_TOKENS = 40_000
+/** A turn's fixed input overhead: its reported input less the job prompt it was sent (at about four
+ *  characters a token), since a job's own budget already covers its prompt. Null when unreported. */
+export function fixedOverhead(inputTokens: number | null | undefined, prompt: { system: string; user: string }): number | null {
+  if (typeof inputTokens !== 'number' || !Number.isFinite(inputTokens) || inputTokens <= 0) return null
+  return Math.max(0, Math.round(inputTokens - Math.ceil((prompt.system.length + prompt.user.length) / 4)))
+}
 
 /** What an evaluation turn spent against the caps: the whole prompt, cache reads and cache writes
  *  included, plus the output. Adapters already count cache tokens inside inputTokens
@@ -76,15 +88,23 @@ export function evaluationTokens(tokens: TokenFigures | undefined): number | nul
 
 /** A failed evaluation turn that still spent tokens: its measured usage, else the worst case (the job's budget). */
 export class EvaluationTurnError extends Error {
-  constructor(message: string, readonly tokens: number | null) { super(message) }
+  constructor(message: string, readonly tokens: number | null, readonly inputTokens: number | null = null, readonly overheadTokens: number | null = null) { super(message) }
 }
 
 /** A job through the native provider path; files come from the answer's path-labelled blocks, as locally. */
 export function cloudRunPort(turn: CloudTurn) {
-  return async (key: ModelKey, job: EvaluationJob, signal: AbortSignal, budget?: { maxTokens: number }): Promise<EvaluationRun> => {
-    const result = await turn(key, evaluationPrompt(job), signal, budget ? { maxTokens: budget.maxTokens } : {})
-    const files = answerFiles(result.answer)
-    return { answer: result.answer, ...(Object.keys(files).length ? { files } : {}), durationMs: result.durationMs, tokens: result.tokens, costUsd: result.costUsd, effort: result.effort }
+  return async (key: ModelKey, job: EvaluationJob, signal: AbortSignal, budget?: { maxTokens: number }): Promise<CloudRun> => {
+    const prompt = evaluationPrompt(job)
+    let result: Awaited<ReturnType<CloudTurn>>
+    try { result = await turn(key, prompt, signal, budget ? { maxTokens: budget.maxTokens } : {}) }
+    catch (error) {
+      // A failed turn still measured its overhead when it reported its input.
+      if (error instanceof EvaluationTurnError && error.overheadTokens === null && error.inputTokens !== null)
+        throw new EvaluationTurnError(error.message, error.tokens, error.inputTokens, fixedOverhead(error.inputTokens, prompt))
+      throw error
+    }
+    const files = answerFiles(result.answer), overheadTokens = fixedOverhead(result.inputTokens, prompt)
+    return { answer: result.answer, ...(Object.keys(files).length ? { files } : {}), durationMs: result.durationMs, tokens: result.tokens, costUsd: result.costUsd, effort: result.effort, ...(overheadTokens !== null ? { overheadTokens } : {}) }
   }
 }
 

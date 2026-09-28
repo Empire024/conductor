@@ -120,6 +120,21 @@ describe('router: a fresh install (no outcomes, no benchmarks)', () => {
     // 97% on a window that does not block is informational only: the weekly-stop comparison is the port's job.
     expect(blocked.candidates.find(candidate => candidate.key.model === 'gpt-6-astra')).toMatchObject({ eligible: true })
   })
+  // The live shape: Codex past its weekly stop, an unproven local model barred from hard work.
+  const codexBlocked = (key: ModelKey) => key.provider === 'codex' ? { percent: 60, blocked: 'weekly window at 60% (stop 55%)' } : { percent: 10, blocked: null }
+  it('falls back within the same provider, to its strongest other model, when no other provider is eligible', async () => {
+    const decision = await route(hard, {}, fresh({ usage: codexBlocked }))
+    expect(chosen(decision)).toBe('claude/opus[1m]')
+    expect(decision.fallback?.key).toEqual({ provider: 'claude', model: 'sonnet' })
+    expect(decision.fallback?.reason).toMatch(/^no other provider eligible \(.*codex: usage: weekly window at 60% \(stop 55%\).*local: no proven record on difficult-coding.*\); same-provider fallback \(capability rank 2, /)
+  })
+  it('keeps preferring another provider whenever one is eligible', async () => {
+    const records = [LOCAL_REG, record('claude', 'opus[1m]', { contextTokens: 1_000_000, efforts: ['low', 'medium', 'high'] }), SONNET, ASTRA, MINI, CHEAP, record('grok', 'grok-4.7', { contextTokens: 256_000 })]
+    const decision = await route(hard, {}, setup({ records, table: {}, live: { loadedLocalModels: () => [], usage: codexBlocked } }).ports)
+    expect(chosen(decision)).toBe('claude/opus[1m]')
+    expect(decision.fallback?.key).toEqual({ provider: 'grok', model: 'grok-4.7' })
+    expect(decision.fallback?.reason).toMatch(/^strongest eligible model on another provider/)
+  })
   it('names why the escalation target was picked', async () => {
     const decision = await route(hard, {}, setup({ records: [LOCAL, CHEAP, STRONG, record('claude', 'claude-fable-5-1', { family: 'claude-fable-5', pricing: price(25, 125) })],
       table: { ...REPUTATION, 'claude/claude-fable-5-1': { 'difficult-coding': [0.95, 0.885, 12] } } }).ports)

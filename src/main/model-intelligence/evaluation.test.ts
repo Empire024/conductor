@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { REPUTATION_POLICY, type ExecutionOutcome, type ModelKey, type ModelStatus, type ReputationScore } from '../../shared/model-routing'
 import { outcome as outcomeRow } from './capture/common'
 import {
-  EVALUATION_AREAS, JOB_TOKEN_BUDGET, answerCode, evaluate, grade, jobTokenBudget, minimumJobTokens, schemaViolation, validateSuite, type CommandRequest, type EvaluationJob, type EvaluationPorts,
+  BATCH_JOB_ID, DEFAULT_FIXED_OVERHEAD_TOKENS, EVALUATION_AREAS, JOB_TOKEN_BUDGET, answerCode, batchJobTokens, batchPrompt, evaluate, grade, splitBatchAnswer, jobTokenBudget, minimumJobTokens, schemaViolation, validateSuite, type CommandRequest, type EvaluationJob, type EvaluationPorts,
   type EvaluationRun, type EvaluationSuite
 } from './evaluation'
 import defaultSuite from './suites/default.json'
@@ -147,7 +147,8 @@ describe('evaluate: a new model', () => {
     ])
     expect(reports[0]![1]).toContain('6/6 graded jobs passed of 8; 60,000 tokens')
     // N4: journaled at the start, after every job and at the end, cumulatively.
-    expect(spends.map(spend => spend.tokens)).toEqual([0, 10_000, 20_000, 30_000, 40_000, 50_000, 60_000, 60_000])
+    // N12: each job's budget is pre-charged before its turn, then reconciled to the real spend.
+    expect(spends.map(spend => spend.tokens)).toEqual([0, ...[1, 2, 3, 4, 5, 6].flatMap(step => [step * 10_000, step * 10_000]), 60_000])
     expect(spends.at(-1)).toMatchObject({ jobs: 8, stoppedBy: 'token-cap' })
   })
   it('gives the last job only what is left, and skips it when that is below its minimum', async () => {
@@ -180,6 +181,9 @@ describe('evaluate: a new model', () => {
     expect(spends.at(-1)!.tokens).toBe(15_000)
     const noTokens = await evaluate(KEY, suite(1), harness(() => { throw new Error('turn failed') }).ports, { maxTokens: 60_000 })
     expect(noTokens.tokens).toBe(JOB_TOKEN_BUDGET[1])
+    // N9 (a): charged its whole budget, the turn was stopped by the cap, not by a wrong answer.
+    expect(noTokens.jobs[0]).toMatchObject({ result: 'not-gradable', detail: expect.stringMatching(/^not graded: the turn was stopped at its 10,000-token budget/) })
+    expect(noTokens.outcomes).toEqual([])
     const local = await evaluate(KEY, suite(1), harness(() => { throw failing }).ports)
     expect(local.tokens).toBe(7_500)
     const localNoTokens = await evaluate(KEY, suite(1), harness(() => { throw new Error('turn failed') }).ports)
@@ -237,5 +241,72 @@ describe('evaluate: a new model', () => {
     expect(result.stoppedBy).toBe('aborted')
     expect(aborting.recorded.map(row => row.result)).toEqual(['success', 'cancelled'])
     expect(aborting.statuses).toEqual(['evaluating', 'unproven'])
+  })
+})
+
+describe('batched cloud evaluation (N9)', () => {
+  const CLOUD: ModelKey = { provider: 'claude', model: 'sonnet' }
+  const mixed: EvaluationSuite = { name: 'mixed', jobs: [
+    job('first', { kind: 'exact', expected: '4+6' }, { complexity: 1 }),
+    job('checked', { kind: 'command', cmd: 'node', args: ['check.mjs'], expectExit: 0, timeoutSec: 5 }),
+    job('json', { kind: 'json-schema', schema: { type: 'object', required: ['n'], properties: { n: { const: 2 } } } }),
+    job('file', { kind: 'file-content', path: 'out/summary.json', regex: '"paid"\\s*:\\s*4' }),
+    job('wrong', { kind: 'exact', expected: 'yes' }),
+  ] }
+  const answer = ['### JOB first', '4+6', '', '### JOB json', '```json', '{"n": 2}', '```', '### JOB file', '```out/summary.json', '{"paid": 4}', '```', '### JOB wrong', 'no'].join('\n')
+
+  it('splits a batched answer by its "### JOB <id>" headers, ignoring reasoning and unknown ids', () => {
+    expect(splitBatchAnswer('<think>### JOB a\nno</think>\npreamble\n### JOB a\none\n## JOB b:\ntwo\n### JOB ghost\nx', ['a', 'b'])).toEqual({ a: 'one', b: 'two\n### JOB ghost\nx' })
+    const prompt = batchPrompt(mixed.jobs.slice(0, 2))
+    expect(prompt).toMatchObject({ id: BATCH_JOB_ID, complexity: 2 })
+    expect(prompt.prompt).toContain('## TASK 1 of 2: first')
+    expect(prompt.prompt).toContain('"### JOB <task id>"')
+  })
+  it('runs every one-shot job of a cloud run in one turn, pays the overhead once and grades each job separately', async () => {
+    const turns: Array<{ job: EvaluationJob; budget?: { maxTokens: number } }> = [], spends: Array<{ tokens: number }> = []
+    const { ports, recorded } = harness(() => ({ answer: 'unused' }), {
+      run: async (_key, batch, _signal, budget) => { turns.push({ job: batch, ...(budget ? { budget } : {}) }); return { answer, tokens: 43_000 } },
+      fixedOverheadTokens: () => 39_000, recordSpend: spend => { spends.push(spend) },
+    })
+    const result = await evaluate(CLOUD, mixed, ports, { maxTokens: 60_000, runId: 'b1' })
+    expect(turns).toHaveLength(1)
+    expect(turns[0]!.budget).toEqual({ maxTokens: 60_000 })
+    expect(turns[0]!.job.prompt).not.toContain('TASK 2 of 4: checked')
+    expect(result.jobs.map(entry => [entry.id, entry.result])).toEqual([['first', 'success'], ['checked', 'not-gradable'], ['json', 'success'], ['file', 'success'], ['wrong', 'failure']])
+    expect(recorded.map(row => [row.ref, row.result])).toEqual([['b1:first', 'success'], ['b1:json', 'success'], ['b1:file', 'success'], ['b1:wrong', 'failure']])
+    expect(result).toMatchObject({ tokens: 43_000, stoppedBy: null })
+    // N12: the batch's budget is pre-charged before its turn, then reconciled.
+    expect(spends.map(spend => spend.tokens)).toEqual([0, 60_000, 43_000])
+  })
+  it('drops the largest jobs when the fixed overhead plus the batch would pass the cap, and takes the overhead from the port', async () => {
+    const sizes = mixed.jobs.filter(entry => entry.grader.kind !== 'command').map(batchJobTokens)
+    const turns: EvaluationJob[] = []
+    const { ports } = harness(() => ({ answer: 'unused' }), { run: async (_key, batch) => { turns.push(batch); return { answer, tokens: 50_000 } }, fixedOverheadTokens: provider => provider === 'claude' ? 55_000 : 0 })
+    const result = await evaluate(CLOUD, mixed, ports, { maxTokens: 55_000 + sizes.reduce((a, b) => a + b, 0) - 1 })
+    const dropped = result.jobs.filter(entry => entry.detail.startsWith('not run: dropped from the batch'))
+    expect(dropped).toHaveLength(1)
+    expect(dropped[0]!.detail).toMatch(/a native turn's 55,000 fixed tokens plus the batched jobs' [\d,]+ pass the run's [\d,]+-token cap/)
+    expect(turns[0]!.prompt).not.toContain(`: ${dropped[0]!.id}\n`)
+    const none = await evaluate(CLOUD, mixed, harness(() => ({ answer: 'unused' }), { fixedOverheadTokens: () => 70_000 }).ports, { maxTokens: 60_000 })
+    expect(none).toMatchObject({ stoppedBy: 'token-cap', tokens: 0, outcomes: [] })
+    expect(DEFAULT_FIXED_OVERHEAD_TOKENS).toBe(40_000)
+  })
+  it('never records a false failure when the batched turn is stopped by the cap or fails as a whole', async () => {
+    const capped = await evaluate(CLOUD, mixed, harness(() => { throw Object.assign(new Error('the evaluation turn passed its 60000-token budget and was stopped'), { tokens: 61_200 }) }).ports, { maxTokens: 60_000 })
+    expect(capped).toMatchObject({ tokens: 61_200, stoppedBy: 'token-cap', outcomes: [] })
+    expect(capped.jobs.filter(entry => entry.id !== 'checked').every(entry => entry.result === 'not-gradable' && entry.detail.startsWith('not graded: the batched turn failed'))).toBe(true)
+    const hung = await evaluate(CLOUD, mixed, harness(() => new Promise<EvaluationRun>(() => {})).ports, { maxTokens: 60_000, jobTimeoutMs: 5 })
+    expect(hung).toMatchObject({ tokens: 60_000, outcomes: [] })
+    // A missing section is the model's own omission: that one job fails, the rest are graded.
+    const partial = await evaluate(CLOUD, mixed, harness(() => ({ answer: '### JOB first\n4+6', tokens: 41_000 })).ports, { maxTokens: 60_000 })
+    expect(partial.jobs.map(entry => entry.result)).toEqual(['success', 'not-gradable', 'failure', 'failure', 'failure'])
+    expect(partial.jobs[2]!.detail).toBe('no "### JOB json" section in the batched answer')
+  })
+  it('keeps one job per turn for local keys, or when batching is switched off', async () => {
+    const turns: string[] = []
+    const { ports } = harness(entry => { turns.push(entry.id); return { answer: 'ok' } })
+    await evaluate(KEY, suite(3), ports)
+    await evaluate(CLOUD, suite(2), ports, { batch: false })
+    expect(turns).toEqual(['job-1', 'job-2', 'job-3', 'job-1', 'job-2'])
   })
 })

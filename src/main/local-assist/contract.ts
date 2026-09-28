@@ -39,6 +39,10 @@ export interface LocalModelRequest {
   /** Overrides GENERATION_TIMEOUT_MS for a request whose prompt alone takes longer to read. */
   timeoutMs?: number
   signal?: AbortSignal
+  /** Never start a server for this call: only one already running answers, found when the call
+   *  takes the queue (not when it was made); otherwise it falls back. Model intelligence's
+   *  local decider sets it (D6). */
+  noStart?: boolean
 }
 
 export interface LocalModelRunner {

@@ -11,9 +11,12 @@ import type { AgentProviderId } from './models'
 export function capabilityRank(provider: AgentProviderId, modelId: string): 0 | 1 | 2 | 3 {
   const id = modelId.toLowerCase()
   if (provider === 'local' || id.startsWith('local/')) return 0
-  if (/gpt-6|astra|opus/.test(id)) return 3
-  if (/terra|sonnet|gpt-5\.5/.test(id)) return 2
-  if (/luna|sol|haiku|mini|cheap/.test(id)) return 1
+  // Tier names first: a generation prefix (gpt-6) says nothing about the tier within it.
+  if (/astra|opus/.test(id)) return 3
+  if (/terra|sonnet/.test(id)) return 2
+  if (/luna|\bsol\b|haiku|mini|cheap/.test(id)) return 1
+  if (/gpt-6/.test(id)) return 3
+  if (/gpt-5\.5/.test(id)) return 2
   return 2
 }
 

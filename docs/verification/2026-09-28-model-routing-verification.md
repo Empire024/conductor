@@ -468,3 +468,201 @@ The caller asked for either of those, so I record them as a note (N10), not a fa
 - **Queued messages:** `structured-sessions*`, `structured-store*`, `structured-agent-reducer*`, and the renderer panes.
 - **Other docs and scripts:** `agent-execution-plan`, `local-safety-review`, `local-work-plan`, and `scripts/smoke-verify-v4-*`.
 - **Not shipped:** `.conductor-scratch/**`.
+
+## Re-verification 3: fix batch 3 (N9, N11, N12) and the wizard's live fixes, 2026-09-28
+
+A new verifier (Claude Opus, agent_muldl8ux_wypx7ub) ran this round. Its inputs were the brief `fix-batch-3.txt` and the working tree as of 17:00, on top of 4df3653. I fixed no product code. My tests are in `.conductor-scratch/model-routing/verify/reverify3.verify.test.ts` (18 tests), and its outputs are in `reverify3-summary.json`.
+
+This time the route facts came from the **live** app, not a synthetic catalog. All reads were read-only:
+- **`models.list`** (`live-models-list.json`): 24 ids. Codex 7, Claude 5, Grok 4, local 4 and cloud 4.
+- **`usage.limits`** (`live-usage-limits.json`):
+  - Claude: weekly 7 %, five-hour 10 %; the Fable weekly window is `reset`.
+  - **Codex: weekly 55 %.**
+  - Grok: unknown.
+- **The owner's registry** (`live-db.json`, from bounded `SELECT`s on the small tables only; `structured_events` was not touched):
+  - 474 records, 5,473 observations.
+  - No execution outcomes, so the route runs on priors.
+  - No `weekly-stop` override in settings.
+
+The test replays those rows into a temp database and builds the live facts exactly as `AgentControl.routeLive` does, with `routeUsage` over `service.weeklyStop`.
+
+### Verdict: **SHIP WITH NOTES**
+
+- **Routing: every live fix holds on the live catalog.**
+  - Ranks are correct.
+  - Codex is blocked at 55 % and the reason is given.
+  - At default weights, hard work never goes below rank 2, and every hard cell has a fallback of rank 2 or higher.
+- **N9, N11 and N12 are fixed.**
+- **Two new evaluation defects, N15 and N14,** should be fixed before the first real cloud `models.evaluate`:
+  - N15: a slip in the batch header format still records every job as a false failure.
+  - N14: a learned overhead at or above the cap locks the provider out of evaluation.
+- Routing does not depend on either of them.
+
+### Tests run
+
+| Command | Result |
+| --- | --- |
+| `npx tsc --noEmit` (`verify/typecheck-4.log`) | exit 0 |
+| `npm test` in the background (`verify/npm-test-4.log`) | 413 files passed, 1 failed. **4576 tests passed, 1 failed, 9 skipped.** The failure is the known `database-wal.test.ts` 5 s flake, which passes alone (`verify/wal-4.log`). The counts are identical to C's `builder-c-npm-test-5.log`. |
+| `npm run test:scripts` (`verify/test-scripts-4.log`) | 190 passed, 0 failed, 3 skipped |
+| **Routing-only tree:** `git archive HEAD` plus exactly the 17 paths below, with `node_modules` junctioned (`verify/ship-tree-3-*.log`) | `tsc` exit 0. `vitest run` over `src/main/model-intelligence`, `approval-review`, `agent-control`, `durable-jobs`, `control`, `local-assist` and `src/shared/model-routing.test.ts`: **63 files, 704 passed, 1 skipped** |
+| Scratch tests (`verify/scratch-all-4.log`) | **78 tests: 76 pass.** reverify3 18/18, gate-shadow 10/10, reverify 20/20, loop 15/15, probe 3/3, d8 1/1. The 2 failures in reverify2 are expected. Its N7 repro ("the runner starts one") now fails because N11 is fixed. Its strict rank ≥ 2 assertion trips on N10 at cost weight 1 (synthetic catalog). |
+
+### Items
+
+**N9: batched cloud runs with a real ~39k overhead. PASS**, but see N15.
+
+The run: `claude/sonnet` on the bundled suite, through the real service and `cloudRunPort`. The fake native turn reads 39,115 tokens plus the prompt, reports usage and is interrupted past its budget, as `evaluationTurn` does.
+- **One turn per run.** Its `maxTokens` is 60,000 (the run cap). It carries all 7 one-shot jobs, 4,860 characters. The 7 command jobs are not-gradable with the reason given.
+- **Every "### JOB <id>" section is graded separately.**
+  - 7 success rows and **no failures**; 40,452 tokens.
+  - A wrong answer fails only its own job ("expected "3", got "4"").
+- **Cut off** (70k overhead against a 60k cap):
+  - 1 turn, every job not-gradable, **0 outcome rows**, `stoppedBy: token-cap`.
+  - Charged 71,215 tokens.
+- **Local runs keep one job per turn:** 7 runner calls, each for a distinct job.
+
+**Overhead learning. PASS**, but see N14.
+- After one run, `model-intelligence:evaluation-overhead` holds `{claude: {tokens: 39115}}`. That is the input less the prompt, exactly.
+- A restarted service with the same settings returns 39,115 for Claude and the 40,000 default for Codex.
+
+**N11: the D6 race. PASS: the repro is flipped.**
+- **Through the real gate:** the guard says a server runs, but the real `createLocalModelRunner` finds none.
+  - `runner.start` is called **0 times**.
+  - The decision records "no local model server is running, and this call never starts one".
+- **Directly on the runner:** no start in any of three cases:
+  - no server;
+  - an unreadable inventory;
+  - a server that stops while a noStart call waits in the queue (the first call held the lock with the server up).
+- **Control:** the same runner without `noStart` does start one.
+- The wrapper now exposes only `ask`, and the docs describe both guards.
+
+**N12: pre-charge, then reconcile. PASS.**
+- While the turn is in flight, `evaluation_runs` holds **60,000** (the run cap).
+- After a simulated restart (service disposed mid-turn, a new one on the same database), it still holds 60,000 and counts 1 run.
+- A finished run is reconciled to its real 40,452.
+
+**Live fix 1: `capabilityRank`. PASS** for every live id. Changes from the installed build are marked with →.
+
+| Provider | Ranks |
+| --- | --- |
+| Codex | `gpt-6-astra` 3; `gpt-6-sol` 3→**1**; `gpt-6-luna` 3→**1**; `gpt-5.6-sol` 1; `gpt-5.6-terra` 2; `gpt-5.6-luna` 1; `gpt-5.5` 2 |
+| Claude | `opus[1m]` 3; `sonnet` 2; `haiku` 1; `default` 2; `claude-fable-5-1[1m]` 2 |
+| Grok | all 2 |
+| Local | all 0 |
+| Cloud | `claude-opus-5-5` 3; `claude-sonnet-5` 2; `claude-haiku-4-5-20251001` 1; `claude-fable-5-1` 2 |
+
+- **Note:** the registry *stores* the rank.
+  - Replayed live rows still say gpt-6-luna, gpt-6-sol and gpt-6-astra are [3, 3, 3] until a `runtime` refresh re-derives them to [1, 1, 3].
+  - So the fix takes effect at the updated app's startup ingestion (`timers.after(0)`), not the moment it is installed.
+- **Ids outside the live catalog:**
+  - `gpt-6-nano`, `gpt-6-pro` and `gpt-6-console` fall to the bare `gpt-6` rule, rank 3.
+  - `gemini-*` matches `mini`, rank 1.
+
+**Live fix 2: hard work on the live catalog. PASS at default weights.**
+
+The matrix: 18 categories × complexity 1–5 × 3 risks × 5 weight settings = 1,350 cells.
+
+| Setting | What gets picked | Hard work |
+| --- | --- | --- |
+| Live usage, Codex blocked; default weights | Opus 252, `local/dolphin-x1-8b` 18 (easy cells only) | never below rank 2, at any of the 5 settings; no hard cell without a fallback at any setting; every hard fallback has rank ≥ 2 at the three settings without cost weight 1 (not asserted at cost weight 1) |
+| Codex opened at 20 % (the old live bug) | difficult-coding/5/high → **Opus** (fallback `codex/gpt-6-astra`), not gpt-6-luna. Default weights: gpt-6-luna 72 (easy only), Opus 198 | 0 cells below rank 2 at cost weights 0.3 and 0 |
+| Codex opened at 20 %, cost weight 1 | — | **18 hard cells go to gpt-6-luna** (complexity 1, high risk). This is N10, still open by design |
+
+**Live fix 3: one weekly stop. PASS.**
+- `weeklyStop` is 55 for Codex, 85 for Claude and 95 for Grok.
+- **Boundary:** Codex at 54.9 % is eligible; at 55 % it is blocked.
+- Every live decision gives the reason:
+  - it carries "codex blocked by its usage stop: Weekly usage 55% at or above the 55% weekly stop";
+  - each Codex candidate is excluded as "usage: Weekly usage 55% …".
+- **The setting moves both routing and evaluation.** With `{codex: 60}`, routing makes Codex eligible and `evaluationCaps().weeklyStop.codex` is 60.
+- **Invalid values keep the defaults:** `"50"`, 101, −1, an array, non-JSON.
+- **`models.evaluate` on Codex at the live 55 %** is refused: "codex is at 55% of its week, at or above the 55% stop". With the setting at 60 it is admitted.
+
+**Live fix 4: C's same-provider fallback. PASS.**
+- **Claude only** (Codex blocked, Grok and local excluded):
+  - the fallback is never null, and it is the strongest other Claude model;
+  - Opus falls back to Sonnet (rank 2), and Haiku falls back to Opus (rank 3);
+  - the reason reads "no other provider eligible (codex: usage: … 55% …; grok: provider grok excluded; local: …); same-provider fallback (capability rank …)".
+- **Claude at 90 % and Codex at 70 %:**
+  - Grok carries difficult-coding/5/high, with a Grok fallback;
+  - both "blocked by its usage stop" reasons are given.
+- **An allow list of one model** gives a null fallback and does not throw.
+
+**Regressions. PASS:** gate-shadow 10/10, typecheck, the module suites, and the full `npm test`, identical to C's log.
+
+### New defects
+
+**N15 — A slip in the batch header format records every one-shot job as a false failure** (medium, evaluation only).
+- **Where:** `evaluation.ts:275` accepts only `^#{2,4}\s*JOB\s+<id>\s*:?$`, and `evaluation.ts:380` records a missing section as a `failure` with `invalidOutput`.
+- **Near-miss headers that split into nothing:**
+  - `### JOB: <id>`
+  - ``### JOB `<id>` ``
+  - `**JOB <id>**`
+  - `### JOB <id> (task 1)`
+  - `### JOB 1`
+- **What that records:** correct answers under `### JOB: <id>` headers give **7 failure rows across 7 categories** in one run (repro: reverify3 "header format slips").
+- A whole answer wrapped in one fence leaves a trailing fence in the last section, so an exact grader fails.
+- **Expected:**
+  - If no section (or clearly too few) can be found, the batch is not-gradable, as a harness format problem.
+  - Near-miss headers are accepted.
+- This is the same class of error N9 was meant to remove.
+
+**N14 — A learned overhead can lock a provider out of evaluation, and runs that cannot fit still use a daily run** (low to medium).
+- **Where:** `index.ts:322` `recordOverhead` keeps the last value unbounded. It comes from `evaluation-ports.ts:74` `fixedOverhead`, applied to `agent-control.ts:1477`, which is the whole turn's summed input.
+- **How it locks:**
+  - A turn that calls the API more than once (a tool call despite "Do not use tools"), or a real preamble at or above the cap, is learned as the overhead.
+  - After that, no batch fits. No turn starts, so the overhead is never measured again.
+  - Each attempt still uses one of the 3 daily runs. Repro, "cut off by the cap": the second run started 0 turns and the day shows 2 runs.
+- **Admission has the same gap:** its `minRunTokens` floor is 20k, below the 40k overhead. A run capped at 30k starts 0 turns and uses 1 daily run (repro: "cap 30k").
+- **Expected:**
+  - Learn from the first usage report, or bound the value.
+  - Refuse at admission when the overhead plus the smallest batched job exceeds the run cap.
+
+**N16 — Stale docs** (low), in `docs/model-routing.md`:
+- **Line 192** still says "The router falls back only to another provider, so with Codex blocked and no other eligible provider a hard route has no fallback". C's same-provider fallback now contradicts that.
+- **Line 222** still describes a cloud run as one budget per job ("hands each job its budget … after every job").
+- **Not documented anywhere:**
+  - the batch itself: one turn per run under the run cap, the `### JOB <id>` answer format, command jobs not gradable in the cloud, the largest jobs dropped first;
+  - N12's pre-charge.
+
+**N17 — The evaluation-caps weekly-stop override is not validated** (low; the line predates the batch but was edited by it).
+- **Where:** `index.ts:306` spreads `evaluation-caps.weeklyStop` unchecked.
+- **Effect:** `{codex: "x"}` gives `"x"`, `usage >= "x"` is false, so a malformed override switches off the evaluation stop.
+- `weekly-stop` itself is validated.
+
+**N18 — Note: models without pricing score as if cost were no concern** (pre-existing scorer behaviour, not batch 3).
+- `grok-4.7-build-fast` has no pricing or context in the registry. It wins over its priced siblings:
+  - for hard work when Claude and Codex are blocked;
+  - in 36 cells at cost weight 1.
+
+**N10** still stands (see above). The owner may want a rank floor for hard work that holds whatever the weights.
+
+### The batch 3 ship: exact paths (17)
+
+These are the paths of `git diff 4df3653 --stat` that belong to routing. **None of the untracked files are routing.** I checked every hunk of the modified files; each one listed here is routing only:
+- `agent-control.ts`: 4 hunks (import, `routeLive` stop, `evaluationTurn` input ×2).
+- `model-runner.ts` and `contract.ts`: `noStart` only.
+
+The paths:
+- `docs/model-routing.md`
+- `docs/verification/2026-09-28-model-routing-verification.md` (this section)
+- `src/main/agent-control.ts`
+- `src/main/local-assist/contract.ts`, `model-runner.ts`, `model-runner.test.ts`
+- `src/main/model-intelligence/`:
+  - `dispatch-routing.test.ts`
+  - `evaluation-ports.ts`, `evaluation-ports.test.ts`
+  - `evaluation.ts`, `evaluation.test.ts`
+  - `index.ts`
+  - `router.ts`, `router.test.ts`
+  - `service.test.ts`
+- `src/shared/model-routing.ts`, `src/shared/model-routing.test.ts`
+
+**Proven:** HEAD plus only these 17 paths typechecks and passes the module suites (see Tests run). The list is in `verify/ship-paths-3.txt`.
+
+**Excluded:**
+- **Scraper:** `local-models/web*`, `web-extract*`, `tools*`, `agent.ts` and `scripts/local-models/`.
+- **Codex question:** `providers/codex.ts`, `codex-async-question.test.ts` and `scripts/*codex-async-questions*`.
+- **Queued messages:** `structured-sessions*`, `structured-store*`, `structured-agent-reducer*`, `StructuredAgentPane.tsx` and `StructuredAgentRenderers.tsx`.
+- **Other docs and scripts:** the other `docs/verification/2026-09-28-*` docs and `scripts/smoke-verify-v4-*`.
+- **`feature-list.md`: flagged.** Its only routing hunk is the added "[~] Adaptive model intelligence and routing" line, among other agents' lines (Codex questions, local-model work, queued messages, `tabs.open`, tab archive). Ship that hunk alone or leave the file out.

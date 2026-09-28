@@ -2,9 +2,29 @@ import { existsSync, readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
 import type { LocalModelRequest } from '../local-assist/contract'
 import type { EvaluationJob } from './evaluation'
-import { answerFiles, cloudRunPort, dockerCommandPort, evaluationPrompt, evaluationTokens, EvaluationTurnError, localRunPort, type ExecFile } from './evaluation-ports'
+import { answerFiles, cloudRunPort, DEFAULT_FIXED_OVERHEAD_TOKENS, dockerCommandPort, evaluationPrompt, evaluationTokens, EvaluationTurnError, fixedOverhead, localRunPort, type ExecFile } from './evaluation-ports'
 
 const job: EvaluationJob = { id: 'add', category: 'simple-coding', complexity: 1, prompt: 'Write src/add.js exporting add(a, b).', files: { 'package.json': '{"type":"module"}' }, grader: { kind: 'file-content', path: 'src/add.js', regex: 'export function add' } }
+
+describe('the fixed input overhead of a cloud turn (N9)', () => {
+  it('is the reported input less the job prompt at four characters a token', () => {
+    expect(fixedOverhead(39_115, { system: 's'.repeat(400), user: 'u'.repeat(3_600) })).toBe(38_115)
+    expect(fixedOverhead(500, { system: 's'.repeat(4_000), user: '' })).toBe(0)
+    expect(fixedOverhead(null, { system: '', user: '' })).toBeNull()
+    expect(fixedOverhead(0, { system: '', user: '' })).toBeNull()
+    expect(DEFAULT_FIXED_OVERHEAD_TOKENS).toBe(40_000)
+  })
+  it('comes back with the run, and with a failure that reported its input', async () => {
+    const job: EvaluationJob = { id: 'j', category: 'simple-coding', complexity: 1, prompt: 'p'.repeat(400), grader: { kind: 'exact', expected: 'x' } }
+    const prompt = evaluationPrompt(job), promptTokens = Math.ceil((prompt.system.length + prompt.user.length) / 4)
+    const run = await cloudRunPort(async () => ({ answer: 'x', tokens: 40_100, costUsd: null, durationMs: 1, effort: 'low', inputTokens: 40_000 }))({ provider: 'claude', model: 'haiku' }, job, new AbortController().signal)
+    expect(run.overheadTokens).toBe(40_000 - promptTokens)
+    const silent = await cloudRunPort(async () => ({ answer: 'x', tokens: null, costUsd: null, durationMs: 1, effort: null }))({ provider: 'claude', model: 'haiku' }, job, new AbortController().signal)
+    expect(silent).not.toHaveProperty('overheadTokens')
+    const failed = cloudRunPort(async () => { throw new EvaluationTurnError('the evaluation turn ended failed', 6_000, 39_000) })({ provider: 'claude', model: 'haiku' }, job, new AbortController().signal)
+    await expect(failed).rejects.toMatchObject({ tokens: 6_000, inputTokens: 39_000, overheadTokens: 39_000 - promptTokens })
+  })
+})
 
 describe('cloud evaluation spend (N3)', () => {
   it('counts the whole prompt with cache reads and writes plus the output, without double counting', () => {

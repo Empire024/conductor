@@ -3,7 +3,7 @@ import type { CompletionRequest, CompletionResult } from '../local-models/client
 import { DOLPHIN_X1_8B, ORNITH_9B, QWEN_9B, type LocalModelConfig } from '../local-models/config.ts'
 import type { LocalServerEntry } from '../local-models/servers.ts'
 import type { LocalModelRunnerPorts } from './contract.ts'
-import { createLocalModelRunner } from './model-runner.ts'
+import { createLocalModelRunner, NO_SERVER_RUNNING } from './model-runner.ts'
 
 const KEY = 'a'.repeat(48)
 const model = (id: string, port: number): LocalModelConfig => ({ id, port } as LocalModelConfig)
@@ -62,6 +62,33 @@ describe('local model runner', () => {
     expect(h.log.starts).toEqual([QWEN_9B])
     expect(outcome).toMatchObject({ ok: true, answer: { model: QWEN_9B } })
     expect(h.log.completes[0]!.endpoint).toBe('http://127.0.0.1:51437')
+  })
+
+  it('never starts a server for a noStart call, and uses one that is running', async () => {
+    const none = harness()
+    expect(await createLocalModelRunner(none.ports).ask({ ...request, noStart: true })).toEqual({ ok: false, reason: NO_SERVER_RUNNING })
+    expect(none.log.starts).toEqual([])
+    const running = harness({ servers: () => [entry(QWEN_9B, 6001)] })
+    expect(await createLocalModelRunner(running.ports).ask({ ...request, noStart: true })).toMatchObject({ ok: true, answer: { model: QWEN_9B } })
+    expect(running.log.starts).toEqual([])
+  })
+
+  it('checks for a server after the queue: one that stopped while a noStart call waited is not replaced (D6)', async () => {
+    let up = true, finish!: () => void
+    const h = harness({
+      servers: () => up ? [entry(QWEN_9B, 6001)] : [],
+      complete: async () => { await new Promise<void>(resolve => { finish = resolve }); return result('first') }
+    })
+    const runner = createLocalModelRunner(h.ports)
+    const first = runner.ask(request)
+    await new Promise(resolve => setImmediate(resolve))
+    // The decider's quick check saw a server; the server stops while its call waits for the queue.
+    const second = runner.ask({ ...request, noStart: true, waitBudgetMs: 60_000 })
+    up = false
+    finish()
+    expect(await first).toMatchObject({ ok: true })
+    expect(await second).toEqual({ ok: false, reason: NO_SERVER_RUNNING })
+    expect(h.log.starts).toEqual([])
   })
 
   it('honours an explicit preference and falls back to any configured model', async () => {

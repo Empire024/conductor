@@ -130,7 +130,8 @@ describe('routing live facts and dispatch (AgentControl over model intelligence)
       emit({ turnId: 't1', itemId: 'usage', data: { type: 'usage', inputTokens: 9_000, cachedTokens: 8_000, cacheCreationTokens: 500, outputTokens: 100, scope: 'turn', source: 'provider' } })
       emit({ turnId: 't1', data: { type: 'session', phase: 'completed' } })
     } })
-    expect((await f.control.evaluationTurn(SYNTHETIC, PROMPT, new AbortController().signal, { maxTokens: 20_000 })).tokens).toBe(9_100)
+    // The whole input comes back too: the fixed overhead is learned from it (N9).
+    expect(await f.control.evaluationTurn(SYNTHETIC, PROMPT, new AbortController().signal, { maxTokens: 20_000 })).toMatchObject({ tokens: 9_100, inputTokens: 9_000 })
   })
   it('counts a usage-less turn at its budget', async () => {
     const f = fixture({ vramBytes: 7 * GiB, availability: () => ({ available: true }), turn: emit => {

@@ -3,6 +3,7 @@ import {
   TASK_CATEGORIES, modelKeyId, type ExecutionOutcome, type ModelKey, type ModelStatus, type ReputationScore, type TaskCategory
 } from '../../shared/model-routing'
 import { outcome as outcomeRow } from './capture/common'
+import { answerFiles } from './evaluation-ports'
 import { isProven, type ReputationDimension } from './reputation'
 
 /**
@@ -216,6 +217,9 @@ export interface EvaluationPorts {
   /** Current alternatives to compare against in the report. */
   alternatives(key: ModelKey): ModelKey[]
   writeReport(name: string, markdown: string): void
+  /** Input tokens a native turn of this provider carries before any task (system prompt, briefing), as last
+   *  measured; DEFAULT_FIXED_OVERHEAD_TOKENS when unknown. A batched cloud run pays it once. */
+  fixedOverheadTokens?(provider: string): number
   /** Journals what the run has spent so far, cumulatively for its runId: at its start, after every job and at its end,
    *  so a run cut short by a restart still counts against the daily cloud caps (the store upserts on runId). */
   recordSpend?(spend: EvaluationSpend): void
@@ -231,6 +235,9 @@ export interface EvaluationOptions {
   /** A hard per-run cap on tokens (input + output): a job starts only with a budget that fits what is left, its
    *  runner is told that budget, and the run stops, the jobs left not gradable, once none fits or a job overran. */
   maxTokens?: number | null
+  /** One turn for every one-shot-gradable job (see batchPrompt). Defaults to true for cloud keys, whose native turns
+   *  carry a large fixed input; local runs keep one job per turn. */
+  batch?: boolean
   runId?: string
 }
 export const DEFAULT_JOB_TIMEOUT_MS = 10 * 60_000
@@ -241,6 +248,37 @@ const MIN_ANSWER_TOKENS = 1_000
 const promptTokens = (job: EvaluationJob): number => Math.ceil((job.prompt.length + Object.values(job.files ?? {}).reduce((sum, text) => sum + text.length, 0)) / 4)
 export const jobTokenBudget = (job: EvaluationJob): number => Math.max(job.maxTokens ?? JOB_TOKEN_BUDGET[job.complexity - 1]!, minimumJobTokens(job))
 export const minimumJobTokens = (job: EvaluationJob): number => promptTokens(job) + MIN_ANSWER_TOKENS
+/** A native cloud turn's fixed input (the CLI system prompt and Conductor's briefing) when nothing measured it: ~39k was seen. */
+export const DEFAULT_FIXED_OVERHEAD_TOKENS = 40_000
+/** What one job adds to a batched turn: its own prompt and files, and room for its answer, by complexity 1..5. */
+const BATCH_ANSWER_TOKENS = [800, 1_500, 3_000, 6_000, 10_000] as const
+export const batchJobTokens = (job: EvaluationJob): number => job.maxTokens ?? promptTokens(job) + BATCH_ANSWER_TOKENS[job.complexity - 1]!
+export const BATCH_JOB_ID = 'batch'
+
+/** The one prompt of a batched run: every job as a numbered section, and a strict answer format to split on. */
+export function batchPrompt(jobs: EvaluationJob[]): EvaluationJob {
+  const sections = jobs.map((job, index) => {
+    const files = Object.entries(job.files ?? {}).map(([path, content]) => `--- ${path} ---\n${content}`).join('\n\n')
+    return `## TASK ${index + 1} of ${jobs.length}: ${job.id}\n\n${job.prompt}${files ? `\n\nFiles for this task:\n\n${files}` : ''}`
+  })
+  const prompt = [
+    `You are evaluated on ${jobs.length} independent tasks in one reply. Do not use tools. Answer every task, in order.`,
+    'Start each answer with a line that is exactly "### JOB <task id>" (for example "### JOB ' + (jobs[0]?.id ?? 'x') + '") and put nothing before the first such line.',
+    'Under each header follow that task\'s own instructions: when it asks for code or JSON only, give one fenced block; when it asks for a file, give it as a fenced block whose info string is its relative path.',
+    '', ...sections,
+  ].join('\n')
+  return { id: BATCH_JOB_ID, category: 'general', complexity: Math.max(1, ...jobs.map(job => job.complexity)) as EvaluationJob['complexity'], prompt, grader: { kind: 'regex', pattern: '.' } }
+}
+/** Each job's section of a batched answer, by its "### JOB <id>" header; a job without one is absent. */
+export function splitBatchAnswer(answer: string, ids: string[]): Record<string, string> {
+  const visible = visibleAnswer(answer), known = new Set(ids), sections: Record<string, string> = {}
+  const headers = [...visible.matchAll(/^[ \t]*#{2,4}[ \t]*JOB[ \t]+([\w.-]+)[ \t]*:?[ \t]*$/gim)].filter(match => known.has(match[1]!))
+  headers.forEach((match, index) => {
+    const id = match[1]!, end = headers[index + 1]?.index ?? visible.length
+    if (!(id in sections)) sections[id] = visible.slice(match.index! + match[0].length, end).trim()
+  })
+  return sections
+}
 
 export type EvaluationJobOutcome = ExecutionOutcome['result'] | 'not-gradable'
 export interface EvaluationJobResult { id: string; category: TaskCategory; result: EvaluationJobOutcome; detail: string; timedOut: boolean; durationMs: number; costUsd: number | null; tokens: number | null }
@@ -278,24 +316,85 @@ async function runJob(ports: EvaluationPorts, key: ModelKey, job: EvaluationJob,
 
 export async function evaluate(key: ModelKey, suite: EvaluationSuite, ports: EvaluationPorts, options: EvaluationOptions = {}): Promise<EvaluationResult> {
   const runId = options.runId ?? makeId('evaluation'), timeoutMs = options.jobTimeoutMs ?? DEFAULT_JOB_TIMEOUT_MS
-  const jobs = suite.jobs.slice(0, options.maxJobs ?? suite.jobs.length)
+  const jobs = suite.jobs.slice(0, options.maxJobs ?? suite.jobs.length), order = new Map(jobs.map((job, index) => [job.id, index]))
   const results: EvaluationJobResult[] = [], outcomes: ExecutionOutcome[] = []
   let spent = 0, tokens = 0, stoppedBy: EvaluationResult['stoppedBy'] = options.maxJobs !== undefined && options.maxJobs < suite.jobs.length ? 'max-jobs' : null
   const notGradable = (job: EvaluationJob, detail: string) => results.push({ id: job.id, category: job.category, result: 'not-gradable', detail, timedOut: false, durationMs: 0, costUsd: null, tokens: null })
   const cap = options.maxTokens ?? null, capText = cap === null ? '' : `${cap.toLocaleString('en-US')}-token`
-  const journal = (): void => {
-    try { ports.recordSpend?.({ runId, key, at: ports.now().toISOString(), tokens, costUsd: spent, jobs: results.length, gradedJobs: results.filter(result => result.result !== 'not-gradable').length, stoppedBy }) }
+  /** `reserved` pre-charges a turn about to start, so a restart mid-turn still leaves its budget in the journal. */
+  const journal = (reserved = 0): void => {
+    try { ports.recordSpend?.({ runId, key, at: ports.now().toISOString(), tokens: tokens + reserved, costUsd: spent, jobs: results.length, gradedJobs: results.filter(result => result.result !== 'not-gradable').length, stoppedBy }) }
     catch { /* The journal is the caps' audit trail; the evaluation's outcomes are already recorded. */ }
   }
-  ports.setStatus(key, 'evaluating')
-  journal()
-  let status: ModelStatus = 'unproven'
-  try {
+  const record = (job: EvaluationJob, row: Parameters<typeof outcomeRow>[0]): void => {
+    const recorded = outcomeRow(row)
+    ports.recordOutcome(recorded)
+    ports.outcomeRecorded?.(recorded)
+    outcomes.push(recorded)
+  }
+  /** The spend a turn that threw is charged: what its port measured, else (capped) its whole budget, else null. */
+  const thrownTokens = (error: unknown, timedOut: boolean, budget: { maxTokens: number } | undefined): number | null => {
+    const reported = (error as { tokens?: unknown } | null)?.tokens
+    return !timedOut && typeof reported === 'number' && Number.isFinite(reported) ? reported : budget?.maxTokens ?? null
+  }
+  const needsCommand = (job: EvaluationJob) => job.grader.kind === 'command'
+
+  // Budget exhaustion is never the model's failure: a job cut off by the cap, or one that never fitted, is not
+  // gradable and writes no outcome. Only a wrong answer is a failure.
+  const runBatched = async (): Promise<void> => {
+    const batched: EvaluationJob[] = []
+    for (const job of jobs) {
+      if (needsCommand(job)) notGradable(job, 'not run: a batched cloud run grades one-shot answers; this job\'s check needs a command runner')
+      else batched.push(job)
+    }
+    const overhead = ports.fixedOverheadTokens?.(key.provider) ?? DEFAULT_FIXED_OVERHEAD_TOKENS
+    if (cap !== null) {
+      // The fixed overhead is paid once; drop the largest jobs until the batch fits the run's cap.
+      const need = () => overhead + batched.reduce((sum, job) => sum + batchJobTokens(job), 0)
+      while (batched.length && need() > cap) {
+        const largest = batched.reduce((big, job) => batchJobTokens(job) > batchJobTokens(big) ? job : big)
+        notGradable(largest, `not run: dropped from the batch; a native turn's ${overhead.toLocaleString('en-US')} fixed tokens plus the batched jobs' ${(need() - overhead).toLocaleString('en-US')} pass the run's ${capText} cap`)
+        batched.splice(batched.indexOf(largest), 1)
+      }
+      if (!batched.length) { stoppedBy = 'token-cap'; return }
+    }
+    if (!batched.length || options.signal?.aborted) { if (options.signal?.aborted) stoppedBy = 'aborted'; return }
+    const budget = cap !== null ? { maxTokens: cap } : undefined, prompt = batchPrompt(batched), started = ports.now().getTime()
+    journal(budget?.maxTokens ?? 0)
+    let run: EvaluationRun
+    try { run = await runJob(ports, key, prompt, timeoutMs * batched.length, options.signal, budget) }
+    catch (error) {
+      const timedOut = error instanceof JobTimeout, cancelled = !timedOut && !!options.signal?.aborted
+      tokens += thrownTokens(error, timedOut, budget) ?? runTokens(prompt, undefined)
+      if (cancelled) stoppedBy = 'aborted'
+      else if (budget && tokens >= budget.maxTokens) stoppedBy = 'token-cap'
+      // One turn answered for all of them: its failure cannot be pinned on any single job.
+      const why = cancelled ? 'the run was aborted' : timedOut ? message(error) : `the batched turn failed: ${message(error)}`
+      for (const job of batched) notGradable(job, `not graded: ${why}`)
+      return
+    }
+    const used = run.tokens ?? budget?.maxTokens ?? runTokens(prompt, run), sections = splitBatchAnswer(run.answer, batched.map(job => job.id))
+    tokens += used; spent += run.costUsd ?? 0
+    for (const job of batched) {
+      const section = sections[job.id]
+      const graded: Grade = section === undefined ? { pass: false, invalidOutput: true, detail: `no "### JOB ${job.id}" section in the batched answer` }
+        : await grade(job, { answer: section, files: { ...run.files, ...answerFiles(section) } }, ports.command?.bind(ports), options.signal)
+      record(job, {
+        key, source: 'evaluation', ref: `${runId}:${job.id}`, category: job.category, at: ports.now().toISOString(), result: graded.pass ? 'success' : 'failure',
+        effort: run.effort ?? null, complexity: job.complexity, verifier: graded.pass ? 'pass' : 'fail', durationMs: null, tokens: null, costUsd: null,
+        invalidOutput: graded.invalidOutput ?? false, detail: `${suite.name}/${job.id} (batched): ${graded.detail}`,
+      })
+      results.push({ id: job.id, category: job.category, result: graded.pass ? 'success' : 'failure', detail: graded.detail, timedOut: false, durationMs: run.durationMs ?? ports.now().getTime() - started, costUsd: null, tokens: null })
+    }
+    if (budget && used > budget.maxTokens) stoppedBy = 'token-cap'
+  }
+
+  const runEach = async (): Promise<void> => {
     for (const [index, job] of jobs.entries()) {
       if (options.signal?.aborted) { stoppedBy = 'aborted'; break }
       if (options.maxCostUsd != null && spent > options.maxCostUsd) { stoppedBy = 'budget'; break }
       // Grading it needs a sandboxed command runner; running the model first would only spend tokens.
-      if (job.grader.kind === 'command' && !ports.command) { notGradable(job, 'not run: its check needs a sandboxed command runner, which is not available here'); continue }
+      if (needsCommand(job) && !ports.command) { notGradable(job, 'not run: its check needs a sandboxed command runner, which is not available here'); continue }
       // A capped run never starts a job that could take it past the cap: the job gets what is left, or does not start.
       let budget: { maxTokens: number } | undefined
       if (cap !== null) {
@@ -308,30 +407,33 @@ export async function evaluate(key: ModelKey, suite: EvaluationSuite, ports: Eva
         budget = { maxTokens: Math.min(jobTokenBudget(job), left) }
       }
       const started = ports.now().getTime()
+      journal(budget?.maxTokens ?? 0)
       let run: EvaluationRun | undefined, failure: string | undefined, timedOut = false, cancelled = false, failedTokens: number | null = null
       try { run = await runJob(ports, key, job, timeoutMs, options.signal, budget) }
       catch (error) {
         timedOut = error instanceof JobTimeout; cancelled = !timedOut && !!options.signal?.aborted; failure = timedOut ? message(error) : `the run failed: ${message(error)}`
         // A failed capped turn is charged what its port measured (at least its budget); a timed-out one never
         // reports back, so it is charged its whole budget. Uncapped runs keep the text estimate.
-        const reported = (error as { tokens?: unknown } | null)?.tokens
-        failedTokens = !timedOut && typeof reported === 'number' && Number.isFinite(reported) ? reported : budget?.maxTokens ?? null
+        failedTokens = thrownTokens(error, timedOut, budget)
       }
-      const graded: Grade = run ? await grade(job, run, ports.command?.bind(ports), options.signal) : { pass: false, detail: failure! }
-      const durationMs = run?.durationMs ?? ports.now().getTime() - started, costUsd = run?.costUsd ?? null, used = run ? runTokens(job, run) : failedTokens ?? runTokens(job, undefined)
-      const result = cancelled ? 'cancelled' : graded.pass ? 'success' : 'failure'
-      const row = outcomeRow({
-        key, source: 'evaluation', ref: `${runId}:${job.id}`, category: job.category, at: ports.now().toISOString(), result,
-        effort: run?.effort ?? null, complexity: job.complexity, verifier: cancelled ? 'none' : graded.pass ? 'pass' : 'fail', durationMs, tokens: run?.tokens ?? failedTokens, costUsd,
-        iterations: run?.iterations ?? null, toolFailures: run?.toolFailures ?? 0, looped: run?.looped ?? false, contextFailure: run?.contextFailure ?? false,
-        timedOut, invalidOutput: graded.invalidOutput ?? false, detail: `${suite.name}/${job.id}: ${graded.detail}`,
-      })
-      ports.recordOutcome(row)
-      ports.outcomeRecorded?.(row)
-      outcomes.push(row)
-      spent += costUsd ?? 0
+      const used = run ? runTokens(job, run) : failedTokens ?? runTokens(job, undefined)
+      // A turn stopped at its budget ran out of tokens; it says nothing about the model.
+      const cutOff = !run && !timedOut && !cancelled && budget !== undefined && used >= budget.maxTokens
       tokens += used
-      results.push({ id: job.id, category: job.category, result, detail: graded.detail, timedOut, durationMs, costUsd, tokens: used })
+      if (cutOff) notGradable(job, `not graded: the turn was stopped at its ${budget!.maxTokens.toLocaleString('en-US')}-token budget (${failure})`)
+      else {
+        const graded: Grade = run ? await grade(job, run, ports.command?.bind(ports), options.signal) : { pass: false, detail: failure! }
+        const durationMs = run?.durationMs ?? ports.now().getTime() - started, costUsd = run?.costUsd ?? null
+        const result = cancelled ? 'cancelled' : graded.pass ? 'success' : 'failure'
+        record(job, {
+          key, source: 'evaluation', ref: `${runId}:${job.id}`, category: job.category, at: ports.now().toISOString(), result,
+          effort: run?.effort ?? null, complexity: job.complexity, verifier: cancelled ? 'none' : graded.pass ? 'pass' : 'fail', durationMs, tokens: run?.tokens ?? failedTokens, costUsd,
+          iterations: run?.iterations ?? null, toolFailures: run?.toolFailures ?? 0, looped: run?.looped ?? false, contextFailure: run?.contextFailure ?? false,
+          timedOut, invalidOutput: graded.invalidOutput ?? false, detail: `${suite.name}/${job.id}: ${graded.detail}`,
+        })
+        spent += costUsd ?? 0
+        results.push({ id: job.id, category: job.category, result, detail: graded.detail, timedOut, durationMs, costUsd, tokens: used })
+      }
       // The real spend stands, even past the budget; a runner that overran is not trusted with another job.
       const overran = budget && used > budget.maxTokens ? budget.maxTokens : null
       if (overran !== null) {
@@ -344,6 +446,14 @@ export async function evaluate(key: ModelKey, suite: EvaluationSuite, ports: Eva
     }
     const ran = results.filter(result => result.result !== 'not-gradable').length
     if (!stoppedBy && options.maxCostUsd != null && spent > options.maxCostUsd && ran < jobs.length) stoppedBy = 'budget'
+  }
+
+  ports.setStatus(key, 'evaluating')
+  journal()
+  let status: ModelStatus = 'unproven'
+  try {
+    await (options.batch ?? key.provider !== 'local' ? runBatched() : runEach())
+    results.sort((a, b) => order.get(a.id)! - order.get(b.id)!)
   } finally {
     const seen = new Set(outcomes.map(row => row.id))
     const evidence = [...(ports.outcomes?.(key) ?? []).filter(row => !seen.has(row.id)), ...outcomes]

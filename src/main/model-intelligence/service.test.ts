@@ -12,7 +12,7 @@ import type { EvaluationSuite } from './evaluation'
 import { softmax } from './deciders/scorer'
 import {
   CALLER_DECIDER_ID, callerFrontier, chosenOnTop, closeCandidates, createModelIntelligence, DEFAULT_EVALUATION_CAPS, DEFAULT_EXCLUDED_MODELS, EVALUATION_CAPS_SETTING, EXCLUDED_MODELS_SETTING,
-  excludedMatcher, LOCAL_DECIDER_UNAVAILABLE, usageVerdict, weeklyUsage, type ModelIntelligenceOptions
+  EVALUATION_OVERHEAD_SETTING, excludedMatcher, LOCAL_DECIDER_UNAVAILABLE, routeUsage, usageVerdict, weeklyUsage, WEEKLY_STOP_SETTING, type ModelIntelligenceOptions
 } from './index'
 
 const dirs: string[] = []
@@ -173,6 +173,19 @@ describe('decisions, bindings and status', () => {
 })
 
 describe('the local decider never starts a model server (D6)', () => {
+  it('asks the shared runner with noStart and exposes none of its measurements', async () => {
+    const asked: LocalModelRequest[] = []
+    const runner = { ask: async (request: LocalModelRequest) => { asked.push(request); return { ok: false as const, reason: 'no local model server is running, and this call never starts one' } },
+      contextTokens: vi.fn(async () => 4096), promptTokens: vi.fn(async () => 10) }
+    const { service: s } = service({ localRunner: runner, localServerRunning: () => true })
+    const record = await s.decisions.decide({ kind: 'retry', question: 'Retry?', options: [{ id: 'yes', label: 'Yes' }, { id: 'no', label: 'No' }], state: {}, impact: 'routine', requester: 'test' })
+    expect(asked).toHaveLength(1)
+    expect(asked[0]).toMatchObject({ noStart: true })
+    expect(record.verdicts[0]).toMatchObject({ decider: 'local-llm', failed: expect.stringContaining('never starts one') })
+    expect(runner.contextTokens).not.toHaveBeenCalled()
+    expect(runner.promptTokens).not.toHaveBeenCalled()
+    s.dispose()
+  })
   const action = { projectId: 'p', machineId: 'local', workerId: 'w', runtimeId: 'r', requestId: 'q', tool: 'Write', arguments: {}, paths: [], boundary: 'workspace-write', reason: 'x', sideEffects: [], ownerEvidence: 'o', authorizationId: 'a', native: {} } as ReviewAction
   const spec = { id: 'w', projectId: 'p', sessionId: 's', provider: 'claude', cwd: '.', title: 'W' } as AgentSpec
   it('skips the shadow and records the skip when no server runs, and uses a running one', async () => {
@@ -241,10 +254,12 @@ describe('cloud evaluation under the owner caps (gap 8)', () => {
     expect((await small.s.startEvaluation(OPUS, 'mini')).maxTokens).toBe(1000)
   })
   it('three runs that each spend their whole cap stay within the daily token cap', async () => {
-    // One job per run whose budget is the whole run cap, answered at exactly that budget.
-    const big: EvaluationSuite = { name: 'big', jobs: [{ id: 'big', category: 'simple-coding', complexity: 5, prompt: 'Say 42', maxTokens: 60_000, grader: { kind: 'exact', expected: '42' } }] }
+    // Each run's one turn spends exactly the budget it is handed (the whole run cap); no fixed overhead, so every cap fits the job.
+    const big: EvaluationSuite = { name: 'big', jobs: [{ id: 'big', category: 'simple-coding', complexity: 5, prompt: 'Say 42', maxTokens: 1_000, grader: { kind: 'exact', expected: '42' } }] }
     const runCloud = vi.fn(async (..._args: unknown[]) => ({ answer: '42', tokens: (_args[3] as { maxTokens: number }).maxTokens, costUsd: null, durationMs: 1 }))
-    const s = createModelIntelligence({ dbPath: ':memory:', settings: settings(), timers: noTimers, clock: () => NOW, log: () => {}, evaluation: { runCloud, usage: () => 10, suites: () => ({ big }) } })
+    const store = settings()
+    store.values.set(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ claude: { tokens: 0, at: NOW.toISOString() } }))
+    const s = createModelIntelligence({ dbPath: ':memory:', settings: store, timers: noTimers, clock: () => NOW, log: () => {}, evaluation: { runCloud, usage: () => 10, suites: () => ({ big }) } })
     register(s, [[OPUS, 'Opus']])
     const caps: number[] = []
     for (let index = 0; index < 3; index++) {
@@ -256,6 +271,21 @@ describe('cloud evaluation under the owner caps (gap 8)', () => {
     expect(s.store.evaluationSpend('2026-09-27T12:00:00Z')).toEqual({ runs: 3, tokens: DEFAULT_EVALUATION_CAPS.perDayTokens })
     await expect(s.startEvaluation(OPUS, 'big')).rejects.toThrow(/3 cloud evaluations ran/)
     s.dispose()
+  })
+  it('learns each provider\'s fixed turn overhead, keeps it in settings and hands it to evaluate() (N9)', async () => {
+    const { s, runCloud } = cloud(10)
+    expect(s.fixedOverheadTokens('claude')).toBe(40_000)
+    runCloud.mockImplementation(async () => ({ answer: '42', tokens: 900, costUsd: null, durationMs: 1, overheadTokens: 38_500 }))
+    const handle = await s.startEvaluation(OPUS, 'mini')
+    await vi.waitFor(() => expect(s.evaluation(handle.runId)!.state).not.toBe('running'))
+    expect(s.fixedOverheadTokens('claude')).toBe(38_500)
+    expect(s.fixedOverheadTokens('codex')).toBe(40_000)
+    expect(JSON.parse(s.decisions['ports'].settings.getSetting(EVALUATION_OVERHEAD_SETTING)!)).toEqual({ claude: { tokens: 38_500, at: NOW.toISOString() } })
+    // A failed turn that reported its input still teaches the overhead.
+    runCloud.mockImplementation(async () => { throw Object.assign(new Error('the evaluation turn ended failed'), { tokens: 6_000, overheadTokens: 41_000 }) })
+    const next = await s.startEvaluation(OPUS, 'mini')
+    await vi.waitFor(() => expect(s.evaluation(next.runId)!.state).not.toBe('running'))
+    expect(s.fixedOverheadTokens('claude')).toBe(41_000)
   })
   it('counts a usage-less cloud job at its budget, never an estimate (N3)', async () => {
     const silent = cloud(10)
@@ -269,6 +299,94 @@ describe('cloud evaluation under the owner caps (gap 8)', () => {
     register(s, [[FABLE, 'Claude Fable 5.1']])
     await expect(s.startEvaluation(FABLE, 'mini')).rejects.toThrow(/claude\/claude-fable-5-1 is excluded by owner setting \(model-intelligence:excluded-models: claude\/claude-fable-5-1\*\)/)
     expect(runCloud).not.toHaveBeenCalled()
+  })
+})
+
+describe('one weekly usage stop for routing and evaluation', () => {
+  const ASTRA: ModelKey = { provider: 'codex', model: 'gpt-6-astra' }, LUNA: ModelKey = { provider: 'codex', model: 'gpt-6-luna' }, SONNET: ModelKey = { provider: 'claude', model: 'sonnet' }
+  const HARD = { category: 'difficult-coding' as const, complexity: 5 as const, risk: 'high' as const, toolsRequired: [], contextTokens: null }
+  /** The running app's shape: Claude and Codex tiers plus a local model, live facts built as AgentControl.routeLive builds them. */
+  function liveShaped(codexWeekly: number, configure?: (values: Map<string, string>) => void) {
+    const store = settings()
+    configure?.(store.values)
+    const s = createModelIntelligence({ dbPath: ':memory:', settings: store, timers: noTimers, clock: () => NOW, log: () => {} })
+    register(s, [[OPUS, 'Claude Opus 5.5 (1M context)'], [SONNET, 'Claude Sonnet 5'], [ASTRA, 'GPT-6-Astra'], [LUNA, 'GPT-6-Luna'], [QWEN, 'Qwen3.6 35B-A3B (local)']])
+    const windows = (provider: string) => provider === 'codex' ? [window({ label: 'Codex weekly', usedPercent: codexWeekly })] : provider === 'claude' ? [window({ label: 'Claude weekly', usedPercent: 30 })] : []
+    const live = { offered: [OPUS, SONNET, ASTRA, LUNA, QWEN], providerEnabled: () => true, loadedLocalModels: () => [], ...routeUsage(windows, key => key.model, provider => s.weeklyStop(provider)) }
+    return { s, store, live }
+  }
+
+  it('defaults to the owner stops (Claude 85, Codex 55), reads the setting, and treats an unnamed provider as 95', () => {
+    const { s, store } = liveShaped(10)
+    expect([s.weeklyStop('claude'), s.weeklyStop('codex'), s.weeklyStop('grok')]).toEqual([85, 55, 95])
+    store.values.set(WEEKLY_STOP_SETTING, JSON.stringify({ codex: 70, grok: 80, claude: 'x' }))
+    expect([s.weeklyStop('claude'), s.weeklyStop('codex'), s.weeklyStop('grok')]).toEqual([85, 70, 80])
+    store.values.set(WEEKLY_STOP_SETTING, 'not json')
+    expect(s.weeklyStop('codex')).toBe(55)
+    s.dispose()
+  })
+
+  it('live-shaped: with Codex at or above 55 % of its week, hard work goes to Opus with a non-Codex fallback, and the route says Codex is blocked', async () => {
+    for (const percent of [55, 80]) {
+      const { s, live } = liveShaped(percent)
+      const { decision, explanation } = await s.route(HARD, {}, live, { requester: 'models.route' })
+      expect(decision.selected.key).toEqual(OPUS)
+      // Codex is blocked and the unproven local model is not eligible for complexity 5, high risk: the fallback stays on Claude (builder C, same-provider fallback).
+      expect(decision.fallback?.key.provider).toBe('claude')
+      expect(decision.fallback?.reason).toMatch(/^no other provider eligible (.*); same-provider fallback/)
+      expect(decision.candidates.filter(candidate => candidate.key.provider === 'codex').every(candidate => !candidate.eligible)).toBe(true)
+      expect(decision.reasons).toContain(`codex blocked by its usage stop: Codex weekly usage ${percent}% at or above the 55% weekly stop`)
+      expect(explanation).toContain('codex blocked by its usage stop')
+      s.dispose()
+    }
+  })
+
+  it('falls back to another unblocked provider, never to the blocked Codex', async () => {
+    const { s: svc, live } = liveShaped(60)
+    const GROK: ModelKey = { provider: 'grok', model: 'grok-4.7' }
+    register(svc, [[GROK, 'Grok 4.7']])
+    const { decision } = await svc.route(HARD, {}, { ...live, offered: [...live.offered, GROK] }, { requester: 'models.route' })
+    expect(decision.selected.key).toEqual(OPUS)
+    expect(decision.fallback?.key).toEqual(GROK)
+    svc.dispose()
+  })
+
+  it('below the stop Codex stays eligible and nothing is blocked; the setting moves the stop for routing', async () => {
+    const below = liveShaped(54)
+    const { decision } = await below.s.route(HARD, {}, below.live, { requester: 'models.route' })
+    expect(decision.candidates.find(candidate => candidate.key.model === ASTRA.model)?.eligible).toBe(true)
+    expect(decision.reasons.some(reason => reason.includes('blocked by its usage stop'))).toBe(false)
+    below.s.dispose()
+    const raised = liveShaped(60, values => values.set(WEEKLY_STOP_SETTING, JSON.stringify({ codex: 90 })))
+    expect((await raised.s.route(HARD, {}, raised.live, { requester: 'models.route' })).decision.candidates.find(candidate => candidate.key.model === ASTRA.model)?.eligible).toBe(true)
+    raised.s.dispose()
+  })
+
+  it('applies the stop when the caller\'s live facts carry only a provider percent', async () => {
+    const { s } = liveShaped(60)
+    const bare = { offered: [OPUS, SONNET, ASTRA, LUNA], providerEnabled: () => true, loadedLocalModels: () => [], usagePercent: (provider: string) => provider === 'codex' ? 60 : 30 }
+    const { decision } = await s.route(HARD, {}, bare, { requester: 'models.route' })
+    expect(decision.selected.key.provider).toBe('claude')
+    expect(decision.reasons).toContain('codex blocked by its usage stop: usage 60% at or above the 55% stop')
+    s.dispose()
+  })
+
+  it('evaluation reads the same stop; evaluation-caps.weeklyStop overrides it for evaluation only', async () => {
+    const suite: EvaluationSuite = { name: 'mini', jobs: [{ id: 'answer', category: 'simple-coding', complexity: 1, prompt: 'Say 42', grader: { kind: 'exact', expected: '42' } }] }
+    const make = (usage: number, configure: (values: Map<string, string>) => void) => {
+      const store = settings()
+      configure(store.values)
+      const runCloud = vi.fn(async () => ({ answer: '42', tokens: 900, costUsd: null, durationMs: 1 }))
+      const s = createModelIntelligence({ dbPath: ':memory:', settings: store, timers: noTimers, clock: () => NOW, log: () => {}, evaluation: { runCloud, usage: () => usage, suites: () => ({ mini: suite }) } })
+      register(s, [[ASTRA, 'GPT-6-Astra']])
+      return s
+    }
+    await expect(make(60, () => {}).startEvaluation(ASTRA, 'mini')).rejects.toThrow(/codex is at 60% of its week, at or above the 55% stop/)
+    await expect(make(60, values => values.set(WEEKLY_STOP_SETTING, JSON.stringify({ codex: 50 }))).startEvaluation(ASTRA, 'mini')).rejects.toThrow(/at or above the 50% stop/)
+    const override = make(60, values => { values.set(WEEKLY_STOP_SETTING, JSON.stringify({ codex: 50 })); values.set(EVALUATION_CAPS_SETTING, JSON.stringify({ weeklyStop: { codex: 70 } })) })
+    expect((await override.startEvaluation(ASTRA, 'mini')).state).toBe('running')
+    expect(override.evaluationCaps().weeklyStop).toMatchObject({ claude: 85, codex: 70 })
+    expect(override.weeklyStop('codex')).toBe(50)
   })
 })
 

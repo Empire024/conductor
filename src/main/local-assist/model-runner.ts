@@ -16,6 +16,8 @@ import { GENERATION_TIMEOUT_MS, MODEL_WAIT_BUDGET_MS, type LocalModelOutcome, ty
 export const DEFAULT_PREFERRED_MODELS = [QWEN_9B, ORNITH_9B, DOLPHIN_X1_8B]
 const POLL_MS = 500
 const FAILED_START_MEMORY_MS = 5 * 60_000
+/** A noStart call's fallback when no server is up. */
+export const NO_SERVER_RUNNING = 'no local model server is running, and this call never starts one'
 
 export interface LocalModelRunnerOptions {
   preferred?: string[]
@@ -92,7 +94,7 @@ export function createLocalModelRunner(ports: LocalModelRunnerPorts, options: Lo
   }
 
   /** A port with a healthy server: the running one, or one started for this call. */
-  const ensureServer = async (started: number, deadline: number, signal?: AbortSignal): Promise<{ port: number; model: string }> => {
+  const ensureServer = async (started: number, deadline: number, signal?: AbortSignal, noStart = false): Promise<{ port: number; model: string }> => {
     let running: LocalServerEntry[] = []
     try { running = ports.servers() } catch { /* unreadable inventory: treated as none running */ }
     const models = configured()
@@ -107,6 +109,8 @@ export function createLocalModelRunner(ports: LocalModelRunnerPorts, options: Lo
       }
       return { port, model: entry.model }
     }
+    // Checked here, after the queue, so a server that stopped while the call waited is never replaced.
+    if (noStart) throw new Fallback(NO_SERVER_RUNNING)
     if (!starting) {
       if (failedStart && ports.now() - failedStart.at < FAILED_START_MEMORY_MS) throw new Fallback(failedStart.reason)
       const model = pick(models)
@@ -213,7 +217,7 @@ export function createLocalModelRunner(ports: LocalModelRunnerPorts, options: Lo
           const models = configured()
           return await generate(request, override, pick(models)?.id ?? 'local', apiKey, started)
         }
-        const { port, model } = await ensureServer(started, deadline, request.signal)
+        const { port, model } = await ensureServer(started, deadline, request.signal, request.noStart === true)
         let busy = true
         // Interactive use first: a local conversation between two generations keeps the slot.
         while ((busy = ports.interactiveBusy() || await ports.slotBusy(port).catch(() => false))) {

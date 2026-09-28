@@ -18,7 +18,7 @@ import { createLocalLlmDecider } from './deciders/local-llm'
 import { createScorerDecider, defaultUsageStop, SCORER_TEMPERATURE, softmax } from './deciders/scorer'
 import defaultSuite from './suites/default.json'
 import { evaluate, validateSuite, type CommandRequest, type CommandResult, type EvaluationJob, type EvaluationOptions, type EvaluationPorts, type EvaluationResult, type EvaluationRun, type EvaluationSuite } from './evaluation'
-import { EvaluationTurnError } from './evaluation-ports'
+import { DEFAULT_FIXED_OVERHEAD_TOKENS, EvaluationTurnError, type CloudRun } from './evaluation-ports'
 import { explainRoute } from './explain'
 import { refreshAll, type IngestionPorts, type IngestionSourceName, type RefreshResult } from './ingest'
 import { linkedBatch } from './ingest/linked'
@@ -38,6 +38,8 @@ const HOUR_MS = 3_600_000
 const DAILY_MS = 24 * HOUR_MS
 const LAST_DAILY_SETTING = 'model-intelligence:last-daily-refresh'
 export const EVALUATION_CAPS_SETTING = 'model-intelligence:evaluation-caps'
+/** The last measured fixed input overhead of a cloud evaluation turn, per provider: {provider: {tokens, at}}. */
+export const EVALUATION_OVERHEAD_SETTING = 'model-intelligence:evaluation-overhead'
 const STARTUP_SOURCES: IngestionSourceName[] = ['configured', 'runtime']
 const DAILY_SOURCES: IngestionSourceName[] = ['configured', 'runtime', 'openrouter', 'latest-models', 'benchmarks']
 const SETTLED: ReadonlySet<SessionPhase> = new Set(['completed', 'failed', 'interrupted'])
@@ -57,7 +59,13 @@ export function excludedMatcher(patterns: readonly string[]): (key: ModelKey) =>
 
 /** The owner's cloud evaluation caps (owner decisions 2026-09-28), overridable in settings. */
 export interface EvaluationCaps { perRunTokens: number; perDayEvaluations: number; perDayTokens: number; /** The smallest run cap worth starting; less left of the day refuses the run. */ minRunTokens: number; weeklyStop: Record<string, number> }
-export const DEFAULT_EVALUATION_CAPS: EvaluationCaps = { perRunTokens: 60_000, perDayEvaluations: 3, perDayTokens: 150_000, minRunTokens: 20_000, weeklyStop: { claude: 85, codex: 55 } }
+/** The owner's weekly usage stop per provider, one source for routing and evaluation (owner decisions 2026-09-28):
+ *  at or above it a provider's weekly window blocks routing to it and evaluating on it. Setting
+ *  'model-intelligence:weekly-stop' overrides it per provider; routing treats a provider without one as 95. */
+export const WEEKLY_STOP_SETTING = 'model-intelligence:weekly-stop'
+export const DEFAULT_WEEKLY_STOP: Readonly<Record<string, number>> = { claude: 85, codex: 55 }
+export const ROUTING_FALLBACK_STOP = 95
+export const DEFAULT_EVALUATION_CAPS: EvaluationCaps = { perRunTokens: 60_000, perDayEvaluations: 3, perDayTokens: 150_000, minRunTokens: 20_000, weeklyStop: { ...DEFAULT_WEEKLY_STOP } }
 
 export interface ModelIntelligenceOptions {
   dbPath: string | DatabaseSync
@@ -84,7 +92,7 @@ export interface EvaluationWiring {
   /** One job on one cloud model through the native provider path, at its lowest effort. `budget` is
    *  the job's token budget (evaluation.ts): the turn is stopped past it where it can be, and a turn
    *  that fails or reports no usage counts it as spent (the error carries `tokens`). */
-  runCloud?(key: ModelKey, job: EvaluationJob, signal: AbortSignal, budget?: { maxTokens: number }): Promise<EvaluationRun>
+  runCloud?(key: ModelKey, job: EvaluationJob, signal: AbortSignal, budget?: { maxTokens: number }): Promise<CloudRun>
   /** The provider's current weekly usage percent, null when unknown (then a cloud evaluation is skipped). */
   usage?(provider: string): number | null
   /** A sandboxed grader command, or null where no sandbox is available (command jobs are then not gradable here). */
@@ -189,6 +197,16 @@ export function usageVerdict(windows: AccountLimitWindow[], model: { id: string;
   }
 }
 
+/** Routing's live usage facts from the providers' limit windows under the weekly stop: each window
+ *  against its own threshold (usageVerdict), and the stop itself for keys without a per-key verdict. */
+export function routeUsage(windows: (provider: string) => AccountLimitWindow[], label: (key: ModelKey) => string, weeklyStop: (provider: string) => number): Pick<RouteLiveFacts, 'usagePercent' | 'usage' | 'usageStopPercent'> {
+  return {
+    usagePercent: provider => weeklyUsage(windows(provider)),
+    usage: key => usageVerdict(windows(key.provider), { id: key.model, label: label(key) }, weeklyStop(key.provider)),
+    usageStopPercent: provider => weeklyStop(provider)
+  }
+}
+
 export function createModelIntelligence(options: ModelIntelligenceOptions) {
   const clock = options.clock ?? (() => new Date())
   const log = options.log ?? ((message: string, error?: unknown) => console.warn(`[model-intelligence] ${message}`, error ?? ''))
@@ -197,8 +215,12 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
   const registry = new ModelRegistry(store)
   const reputation = new ReputationService(store, { now: () => clock().getTime() })
   const localAvailable = (): boolean => { try { return options.localServerRunning ? options.localServerRunning() : true } catch { return false } }
-  // The shared runner, guarded so the decider never starts a server: only one already running is used.
-  const localRunner: LocalModelRunner | null = options.localRunner ? { ...options.localRunner, ask: request => localAvailable() ? options.localRunner!.ask(request) : Promise.resolve({ ok: false, reason: LOCAL_DECIDER_UNAVAILABLE }) } : null
+  // The shared runner, guarded so the decider never starts a server (D6): the quick check skips the
+  // queue when none runs, and noStart makes the runner itself refuse to start one, so a server that
+  // stops between the check and the ask is never replaced. Only ask is exposed: the runner's
+  // measurements locate a server and could start one.
+  const localRunner: LocalModelRunner | null = options.localRunner
+    ? { ask: request => localAvailable() ? options.localRunner!.ask({ ...request, noStart: true }) : Promise.resolve({ ok: false, reason: LOCAL_DECIDER_UNAVAILABLE }) } : null
   const rank = (id: string): number => { const key = parseKeyId(id); if (!key) return 0; const record = registry.get(key); return record?.capabilityRank ?? rankOf(key, record?.family ?? null) }
   let decisions: DecisionService
   const deciders = [createScorerDecider(), ...(localRunner ? [createLocalLlmDecider(localRunner)] : []),
@@ -265,15 +287,42 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
 
   const shadow: ApprovalShadowService = createApprovalShadow({ decisions, store, recordOutcome, log, now: clock, localAvailable: () => Boolean(localRunner) && localAvailable() })
 
+  /** The weekly stops, defaults overlaid with the setting's valid percents; an unreadable setting keeps the defaults. */
+  const weeklyStops = (): Record<string, number> => {
+    try {
+      const stored: unknown = JSON.parse(options.settings.getSetting(WEEKLY_STOP_SETTING) ?? '{}')
+      const valid = stored && typeof stored === 'object' && !Array.isArray(stored)
+        ? Object.entries(stored as Record<string, unknown>).filter((entry): entry is [string, number] => typeof entry[1] === 'number' && Number.isFinite(entry[1]) && entry[1] >= 0 && entry[1] <= 100) : []
+      return { ...DEFAULT_WEEKLY_STOP, ...Object.fromEntries(valid) }
+    } catch { return { ...DEFAULT_WEEKLY_STOP } }
+  }
+  const weeklyStop = (provider: string): number => weeklyStops()[provider] ?? ROUTING_FALLBACK_STOP
   const evaluationCaps = (): EvaluationCaps => {
     try {
       const stored = JSON.parse(options.settings.getSetting(EVALUATION_CAPS_SETTING) ?? '{}') as Partial<EvaluationCaps>
       const count = (value: unknown, fallback: number): number => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback
       return {
         perRunTokens: count(stored.perRunTokens, DEFAULT_EVALUATION_CAPS.perRunTokens), perDayEvaluations: count(stored.perDayEvaluations, DEFAULT_EVALUATION_CAPS.perDayEvaluations),
-        perDayTokens: count(stored.perDayTokens, DEFAULT_EVALUATION_CAPS.perDayTokens), minRunTokens: count(stored.minRunTokens, DEFAULT_EVALUATION_CAPS.minRunTokens), weeklyStop: { ...DEFAULT_EVALUATION_CAPS.weeklyStop, ...stored.weeklyStop && typeof stored.weeklyStop === 'object' ? stored.weeklyStop : {} }
+        perDayTokens: count(stored.perDayTokens, DEFAULT_EVALUATION_CAPS.perDayTokens), minRunTokens: count(stored.minRunTokens, DEFAULT_EVALUATION_CAPS.minRunTokens), weeklyStop: { ...weeklyStops(), ...stored.weeklyStop && typeof stored.weeklyStop === 'object' ? stored.weeklyStop : {} }
       }
-    } catch { return DEFAULT_EVALUATION_CAPS }
+    } catch { return { ...DEFAULT_EVALUATION_CAPS, weeklyStop: weeklyStops() } }
+  }
+  /** Each provider's last measured fixed overhead of a cloud evaluation turn (N9): what a native turn
+   *  reads before the job itself. Kept in settings so it survives a restart; DEFAULT_FIXED_OVERHEAD_TOKENS until measured. */
+  const overheads = (): Record<string, { tokens: number; at: string }> => {
+    try {
+      const stored: unknown = JSON.parse(options.settings.getSetting(EVALUATION_OVERHEAD_SETTING) ?? '{}')
+      return stored && typeof stored === 'object' && !Array.isArray(stored) ? stored as Record<string, { tokens: number; at: string }> : {}
+    } catch { return {} }
+  }
+  const fixedOverheadTokens = (provider: string): number => {
+    const tokens = overheads()[provider]?.tokens
+    return typeof tokens === 'number' && Number.isFinite(tokens) && tokens >= 0 ? tokens : DEFAULT_FIXED_OVERHEAD_TOKENS
+  }
+  const recordOverhead = (provider: string, tokens: unknown): void => {
+    if (typeof tokens !== 'number' || !Number.isFinite(tokens) || tokens < 0) return
+    try { options.settings.setSetting(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ ...overheads(), [provider]: { tokens: Math.round(tokens), at: clock().toISOString() } })) }
+    catch (error) { log('evaluation overhead not saved', error) }
   }
   /** The owner's exclusion patterns; an unreadable setting keeps the defaults, an empty array excludes nothing. */
   const excludedModels = (): string[] => {
@@ -315,12 +364,16 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
         ...(excluded.length > EXCLUDED_REASONS_MAX ? [`${excluded.length - EXCLUDED_REASONS_MAX} more ${EXCLUDED_BY_OWNER}`] : [])]
       let decision: RouteDecision
       try {
-        decision = await route(features, constraints, { records: () => records, reputation: (key, dimension) => reputation.reputation(key, dimension), live, decisions }, routeOptions)
+        // The owner's weekly stop wherever the caller's live facts name none.
+        const withStop: RouteLiveFacts = live.usageStopPercent ? live : { ...live, usageStopPercent: weeklyStop }
+        decision = await route(features, constraints, { records: () => records, reputation: (key, dimension) => reputation.reputation(key, dimension), live: withStop, decisions }, routeOptions)
       } catch (error) {
         if (excluded.length && error instanceof Error) error.message = `${error.message}; ${excluded.join(', ')} ${EXCLUDED_BY_OWNER} (${EXCLUDED_MODELS_SETTING})`
         throw error
       }
       if (exclusionReasons.length) decision = { ...decision, reasons: [...decision.reasons, ...exclusionReasons] }
+      const blocked = usageBlockedProviders(decision)
+      if (blocked.length) decision = { ...decision, reasons: [...decision.reasons, ...blocked.map(({ provider, reason }) => `${provider} blocked by its usage stop: ${reason}`)] }
       const record = store.decision(decision.decisionId)
       const close = record?.escalated && record.decidedBy === CALLER_DECIDER_ID
         ? closeCandidates({ options: record.options }, decisions.thresholds('route').minMargin, rank).map(({ utility: _utility, ...entry }) => entry) : undefined
@@ -382,6 +435,9 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
 
     evaluationCaps,
     excludedModels,
+    /** The owner's weekly stop for a provider (setting `model-intelligence:weekly-stop`), as routing applies it. */
+    weeklyStop,
+    fixedOverheadTokens,
     /** Starts an evaluation in the background. Local keys through the local runner; cloud keys through
      *  the native provider path under the owner's caps (daily count and tokens, per-run tokens, and
      *  never at or above the provider's weekly stop, where unknown usage means skip). */
@@ -433,15 +489,18 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
       const cloudJob = async (runKey: ModelKey, job: EvaluationJob, signal: AbortSignal, budget?: { maxTokens: number }): Promise<EvaluationRun> => {
         const jobBudget = budget ?? (maxTokens !== undefined ? { maxTokens } : undefined)
         try {
-          const result = await run(runKey, job, signal, jobBudget)
+          const { overheadTokens, ...result }: CloudRun = await run(runKey, job, signal, jobBudget)
+          recordOverhead(runKey.provider, overheadTokens)
           return result.tokens == null && jobBudget ? { ...result, tokens: jobBudget.maxTokens } : result
         } catch (error) {
+          recordOverhead(runKey.provider, (error as { overheadTokens?: unknown } | null)?.overheadTokens)
           const reported = (error as { tokens?: unknown } | null)?.tokens
           const measured = typeof reported === 'number' && Number.isFinite(reported) ? reported : null
           throw new EvaluationTurnError(error instanceof Error ? error.message : String(error), jobBudget ? Math.max(measured ?? 0, jobBudget.maxTokens) : measured)
         }
       }
-      const ports: EvaluationPorts = {
+      // fixedOverheadTokens is evaluation.ts's batching input (builder C, N9): a cloud run pays it once.
+      const ports: EvaluationPorts & { fixedOverheadTokens(provider: string): number } = {
         run: cloud ? cloudJob : (runKey, job, signal, budget) => run(runKey, job, signal, budget),
         ...(command ? { command } : {}),
         recordOutcome: outcome => { recordOutcome(outcome) },
@@ -450,7 +509,7 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
         reputation: (reputationKey, dimension) => reputation.reputation(reputationKey, dimension),
         alternatives: altKey => registry.list({ provider: altKey.provider }).map(record => record.key).slice(0, 4),
         writeReport: (reportName, markdown) => { try { wiring.writeReport?.(reportName, markdown) } catch (error) { log('evaluation report not written', error) } },
-        now: clock, ...spendPort
+        now: clock, ...spendPort, fixedOverheadTokens
       }
       const tokenCap = maxTokens !== undefined ? { maxTokens } : {}
       const runOptions: EvaluationOptions = { runId: handle.runId, ...(evaluationOptions.maxJobs ? { maxJobs: evaluationOptions.maxJobs } : {}), ...tokenCap }
@@ -476,6 +535,15 @@ export { BINDING_TTL_DAYS }
 export function bundledSuites(): Record<string, EvaluationSuite> {
   const suite = validateSuite(defaultSuite)
   return { [suite.name]: suite }
+}
+
+/** Providers none of whose candidates may be used because of a usage limit, with the first reason. */
+export function usageBlockedProviders(decision: Pick<RouteDecision, 'candidates'>): Array<{ provider: string; reason: string }> {
+  const byProvider = new Map<string, typeof decision.candidates>()
+  for (const candidate of decision.candidates) byProvider.set(candidate.key.provider, [...byProvider.get(candidate.key.provider) ?? [], candidate])
+  const usage = (text: string | null | undefined) => !!text && /usage .*(stop|limit)/i.test(text)
+  return [...byProvider].filter(([, candidates]) => candidates.every(candidate => !candidate.eligible) && candidates.some(candidate => usage(candidate.excluded)))
+    .map(([provider, candidates]) => ({ provider, reason: candidates.find(candidate => usage(candidate.excluded))!.excluded!.replace(/^usage: /, '') }))
 }
 
 /** The current weekly usage percent of a provider's reports, null when none is current (unknown). */

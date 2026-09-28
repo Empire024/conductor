@@ -59,7 +59,7 @@ import { isControlActivityNotice, type AppControlEntry, type ControlTarget } fro
 import type { ApprovalReviewRouting } from './approval-review-gate'
 import type { ModelKey, RegistryRecord, RouteDecision, TaskFeatures } from '../shared/model-routing'
 import { callModelMethod, modelMethods, modelSignatures, routeFeatures, type ModelControlCaller } from './model-intelligence/control'
-import { defaultUsageStop, routeConstraints, usageVerdict, weeklyUsage, type ModelIntelligence } from './model-intelligence'
+import { routeConstraints, routeUsage, type ModelIntelligence } from './model-intelligence'
 import { categorize } from './model-intelligence/categorize'
 import { EvaluationTurnError, evaluationTokens } from './model-intelligence/evaluation-ports'
 
@@ -1371,11 +1371,12 @@ export class AgentControl {
     }))
     const vramTotalGb = (() => { try { return this.deps.localModels?.vramTotalGb?.() ?? null } catch { return null } })()
     const windows = (provider: string) => ['claude', 'codex', 'grok'].includes(provider) ? this.deps.sessions.usageLimits(provider as StructuredProvider).flatMap(report => report.windows) : []
+    // The owner's weekly stop (setting model-intelligence:weekly-stop), the same one evaluation applies.
+    const stop = (provider: string): number => this.deps.modelIntelligence?.weeklyStop(provider) ?? 95
     const live = {
       offered: catalog.flatMap(entry => entry.models.map(model => ({ provider: entry.provider, model: model.id }))),
       providerEnabled: (provider: string) => enabled.has(provider),
-      usagePercent: (provider: string) => weeklyUsage(windows(provider)),
-      usage: (key: ModelKey) => usageVerdict(windows(key.provider), { id: key.model, label: labels.get(`${key.provider}\0${key.model}`) ?? key.model }, defaultUsageStop(key.provider)),
+      ...routeUsage(windows, key => labels.get(`${key.provider}\0${key.model}`) ?? key.model, stop),
       loadedLocalModels: () => { try { return (this.deps.localModels?.servers?.() ?? []).map(server => server.model) } catch { return [] } },
       localAdmission: (record: RegistryRecord) => {
         const vramGb = record.local?.vramGb ?? null
@@ -1462,7 +1463,7 @@ export class AgentControl {
    * a turn that fails, is stopped or reports no usage counts at least that budget as spent (N3): a
    * failure throws an EvaluationTurnError carrying those tokens.
    */
-  async evaluationTurn(key: ModelKey, prompt: { system: string; user: string }, signal: AbortSignal, options: { maxTokens?: number } = {}): Promise<{ answer: string; tokens: number | null; costUsd: number | null; durationMs: number; effort: string | null }> {
+  async evaluationTurn(key: ModelKey, prompt: { system: string; user: string }, signal: AbortSignal, options: { maxTokens?: number } = {}): Promise<{ answer: string; tokens: number | null; costUsd: number | null; durationMs: number; effort: string | null; inputTokens: number | null }> {
     const scope = this.ownerScope(undefined)
     const model = this.catalog(scope).find(entry => entry.provider === key.provider && entry.available)?.models.find(entry => entry.id === key.model)
     if (!model) throw new Error(`${key.provider}/${key.model} is not offered on this machine now`)
@@ -1472,6 +1473,8 @@ export class AgentControl {
     const id = tab.resourceId!
     const budget = options.maxTokens !== undefined && Number.isFinite(options.maxTokens) && options.maxTokens > 0 ? options.maxTokens : null
     const spentOf = (items: SessionProjection['items'] | undefined): number | null => items ? evaluationTokens(summarizeUsage(items).tokens) : null
+    // The turn's whole input (cache included), from which the fixed overhead of a native turn is learned.
+    const inputOf = (items: SessionProjection['items'] | undefined): number | null => (items ? summarizeUsage(items).tokens?.inputTokens : undefined) ?? null
     // What a turn that did not complete counts: its measured spend, never below the budget it was given.
     const worstCase = (measured: number | null): number | null => measured === null ? budget : Math.max(measured, budget ?? 0)
     try {
@@ -1487,17 +1490,19 @@ export class AgentControl {
         signal.addEventListener('abort', () => {
           clearInterval(poll)
           void this.deps.sessions.interrupt(id).catch(() => undefined)
-          reject(new EvaluationTurnError('evaluation turn aborted', worstCase(spentOf(this.deps.database.structured.snapshot(id)?.items))))
+          const items = this.deps.database.structured.snapshot(id)?.items
+          reject(new EvaluationTurnError('evaluation turn aborted', worstCase(spentOf(items)), inputOf(items)))
         }, { once: true })
       })
-      const usage = summarizeUsage(settled.items), measured = evaluationTokens(usage.tokens)
-      if (overBudget) throw new EvaluationTurnError(`the evaluation turn passed its ${budget}-token budget and was stopped`, worstCase(measured))
-      if (settled.phase !== 'completed') throw new EvaluationTurnError(`the evaluation turn ended ${settled.phase}`, worstCase(measured))
+      const usage = summarizeUsage(settled.items), measured = evaluationTokens(usage.tokens), inputTokens = usage.tokens?.inputTokens ?? null
+      if (overBudget) throw new EvaluationTurnError(`the evaluation turn passed its ${budget}-token budget and was stopped`, worstCase(measured), inputTokens)
+      if (settled.phase !== 'completed') throw new EvaluationTurnError(`the evaluation turn ended ${settled.phase}`, worstCase(measured), inputTokens)
       const answer = [...settled.items].reverse().find(item => item.data.type === 'text' && item.data.role === 'assistant')
-      return { answer: answer?.data.type === 'text' ? answer.data.text : '', tokens: measured ?? budget, costUsd: usage.costUsd ?? null, durationMs: Date.now() - started, effort }
+      return { answer: answer?.data.type === 'text' ? answer.data.text : '', tokens: measured ?? budget, costUsd: usage.costUsd ?? null, durationMs: Date.now() - started, effort, inputTokens }
     } catch (error) {
       if (error instanceof EvaluationTurnError) throw error
-      throw new EvaluationTurnError(error instanceof Error ? error.message : String(error), worstCase(spentOf(this.deps.database.structured.snapshot(id)?.items)))
+      const items = this.deps.database.structured.snapshot(id)?.items
+      throw new EvaluationTurnError(error instanceof Error ? error.message : String(error), worstCase(spentOf(items)), inputOf(items))
     } finally {
       const open = this.tabs(scope).find(candidate => candidate.resourceId === id)
       if (open) await this.ui(scope, 'tabs.close', { tabId: open.id }).catch(() => undefined)
