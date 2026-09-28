@@ -385,3 +385,37 @@ test('a child started by a lowered process inherits below-normal priority', () =
   assert.equal(run.status, 0, run.stderr)
   assert.ok(Number(run.stdout) >= BACKGROUND_PRIORITY, `child priority ${run.stdout}`)
 })
+
+// ---- the real entry: verify-kit imports smoke-lock, so a top-level await of main() deadlocked the
+// lazy verify-kit import and Node exited 13 before spawning anything (fault-control 1790592490419).
+
+/** Runs the real `node scripts/smoke-lock.mjs --timeout-min 1 -- node <args>` against a private temp
+ *  folder, so its lock and queue never touch the owner's global conductor-smoke.lock. */
+function runEntry(childArgs) {
+  const temp = mkdtempSync(join(tmpdir(), 'smoke-lock-entry-'))
+  try {
+    const run = spawnSync(process.execPath, [join(import.meta.dirname, 'smoke-lock.mjs'), '--timeout-min', '1', '--', process.execPath, ...childArgs], {
+      encoding: 'utf8', timeout: 90_000, windowsHide: true,
+      env: { ...process.env, TEMP: temp, TMP: temp, TMPDIR: temp }
+    })
+    return { run, lockHeld: existsSync(join(temp, 'conductor-smoke.lock')), privateLock: readdirSync(temp).includes('conductor-smoke.queue') }
+  } finally { rmSync(temp, { recursive: true, force: true }) }
+}
+
+test('entry: a passing command exits 0 (or the documented unaccounted-cleanup 3), never 13, and leaves no lock held', { timeout: 120_000 }, () => {
+  const { run, lockHeld, privateLock } = runEntry(['-e', '0'])
+  assert.equal(run.error, undefined, String(run.error))
+  assert.doesNotMatch(run.stderr, /unsettled top-level await/i)
+  assert.notEqual(run.status, 13, run.stderr)
+  assert.ok([0, 3].includes(run.status), `exit ${run.status}: ${run.stderr}`)
+  assert.ok(privateLock, 'the run queued in the private temp folder, not the global one')
+  assert.equal(lockHeld, false, 'the lock is released after the run')
+})
+
+test('entry: the command\'s own failing exit code propagates', { timeout: 120_000 }, () => {
+  const { run, lockHeld } = runEntry(['-e', 'process.exit(7)'])
+  assert.equal(run.error, undefined, String(run.error))
+  assert.doesNotMatch(run.stderr, /unsettled top-level await/i)
+  assert.equal(run.status, 7, run.stderr)
+  assert.equal(lockHeld, false, 'the lock is released after the run')
+})

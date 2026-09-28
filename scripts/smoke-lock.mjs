@@ -358,4 +358,15 @@ async function main() {
   for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => finish(130))
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) await main()
+// Called, never awaited at the top level: verify-kit imports this file, so while the entry module
+// sat in a top-level await, main()'s import of verify-kit waited on this module and this module on
+// it. Node then drained the loop and exited 13 before anything was spawned. Every normal ending
+// still exits through main() and its finisher; an unexpected rejection exits 1 and gives the lock
+// back if this process holds it (release() leaves anyone else's lock alone).
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(error => {
+    console.error(`[smoke-lock] ${error?.stack ?? error}`)
+    try { release() } catch { /* nothing to release */ }
+    process.exit(1)
+  })
+}
