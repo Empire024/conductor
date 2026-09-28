@@ -6,7 +6,8 @@ import { join } from 'node:path'
 import {
   REPO, VERDICT, ancestorsOf, cpuPercent, descendantsOf, formatRecordLine, identityOf, judgeLoad, leavesFirst, listProcesses, matchProcesses, midTurnTabs, newInstance, suppliedControl,
   ownedTree, parseLlamaCommandLine, parseNvidiaSmi, parseProcessList, poll, readGateThresholds, registerRelaunch, registerRoot, retryAck, safeClose,
-  sameProcesses, terminateIdentity, trackDescendants, withDeadline, commandHasArg, creationMs, startTracking, stopTracking, assertBuildHash, registerOwnChild
+  sameProcesses, terminateIdentity, trackDescendants, withDeadline, commandHasArg, creationMs, startTracking, stopTracking, assertBuildHash, registerOwnChild,
+  possibleDescendants
 } from './verify-kit.mjs'
 
 // shell(100) -> agent node(200) -> smoke-lock(300) -> smoke(400) -> electron(500) -> renderer(501), fixture(502)
@@ -175,10 +176,84 @@ test('safeClose: a member pid reused by the same program after the close is left
 
 test('safeClose: a member whose identity is unreadable after the close is reported, not killed', async () => {
   const partial = [proc(500, 400, 1000), proc(501, 500, null), owned[4]]
-  const m = machine({ snapshots: [[owned[0], owned[1], owned[4]], partial, [owned[4]]] })
+  // 501 stays listed and unreadable through the re-probe: nothing proves it exited.
+  const m = machine({ snapshots: [[owned[0], owned[1], owned[4]], partial, [proc(501, 500, null), owned[4]]] })
   const report = await quietClose(m.inst, { deps: m.deps })
   assert.deepEqual(m.calls.terminate, [500])
   assert.ok(report.unresolved.some(entry => entry.pid === 501 && /no readable OS identity/.test(entry.reason)))
+})
+
+// ---- an unreadable child is re-probed (fault 1790593849520: nvidia-smi caught mid-exit)
+const smi = (pid, extra = {}) => proc(pid, 500, null, { name: 'nvidia-smi.exe', executable: null, ...extra })
+
+test('safeClose: a transient unreadable child that is gone on re-probe is a note, never killed, and the close is clean', async () => {
+  // Before the close: the app, its renderer, and nvidia-smi 900 mid-exit (no identity). After: all gone.
+  const m = machine({ snapshots: [[owned[0], owned[1], smi(900), owned[4]], [owned[4]]] })
+  const report = await quietClose(m.inst, { deps: m.deps })
+  assert.deepEqual(m.calls.terminate, [])
+  assert.deepEqual(report.unresolved, [])
+  assert.deepEqual(report.leftovers, [])
+  assert.ok(report.notes.some(entry => entry.pid === 900 && /exited, never killed/.test(entry.reason)), JSON.stringify(report.notes))
+  const probe = m.ledger.find(entry => entry.event === 'reprobe')
+  assert.deepEqual([probe.exited, probe.still, probe.failure], [[900], [], null])
+})
+
+test('safeClose: an unreadable child still listed after the bounded re-probe stays unresolved and is never killed', async () => {
+  const m = machine({ snapshots: [[owned[0], smi(900), owned[4]], [smi(900, { ppid: 1 }), owned[4]]] })
+  const report = await quietClose(m.inst, { deps: m.deps })
+  assert.deepEqual(m.calls.terminate, [])
+  assert.ok(report.unresolved.some(entry => entry.pid === 900 && /child of 500 has no readable OS identity/.test(entry.reason)))
+  assert.ok(!report.notes.some(entry => entry.pid === 900))
+  const probe = m.ledger.find(entry => entry.event === 'reprobe')
+  assert.deepEqual([probe.exited, probe.still], [[], [900]])
+  assert.ok(m.calls.list >= 11, `re-probed for the whole window (${m.calls.list} inventories)`)
+})
+
+test('safeClose: an unreadable child that turns readable, or leaves a listed child behind, stays unresolved', async () => {
+  const readable = machine({ snapshots: [[owned[0], smi(900), owned[4]], [smi(900, { creationTime: '5000', executable: 'C:\\nv\\nvidia-smi.exe', ppid: 1 }), owned[4]]] })
+  const orphan = machine({ snapshots: [[owned[0], smi(900), owned[4]], [proc(901, 900, 5001, { name: 'conhost.exe' }), owned[4]]] })
+  for (const m of [readable, orphan]) {
+    const report = await quietClose(m.inst, { deps: m.deps })
+    assert.deepEqual(m.calls.terminate, [])
+    assert.ok(report.unresolved.some(entry => entry.pid === 900), JSON.stringify(report.unresolved))
+  }
+})
+
+test('safeClose: a failed inventory during the re-probe keeps the unreadable child unresolved', async () => {
+  const m = machine({ snapshots: [[owned[0], smi(900), owned[4]], [owned[4]], new Error('query timed out')] })
+  // Close: before, after (member 500 gone, graceful false -> exit confirmation reads the third), then re-probe.
+  const report = await quietClose(m.inst, { deps: m.deps })
+  assert.deepEqual(m.calls.terminate, [])
+  assert.ok(report.unresolved.some(entry => entry.pid === 900))
+  assert.ok(report.unresolved.some(entry => /inventory failed/.test(entry.reason)))
+})
+
+test('safeClose: R-1 - U -> C -> G seen before the close, only G left on re-probe: U stays unresolved, nothing killed', async () => {
+  // U 900 (unreadable) -> C 901 -> G 902, all under the app 500 before the close. Afterwards U and C
+  // are gone and G survives with ppid 901: neither 900 nor ppid 900 is listed, but G is its descendant.
+  const g = proc(902, 901, 5002, { name: 'conhost.exe' })
+  const m = machine({ snapshots: [[owned[0], smi(900), proc(901, 900, 5001, { name: 'cmd.exe' }), g, owned[4]], [g, owned[4]]] })
+  const report = await quietClose(m.inst, { deps: m.deps })
+  assert.deepEqual(m.calls.terminate, [])
+  assert.ok(report.unresolved.some(entry => entry.pid === 900 && /no readable OS identity/.test(entry.reason)), JSON.stringify(report.unresolved))
+  assert.ok(!report.notes.some(entry => entry.pid === 900))
+  assert.deepEqual(m.ledger.find(entry => entry.event === 'reprobe').still, [900])
+})
+
+test('possibleDescendants follows every ppid link across snapshots, even to a child older than its parent', () => {
+  // 903 predates its listed parent 902 (a possibly reused pid): followed anyway, since over-inclusion
+  // only makes the close stricter.
+  const snapshots = [[smi(900), proc(901, 900, 5001)], [proc(902, 901, 5002), proc(903, 902, 4000)]]
+  assert.deepEqual([...possibleDescendants(900, snapshots)].sort(), [900, 901, 902, 903])
+  assert.deepEqual([...possibleDescendants(900, [[proc(700, 1, 5)]])], [900])
+})
+
+test('safeClose: readable foreign processes are unaffected by the re-probe', async () => {
+  // 700 (foreign, readable) is listed throughout; 900 is gone: only 900 is resolved, 700 is never touched.
+  const m = machine({ snapshots: [[owned[0], smi(900), owned[4]], [owned[4]]] })
+  const report = await quietClose(m.inst, { deps: m.deps })
+  assert.deepEqual(m.calls.terminate, [])
+  assert.ok(!report.notes.some(entry => entry.pid === 700) && !report.unresolved.some(entry => entry.pid === 700))
 })
 
 test('safeClose: a pid that changed between selection and kill is refused by the kill helper and not counted', async () => {

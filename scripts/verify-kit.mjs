@@ -159,6 +159,53 @@ export function ownedTree(list, roots) {
   return { members: [...members.values()].map(member => ({ ...member, depth: depth(member) })), unresolved }
 }
 
+/** The ownedTree reason for a child whose OS identity could not be read in that snapshot. */
+export const UNREADABLE_CHILD = /^child of \d+ has no readable OS identity$/
+
+/**
+ * Re-probes children ownedTree could not identify. Win32_Process lists a process caught mid-exit
+ * without its creation time or image path (a short-lived nvidia-smi from the app's own GPU polling,
+ * fault 1790593849520), so one unreadable row is not yet a stranger. Fresh inventories for up to
+ * `windowMs`. Its possible descendants are every pid reached from it through ppid links across the
+ * `observed` snapshots safeClose already took, so U -> C -> G with U and C gone still finds G. It has exited - resolved, never killed -
+ * only once neither it nor any of those pids is listed as a pid or a ppid. One still listed (readable
+ * or not), with a listed descendant, or any entry left when an inventory fails, stays unresolved:
+ * nothing proves what it is. Never kills anything. Returns {exited, still, failure}.
+ */
+export async function reprobeUnreadable(entries, { listProcesses: list, now, sleep, observed = [], windowMs = 10_000, intervalMs = 1000 }) {
+  const family = new Map(entries.map(entry => [entry.pid, possibleDescendants(entry.pid, observed)]))
+  const pending = new Map(entries.map(entry => [entry.pid, entry]))
+  const exited = []
+  const deadline = now() + windowMs
+  let failure = null
+  while (pending.size) {
+    let rows
+    try { rows = (await list()).list } catch (error) { failure = String(error?.message ?? error).slice(0, 200); break }
+    for (const [pid, entry] of pending) {
+      const pids = family.get(pid)
+      if (!rows.some(row => pids.has(row.pid) || pids.has(row.ppid))) { exited.push(entry); pending.delete(pid) }
+    }
+    if (!pending.size || now() >= deadline) break
+    await sleep(intervalMs)
+  }
+  return { exited, still: [...pending.values()], failure }
+}
+
+/** `pid` and every pid reached from it through ppid links in any of `snapshots`. Every link is
+ *  followed, even one a reused pid may have made: taking in too much only makes the close stricter,
+ *  while skipping a link could hide a live descendant. */
+export function possibleDescendants(pid, snapshots) {
+  const found = new Set([pid])
+  for (let grew = true; grew;) {
+    grew = false
+    for (const rows of snapshots) for (const row of rows) {
+      if (found.has(row.pid) || !found.has(row.ppid)) continue
+      found.add(row.pid); grew = true
+    }
+  }
+  return found
+}
+
 /** Kill order: deepest first, so no member outlives its own children being orphaned mid-kill. */
 export const leavesFirst = members => [...members].sort((a, b) => b.depth - a.depth || a.pid - b.pid)
 
@@ -826,7 +873,9 @@ export async function safeClose(inst = state.current, { boundMs = CLOSE_BOUND_MS
     return false
   })
   if (!roots.length) unresolved.push({ pid: null, reason: 'no registered root identity for this instance: nothing can be attributed or killed' })
-  const snapshot = async label => { try { return (await d.listProcesses()).list } catch (error) { unresolved.push({ pid: null, reason: `process inventory failed ${label}: ${String(error?.message ?? error).slice(0, 200)}` }); ledger({ event: 'inventory-failed', label }); return null } }
+  // Every inventory of this close, for reprobeUnreadable's descendant search.
+  const observed = []
+  const snapshot = async label => { try { const list = (await d.listProcesses()).list; observed.push(list); return list } catch (error) { unresolved.push({ pid: null, reason: `process inventory failed ${label}: ${String(error?.message ?? error).slice(0, 200)}` }); ledger({ event: 'inventory-failed', label }); return null } }
   const before = roots.length ? await snapshot('before the close') : null
   const treeBefore = before ? ownedTree(before, roots) : { members: [], unresolved: [] }
   ledger({ event: 'tree', label: 'before close', members: treeBefore.members.map(member => ({ pid: member.pid, name: member.name, depth: member.depth })), unresolved: treeBefore.unresolved })
@@ -908,6 +957,20 @@ export async function safeClose(inst = state.current, { boundMs = CLOSE_BOUND_MS
     }
   }
   for (const member of unknown) unresolved.push({ pid: member.pid, name: member.name, reason: 'still listed with an unreadable OS identity: exit not proven' })
+  // A child that was unreadable in one snapshot is re-probed (reprobeUnreadable): gone for good is a
+  // note, anything else keeps its unresolved entry.
+  const unreadable = unresolved.filter(entry => Number.isSafeInteger(entry.pid) && UNREADABLE_CHILD.test(entry.reason))
+  if (unreadable.length) {
+    const probe = await reprobeUnreadable(unreadable, { listProcesses: d.listProcesses, now: d.now, sleep: d.sleep, observed })
+    ledger({ event: 'reprobe', exited: probe.exited.map(entry => entry.pid), still: probe.still.map(entry => entry.pid), failure: probe.failure })
+    const gone = new Set(probe.exited.map(entry => entry.pid))
+    for (let i = unresolved.length - 1; i >= 0; i--) if (gone.has(unresolved[i].pid) && UNREADABLE_CHILD.test(unresolved[i].reason)) unresolved.splice(i, 1)
+    for (const pid of gone) {
+      const entry = unreadable.find(candidate => candidate.pid === pid)
+      notes.push({ pid, name: entry.name, reason: `${entry.reason}; no longer listed on re-probe: exited, never killed` })
+    }
+    if (probe.failure) unresolved.push({ pid: null, reason: `process inventory failed while re-probing unreadable children: ${probe.failure}` })
+  }
   stopTracking(inst)
   inst.closeReport = { graceful, closeMs, ms: d.now() - started, tree: treeBefore.members.length, killed, attempts, leftovers: leftovers.map(entry => ({ pid: entry.pid, name: entry.name })), unresolved, notes }
   ledger({ event: 'closed', report: inst.closeReport })
