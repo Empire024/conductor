@@ -9,7 +9,7 @@ export async function fetchAllHistory(call, agentSessionId, { afterSequence = 0,
   const events = []
   let after = afterSequence
   for (let page = 0; page < maxPages; page++) {
-    const batch = await call('agents.history', { agentSessionId, afterSequence: after })
+    const batch = await call('agents.history', { agentSessionId, afterSequence: after, raw: true })
     if (!Array.isArray(batch) || batch.length === 0) break
     events.push(...batch)
     after = batch[batch.length - 1].sequence

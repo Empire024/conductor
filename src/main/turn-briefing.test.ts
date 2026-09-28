@@ -6,6 +6,7 @@ import type { AgentSpec } from '../shared/models'
 import { ConductorDatabase } from './database'
 import { MEMORY_PROTOCOL } from './memory'
 import type { CoworkerBriefingOptions } from './agent-collaboration-store'
+import { CoworkerRecovery } from './coworker-recovery'
 import { COWORKER_OPENED_PREFIX } from './coworker-autoclose'
 import { CONTEXT_RESET, OUTAGE_NUDGES, FINISH_HINT, MEMORY_HEADING, LOCAL_ASSIST_HINT, SHELL_HYGIENE_HINT, TurnBriefings, handoffNudge, SUCCESSION_HINT, SUCCESSION_PERCENT, SUCCESSION_TURNS, successionNudge, coworkerHint } from './turn-briefing'
 
@@ -184,6 +185,20 @@ describe('what a native runtime is told, and how often', () => {
     expect(briefings.compose(f.spec, 'Again', 'item-2', '')).not.toContain('coworker of')
     // Without a title it still names the controller by id.
     expect(coworkerHint({ id: 'agent-lead' })).toMatch(/^You are a coworker of agent-lead\. /)
+  })
+
+  it('names the controller that holds the tab now, and a superseded controller by its successor', () => {
+    const f = fixture()
+    const controller = vi.fn((id: string) => ({ id, title: id === 'agent-successor' ? 'Wizard successor' : 'Old wizard' }))
+    const briefings = new TurnBriefings({ database: f.database, controller })
+    f.database.setSetting(COWORKER_OPENED_PREFIX + f.spec.id, 'agent-opener')
+    f.database.setSetting('agentControlParent:' + f.spec.id, JSON.stringify({ targetAgentSessionId: f.spec.id, controllerAgentSessionId: 'agent-old', projectId: f.spec.projectId }))
+    new CoworkerRecovery(f.database).supersede({ projectId: f.spec.projectId, sessionId: f.spec.sessionId, agentSessionId: 'agent-old' }, 'agent-old', 'completed', 'agent-successor', 'Continued in "Wizard successor" (agents.handoff successor)')
+    const first = briefings.compose(f.spec, 'Build it', 'item-1', '')
+    expect(first).toContain(coworkerHint({ id: 'agent-successor', title: 'Wizard successor' }))
+    expect(first).not.toContain('agent-old')
+    expect(first).not.toContain('agent-opener')
+    expect(first).toContain('a longer report is kept whole for your controller to read, so never shorten or resend one')
   })
 
   it('gives a local model only its memory lines: no heading, no nudge, never a control credential', () => {

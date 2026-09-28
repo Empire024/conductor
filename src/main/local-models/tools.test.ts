@@ -41,7 +41,8 @@ describe('agents.report over the local control bridge', () => {
     expect(() => assertLocalControlAllowed('agents.report', { text: 'UPDATE OK 1.2.3' }, false)).not.toThrow()
     expect(() => assertLocalControlAllowed('agents.report', { text: 'x', agentSessionId: 'forged' }, false)).toThrow(ToolPolicyError)
     expect(() => assertLocalControlAllowed('agents.report', { text: '' }, false)).toThrow(/text/)
-    expect(() => assertLocalControlAllowed('agents.report', { text: 'x'.repeat(2001) }, false)).toThrow(/2000/)
+    expect(() => assertLocalControlAllowed('agents.report', { text: 'x'.repeat(2001) }, false)).not.toThrow()
+    expect(() => assertLocalControlAllowed('agents.report', { text: '  ' }, false)).toThrow(/non-empty/)
     expect(() => assertLocalControlAllowed('agents.report', { text: 'x'.repeat(2000) }, false)).not.toThrow()
   })
 

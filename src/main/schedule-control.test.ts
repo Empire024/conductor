@@ -150,3 +150,14 @@ describe('schedules.* through AgentControl', () => {
     expect(f.store.list(f.project.id)).toEqual([])
   })
 })
+
+describe('schedules.* argument aliases (harness gap H11)', () => {
+  it('reads id and scheduleId as taskId, and names a typo with its likely meaning', async () => {
+    const f = unit()
+    const created = await f.call(f.caller(), 'schedules.create', { name: 'Alias check', prompt: 'Check aliases.' }) as { task: { id: string } }
+    expect(await f.call(f.caller(), 'schedules.pause', { id: created.task.id })).toMatchObject({ id: created.task.id, enabled: false })
+    expect(await f.call(f.caller(), 'schedules.resume', { scheduleId: created.task.id })).toMatchObject({ id: created.task.id, enabled: true })
+    await expect(f.call(f.caller(), 'schedules.pause', { taskID: created.task.id })).rejects.toThrow('schedules.pause accepts only taskId; taskID is not an argument (did you mean taskId?).')
+    await expect(f.call(f.caller(), 'schedules.pause', { id: created.task.id, taskId: 'other' })).rejects.toThrow(/id and taskId name the same argument/)
+  })
+})

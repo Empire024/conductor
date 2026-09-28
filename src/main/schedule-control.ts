@@ -2,6 +2,7 @@ import { SCHEDULE_AGENT_PROVIDERS, SCHEDULE_TIMINGS, scheduleScriptLanguages, ty
 import type { ScheduleRunner } from './schedule-runner'
 import type { ScheduleStore } from './schedule-store'
 import { validAgent } from './schedule-store'
+import { validateArgs } from './control-args'
 
 /**
  * The app-control surface of scheduled tasks (docs/schedules.md), so an agent can set one up when
@@ -79,7 +80,7 @@ export interface ScheduleControlContext extends ScheduleControlService {
 
 type Args = Record<string, unknown>
 const taskId = (args: Args): string => {
-  if (typeof args.taskId !== 'string' || !args.taskId.trim() || args.taskId.length > 160) throw new Error('taskId is required: the id of a task from schedules.list')
+  if (typeof args.taskId !== 'string' || !args.taskId.trim() || args.taskId.length > 160) throw new Error('taskId is required: the id of a task from schedules.list (id and scheduleId are accepted too)')
   return args.taskId
 }
 
@@ -125,8 +126,8 @@ const summary = (context: ScheduleControlContext, task: ScheduleDefinition) => {
 export async function scheduleCall(context: ScheduleControlContext, caller: ScheduleControlCaller, method: string, args: Args): Promise<unknown> {
   const allowed = scheduleKeys[method]
   if (!allowed) throw new Error('Unknown control method; use tools.list')
-  const extra = Object.keys(args).filter(key => !allowed.includes(key) && key !== 'projectId')
-  if (extra.length) throw new Error(`${method} accepts only ${allowed.join(', ') || 'no arguments'}; ${extra.join(', ')} is not an argument`)
+  // A task is named taskId everywhere here; id and scheduleId are what callers reach for first.
+  args = validateArgs(method, args, allowed, { ignore: ['projectId'], aliases: allowed.includes('taskId') ? { id: 'taskId', scheduleId: 'taskId' } : {} })
   const { store } = context
   const done = <T>(value: T): T => { context.changed(caller.projectId); return value }
 

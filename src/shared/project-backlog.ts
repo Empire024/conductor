@@ -26,7 +26,7 @@ export function heaviestProjectTaskWeight(weights: ProjectTaskWeight[]): Project
  *  light tasks get a cheaper, faster one at lower effort. */
 export const projectTaskWeightDefaults: Record<'codex' | 'claude', Record<ProjectTaskWeight, { model: string; effort: string }>> = {
   codex: { heavy: { model: 'gpt-6-astra', effort: 'high' }, medium: { model: 'gpt-5.6-sol', effort: 'medium' }, light: { model: 'gpt-5.6-luna', effort: 'low' } },
-  claude: { heavy: { model: 'opus', effort: 'high' }, medium: { model: 'sonnet', effort: 'medium' }, light: { model: 'haiku', effort: 'low' } }
+  claude: { heavy: { model: 'opus[1m]', effort: 'high' }, medium: { model: 'sonnet', effort: 'medium' }, light: { model: 'haiku', effort: 'low' } }
 }
 /** Who moved a task, in which workspace, and what the repository looked like then. */
 export interface ProjectTaskActivity {

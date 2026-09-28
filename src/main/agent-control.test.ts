@@ -20,6 +20,7 @@ import type { DurableJobEvent, DurableJobSummary } from '../shared/durable-jobs'
 import { assertLocalControlAllowed, assertToolAllowed, toolSpecs } from './local-models/tools'
 import { SUCCESSION_NUDGE, SUCCESSION_TURNS, TurnBriefings } from './turn-briefing'
 import { COWORKER_OPENED_PREFIX, CoworkerAutoClose } from './coworker-autoclose'
+import { CoworkerRecovery } from './coworker-recovery'
 import { encodeRestartInitiator, encodeRestartRequest, parseRestartRequest, RESTART_INITIATOR_KEY, RESTART_REQUEST_KEY, takeRestartInitiator } from './restart-initiator'
 
 const dispose: Array<() => void> = []
@@ -306,9 +307,8 @@ locked: [budget]
     const childScope = { ...f.scope, agentSessionId: child.resourceId! }
     await expect(f.control.call(f.scope, 'agents.report', { text: 'not controlled by anyone' })).rejects.toThrow(/No controlling conversation/)
     await expect(f.control.call(childScope, 'agents.report', { text: 'x', extra: 1 })).rejects.toThrow(/accepts only text/)
-    await expect(f.control.call(childScope, 'agents.report', { text: 'x'.repeat(2001) })).rejects.toThrow()
     const result = await f.control.call(childScope, 'agents.report', { text: 'UPDATE OK 1.2.3' }) as { agentSessionId: string; delivery: string }
-    expect(result).toEqual({ agentSessionId: f.scope.agentSessionId, delivery: 'started' })
+    expect(result).toEqual({ agentSessionId: f.scope.agentSessionId, delivery: 'started', delivered: 15, total: 15 })
     expect(f.submissions.at(-1)).toMatchObject({ prompt: 'UPDATE OK 1.2.3' })
   })
   it('a coworker reaches its controller and ancestors with send_message (agents.steer) and reads them with agents.status', async () => {
@@ -443,7 +443,7 @@ locked: [budget]
     expect(f.control.tabs(f.scope).some(tab => tab.id === child.tabId && tab.resourceId === child.agentSessionId)).toBe(true)
     expect(f.submissions.map(submission => submission.provider)).toEqual(['codex', 'claude'])
     expect(f.submissions[1]?.prompt).toContain(child.taskId)
-    expect(f.submissions[1]?.prompt).toContain('Mark it done with orchestration.tasks.update only after finishing.')
+    expect(f.submissions[1]?.prompt).toContain('Mark it done with orchestration.tasks.update({id:"' + child.taskId + '",status:"done"}) only after finishing.')
     expect(f.submissions[1]?.prompt).toContain('Your controller is ' + routerScope.agentSessionId + '. Report to it with report (agents.report) when finished.')
     expect(f.database.structured.snapshot(child.agentSessionId)?.items).toEqual(expect.arrayContaining([expect.objectContaining({ data: expect.objectContaining({ type: 'text', role: 'user' }) }), expect.objectContaining({ data: expect.objectContaining({ type: 'text', role: 'assistant', text: 'Native fixture result' }) })]))
     expect(f.control.listLinks(f.project.id, f.workspace.id)).toHaveLength(2)
@@ -707,8 +707,8 @@ describe('controlled coworker model configuration', () => {
   it('rejects invalid or arbitrary settings and refuses active, queued, or pending work', async () => {
     const f = fixture(), child = await f.control.call(f.scope, 'tabs.open', { provider: 'codex' }) as AgentControlTab
     const original = structuredClone(f.database.structured.snapshot(child.resourceId!)!.settings)
-    await expect(f.control.call(f.scope, 'agents.configure', { agentSessionId: child.resourceId, model: 'missing-model', effort: 'high' })).rejects.toThrow(/exact model/)
-    await expect(f.control.call(f.scope, 'agents.configure', { agentSessionId: child.resourceId, model: 'codex-advanced', effort: 'low' })).rejects.toThrow(/effort supported/)
+    await expect(f.control.call(f.scope, 'agents.configure', { agentSessionId: child.resourceId, model: 'missing-model', effort: 'high' })).rejects.toThrow(/Model "missing-model" is not offered for codex here\. Choose one of: codex-synthetic/)
+    await expect(f.control.call(f.scope, 'agents.configure', { agentSessionId: child.resourceId, model: 'codex-advanced', effort: 'low' })).rejects.toThrow(/Effort "low" is not offered for codex-advanced; choose one of: high/)
     await expect(f.control.call(f.scope, 'agents.configure', { agentSessionId: child.resourceId, model: 'codex-advanced', effort: 'high', permission: 'auto' })).rejects.toThrow(/accepts only/)
     append(f, child.resourceId!, { type: 'session', phase: 'running' })
     await expect(f.control.call(f.scope, 'agents.configure', { agentSessionId: child.resourceId, model: 'codex-advanced', effort: 'high' })).rejects.toThrow(/idle/)
@@ -1109,7 +1109,7 @@ describe('steering an uncontrolled tab in a co-opened project', () => {
     expect(listed.find(agent => agent.agentSessionId === f.spec.id)).toMatchObject({ projectId: f.project.id, crossProject: true, controlled: false })
     await expect(f.control.call(astra, 'agents.snapshot', { agentSessionId: f.spec.id })).resolves.toMatchObject({ agentSessionId: f.spec.id })
     await expect(f.control.call(astra, 'agents.status', { agentSessionId: f.spec.id })).resolves.toBeTruthy()
-    await expect(f.control.call(astra, 'agents.history', { agentSessionId: f.spec.id })).resolves.toBeInstanceOf(Array)
+    await expect(f.control.call(astra, 'agents.history', { agentSessionId: f.spec.id })).resolves.toMatchObject({ order: 'newest-first', entries: expect.any(Array) })
     // Settings outlive a prompt, so an uncontrolled tab is not configurable from next door.
     await expect(f.control.call(astra, 'agents.configure', { agentSessionId: f.spec.id, model: 'codex-advanced', effort: 'high' })).rejects.toThrow(/outside this workspace/)
     await f.control.call(astra, 'agents.submit', { agentSessionId: f.spec.id, prompt: 'Rebuild the invoice export' })
@@ -1409,7 +1409,7 @@ describe('context handoff to a fresh tab', () => {
     const f = fixture()
     const before = f.control.tabs(f.scope).filter(tab => tab.kind === 'agent').length
     await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), provider: 'claude' })).rejects.toThrow(/names its model/)
-    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), provider: 'claude', model: 'does-not-exist' })).rejects.toThrow(/not one of/)
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), provider: 'claude', model: 'does-not-exist' })).rejects.toThrow(/Model "does-not-exist" is not offered for claude here/)
     await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), provider: 'cloud' })).rejects.toThrow(/cloud/)
     await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), provider: 42 })).rejects.toThrow(/must be a string/)
     // 'local' is not a registered provider in this fixture at all; either way is refused.
@@ -1493,7 +1493,7 @@ describe('main-brain succession: agents.handoff successor:true', () => {
     expect(await f.control.call(workerScope, 'agents.report', { text: 'before' })).toMatchObject({ agentSessionId: f.spec.id })
     const result = await f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: true }) as Succession
     const successorScope = { ...f.scope, agentSessionId: result.agentSessionId }
-    expect(await f.control.call(workerScope, 'agents.report', { text: 'W1 DONE abc123' })).toEqual({ agentSessionId: result.agentSessionId, delivery: expect.any(String) })
+    expect(await f.control.call(workerScope, 'agents.report', { text: 'W1 DONE abc123' })).toEqual({ agentSessionId: result.agentSessionId, delivery: expect.any(String), delivered: 14, total: 14 })
     expect(f.submissions.at(-1)).toMatchObject({ prompt: 'W1 DONE abc123' })
     // The superseded caller, no longer a wizard, cannot steer or configure what it handed over.
     await expect(f.control.call(f.scope, 'agents.submit', { agentSessionId: worker.resourceId, prompt: 'from the old main' })).rejects.toThrow('Another agent already controls this tab')
@@ -1644,7 +1644,7 @@ describe('local-model grants through app control', () => {
     await f.control.call(f.scope, 'agents.submit', { agentSessionId: id, prompt: 'Push the finished commit.' })
     expect(f.submissions.at(-1)?.settings).toMatchObject({ localGit: false, localResearch: true })
     // Unknown keys and non-boolean values are refused before anything changes.
-    await expect(f.control.call(f.scope, 'agents.grant', { agentSessionId: id, repository: true, network: true })).rejects.toThrow('accepts only agentSessionId, repository and research')
+    await expect(f.control.call(f.scope, 'agents.grant', { agentSessionId: id, repository: true, network: true })).rejects.toThrow('agents.grant accepts only agentSessionId, repository, research; network is not an argument')
     await expect(f.control.call(f.scope, 'agents.grant', { agentSessionId: id, repository: 'yes' })).rejects.toThrow('repository must be true or false')
     expect(grantsOf(f, id)).toEqual({ repository: false, research: true })
     expect((await f.control.call(f.scope, 'tools.list') as Record<string, string>)['agents.grant']).toContain('({agentSessionId,repository?,research?})')
@@ -2358,7 +2358,7 @@ describe('B1: orphaned live agents and the restart initiator', () => {
     await expect(control.call(control.ownerScope({ projectId: f.project.id }), 'app.restart.request', { reason: 'x' })).rejects.toThrow(/is for a wizard tab/)
     asWizard(f)
     expect(Object.keys(await control.call(f.scope, 'tools.list', {}) as object)).toEqual(expect.arrayContaining(['app.restart.request', 'app.quit.confirm']))
-    await expect(control.call(f.scope, 'app.restart.request', {})).rejects.toThrow(/Invalid reason/)
+    await expect(control.call(f.scope, 'app.restart.request', {})).rejects.toThrow('app.restart.request: reason is required')
     await expect(control.call(f.scope, 'app.restart.request', { reason: 'x', force: true })).rejects.toThrow(/accepts only reason/)
     expect(await control.call(f.scope, 'app.restart.request', { reason: 'Install the new build' })).toMatchObject({ requested: true, agentSessionId: f.spec.id, reason: 'Install the new build' })
     expect(host.requestRestart).toHaveBeenCalledWith({ agentSessionId: f.spec.id, title: expect.any(String), reason: 'Install the new build' })
@@ -2663,5 +2663,145 @@ describe('agents.list({load:true}) for a smoke load check', () => {
     tab.state = { ...tab.state, remotePeerId: 'peer-1', remoteMachineName: 'Render Desktop' }
     f.database.saveSession(f.workspace.id, current.layout, null, [])
     await expect(f.control.call(f.scope, 'agents.list', { load: true })).rejects.toThrow(/driven by a paired machine/)
+  })
+})
+
+describe('harness gaps H05, H08, H09, H11: arguments, aliases and reports', () => {
+  const claudeModels: ProviderCapabilities['models'] = [
+    { id: 'opus[1m]', label: 'Claude Opus 5.5 (1M context)', effort: ['high'], defaultEffort: 'high' },
+    { id: 'claude-fable-5-1', label: 'Claude Fable 5.1', effort: ['high'], defaultEffort: 'high' }
+  ]
+  const agentTabs = (f: ReturnType<typeof fixture>) => f.control.tabs(f.scope).filter(tab => tab.kind === 'agent').length
+
+  it('H09: resolves a unique model alias, names what it opened, and refuses with the choices or the right provider', async () => {
+    const f = fixture(false, undefined, undefined, claudeModels)
+    seedClaudeModels(f)
+    const opus = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', model: 'opus' }) as AgentControlTab & { modelResolvedFrom?: string }
+    expect(opus.state?.model).toBe('opus[1m]')
+    expect(opus.modelResolvedFrom).toBe('opus')
+    const fable = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', model: 'fable' }) as AgentControlTab & { modelResolvedFrom?: string }
+    expect(fable.state?.model).toBe('claude-fable-5-1')
+    const exact = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', model: 'claude-synthetic' }) as AgentControlTab & { modelResolvedFrom?: string }
+    expect(exact.modelResolvedFrom).toBeUndefined()
+    await expect(f.control.call(f.scope, 'tabs.open', { provider: 'claude', model: 'nonsense' })).rejects.toThrow(/Model "nonsense" is not offered for claude here\. Choose one of: claude-synthetic \(claude Synthetic\), claude-advanced .*opus\[1m\] .*claude-fable-5-1/)
+    await expect(f.control.call(f.scope, 'tabs.open', { provider: 'claude', model: 'codex-advanced' })).rejects.toThrow('"codex-advanced" is a codex model; pass provider:"codex" (you asked for claude).')
+    await expect(f.control.call(f.scope, 'tabs.open', { provider: 'grok' })).rejects.toThrow('Provider "grok" is not available here; available: codex, claude (models.list).')
+    await expect(f.control.call(f.scope, 'tabs.open', { provider: 'claude', model: 'opus', effort: 'low' })).rejects.toThrow('Effort "low" is not offered for opus[1m]; choose one of: high.')
+  })
+
+  it('H09: router.dispatch checks every task before opening any, and a late open failure is that task\'s result', async () => {
+    const f = fixture()
+    const before = agentTabs(f)
+    await expect(f.control.call(f.scope, 'router.dispatch', { tasks: [
+      { title: 'Valid', prompt: 'Do it', provider: 'codex', model: 'codex-synthetic' },
+      { title: 'Broken', prompt: 'Do it', provider: 'codex', model: 'nope' }
+    ] })).rejects.toThrow(/^Task 2 \("Broken"\): Model "nope" is not offered for codex here.*; no task was opened\.$/)
+    await expect(f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Bad effort', prompt: 'x', provider: 'codex', model: 'codex-synthetic', effort: 'xhigh' }] })).rejects.toThrow(/Task 1 .*Effort "xhigh"/)
+    await expect(f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Bad mode', prompt: 'x', provider: 'codex', permission: 'yolo' }] })).rejects.toThrow(/Task 1 .*permission must be one of/)
+    expect(agentTabs(f)).toBe(before)
+    expect(f.submissions).toHaveLength(0)
+    expect(f.orchestration.listTasks(f.project.id)).toHaveLength(0)
+    const dispatched = await f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Alias', prompt: 'Do it', provider: 'codex', model: 'CODEX-ADVANCED', effort: 'high' }] }) as Array<{ accepted: boolean; model: string; modelResolvedFrom?: string }>
+    expect(dispatched[0]).toMatchObject({ accepted: true, model: 'codex-advanced', modelResolvedFrom: 'CODEX-ADVANCED' })
+  })
+
+  it('H05: a worker marks its dispatched task done with taskId; stray keys and a missing id are named', async () => {
+    const f = fixture()
+    const [worker] = await f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Worker', prompt: 'Do it', provider: 'codex' }] }) as Array<{ agentSessionId: string; taskId: string }>
+    const workerScope = { ...f.scope, agentSessionId: worker!.agentSessionId }
+    expect(f.submissions.at(-1)?.prompt).toContain('orchestration.tasks.update({id:"' + worker!.taskId + '",status:"done"})')
+    const failure = await f.control.call(workerScope, 'orchestration.tasks.update', { taskId: worker!.taskId, status: 'done', result: 'shipped' }).catch((error: Error) => error.message)
+    expect(failure).toBe('orchestration.tasks.update accepts only id, title, description, priority, status, assignedAgentId; result is not an argument. Put results in agents.report or the task description.')
+    await expect(f.control.call(workerScope, 'orchestration.tasks.update', { status: 'done' })).rejects.toThrow('orchestration.tasks.update needs id (the task id from router.dispatch, e.g. task_...); orchestration.snapshot lists them.')
+    await expect(f.control.call(workerScope, 'orchestration.tasks.update', { taskId: worker!.taskId, status: 'finalised' })).rejects.toThrow(/status must be one of backlog, ready, in_progress, blocked, done, cancelled/)
+    expect(await f.control.call(workerScope, 'orchestration.tasks.update', { taskId: worker!.taskId, status: 'completed' })).toMatchObject({ id: worker!.taskId, status: 'done' })
+    for (const call of [{}, { id: '' }, { id: 42 }]) {
+      const message = await f.control.call(workerScope, 'orchestration.tasks.update', call).catch((error: Error) => error.message)
+      expect(message).not.toMatch(/Invalid id/)
+    }
+  })
+
+  it('H08: a long report is never refused; the controller gets 2,000 characters and a pointer to the whole text', async () => {
+    const f = fixture()
+    const child = await f.control.call(f.scope, 'tabs.open', { title: 'Reporter' }) as AgentControlTab
+    const childScope = { ...f.scope, agentSessionId: child.resourceId! }
+    const long = Array.from({ length: 60 }, (_, index) => `line ${String(index).padStart(2, '0')} ${'r'.repeat(34)}`).join('\n') + '\nTAIL-MARKER'
+    expect(long.length).toBeGreaterThan(2000)
+    const result = await f.control.call(childScope, 'agents.report', { text: long }) as { delivered: number; total: number; artifactId: string; agentSessionId: string }
+    expect(result).toMatchObject({ agentSessionId: f.scope.agentSessionId, total: long.length, artifactId: expect.any(String) })
+    expect(result.delivered).toBeLessThanOrEqual(2000)
+    const delivered = f.submissions.at(-1)!.prompt
+    expect(delivered.startsWith(long.slice(0, result.delivered).trimEnd())).toBe(true)
+    expect(long[result.delivered]).toBe('\n')
+    expect(delivered).not.toContain('TAIL-MARKER')
+    expect(delivered).toContain(`[... ${(long.length - result.delivered).toLocaleString('en-US')} more characters: agents.artifact({agentSessionId:"${child.resourceId}",artifactId:"${result.artifactId}"})]`)
+    const artifact = await f.control.call(f.scope, 'agents.artifact', { agentSessionId: child.resourceId, id: result.artifactId }) as { content: string }
+    expect(artifact.content).toBe(long)
+    // The caller's own controller named as agentSessionId is harmless; anyone else is not.
+    await expect(f.control.call(childScope, 'agents.report', { text: 'ok', agentSessionId: f.scope.agentSessionId })).resolves.toMatchObject({ delivered: 2 })
+    await expect(f.control.call(childScope, 'agents.report', { text: 'ok', agentSessionId: 'someone-else' })).rejects.toThrow(/takes no agentSessionId/)
+    await expect(f.control.call(childScope, 'agents.report', { summary: 'aliased' })).resolves.toMatchObject({ delivered: 7 })
+    await expect(f.control.call(childScope, 'agents.report', {})).rejects.toThrow('agents.report: text is required')
+  })
+
+  it('reports and send_message to a controller that handed itself on go to its successor', async () => {
+    const f = fixture()
+    const child = await f.control.call(f.scope, 'tabs.open', { title: 'Worker' }) as AgentControlTab
+    const successor = await f.control.call(f.scope, 'tabs.open', { title: 'Successor' }) as AgentControlTab
+    const childScope = { ...f.scope, agentSessionId: child.resourceId! }
+    new CoworkerRecovery(f.database).supersede(f.scope, f.scope.agentSessionId, 'completed', successor.resourceId!, 'Continued in "Successor" (agents.handoff successor)')
+    expect(await f.control.call(childScope, 'agents.report', { text: 'DONE via report' })).toMatchObject({ agentSessionId: successor.resourceId, forwardedFrom: f.scope.agentSessionId })
+    expect(f.submissions.at(-1)).toMatchObject({ prompt: 'DONE via report', options: expect.objectContaining({}) })
+    expect(f.database.structured.snapshot(successor.resourceId!)?.items.some(item => item.data.type === 'text' && item.data.role === 'user' && item.data.text === 'DONE via report')).toBe(true)
+    expect(await f.control.call(childScope, 'agents.steer', { agentSessionId: f.scope.agentSessionId, prompt: 'DONE via send_message' })).toMatchObject({ agentSessionId: successor.resourceId, forwardedFrom: f.scope.agentSessionId })
+    expect(f.database.structured.snapshot(f.scope.agentSessionId)?.items.some(item => item.data.type === 'text' && item.data.role === 'user' && /DONE via/.test(item.data.text))).toBe(false)
+  })
+
+  it('H11: aliases for agentSessionId, runId and artifact ids; typos get a suggestion; handoff lists its sections', async () => {
+    const f = fixture()
+    const child = await f.control.call(f.scope, 'tabs.open', { title: 'Worker' }) as AgentControlTab
+    expect(await f.control.call(f.scope, 'agents.status', { agentId: child.resourceId })).toMatchObject({ agentSessionId: child.resourceId })
+    expect(await f.control.call(f.scope, 'agents.status', { tabId: child.id })).toMatchObject({ agentSessionId: child.resourceId })
+    await expect(f.control.call(f.scope, 'agents.status', { tabId: 'tab_nope' })).rejects.toThrow(/tabId "tab_nope" is not an agent tab/)
+    await expect(f.control.call(f.scope, 'git.ship.status', { runid: 'x' })).rejects.toThrow('git.ship.status accepts only runId, waitSeconds; runid is not an argument (did you mean runId?).')
+    await expect(f.control.call(f.scope, 'git.ship.status', { id: 'run-missing' })).rejects.toThrow(/No delivery run-missing/)
+    await expect(f.control.call(f.scope, 'git.ship', { messag: 'x' })).rejects.toThrow(/messag is not an argument \(did you mean message\?\)/)
+    const handoffError = await f.control.call(f.scope, 'agents.handoff', {}).catch((error: Error) => error.message)
+    expect(handoffError).toBe('agents.handoff requires handoff: text of 200-12000 characters with these sections on their own lines, in order: Objective, Constraints, Owned files, Verified findings, Remaining work, Artifact references.')
+  })
+
+  it('agents.history is newest first, bounded, compact, and pages back with before', async () => {
+    const f = fixture()
+    const child = await f.control.call(f.scope, 'tabs.open', { title: 'Talker' }) as AgentControlTab
+    const id = child.resourceId!
+    for (let turn = 1; turn <= 4; turn++) await f.control.call(f.scope, 'agents.submit', { agentSessionId: id, prompt: `PROMPT ${turn} ` + 'p'.repeat(3000) })
+    type Page = { order: string; entries: Array<{ sequence: number; type: string; role?: string; text?: string; truncated?: boolean; chars?: number }>; hasMore: boolean; before?: number }
+    const first = await f.control.call(f.scope, 'agents.history', { agentSessionId: id, limit: 3 }) as Page
+    expect(first.order).toBe('newest-first')
+    expect(first.entries).toHaveLength(3)
+    expect(first.entries.map(entry => entry.sequence)).toEqual([...first.entries.map(entry => entry.sequence)].sort((a, b) => b - a))
+    expect(first.hasMore).toBe(true)
+    const prompts = (await f.control.call(f.scope, 'agents.history', { agentSessionId: id, limit: 100 }) as Page).entries.filter(entry => entry.type === 'text' && entry.role === 'user')
+    expect(prompts[0]!.text).toMatch(/^PROMPT 4 /)
+    expect(prompts[0]).toMatchObject({ truncated: true, chars: 3009 })
+    expect(prompts[0]!.text!.length).toBe(2000)
+    // Paging back never repeats or skips an entry.
+    const seen: number[] = []
+    let cursor: number | undefined
+    for (let page = 0; page < 50; page++) {
+      const next = await f.control.call(f.scope, 'agents.history', { agentSessionId: id, limit: 2, ...(cursor === undefined ? {} : { before: cursor }) }) as Page
+      seen.push(...next.entries.map(entry => entry.sequence))
+      if (!next.hasMore) break
+      cursor = next.before
+    }
+    const everything = (await f.control.call(f.scope, 'agents.history', { agentSessionId: id, limit: 100 }) as Page).entries.map(entry => entry.sequence)
+    expect(seen).toEqual(everything)
+    expect(JSON.stringify(await f.control.call(f.scope, 'agents.history', { agentSessionId: id }))).not.toContain('"native"')
+    // raw:true keeps the journal contract mirrors and the overseer read: oldest first after afterSequence.
+    const raw = await f.control.call(f.scope, 'agents.history', { agentSessionId: id, raw: true, afterSequence: 0, limit: 5 }) as Array<{ sequence: number }>
+    expect(raw).toHaveLength(5)
+    expect(raw.map(event => event.sequence)).toEqual([...raw.map(event => event.sequence)].sort((a, b) => a - b))
+    await expect(f.control.call(f.scope, 'agents.history', { agentSessionId: id, limit: 0 })).rejects.toThrow('agents.history: limit must be a whole number from 1 to 100')
+    await expect(f.control.call(f.scope, 'agents.history', { agentSessionId: id, before: 5, afterSequence: 1 })).rejects.toThrow(/not both/)
   })
 })

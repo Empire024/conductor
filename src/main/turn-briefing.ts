@@ -28,6 +28,7 @@ import type { CoworkerBriefingOptions, SentLease } from './agent-collaboration-s
 import { fitRecalledMemories, formatRecalledMemories, MEMORY_PROTOCOL, memoryTokens } from './memory'
 import { projectTaskBriefing } from './project-backlog'
 import { COWORKER_OPENED_PREFIX } from './coworker-autoclose'
+import { CoworkerRecovery } from './coworker-recovery'
 
 /** An adapter sets this on a notice payload the moment the runtime has compacted its context. */
 export const CONTEXT_RESET = 'contextReset'
@@ -54,7 +55,7 @@ export const FINISH_HINT = 'When your work is delivered and reported, end with a
 
 /** Who a coworker reports to, and how, so it does not go looking for a way to reach its controller. */
 export const coworkerHint = (controller: { id: string; title?: string }): string =>
-  `You are a coworker of ${controller.title ? `"${controller.title}" (${controller.id})` : controller.id}. Report results with report (agents.report({text}), up to 2000 characters); send_message to ${controller.id} reaches it too. ${FINISH_HINT}`
+  `You are a coworker of ${controller.title ? `"${controller.title}" (${controller.id})` : controller.id}. Report results with report (agents.report({text})): the first 2000 characters arrive inline and a longer report is kept whole for your controller to read, so never shorten or resend one; send_message to ${controller.id} reaches it too. ${FINISH_HINT}`
 
 /** Claude Code refusals that are outages, not verdicts (harness gap H16). An adapter marks the
  *  notice it posts with one of these payload keys; the next message then carries the matching
@@ -194,10 +195,36 @@ export class TurnBriefings {
 
   private coworkerHint(spec: AgentSpec): string {
     try {
-      const controllerId = this.deps.database.getSetting?.(COWORKER_OPENED_PREFIX + spec.id)
+      const controllerId = this.controllerOf(spec)
       if (!controllerId) return ''
       return coworkerHint(this.deps.controller?.(controllerId) ?? { id: controllerId })
     } catch { return '' /* A hint never stops a message. */ }
+  }
+
+  /** Who a coworker reports to now: the conversation that controls its tab (AgentControl's link,
+   *  which moves when another controller takes the tab over), else the one that opened it; and a
+   *  controller that handed itself on (agents.handoff successor, agents.supersede) is named by its
+   *  successor, since agents.report and send_message deliver there. Naming the old one sent
+   *  reports to a superseded wizard (2026-09-28). */
+  private controllerOf(spec: AgentSpec): string | undefined {
+    const database = this.deps.database
+    if (!database.getSetting) return undefined
+    const read = (key: string): string | null => database.getSetting!(key)
+    // Only a coworker a controller opened gets the hint (and its agents.finish advice); the
+    // owner's own tab that a controller merely took over does not.
+    const opened = read(COWORKER_OPENED_PREFIX + spec.id)
+    if (!opened) return undefined
+    let link: { controllerAgentSessionId?: string; controllerProjectId?: string; projectId?: string } | null = null
+    try { link = JSON.parse(read('agentControlParent:' + spec.id) || 'null') } catch { link = null }
+    let id = link?.controllerAgentSessionId ?? opened
+    const recovery = new CoworkerRecovery({ getSetting: read, setSetting: () => undefined })
+    const projectId = link?.controllerProjectId ?? link?.projectId ?? spec.projectId
+    for (let hops = 0; hops < 8; hops++) {
+      const by = recovery.status(projectId, id).superseded?.by
+      if (!by || by === id || by === spec.id) break
+      id = by
+    }
+    return id
   }
 
   /** Once per runtime, like the static briefing, but from the first message after the

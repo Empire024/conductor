@@ -35,6 +35,9 @@ describe('projectTaskWeightDefaults', () => {
       expect(heavy.model).not.toBe(light.model)
     }
   })
+  it('suggests the Claude model id the runtime offers, opus[1m], not the bare alias', () => {
+    expect(projectTaskWeightDefaults.claude.heavy.model).toBe('opus[1m]')
+  })
   it('never suggests the same model for heavy and light work', () => {
     const weights: ProjectTaskWeight[] = ['heavy', 'medium', 'light']
     for (const provider of ['codex', 'claude'] as const) {
