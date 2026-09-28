@@ -99,6 +99,14 @@ const object = (value: unknown): Args => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Expected an object')
   return value as Args
 }
+/** The top-level argument names out of a tools.list signature string ('({a?,b?}) — ...'), read
+ *  from the same text a caller sees so a method's accepted keys and its documented ones cannot
+ *  drift apart. Only the leading parenthesized object is parsed; prose and nested shapes after it
+ *  (e.g. tabs.open's contract) are not argument names and are left alone. */
+const signatureKeys = (signature: string): string[] => {
+  const body = signature.match(/^\(\{([^}]*)\}\)/)?.[1]
+  return body ? body.split(',').filter(Boolean).map(part => (part.split(/[?:]/)[0] ?? '').trim()) : []
+}
 /** The sections docs/token-thrift-policy.md requires of a bounded handoff, in the order it
  *  states them. A receiver that opens on a handoff has no other context, so a missing section is
  *  refused by name rather than half-understood: "Owned files" absent is a worker about to edit
@@ -137,7 +145,7 @@ const toolSignatures = {
   'machines.list': '() — this machine and the paired machines that can run a tab, with the projects each one accepts, plus execution nodes (kind "node", or a peer\'s node facet) that run commands through nodes.run; the local machine carries readiness (whether it comes back unattended after a reboot, with the missing steps in words)',
   'models.list': '() — available providers and model-specific effort choices; discovered runtime models take precedence',
   'tabs.list': '({projectId?,workspaceId?}) — open tabs in this workspace, including detached windows, or in a sibling project from projects.list',
-  'tabs.open': '({kind?,provider?,model?,effort?,permission?,exactPermission?,title?,machineId?,projectId?,workspaceId?,repository?,research?,contract?,jobId?,focus?}) — visible tab, opened in the background with a "new" mark so the owner’s active tab, caret and window stay put; focus:true brings it into view once the owner pauses typing; agent default kind, provider/model must be available; a Claude, Codex or Grok coworker opens on Auto (the highest mode the provider offers) unless the controller is itself read-only or planning; only with exactPermission: true — for an agent that cannot be trusted at all — does it open on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode, clamped to the controller’s autonomy and to what the provider offers; a local model has no Auto and opens on accept-edits or read-only as before; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list, and only the controller that opened such a tab may steer it; repository/research open a provider-local tab with its repository-writes and deep-research grants already on, under the agents.grant rules; contract ({allowedPaths?:string[],acceptance?:{command,timeoutSec?}}) opens a provider-local tab as a bounded coding task: the runtime refuses writes outside allowedPaths, runs the acceptance command itself after edits, and when it passes with only allowed paths changed tells the model to finish; kind "job" with jobId (from jobs.list) opens the view of that durable job in this workspace, and asking again returns the open one (focus:true brings it into view)',
+  'tabs.open': '({kind?,provider?,model?,effort?,permission?,exactPermission?,title?,machineId?,projectId?,workspaceId?,repository?,research?,contract?,jobId?,focus?,prompt?,anonymous?}) — visible tab, opened in the background with a "new" mark so the owner’s active tab, caret and window stay put; focus:true brings it into view once the owner pauses typing; agent default kind, provider/model must be available; a Claude, Codex or Grok coworker opens on Auto (the highest mode the provider offers) unless the controller is itself read-only or planning; only with exactPermission: true — for an agent that cannot be trusted at all — does it open on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode, clamped to the controller’s autonomy and to what the provider offers; a local model has no Auto and opens on accept-edits or read-only as before; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list, and only the controller that opened such a tab may steer it; repository/research open a provider-local tab with its repository-writes and deep-research grants already on, under the agents.grant rules; contract ({allowedPaths?:string[],acceptance?:{command,timeoutSec?}}) opens a provider-local tab as a bounded coding task: the runtime refuses writes outside allowedPaths, runs the acceptance command itself after edits, and when it passes with only allowed paths changed tells the model to finish; kind "job" with jobId (from jobs.list) opens the view of that durable job in this workspace, and asking again returns the open one (focus:true brings it into view); prompt submits it as the new tab’s first turn exactly as agents.submit would (same path, same permission checks), and the result says submitted:true; anonymous:true (local models only) opens it as an anonymous conversation hidden from a kept controller’s history. A cloud tab (provider "cloud") takes its own narrower shape, see cloud.start. Any other key is rejected, naming it and the accepted keys',
   'tabs.focus': '({tabId,projectId?,workspaceId?}) — brings a tab into view once the owner pauses typing (deferred:true when it is still waiting); any tab of this workspace, or an agent tab this caller controls in a sibling project (agents.list controlled:true); the same holds for rename, split, detach and close',
   'tabs.rename': '({tabId,title,projectId?,workspaceId?})',
   'tabs.split': '({tabId,direction:"horizontal"|"vertical",projectId?,workspaceId?})',
@@ -914,6 +922,30 @@ export class AgentControl {
     return { ...opened, projectId: target.projectId, workspaceId: target.sessionId, ...(grants ? { grants } : {}) }
   }
 
+  /** The public tabs.open entry: unknown keys are rejected by name so a dropped one (a `prompt`
+   *  on 2026-09-28 was silently ignored, and three coworkers sat idle) fails loudly instead. The
+   *  accepted keys are read straight out of the tools.list signature so this and the docs cannot
+   *  drift apart. A cloud tab opens its own narrower shape through cloud.start and is exempt. A
+   *  local conversation not opened by the owner opens a swarm coworker of itself (openLocalCoworker
+   *  already submits its own prompt); everyone else's prompt, once the tab exists, is submitted as
+   *  its first turn exactly as agents.submit would - same path, same permission checks. */
+  private async callOpen(scope: AgentControlScope, source: AgentSpec, args: Args): Promise<unknown> {
+    const cloud = args.provider === 'cloud'
+    if (!cloud) {
+      const allowed = signatureKeys(toolSignatures['tabs.open'])
+      const extra = Object.keys(args).filter(key => !allowed.includes(key) && key !== 'sessionId')
+      if (extra.length) throw new Error(`tabs.open accepts only ${allowed.join(', ')}; ${extra.join(', ')} is not an argument`)
+      if (args.prompt !== undefined && (args.kind ?? 'agent') !== 'agent') throw new Error('prompt only starts a turn in an agent tab')
+    }
+    if (source.provider === 'local' && !scope.owner) return this.openLocalCoworker(scope, args)
+    const opened = await this.open(scope, args)
+    if (cloud || args.prompt === undefined) return opened
+    const agentSessionId = opened.resourceId ?? (opened as { agentSessionId?: string }).agentSessionId
+    if (!agentSessionId) throw new Error('prompt only starts a turn in an agent tab')
+    await this.call(scope, 'agents.submit', { agentSessionId, prompt: args.prompt })
+    return { ...opened, submitted: true }
+  }
+
   /** A local conversation's tabs.open: a coworker of itself, on its model and within its limits
    *  (local-models/swarm.ts), started on the prompt it was given. */
   private async openLocalCoworker(scope: AgentControlScope, args: Args): Promise<unknown> {
@@ -1033,8 +1065,7 @@ export class AgentControl {
     }
     if (method === 'models.list') return this.withModelFacts(this.deps.cloud ? [...this.catalog(scope), cloudCatalogEntry(this.deps.cloud.available())] : this.catalog(scope))
     if (method === 'tabs.list') return this.tabs(this.sibling(scope, args))
-    if (method === 'tabs.open' && source.provider === 'local' && !scope.owner) return this.openLocalCoworker(scope, args)
-    if (method === 'tabs.open') return this.open(scope, args)
+    if (method === 'tabs.open') return this.callOpen(scope, source, args)
     // A local conversation steers and finishes only the local coworkers it opened (swarm.ts).
     if ((method === 'agents.steer' || method === 'agents.finish') && source.provider === 'local' && !scope.owner && args.agentSessionId !== undefined) {
       const id = String(args.agentSessionId)

@@ -308,6 +308,27 @@ locked: [budget]
     expect(result).toEqual({ agentSessionId: f.scope.agentSessionId, delivery: 'started' })
     expect(f.submissions.at(-1)).toMatchObject({ prompt: 'UPDATE OK 1.2.3' })
   })
+  it('tabs.open submits a prompt as the new tab’s first turn, exactly as agents.submit would', async () => {
+    const f = fixture()
+    const opened = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', title: 'Prompted worker', prompt: 'Do the thing' }) as AgentControlTab & { submitted: boolean }
+    expect(opened.submitted).toBe(true)
+    expect(f.submissions.at(-1)).toMatchObject({ provider: 'claude', prompt: 'Do the thing' })
+    expect(f.database.structured.snapshot(opened.resourceId!)?.items).toEqual(expect.arrayContaining([expect.objectContaining({ data: expect.objectContaining({ type: 'text', role: 'assistant', text: 'Native fixture result' }) })]))
+    // A non-agent tab has no turn to start.
+    await expect(f.control.call(f.scope, 'tabs.open', { kind: 'terminal', prompt: 'echo hi' })).rejects.toThrow(/prompt only starts a turn in an agent tab/)
+  })
+  it('tabs.open rejects an unknown argument, naming it and the accepted keys', async () => {
+    const f = fixture()
+    await expect(f.control.call(f.scope, 'tabs.open', { provider: 'claude', bogus: true })).rejects.toThrow(/tabs\.open accepts only/)
+    await expect(f.control.call(f.scope, 'tabs.open', { provider: 'claude', bogus: true })).rejects.toThrow('bogus is not an argument')
+    expect(f.submissions).toHaveLength(0)
+  })
+  it('tabs.open still accepts its documented keys together', async () => {
+    const f = fixture()
+    const opened = await f.control.call(f.scope, 'tabs.open', { kind: 'agent', provider: 'claude', model: 'claude-synthetic', effort: 'low', permission: 'read-only', exactPermission: true, title: 'Known keys', focus: false }) as AgentControlTab
+    expect(opened.state).toMatchObject({ provider: 'claude', model: 'claude-synthetic', effort: 'low' })
+    expect(opened.title).toBe('Known keys')
+  })
   it('advertises configured local models and dispatches native local coworkers within inherited read-only permissions', async () => {
     const f = fixture(false, { local: ['accept-edits', 'read-only'] })
     f.deps.providers().push({ id: 'local', displayName: 'Local', available: true, installUrl: '', models: [{ id: 'local-synthetic', label: 'Local synthetic' }], efforts: [] })
