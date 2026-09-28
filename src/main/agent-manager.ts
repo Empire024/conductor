@@ -257,6 +257,8 @@ interface LiveAgent {
   lastOutputSignal: string
   lastVisualBody: string
   status: RuntimeEnsureResult['status']
+  /** What turn-briefing.ts keys this process's briefing ledger by. */
+  runtimeId: string
 }
 
 const statusListeners = new Set<() => void>()
@@ -307,7 +309,7 @@ export class AgentManager {
   constructor(
     private readonly database: ConductorDatabase,
     private readonly collaboration?: AgentCollaborationRuntime,
-    private readonly controlBriefing?: (spec: AgentSpec) => string,
+    controlBriefing?: (spec: AgentSpec) => string,
     private readonly mcp?: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }
   ) {
     // Everything static in the briefing is sent once per native runtime, a memory once per
@@ -316,7 +318,7 @@ export class AgentManager {
     // CPU and RAM are known at once; the GPU line arrives when nvidia-smi has answered.
     let machine = describeMachine(baseMachineFacts())
     void detectMachine().then(facts => { machine = describeMachine(facts) }).catch(() => { /* CPU and RAM alone still say enough. */ })
-    this.briefings = new TurnBriefings({ database, coworkers: collaboration ? (id, options) => collaboration.briefingFor(id, options) : undefined, control: controlBriefing,
+    this.briefings = new TurnBriefings({ database, nativeSession: id => database.structured.snapshot(id)?.nativeSessionId, coworkers: collaboration ? (id, options) => collaboration.briefingFor(id, options) : undefined, control: controlBriefing,
       controller: id => { const spec = database.structured.spec<AgentSpec>(id); return spec ? { id, title: spec.title } : null },
       machine: () => machine })
     this.structured = new StructuredSessions(database, (provider) => providers[provider].resolveExecutable(), broadcast,
@@ -510,15 +512,6 @@ export class AgentManager {
     if (!normalized) return
     agent.lastVisualBody = ''
 
-    const memories = this.database.recall(agent.spec.projectId, normalized, agent.spec.provider, 8)
-    const memoryLines: string[] = []
-    let memoryLength = 0
-    for (const memory of memories) {
-      const line = `- [${memory.kind}] ${memory.gist.replace(/\s+/g, ' ').trim().slice(0, 520)}`
-      if (memoryLength + line.length > 3_500) break
-      memoryLines.push(line)
-      memoryLength += line.length
-    }
     const modeInstruction = {
       manual: 'Ask before editing files or executing commands.',
       edit: 'Apply the requested edits, respecting the runtime permission prompts.',
@@ -539,26 +532,24 @@ export class AgentManager {
     } catch {
       // Coordination is advisory; a storage failure cannot swallow user input.
     }
-    const context = memoryLines.length
-      ? `\n\nConductor recalled durable project knowledge. Use only what is relevant; current project evidence wins:\n${memoryLines.join('\n')}`
-      : ''
-    let coworkerBriefing = ''
-    try {
-      coworkerBriefing = this.collaboration?.briefingFor(id) ?? ''
-    } catch {
-      // Collaboration context should never prevent a user message from sending.
-    }
-    const collaborationContext = [coworkerBriefing, this.controlBriefing?.(agent.spec) ?? ''].filter(Boolean).map(context => '\n\n' + context).join('')
-    const submitted = `[Conductor ${mode} mode: ${modeInstruction}]${collaborationContext}${context}\n\n${normalized}`
-    this.emitEvent(agent.spec, 'text', normalized, {
+    const itemId = this.emitEvent(agent.spec, 'text', normalized, {
       role: 'user',
       source: 'composer',
       mode
     })
-    this.submitMessage(id, submitted)
-    this.emitEvent(agent.spec, 'activity', `Using ${mode} mode${memoryLines.length ? ` with ${memoryLines.length} recalled memories` : ''}.`, {
+    // The same ledger as a structured conversation, keyed to this CLI process: the static block and
+    // a memory once per process, the coworker log and its leases as a delta.
+    let briefing = ''
+    try {
+      briefing = this.briefings.compose(agent.spec, normalized, itemId, agent.runtimeId)
+    } catch {
+      // Briefing context should never prevent a user message from sending.
+    }
+    const recalledMemoryCount = briefing.match(/^- \[(?:semantic|episodic|procedural)\] /gm)?.length ?? 0
+    this.submitMessage(id, `[Conductor ${mode} mode: ${modeInstruction}]${briefing ? `\n\n${briefing}` : ''}\n\n${normalized}`)
+    this.emitEvent(agent.spec, 'activity', `Using ${mode} mode${recalledMemoryCount ? ` with ${recalledMemoryCount} recalled memories` : ''}.`, {
       mode,
-      recalledMemoryCount: memoryLines.length,
+      recalledMemoryCount,
       presentation: 'quiet'
     })
   }
@@ -724,7 +715,8 @@ export class AgentManager {
         inputBuffer: '',
         lastOutputSignal: '',
         lastVisualBody: '',
-        status: 'running'
+        status: 'running',
+        runtimeId: makeId('pty')
       }
       this.agents.set(spec.id, live)
       this.database.setAgentStatus(spec.id, 'running', 'idle')
@@ -995,7 +987,7 @@ export class AgentManager {
     type: NormalizedAgentEvent['type'],
     message: string,
     metadata?: Record<string, unknown>
-  ): void {
+  ): string {
     const event: NormalizedAgentEvent = {
       id: makeId('event'),
       agentSessionId: spec.id,
@@ -1011,5 +1003,6 @@ export class AgentManager {
       // Presence extraction is auxiliary and must not disrupt provider output.
     }
     broadcast('agent:event', event)
+    return event.id
   }
 }

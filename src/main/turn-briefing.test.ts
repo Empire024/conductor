@@ -15,7 +15,7 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 })
 })
 
-function fixture(provider: AgentSpec['provider'] = 'claude') {
+function fixture(provider: AgentSpec['provider'] = 'claude', native?: { id?: string }) {
   const root = mkdtempSync(join(tmpdir(), 'conductor-turn-briefing-')); roots.push(root)
   const database = new ConductorDatabase(join(root, 'conductor.db')); databases.push(database)
   const project = database.upsertProject(join(root, 'project'), 'Project')
@@ -27,9 +27,12 @@ function fixture(provider: AgentSpec['provider'] = 'claude') {
   const control = vi.fn((target: AgentSpec) => `CONTROL for ${target.id}`)
   const machine = vi.fn(() => 'MACHINE limits: one local model server at a time')
   let tick = 0
-  const briefings = new TurnBriefings({ database, coworkers, control, machine, now: () => new Date(Date.UTC(2026, 8, 21, 12, 0, tick++)).toISOString() })
+  // `native` stands in for the structured state's nativeSessionId; a second instance on the same
+  // database is the next app launch.
+  const launch = () => new TurnBriefings({ database, coworkers, control, machine, ...(native ? { nativeSession: () => native.id } : {}), now: () => new Date(Date.UTC(2026, 8, 21, 12, 0, tick++)).toISOString() })
+  const briefings = launch()
   const starting = (runtimeId: string) => briefings.observe(spec, { runtimeId, data: { type: 'session', phase: 'starting' } })
-  return { database, project, spec, remember, coworkers, control, briefings, starting }
+  return { database, project, spec, remember, coworkers, control, briefings, starting, launch }
 }
 
 const STATIC = [MEMORY_PROTOCOL, 'Conductor project tasks: feature-list.md', 'MACHINE limits: one local model server at a time', 'CONTROL for agent-one']
@@ -42,14 +45,14 @@ describe('what a native runtime is told, and how often', () => {
     expect(first).toContain(`${MEMORY_HEADING}\n- [semantic] The checkout tax total`)
     for (const block of STATIC) expect(first).toContain(block)
     expect(first).toContain('COWORKERS with guidance')
-    expect(f.coworkers.mock.calls[0]![1]).toEqual({ since: undefined, workOnly: true, guidance: true })
+    expect(f.coworkers.mock.calls[0]![1]).toEqual({ since: undefined, workOnly: true, guidance: true, leases: expect.any(Map) })
     // The prompt above was composed before its process existed; this is that process.
     f.starting('runtime-1')
 
     const second = f.briefings.compose(f.spec, 'Fix the checkout tax total now', 'item-2', 'runtime-1')
     expect(second).toBe('COWORKERS delta')
-    expect(f.control).toHaveBeenCalledTimes(1)
-    expect(f.coworkers.mock.calls[1]![1]).toEqual({ since: '2026-09-21T12:00:00.000Z', workOnly: true, guidance: false })
+    expect(second).not.toContain('CONTROL for agent-one')
+    expect(f.coworkers.mock.calls[1]![1]).toEqual({ since: '2026-09-21T12:00:00.000Z', workOnly: true, guidance: false, leases: expect.any(Map) })
 
     // A memory learned since is new to this runtime; the one it already holds is not repeated.
     f.remember('Tax rounding happens in cart-totals.ts', ['tax', 'rounding'])
@@ -87,7 +90,6 @@ describe('what a native runtime is told, and how often', () => {
     for (const block of STATIC) expect(resumed).toContain(block)
     expect(resumed).toContain('stale cart totals')
     expect(resumed).toContain('COWORKERS with guidance')
-    expect(f.control).toHaveBeenCalledTimes(2)
     // The adapter announces its own start a second time; the same process is not a new one.
     f.starting('runtime-2')
     expect(f.briefings.compose(f.spec, 'Still on the checkout tax', 'item-4', 'runtime-2')).toBe('COWORKERS delta')
@@ -97,7 +99,6 @@ describe('what a native runtime is told, and how often', () => {
     const compacted = f.briefings.compose(f.spec, 'And the checkout tax after compaction', 'item-5', 'runtime-2')
     for (const block of STATIC) expect(compacted).toContain(block)
     expect(compacted).toContain('stale cart totals')
-    expect(f.control).toHaveBeenCalledTimes(3)
     // An ordinary notice is not a reset.
     f.briefings.observe(f.spec, { runtimeId: 'runtime-2', data: { type: 'notice', message: 'diagnostic', payload: { stderr: 'x' } } })
     expect(f.briefings.compose(f.spec, 'One more checkout tax question', 'item-6', 'runtime-2')).toBe('COWORKERS delta')
@@ -198,6 +199,108 @@ describe('what a native runtime is told, and how often', () => {
     expect(first).toContain('stale cart totals')
     for (const block of STATIC) expect(first).toContain(block)
     expect(first).not.toContain('COWORKERS')
+  })
+})
+
+// conductor-task:gap-H12
+describe('a resumed provider session keeps what it was told', () => {
+  const session = (f: ReturnType<typeof fixture>, runtimeId: string, nativeSessionId?: string, phase: 'starting' | 'idle' = 'starting') =>
+    f.briefings.observe(f.spec, { runtimeId, nativeSessionId, data: { type: 'session', phase, ...(phase === 'idle' && nativeSessionId ? { nativeSessionId } : {}) } })
+
+  it('does not resend the static block or a memory to a new process on the same provider session', () => {
+    const native: { id?: string } = {}
+    const f = fixture('claude', native)
+    f.remember('The checkout tax total is computed from stale cart totals', ['checkout', 'tax'])
+    const first = f.briefings.compose(f.spec, 'Investigate the checkout tax bug', 'item-1', '')
+    for (const block of STATIC) expect(first).toContain(block)
+    session(f, 'runtime-1')
+    // The runtime names its provider session once it has one.
+    native.id = 'thread-1'
+    session(f, 'runtime-1', 'thread-1', 'idle')
+
+    // A resume, a reconnect: a new process on thread-1.
+    session(f, 'runtime-2', 'thread-1')
+    expect(f.briefings.compose(f.spec, 'Continue with the checkout tax', 'item-2', 'runtime-2')).toBe('COWORKERS delta')
+    // A caller that already knows the new runtime, without a lifecycle event.
+    expect(f.briefings.compose(f.spec, 'Still the checkout tax', 'item-3', 'runtime-3')).toBe('COWORKERS delta')
+
+    // Compaction still forgets.
+    f.briefings.observe(f.spec, { runtimeId: 'runtime-3', data: { type: 'notice', message: 'compacted', payload: { [CONTEXT_RESET]: true } } })
+    const compacted = f.briefings.compose(f.spec, 'The checkout tax after compaction', 'item-4', 'runtime-3')
+    for (const block of STATIC) expect(compacted).toContain(block)
+    expect(compacted).toContain('stale cart totals')
+  })
+
+  it('briefs afresh when the runtime turns out to hold another provider session', () => {
+    const native: { id?: string } = { id: 'thread-1' }
+    const f = fixture('codex', native)
+    f.briefings.compose(f.spec, 'Start the work', 'item-1', '')
+    session(f, 'runtime-1', 'thread-1', 'idle')
+    expect(f.briefings.compose(f.spec, 'Keep going', 'item-2', 'runtime-1')).toBe('COWORKERS delta')
+    // Codex had no saved rollout and started a new thread in its place.
+    native.id = 'thread-2'
+    session(f, 'runtime-2', 'thread-1')
+    session(f, 'runtime-2', 'thread-2', 'idle')
+    const fresh = f.briefings.compose(f.spec, 'Keep going', 'item-3', 'runtime-2')
+    for (const block of STATIC) expect(fresh).toContain(block)
+    // A new process whose conversation is not known yet is a new conversation.
+    native.id = undefined
+    const unknown = f.briefings.compose(f.spec, 'Keep going', 'item-4', 'runtime-3')
+    for (const block of STATIC) expect(unknown).toContain(block)
+  })
+
+  it('keeps the ledger across an app restart for Claude and Codex, not for a provider whose resume is not relied on', () => {
+    const native: { id?: string } = { id: 'thread-1' }
+    const f = fixture('claude', native)
+    f.remember('The checkout tax total is computed from stale cart totals', ['checkout', 'tax'])
+    f.briefings.compose(f.spec, 'Investigate the checkout tax bug', 'item-1', '')
+    session(f, 'runtime-1', 'thread-1', 'idle')
+    f.briefings.compose(f.spec, 'Keep going', 'item-2', 'runtime-1')
+
+    // The next launch resumes thread-1.
+    expect(f.launch().compose(f.spec, 'Continue with the checkout tax', 'item-3', '')).toBe('COWORKERS delta')
+    // A launch whose conversation resumes another provider session starts over.
+    native.id = 'thread-9'
+    const other = f.launch().compose(f.spec, 'Continue with the checkout tax', 'item-4', '')
+    for (const block of STATIC) expect(other).toContain(block)
+
+    const grok = fixture('grok', { id: 'grok-1' })
+    grok.briefings.compose(grok.spec, 'Start', 'item-1', '')
+    session(grok, 'runtime-1', 'grok-1')
+    session(grok, 'runtime-1', 'grok-1', 'idle')
+    session(grok, 'runtime-2', 'grok-1')
+    expect(grok.briefings.compose(grok.spec, 'Resumed', 'item-2', 'runtime-2')).toContain(MEMORY_PROTOCOL)
+    expect(grok.launch().compose(grok.spec, 'After a restart', 'item-3', '')).toContain(MEMORY_PROTOCOL)
+  })
+
+  it('restates the static block when the control credential it carried changed', () => {
+    const f = fixture('claude', { id: 'thread-1' })
+    f.briefings.compose(f.spec, 'Start the work', 'item-1', 'runtime-1')
+    expect(f.briefings.compose(f.spec, 'Keep going', 'item-2', 'runtime-1')).toBe('COWORKERS delta')
+    f.control.mockImplementation((target: AgentSpec) => `CONTROL for ${target.id} on a new endpoint`)
+    const rotated = f.briefings.compose(f.spec, 'Keep going', 'item-3', 'runtime-1')
+    expect(rotated).toContain('CONTROL for agent-one on a new endpoint')
+    expect(rotated).toContain(MEMORY_PROTOCOL)
+    expect(f.briefings.compose(f.spec, 'Keep going', 'item-4', 'runtime-1')).toBe('COWORKERS delta')
+  })
+
+  it('hands the coworker log the leases this provider session was told about, and forgets them with it', () => {
+    const f = fixture('claude', { id: 'thread-1' })
+    const known: string[][] = []
+    f.coworkers.mockImplementation((_id: string, options: CoworkerBriefingOptions) => {
+      known.push([...options.leases!.keys()])
+      options.leases!.set('agent-two|src/a.ts|edit', { path: 'src/a.ts', agent: 'Two', intent: 'edit' })
+      return 'COWORKERS delta' as const
+    })
+    f.briefings.compose(f.spec, 'Start', 'item-1', 'runtime-1')
+    f.briefings.compose(f.spec, 'Again', 'item-2', 'runtime-1')
+    const [first, second] = f.coworkers.mock.calls.map(call => call[1].leases)
+    expect(second).toBe(first)
+    // Kept for the next launch too.
+    f.launch().compose(f.spec, 'After a restart', 'item-3', '')
+    expect(known).toEqual([[], ['agent-two|src/a.ts|edit'], ['agent-two|src/a.ts|edit']])
+    f.briefings.observe(f.spec, { runtimeId: 'runtime-1', data: { type: 'notice', message: 'compacted', payload: { [CONTEXT_RESET]: true } } })
+    expect(first!.size).toBe(0)
   })
 })
 

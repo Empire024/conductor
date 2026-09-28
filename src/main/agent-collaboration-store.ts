@@ -68,13 +68,26 @@ export const conflictSeverity = (
     : 'advisory'
 }
 
+/** A lease line a runtime has already read, by `leaseKey`; enough to say later that it went. */
+export interface SentLease { path: string; agent: string; intent: FileWorkIntent }
+
+/** One lease as a runtime knows it. A heartbeat or a later expiry is the same lease, so neither is
+ *  news; a new holder, path or intent is. */
+export const leaseKey = (lease: Pick<AgentFilePresence, 'agentSessionId' | 'path' | 'intent'>): string =>
+  `${lease.agentSessionId}|${lease.path.toLowerCase()}|${lease.intent}`
+
 /** Durable live-agent messages and expiring file work leases in conductor.db. */
 /** How much of the coworker log one prompt should carry. */
 export interface CoworkerBriefingOptions {
-  /** Only records created after this time; active leases are live state and are always included. */
+  /** Only records created after this time. Leases are live state and follow `leases`. */
   since?: string
-  /** Leave out intents that only say a file was looked at: they are the bulk of the log and
-   *  coordinate nothing. An edit, create, delete or execute intent is always kept. */
+  /** The leases this runtime has already been told about. When given, only the change is written:
+   *  a new lease as a full line, an exclusive lease that is gone as a `Released` line (another
+   *  one simply lapses, as its line said it would); the map is updated to what the returned text
+   *  told. Without it every active lease is listed. */
+  leases?: Map<string, SentLease>
+  /** Leave out intents and leases that only say a file was looked at: they are the bulk of the log
+   *  (four lease lines in five) and coordinate nothing. Edit, create, delete and execute are kept. */
   workOnly?: boolean
   /** Whether to include the two standing guidance lines; a runtime that has read them once
    *  does not need them again. */
@@ -313,6 +326,7 @@ export class AgentCollaborationStore {
     const scope = this.requireAgentScope(agentSessionId)
     const presence = this.listPresence({ projectId: scope.projectId, includeIdle: false })
       .filter((item) => item.agentSessionId !== agentSessionId && item.state === 'active')
+      .filter((item) => !options.workOnly || item.intent !== 'view')
     const messages = this.listMessages({
       projectId: scope.projectId,
       agentSessionId,
@@ -321,29 +335,43 @@ export class AgentCollaborationStore {
       .filter((message) => !options.since || message.createdAt > options.since)
       .filter((message) => !options.workOnly || !viewOnlyIntent(message))
       .slice(-10)
-    if (presence.length === 0 && messages.length === 0) return ''
+    const sent = options.leases
+    const current = new Set(presence.map(leaseKey))
+    const added = sent ? presence.filter((item) => !sent.has(leaseKey(item))) : presence
+    const gone = sent ? [...sent].filter(([key]) => !current.has(key)) : []
+    for (const [key, lease] of gone) if (!exclusiveIntents.has(lease.intent)) sent!.delete(key)
+    const released = gone.filter(([, lease]) => exclusiveIntents.has(lease.intent))
+    if (added.length === 0 && released.length === 0 && messages.length === 0) return ''
 
     const agents = this.agentLabels(scope.projectId), tabs = this.agentTabs(scope.projectId)
     const location = (workspaceId: string, id: string): string =>
       `${workspaceId === scope.sessionId ? 'this workspace' : 'another workspace'}=${workspaceId}; agent=${id}; tab=${tabs.get(workspaceId + ':' + id)?.join(',') ?? 'none'}`
-    const lines = [`[Conductor coworker briefing — project-wide; generated ${now()}; other workspaces are included]`]
+    const lines: Array<{ text: string; lease?: () => void }> = [{ text: `[Conductor coworker briefing — project-wide; generated ${now()}; other workspaces are included]` }]
     if (options.guidance !== false) lines.push(
-      '- Recorded coordination, not live execution evidence. Refresh app.state, agents.list and agents.snapshot for current phase and results; old intents may be stale.',
-      '- Coordinate before overlapping edits. Treat active exclusive file work as owned until its lease expires or is released.'
+      { text: '- Recorded coordination, not live execution evidence. Refresh app.state, agents.list and agents.snapshot for current phase and results; old intents may be stale.' },
+      { text: '- Coordinate before overlapping edits. Treat active exclusive file work as owned until its lease expires or is released; a lease that ends is announced as Released.' }
     )
-    for (const item of presence) {
-      lines.push(`- Active ${item.intent} lease from ${agents.get(item.agentSessionId) ?? item.agentSessionId}: ${item.path} (${location(item.sessionId, item.agentSessionId)}; heartbeat=${item.heartbeatAt}; expires=${item.expiresAt}).`)
+    for (const [key, lease] of released) lines.push({ text: `- Released: ${lease.path} by ${lease.agent}.`, lease: () => sent!.delete(key) })
+    for (const item of added) {
+      const agent = agents.get(item.agentSessionId) ?? item.agentSessionId
+      const minutes = Math.max(1, Math.round((Date.parse(item.expiresAt) - Date.now()) / 60_000))
+      lines.push({
+        text: `- Active ${item.intent} lease from ${agent}: ${item.path} (${location(item.sessionId, item.agentSessionId)}; expires in ~${minutes} min unless renewed).`,
+        lease: () => sent?.set(leaseKey(item), { path: item.path, agent, intent: item.intent })
+      })
     }
     // Most recent records first, so a bounded briefing does not prefer stale intents.
     for (const message of [...messages].reverse()) {
       const paths = message.paths.length ? ` [${message.paths.join(', ')}]` : ''
-      lines.push(`- Recorded ${message.kind} at ${message.createdAt} from ${agents.get(message.agentSessionId) ?? message.agentSessionId} (${location(message.sessionId, message.agentSessionId)}): ${message.body}${paths}`)
+      lines.push({ text: `- Recorded ${message.kind} at ${message.createdAt} from ${agents.get(message.agentSessionId) ?? message.agentSessionId} (${location(message.sessionId, message.agentSessionId)}): ${message.body}${paths}` })
     }
 
+    // Only a lease line that fits is recorded as told; one cut off here is offered again next time.
     let result = ''
     for (const line of lines) {
-      if (result.length + line.length + 1 > Math.max(400, maxCharacters)) break
-      result += `${result ? '\n' : ''}${line}`
+      if (result.length + line.text.length + 1 > Math.max(400, maxCharacters)) break
+      result += `${result ? '\n' : ''}${line.text}`
+      line.lease?.()
     }
     return result
   }

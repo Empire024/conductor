@@ -10,14 +10,21 @@
  * than two to one, and the control paragraph alone was repeated verbatim in four turns out
  * of ten.
  *
- * A runtime forgets on exactly two occasions: a new process (a fresh conversation, a resume,
- * a reconnect) and a context compaction. So everything static is sent once per runtime and
- * again after either; a memory is sent once per runtime; the coworker log is sent as a delta.
+ * A runtime forgets on exactly two occasions: a new native conversation and a context compaction.
+ * A new process is not one of them when it resumes the same provider session: Claude `--resume`
+ * and Codex `thread/resume` reload the whole transcript, briefings included. Counting every
+ * resume or reconnect as new resent the static block and the recalled memories on 40 % of turns
+ * (docs/verification/2026-09-28-harness-gap-sweep.md, H12). So everything static is sent once per
+ * provider session and again after a compaction or when the control credential it names changed;
+ * a memory once per provider session; the coworker log and its leases as a delta. For Claude and
+ * Codex the ledger outlives an app restart (a setting per conversation), since the conversation
+ * does too.
  */
+import { createHash } from 'node:crypto'
 import type { AgentEvent } from '../shared/structured-agent'
 import type { AgentSpec } from '../shared/models'
 import type { ConductorDatabase } from './database'
-import type { CoworkerBriefingOptions } from './agent-collaboration-store'
+import type { CoworkerBriefingOptions, SentLease } from './agent-collaboration-store'
 import { fitRecalledMemories, formatRecalledMemories, MEMORY_PROTOCOL, memoryTokens } from './memory'
 import { projectTaskBriefing } from './project-backlog'
 import { COWORKER_OPENED_PREFIX } from './coworker-autoclose'
@@ -86,19 +93,50 @@ interface Ledger {
   /** The runtime this ledger describes. Empty while the first prompt of a conversation is
    *  composed, because its process does not exist until the prompt is dispatched. */
   runtimeId: string
+  /** The provider conversation the runtime holds, once it has named it. A new process on the same
+   *  one (a resume, a reconnect, an app restart) keeps what it was told; another one does not. */
+  nativeSessionId?: string
   staticSent: boolean
+  /** Which control paragraph the static block carried: a new credential or endpoint is news. */
+  controlDigest?: string
   guidanceSent: boolean
   memoryIds: Set<string>
   /** Coworker records up to this time have been sent. */
   coworkerSince?: string
+  /** The coworker leases this runtime has been told about (agent-collaboration-store.ts leaseKey). */
+  leases: Map<string, SentLease>
   /** The highest context band this runtime has already been nudged at. */
   nudgedBand: number
   /** Whether this runtime has been told when a main brain hands off to a successor. */
   successionHinted: boolean
 }
 
+/** Providers whose resumed session reloads its whole transcript, so a new process on the same
+ *  provider session still holds every briefing it was sent. Grok's resume is not relied on and a
+ *  local model is briefed with memory lines only. */
+const RESUMABLE_PROVIDERS = new Set(['claude', 'codex'])
+/** Where a resumable conversation's ledger survives an app restart. */
+export const BRIEFING_LEDGER_PREFIX = 'briefingLedger:'
+
+interface StoredLedger {
+  nativeSessionId: string
+  staticSent: boolean
+  controlDigest?: string
+  guidanceSent: boolean
+  memoryIds: string[]
+  coworkerSince?: string
+  leases: Array<[string, SentLease]>
+  nudgedBand: number
+  successionHinted: boolean
+}
+
+const digest = (text: string): string | undefined => text ? createHash('sha256').update(text).digest('hex').slice(0, 16) : undefined
+
 export interface TurnBriefingDependencies {
-  database: Pick<ConductorDatabase, 'recall' | 'recordMemoryRecall' | 'forgetStaleMemories'> & Partial<Pick<ConductorDatabase, 'getSetting'>>
+  database: Pick<ConductorDatabase, 'recall' | 'recordMemoryRecall' | 'forgetStaleMemories'> & Partial<Pick<ConductorDatabase, 'getSetting' | 'setSetting'>>
+  /** The provider session a conversation resumes (its structured state's nativeSessionId). Without
+   *  it every new runtime is treated as a new conversation. */
+  nativeSession?: (agentSessionId: string) => string | undefined
   coworkers?: (agentSessionId: string, options: CoworkerBriefingOptions) => string
   control?: (spec: AgentSpec) => string
   /** The title of the conversation that opened a coworker, for its coworker hint. */
@@ -115,21 +153,26 @@ export class TurnBriefings {
   /** Composes the context appended to one user message. `runtimeId` is the adapter the message
    *  will reach, or '' when dispatching it is what creates the adapter. */
   compose(spec: AgentSpec, prompt: string, itemId: string, runtimeId: string, context?: BriefingContext): string {
-    const ledger = this.ledger(spec.id, runtimeId)
-    const staticDue = !ledger.staticSent
+    const ledger = this.ledger(spec, runtimeId)
+    const local = spec.provider === 'local'
+    // Local models use the scoped in-process tool bridge. Never put a bearer credential for the
+    // unrestricted app-control HTTP surface into their prompt or sandbox.
+    const control = local ? '' : this.deps.control?.(spec) ?? ''
+    const staticDue = !ledger.staticSent || ledger.controlDigest !== digest(control)
     if (staticDue) {
       ledger.staticSent = true
+      ledger.controlDigest = digest(control)
       try { this.deps.database.forgetStaleMemories(spec.projectId) } catch { /* Pruning is opportunistic; recall works without it. */ }
     }
-    const local = spec.provider === 'local'
     const memory = this.memory(spec, prompt, itemId, ledger, !local)
-    // Local models use the scoped in-process tool bridge. Never put a bearer credential for the
-    // unrestricted app-control HTTP surface into their prompt or sandbox. They get no per-turn
-    // nudge either: a small model takes the last imperative it reads as its orders, so only the
-    // recalled memory lines travel, fenced ahead of the owner's words (local-models/briefing.ts).
+    // They get no per-turn nudge either: a small model takes the last imperative it reads as its
+    // orders, so only the recalled memory lines travel, fenced ahead of the owner's words
+    // (local-models/briefing.ts).
     if (local) return memory
     const coworkers = this.coworkers(spec, ledger)
-    return [memory, staticDue ? MEMORY_PROTOCOL : '', coworkers, staticDue ? projectTaskBriefing(spec) : '', staticDue ? [this.deps.machine?.() ?? '', LOCAL_ASSIST_PROVIDERS.has(spec.provider) ? LOCAL_ASSIST_HINT : '', spec.provider === 'claude' ? PERMISSION_GRANT_HINT : ''].filter(Boolean).join(' ') : '', staticDue ? this.deps.control?.(spec) ?? '' : '', staticDue ? this.coworkerHint(spec) : '', this.successionHint(ledger, context), this.succession(spec.id, context) || this.nudge(ledger, context)].filter(Boolean).join('\n\n')
+    const text = [memory, staticDue ? MEMORY_PROTOCOL : '', coworkers, staticDue ? projectTaskBriefing(spec) : '', staticDue ? [this.deps.machine?.() ?? '', LOCAL_ASSIST_PROVIDERS.has(spec.provider) ? LOCAL_ASSIST_HINT : '', spec.provider === 'claude' ? PERMISSION_GRANT_HINT : ''].filter(Boolean).join(' ') : '', staticDue ? control : '', staticDue ? this.coworkerHint(spec) : '', this.successionHint(ledger, context), this.succession(spec.id, context) || this.nudge(ledger, context)].filter(Boolean).join('\n\n')
+    this.save(spec, ledger)
+    return text
   }
 
   private coworkerHint(spec: AgentSpec): string {
@@ -177,38 +220,93 @@ export class TurnBriefings {
     return handoffNudge(Math.round(percent), context?.mainBrain === true)
   }
 
-  /** Watches a conversation for the two moments its runtime forgets. */
-  observe(spec: AgentSpec, event: Pick<AgentEvent, 'runtimeId' | 'data'>): void {
+  /** Watches a conversation for the two moments its runtime forgets: another provider session
+   *  and a compaction. */
+  observe(spec: AgentSpec, event: Pick<AgentEvent, 'runtimeId' | 'data'> & Partial<Pick<AgentEvent, 'nativeSessionId'>>): void {
     const ledger = this.ledgers.get(spec.id)
     if (!ledger) return
     const { data } = event
-    if (data.type === 'session' && data.phase === 'starting' && event.runtimeId) {
-      // The first prompt was composed before its process existed; this is that process.
-      if (!ledger.runtimeId) ledger.runtimeId = event.runtimeId
-      else if (ledger.runtimeId !== event.runtimeId) this.reset(ledger, event.runtimeId)
+    if (data.type === 'session') {
+      if (data.phase === 'starting' && event.runtimeId) {
+        // The first prompt was composed before its process existed; this is that process.
+        if (!ledger.runtimeId) ledger.runtimeId = event.runtimeId
+        else if (ledger.runtimeId !== event.runtimeId) this.newRuntime(spec, ledger, event.runtimeId, data.nativeSessionId ?? event.nativeSessionId)
+      }
+      // The runtime names its provider session. Another one than the ledger describes (a resume
+      // that found no history and started over) holds none of what was sent.
+      if (data.nativeSessionId && data.nativeSessionId !== ledger.nativeSessionId) {
+        if (ledger.nativeSessionId) this.reset(ledger, ledger.runtimeId)
+        ledger.nativeSessionId = data.nativeSessionId
+        this.save(spec, ledger)
+      }
       return
     }
-    if (data.type === 'notice' && data.payload && typeof data.payload === 'object' && !Array.isArray(data.payload) && data.payload[CONTEXT_RESET] === true) this.reset(ledger, ledger.runtimeId)
+    if (data.type === 'notice' && data.payload && typeof data.payload === 'object' && !Array.isArray(data.payload) && data.payload[CONTEXT_RESET] === true) {
+      this.reset(ledger, ledger.runtimeId)
+      this.save(spec, ledger)
+    }
   }
 
   forget(agentSessionId: string): void { this.ledgers.delete(agentSessionId); this.succeeded.delete(agentSessionId) }
 
-  private ledger(id: string, runtimeId: string): Ledger {
-    let ledger = this.ledgers.get(id)
-    if (!ledger) { ledger = { runtimeId, staticSent: false, guidanceSent: false, memoryIds: new Set(), nudgedBand: 0, successionHinted: false }; this.ledgers.set(id, ledger) }
-    else if (runtimeId && ledger.runtimeId && ledger.runtimeId !== runtimeId) this.reset(ledger, runtimeId)
+  private ledger(spec: AgentSpec, runtimeId: string): Ledger {
+    let ledger = this.ledgers.get(spec.id) ?? this.restore(spec, runtimeId)
+    // A new ledger describes the provider session the conversation resumes, if it names one yet.
+    if (!ledger) ledger = { runtimeId, nativeSessionId: this.nativeSession(spec), staticSent: false, guidanceSent: false, memoryIds: new Set(), leases: new Map(), nudgedBand: 0, successionHinted: false }
+    else if (runtimeId && ledger.runtimeId && ledger.runtimeId !== runtimeId) this.newRuntime(spec, ledger, runtimeId, this.nativeSession(spec))
     else if (runtimeId) ledger.runtimeId = runtimeId
+    this.ledgers.set(spec.id, ledger)
     return ledger
+  }
+
+  /** A new process keeps its ledger only when it resumes the provider session the ledger
+   *  describes; anything unknown is a new conversation. */
+  private newRuntime(spec: AgentSpec, ledger: Ledger, runtimeId: string, nativeSessionId: string | undefined): void {
+    if (RESUMABLE_PROVIDERS.has(spec.provider) && ledger.nativeSessionId && nativeSessionId === ledger.nativeSessionId) ledger.runtimeId = runtimeId
+    else this.reset(ledger, runtimeId)
+  }
+
+  private nativeSession(spec: AgentSpec): string | undefined {
+    try { return this.deps.nativeSession?.(spec.id) || undefined } catch { return undefined }
   }
 
   private reset(ledger: Ledger, runtimeId: string): void {
     ledger.runtimeId = runtimeId
     ledger.staticSent = false
+    ledger.controlDigest = undefined
     ledger.guidanceSent = false
     ledger.memoryIds.clear()
     ledger.coworkerSince = undefined
+    ledger.leases.clear()
     ledger.nudgedBand = 0
     ledger.successionHinted = false
+  }
+
+  /** The ledger of a resumable conversation this app launch has not seen yet, if it was kept for
+   *  the provider session the conversation still resumes. */
+  private restore(spec: AgentSpec, runtimeId: string): Ledger | undefined {
+    if (!RESUMABLE_PROVIDERS.has(spec.provider) || !this.deps.database.getSetting) return undefined
+    try {
+      const raw = this.deps.database.getSetting(BRIEFING_LEDGER_PREFIX + spec.id)
+      if (!raw) return undefined
+      const stored = JSON.parse(raw) as StoredLedger
+      if (!stored.nativeSessionId || stored.nativeSessionId !== this.nativeSession(spec)) return undefined
+      return {
+        runtimeId, nativeSessionId: stored.nativeSessionId, staticSent: stored.staticSent === true, controlDigest: stored.controlDigest, guidanceSent: stored.guidanceSent === true,
+        memoryIds: new Set(stored.memoryIds ?? []), coworkerSince: stored.coworkerSince, leases: new Map(stored.leases ?? []),
+        nudgedBand: Number(stored.nudgedBand) || 0, successionHinted: stored.successionHinted === true
+      }
+    } catch { return undefined /* An unreadable ledger only means the briefing is sent again. */ }
+  }
+
+  private save(spec: AgentSpec, ledger: Ledger): void {
+    if (!RESUMABLE_PROVIDERS.has(spec.provider) || !ledger.nativeSessionId || !this.deps.database.setSetting) return
+    const stored: StoredLedger = {
+      nativeSessionId: ledger.nativeSessionId, staticSent: ledger.staticSent, controlDigest: ledger.controlDigest, guidanceSent: ledger.guidanceSent,
+      memoryIds: [...ledger.memoryIds], coworkerSince: ledger.coworkerSince, leases: [...ledger.leases], nudgedBand: ledger.nudgedBand, successionHinted: ledger.successionHinted
+    }
+    try { this.deps.database.setSetting(BRIEFING_LEDGER_PREFIX + spec.id, JSON.stringify(stored)) }
+    catch { /* The ledger saves briefing bytes; it never blocks a message. */ }
   }
 
   private memory(spec: AgentSpec, prompt: string, itemId: string, ledger: Ledger, heading = true): string {
@@ -230,7 +328,7 @@ export class TurnBriefings {
     if (!this.deps.coworkers) return ''
     const watermark = (this.deps.now ?? (() => new Date().toISOString()))()
     let text = ''
-    try { text = this.deps.coworkers(spec.id, { since: ledger.coworkerSince, workOnly: true, guidance: !ledger.guidanceSent }) }
+    try { text = this.deps.coworkers(spec.id, { since: ledger.coworkerSince, workOnly: true, guidance: !ledger.guidanceSent, leases: ledger.leases }) }
     catch { return '' /* Coordination is advisory; it never blocks a message. */ }
     ledger.coworkerSince = watermark
     if (text) ledger.guidanceSent = true

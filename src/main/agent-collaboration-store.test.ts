@@ -143,7 +143,9 @@ describe('AgentCollaborationStore', () => {
       const leased = store.buildBriefing(second.id)
       expect(leased).toContain('generated 2026-09-08T10:00:00.000Z')
       expect(leased).toContain('Active edit lease')
-      expect(leased).toContain('heartbeat=2026-09-08T10:00:00.000Z; expires=2026-09-08T10:01:30.000Z')
+      // A heartbeat is not news: the line says how long the lease lasts, not when it was renewed.
+      expect(leased).toContain('expires in ~2 min unless renewed')
+      expect(leased).not.toContain('heartbeat=')
       expect(leased).toContain('another workspace=' + first.sessionId + '; agent=' + first.id + '; tab=coworker-tab')
       expect(leased).toContain('Recorded intent at 2026-09-08T10:00:00.000Z')
       expect(leased).toContain('not live execution evidence')
@@ -244,6 +246,66 @@ describe('coworker briefing as a prompt delta', () => {
       expect(delta).toContain('Release notes are ready')
       expect(delta).not.toContain('edit src/c.ts')
       expect(delta).not.toContain('Coordinate before overlapping edits')
+    })
+  })
+
+  it('tells a runtime about a lease once, and again only when it goes', () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-09-28T10:00:00.000Z'))
+    withCollaboration(({ store, projectId, first, second }) => {
+      const lease = (path: string) => store.announcePresence({ projectId, sessionId: first.sessionId, agentSessionId: first.id, path, intent: 'edit', ttlSeconds: 90 })
+      const leases = new Map()
+      const brief = () => store.buildBriefing(second.id, 1800, { since: new Date().toISOString(), workOnly: true, guidance: false, leases })
+      lease('src/a.ts')
+      const told = brief()
+      expect(told).toContain('Active edit lease')
+      expect(told).toContain('src/a.ts')
+      expect([...leases.keys()]).toEqual([`${first.id}|src/a.ts|edit`])
+      // Heartbeats move expires_at on every renewal; the same lease is not sent again, and a
+      // briefing with nothing new has no header either.
+      vi.setSystemTime(new Date('2026-09-28T10:01:00.000Z'))
+      lease('src/a.ts')
+      expect(brief()).toBe('')
+      vi.setSystemTime(new Date('2026-09-28T10:02:00.000Z'))
+      lease('src/a.ts')
+      lease('src/b.ts')
+      const added = brief()
+      expect(added).toContain('src/b.ts')
+      expect(added).not.toContain('src/a.ts')
+      store.releasePresence(first.id, 'src/a.ts')
+      const released = brief()
+      expect(released).toMatch(/^- Released: src\/a\.ts by .+\.$/m)
+      expect(released).not.toContain('Active edit lease')
+      expect(brief()).toBe('')
+      // Without the ledger (the collaboration pane) every active lease is listed.
+      expect(store.buildBriefing(second.id)).toContain('src/b.ts')
+
+      // A view lease coordinates nothing and is left out of the work briefing; a non-exclusive
+      // lease that ends lapses without a Released line, as its own line said it would.
+      store.announcePresence({ projectId, sessionId: first.sessionId, agentSessionId: first.id, path: 'src/read.ts', intent: 'view' })
+      store.announcePresence({ projectId, sessionId: first.sessionId, agentSessionId: first.id, path: 'scripts/run.mjs', intent: 'execute' })
+      const work = brief()
+      expect(work).toContain('Active execute lease')
+      expect(work).not.toContain('src/read.ts')
+      expect(store.buildBriefing(second.id)).toContain('src/read.ts')
+      store.releasePresence(first.id, 'scripts/run.mjs')
+      expect(brief()).toBe('')
+      expect([...leases.keys()]).toEqual([`${first.id}|src/b.ts|edit`])
+    })
+  })
+
+  it('records only the lease lines that fit the briefing, so a cut one is offered again', () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-09-28T10:00:00.000Z'))
+    withCollaboration(({ store, projectId, first, second }) => {
+      for (let index = 0; index < 8; index++) store.announcePresence({ projectId, sessionId: first.sessionId, agentSessionId: first.id, path: `src/module-${index}.ts`, intent: 'edit' })
+      const leases = new Map()
+      const cut = store.buildBriefing(second.id, 600, { guidance: false, leases })
+      expect(leases.size).toBeGreaterThan(0)
+      expect(leases.size).toBeLessThan(8)
+      for (const { path } of leases.values()) expect(cut).toContain(path)
+      store.buildBriefing(second.id, 20_000, { guidance: false, leases })
+      expect(leases.size).toBe(8)
     })
   })
 })
