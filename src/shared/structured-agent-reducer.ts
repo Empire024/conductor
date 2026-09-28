@@ -5,6 +5,9 @@ export const MAX_PREVIEW_CHARS = 64_000
 export const emptyProjection = (sessionId: string): SessionProjection => ({ sessionId, runtimeId: '', phase: 'idle', sequence: 0, items: [], settings: { permission: 'default', plan: false }, title: '', archived: false, truncated: false })
 
 function reconcile(previous: AgentEventData, next: AgentEventData): AgentEventData {
+  if (previous.type === 'interaction' && next.type === 'interaction' &&
+    (previous.interaction.input as { protocol?: string } | null)?.protocol === 'codex-async-question' &&
+    previous.interaction.status !== 'pending' && next.interaction.status === 'pending') return previous
   if (previous.type === 'usage' && next.type === 'usage') return { ...previous, ...Object.fromEntries(Object.entries(next).filter(([, value]) => value !== undefined)) } as AgentEventData
   if (previous.type === 'text' && next.type === 'text') return { ...next, text: (next.mode === 'delta' ? previous.text + next.text : next.text).slice(-MAX_PREVIEW_CHARS) }
   if (previous.type === 'tool' && next.type === 'tool') return {
@@ -28,8 +31,11 @@ function bound(data: AgentEventData): AgentEventData {
 
 const settledPhases = new Set(['failed', 'disconnected', 'interrupted', 'completed'])
 /** A turn that ended leaves nothing waiting on it: pending questions expire and running tools stop. */
-function settleItem(item: TimelineItem): TimelineItem {
-  if (item.data.type === 'interaction' && item.data.interaction.status === 'pending') return { ...item, data: { ...item.data, interaction: { ...item.data.interaction, status: 'expired' as const } } }
+function settleItem(item: TimelineItem, phase: string): TimelineItem {
+  if (item.data.type === 'interaction' && item.data.interaction.status === 'pending') {
+    if (phase !== 'interrupted' && phase !== 'failed' && (item.data.interaction.input as { protocol?: string } | null)?.protocol === 'codex-async-question') return item
+    return { ...item, data: { ...item.data, interaction: { ...item.data.interaction, status: 'expired' as const } } }
+  }
   if (item.data.type === 'tool' && !item.data.detached && ['running', 'preparing', 'awaiting_approval'].includes(item.data.status)) return { ...item, data: { ...item.data, status: 'interrupted' as const } }
   return item
 }
@@ -65,8 +71,9 @@ function projectHeader(state: SessionProjection, event: AgentEvent): SessionProj
  *  root session (used only when no item has the first id yet). */
 function itemIdentity(state: SessionProjection, event: AgentEvent): { id: string; initialId?: string } {
   const identity = event.data.type === 'interaction' ? event.requestId : event.itemId
+  const asyncQuestion = event.data.type === 'interaction' && (event.data.interaction.input as { protocol?: string } | null)?.protocol === 'codex-async-question'
   const id = identity ? JSON.stringify(event.data.type === 'interaction'
-    ? [event.runtimeId, identity, event.data.type]
+    ? [asyncQuestion ? 'codex-async-question' : event.runtimeId, identity, event.data.type]
     : [event.runtimeId, event.nativeSessionId ?? state.nativeSessionId ?? '', event.turnId ?? '', identity, event.data.type]) : event.id
   // Claude can reveal its root session ID only after text has begun streaming.
   // Reconcile that initial item without merging explicitly identified child conversations.
@@ -90,7 +97,7 @@ function titled(next: SessionProjection, event: AgentEvent): SessionProjection {
 export function projectAgentEvent(state: SessionProjection, event: AgentEvent): SessionProjection {
   if (!accepts(state, event)) return state
   const header = projectHeader(state, event)
-  if (header) return event.data.type === 'session' && settledPhases.has(header.phase) ? { ...header, items: state.items.map(settleItem) } : header
+  if (header) return event.data.type === 'session' && settledPhases.has(header.phase) ? { ...header, items: state.items.map(item => settleItem(item, header.phase)) } : header
   const next = advance(state, event)
   const { id, initialId } = itemIdentity(state, event)
   let index = next.items.findIndex(item => item.id === id)
@@ -123,7 +130,7 @@ export function projectAgentEvents(state: SessionProjection, events: readonly Ag
       header = projected
       if (event.data.type === 'session' && settledPhases.has(projected.phase)) {
         const working = own()
-        for (let position = start; position < working.length; position++) working[position] = settleItem(working[position]!)
+        for (let position = start; position < working.length; position++) working[position] = settleItem(working[position]!, projected.phase)
       }
       continue
     }

@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, renameSync } from 'node:fs'
 import { tmpdir } from 'node:os'
+import { DatabaseSync } from 'node:sqlite'
 import { join, dirname } from 'node:path'
 import { claudeHistoryPath } from './native-history'
 import { ConductorDatabase } from './database'
+import { StructuredAgentStore } from './structured-store'
 import { StructuredSessions } from './structured-sessions'
 import type { AgentSpec } from '../shared/models'
 import type { StructuredProvider } from '../shared/structured-agent'
@@ -41,13 +43,14 @@ class FakeProvider implements ProviderAdapter {
   steerIds: string[] = []
   async steer(text: string, settings: SessionSettings, attachments?: ContextAttachment[], inputId = 'fixture-input'): Promise<void> { this.steers.push({ text, settings, attachments }); this.steerIds.push(inputId); await this.onSteer?.(); if (this.autoDeliver) this.emit({ data: { type: 'input_delivery', inputId, status: 'delivered' } }) }
   responses: InteractionResponse[] = []
+  submitGate?: Promise<void>
   startGate?: Promise<void>
   responseGate?: Promise<void>
   renameGate?: Promise<void>
   onResponse?: (response: InteractionResponse) => Promise<void>
   constructor(readonly options: AdapterOptions) {}
   async start(): Promise<void> { this.starts++; await this.startGate; this.emit({ data: { type: 'session', phase: 'idle', nativeSessionId: this.options.nativeSessionId ?? (this.nativeIdentityOnStart ? `native-${this.options.runtimeId}` : undefined) } }) }
-  async submit(text: string, settings: SessionSettings, attachments?: ContextAttachment[]): Promise<void> { if (this.disposed) throw new Error('Fake runtime disposed'); this.submissions.push({ text, settings, attachments }) }
+  async submit(text: string, settings: SessionSettings, attachments?: ContextAttachment[]): Promise<void> { if (this.disposed) throw new Error('Fake runtime disposed'); this.submissions.push({ text, settings, attachments }); await this.submitGate }
   async respond(response: InteractionResponse): Promise<void> { this.responses.push(response); await this.responseGate; await this.onResponse?.(response) }
   async interrupt(): Promise<void> { this.emit({ data: { type: 'session', phase: 'interrupted' } }) }
   /** Work the runtime backgrounded and will wake this conversation for; only the live process
@@ -391,6 +394,70 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     expect(runtime.responses).toEqual([corrected])
     expect(f.database.structured.snapshot(f.spec.id)?.items.find(item => item.data.type === 'interaction')?.data).toMatchObject({ interaction: { status: 'resolved', outcome: 'answered' } })
     await expect(f.manager.respond(corrected)).rejects.toThrow('already submitted')
+  })
+
+  it('sends an async Codex question answer as one later user message and retains the chosen values', async () => {
+    const f = fixture('codex')
+    await f.manager.submit(f.spec.id, 'First turn', settings)
+    const runtime = f.current, native = f.database.structured.snapshot(f.spec.id)!.nativeSessionId!
+    const interaction = { id: `codex-async:${native}:ask-1`, kind: 'question' as const, title: 'Codex asked you',
+      input: { protocol: 'codex-async-question', threadId: native, itemId: 'ask-1' }, choices: [], status: 'pending' as const,
+      questions: [{ id: 'ask-1:0', question: 'Choose one', options: [{ label: 'A' }, { label: 'B' }], allowCustom: true },
+        { id: 'ask-1:1', question: 'Explain', options: [], allowCustom: true }] }
+    runtime.emit({ itemId: 'ask-1', requestId: interaction.id, data: { type: 'interaction', interaction } })
+    runtime.finish()
+    const response = { sessionId: f.spec.id, runtimeId: runtime.options.runtimeId, requestId: interaction.id,
+      answers: { 'ask-1:0': ['B'], 'ask-1:1': ['custom detail'] } }
+    let releaseSubmit!: () => void
+    runtime.submitGate = new Promise<void>(resolve => { releaseSubmit = resolve })
+    const pending = f.manager.respond(response)
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(runtime.submissions).toHaveLength(2) // native dispatch entered; acknowledgement is still held
+    const reader = new DatabaseSync(f.databasePath)
+    try { expect(new StructuredAgentStore(reader, f.root).snapshot(f.spec.id)?.items.find(item => item.data.type === 'interaction')?.data).toMatchObject({ interaction: { status: 'resolved', outcome: 'Delivery unconfirmed' } }) }
+    finally { reader.close() }
+    await expect(f.manager.respond(response)).rejects.toThrow()
+    releaseSubmit()
+    await pending
+    expect(runtime.responses).toHaveLength(0)
+    expect(runtime.submissions).toHaveLength(2)
+    expect(runtime.submissions[1]!.text).toContain('Choose one\nAnswer: B')
+    expect(runtime.submissions[1]!.text).toContain('Explain\nAnswer: custom detail')
+    expect(f.database.structured.snapshot(f.spec.id)?.items.find(item => item.data.type === 'interaction')?.data).toMatchObject({ interaction: {
+      status: 'resolved', answers: { 'ask-1:0': ['B'], 'ask-1:1': ['custom detail'] }
+    } })
+    await expect(f.manager.respond(response)).rejects.toThrow('already submitted')
+  })
+
+  it('durably claims an async answer before reconnect so concurrent or reopened views cannot resend it', async () => {
+    const f = fixture('codex')
+    await f.manager.submit(f.spec.id, 'First turn', settings)
+    const old = f.current, native = f.database.structured.snapshot(f.spec.id)!.nativeSessionId!
+    const interaction = { id: `codex-async:${native}:ask-2`, kind: 'question' as const, title: 'Codex asked you',
+      input: { protocol: 'codex-async-question', threadId: native, itemId: 'ask-2' }, choices: [], status: 'pending' as const,
+      questions: [{ id: 'ask-2:0', question: 'Same title', options: [{ label: 'A' }] }, { id: 'ask-2:1', question: 'Same title', options: [], allowCustom: true }] }
+    old.emit({ itemId: 'ask-2', requestId: interaction.id, data: { type: 'interaction', interaction } })
+    old.emit({ data: { type: 'session', phase: 'disconnected' } })
+    let release!: () => void
+    f.gateStart(new Promise<void>(resolve => { release = resolve }))
+    const response = { sessionId: f.spec.id, runtimeId: old.options.runtimeId, requestId: interaction.id,
+      answers: { 'ask-2:0': ['A'], 'ask-2:1': ['custom'] } }
+    const sending = f.manager.respond(response)
+    await new Promise(resolve => setTimeout(resolve, 10))
+    const reader = new DatabaseSync(f.databasePath)
+    try {
+      const row = reader.prepare('SELECT projection_json FROM structured_sessions WHERE id=?').get(f.spec.id) as { projection_json: string }
+      expect(JSON.parse(row.projection_json).items.find((entry: { data: { type: string } }) => entry.data.type === 'interaction').data.interaction).toMatchObject({
+        status: 'resolved', outcome: 'Delivery unconfirmed', answers: { 'ask-2:0': ['A'], 'ask-2:1': ['custom'] }
+      })
+      expect(new StructuredAgentStore(reader, f.root).snapshot(f.spec.id)?.items.find(item => item.data.type === 'interaction')?.data).toMatchObject({ interaction: { status: 'resolved', outcome: 'Delivery unconfirmed' } })
+    } finally { reader.close() }
+    f.current.emit({ itemId: 'ask-2', requestId: interaction.id, data: { type: 'interaction', interaction } })
+    await expect(f.manager.respond(response)).rejects.toThrow()
+    release()
+    await sending
+    expect(f.current.submissions).toHaveLength(1)
+    expect(f.database.structured.snapshot(f.spec.id)?.items.find(item => item.data.type === 'interaction')?.data).toMatchObject({ interaction: { status: 'resolved', outcome: 'answered' } })
   })
 
   it('resumes the same native conversation for a new message, sends it once, and ignores stale callbacks', async () => {
@@ -1088,6 +1155,72 @@ describe('mid-turn steering and input retention', () => {
     await expect(f.manager.steer(f.spec.id, 'Keep my draft', settings)).rejects.toThrow('queue is full')
     expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts).toHaveLength(100)
     expect(f.current.steers).toHaveLength(0)
+  })
+})
+
+describe('messages queued together are delivered together', () => {
+  const controller: PromptOrigin = { agentSessionId: 'controller-tab', label: 'Controller' }
+  const userTexts = (f: ReturnType<typeof fixture>) => f.database.structured.snapshot(f.spec.id)!.items.flatMap(item => item.data.type === 'text' && item.data.role === 'user' ? [item.data] : [])
+  /** The running turn cannot take a steer yet, so each message is held as a queued steer. */
+  const heldBehindRunningTurn = async (f: ReturnType<typeof fixture>, ...messages: Array<[string, PromptOrigin?]>) => {
+    await f.manager.submit(f.spec.id, 'Original', settings)
+    for (const [text, origin] of messages) await (origin ? f.manager.steerOrStart(f.spec.id, text, settings, [], origin) : f.manager.steer(f.spec.id, text, settings))
+    expect(f.database.structured.snapshot(f.spec.id)!.queuedPrompts!.map(prompt => [prompt.text, prompt.steer])).toEqual(messages.map(([text]) => [text, true]))
+    expect(f.current.steers).toHaveLength(0)
+    f.current.capabilities.steering = true
+    f.current.emit({ data: { type: 'session', phase: 'running', capabilities: f.current.capabilities } })
+    await vi.waitFor(() => expect(f.current.steers.length).toBeGreaterThan(0))
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+
+  it('steers two messages queued during a running turn as exactly one combined steer, in order', async () => {
+    const f = fixture()
+    await heldBehindRunningTurn(f, ['First'], ['Second'])
+    expect(f.current.steers.map(steer => steer.text)).toEqual(['First\n\n\nSecond'])
+    expect(f.current.submissions).toHaveLength(1)
+    const state = f.database.structured.snapshot(f.spec.id)!
+    expect(state.queuedPrompts ?? []).toEqual([])
+    expect(state.pendingSteering ?? []).toEqual([])
+    expect(userTexts(f).map(item => item.text)).toEqual(['Original', 'First\n\n\nSecond'])
+  })
+
+  it('combines a controller steer and the owner message into one steer, labelling the controller part', async () => {
+    const f = fixture()
+    await heldBehindRunningTurn(f, ['Owner note'], ['Controller note', controller])
+    expect(f.current.steers.map(steer => steer.text)).toEqual(['Owner note\n\n\n(Controller) Controller note'])
+    expect(userTexts(f).at(-1)).toMatchObject({ text: 'Owner note\n\n\n(Controller) Controller note' })
+    expect(userTexts(f).at(-1)?.origin).toBeUndefined()
+  })
+
+  it('leaves a single queued steer exactly as it was', async () => {
+    const f = fixture()
+    await heldBehindRunningTurn(f, ['Only message', controller])
+    expect(f.current.steers.map(steer => steer.text)).toEqual(['Only message'])
+    expect(userTexts(f).at(-1)).toMatchObject({ text: 'Only message', origin: controller })
+  })
+
+  it('starts one turn for queued messages from the owner and a controller once the turn settles', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'first', settings)
+    await f.manager.queue(f.spec.id, 'owner followup', settings)
+    await f.manager.queue(f.spec.id, 'controller followup', settings, [], controller)
+    f.current.finish()
+    await vi.waitFor(() => expect(f.current.submissions).toHaveLength(2))
+    await new Promise(resolve => setTimeout(resolve, 25))
+    expect(f.current.submissions.map(submission => submission.text)).toEqual(['first', 'owner followup\n\n\n(Controller) controller followup'])
+    expect(f.database.structured.snapshot(f.spec.id)?.queued).toBeNull()
+  })
+
+  it('never folds a remote-peer message into a local batch', async () => {
+    const f = fixture()
+    f.manager.setPromptDispatchAuthorityGuard(() => undefined)
+    await f.manager.submit(f.spec.id, 'first', settings)
+    await f.manager.queue(f.spec.id, 'owner followup', settings)
+    await f.manager.queue(f.spec.id, 'remote followup', settings, [], remoteOrigin(f.spec.projectId))
+    f.current.finish()
+    await vi.waitFor(() => expect(f.current.submissions).toHaveLength(2))
+    expect(f.current.submissions[1]?.text).toBe('owner followup')
+    expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts?.map(prompt => prompt.text)).toEqual(['remote followup'])
   })
 })
 

@@ -21,6 +21,20 @@ function fixture() {
 const event = (sequence: number, data: AgentEventData, overrides: Partial<AgentEvent> = {}): AgentEvent => ({ schemaVersion: 1, id: `event-${sequence}`, sequence, sessionId: 'one', runtimeId: 'runtime', provider: 'claude', projectId: 'project', workspaceId: 'workspace', cwd: 'fixture', timestamp: '2026-09-07T00:00:00.000Z', data, ...overrides })
 
 describe('structured SQLite journal and immutable artifacts', () => {
+  it('restores an unanswered async Codex card while expiring a blocking approval', () => {
+    const f = fixture()
+    const question = { id: 'codex-async:thread:item', kind: 'question' as const, title: 'Codex asked you',
+      input: { protocol: 'codex-async-question', threadId: 'thread', itemId: 'item' }, choices: [], status: 'pending' as const,
+      questions: [{ id: 'item:0', question: 'Choose', options: [{ label: 'A' }] }] }
+    f.store.append(event(1, { type: 'session', phase: 'running', nativeSessionId: 'thread' }, { sessionId: 'two', provider: 'codex' }))
+    f.store.append(event(2, { type: 'interaction', interaction: question }, { sessionId: 'two', provider: 'codex', requestId: question.id }))
+    f.store.checkpoint('two')
+    f.db.close()
+    const reopened = new DatabaseSync(f.path); databases.push(reopened)
+    const restored = new StructuredAgentStore(reopened, f.root).snapshot('two')!
+    expect(restored.phase).toBe('disconnected')
+    expect(restored.items.find(item => item.data.type === 'interaction')?.data).toMatchObject({ interaction: { status: 'pending' } })
+  })
   it('hydrates imported projections only after their database rows exist', () => {
     const { db, store } = fixture()
     const projection = { ...emptyProjection('imported'), title: 'Imported history', phase: 'disconnected' as const, nativeSessionId: 'native-imported' }

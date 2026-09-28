@@ -6,6 +6,20 @@ const event = (sequence: number, data: AgentEventData, overrides: Partial<AgentE
   schemaVersion: 1, id: `event-${sequence}`, sequence, sessionId: 'session', runtimeId: 'runtime', provider: 'claude', projectId: 'project', workspaceId: 'workspace', cwd: 'fixture', timestamp: '2026-09-07T00:00:00.000Z', data, ...overrides
 })
 describe('durable agent projection — synthetic events', () => {
+  it('keeps an async Codex question through completion and reload, without reopening an answered card', () => {
+    const interaction = { id: 'codex-async:thread:item', kind: 'question' as const, title: 'Codex asked you', input: { protocol: 'codex-async-question', threadId: 'thread', itemId: 'item' }, choices: [], status: 'pending' as const,
+      questions: [{ id: 'item:0', question: 'Choose', options: [{ label: 'One' }] }, { id: 'item:1', question: 'Why?', options: [], allowCustom: true }] }
+    const facts = [
+      event(1, { type: 'interaction', interaction }, { provider: 'codex', requestId: interaction.id, itemId: 'item' }),
+      event(2, { type: 'session', phase: 'completed' }, { provider: 'codex' }),
+      event(3, { type: 'session', phase: 'disconnected' }, { provider: 'codex' }),
+      event(4, { type: 'interaction', interaction: { ...interaction, status: 'resolved' as const, answers: { Choose: ['One'], 'Why?': ['custom'] } } }, { provider: 'codex', runtimeId: 'runtime-2', requestId: interaction.id }),
+      event(5, { type: 'interaction', interaction }, { provider: 'codex', runtimeId: 'runtime-2', requestId: interaction.id })
+    ]
+    const state = replayAgentEvents('session', facts)
+    expect(state.items).toHaveLength(1)
+    expect(state.items[0]!.data).toMatchObject({ interaction: { status: 'resolved', answers: { Choose: ['One'], 'Why?': ['custom'] } } })
+  })
   it('separates identical item IDs in different turns and native child conversations', () => {
     const facts = [
       event(1, { type: 'text', role: 'assistant', text: 'first', mode: 'snapshot' }, { itemId: 'reused', turnId: 'one', nativeSessionId: 'parent' }),

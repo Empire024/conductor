@@ -435,16 +435,16 @@ function InteractionCard({ item, interactive, onRespond, dockedQuestion, onDockQ
   // question that was actually asked instead of repeating the generic, now-stale "needs your
   // input" prompt, and its body reads as question/answer text instead of a raw request dump.
   const heading = request.kind === 'question' && questions.length ? (questions.length === 1 ? questions[0]!.question : `${questions.length} questions`) : request.title
-  const status = request.kind === 'question' && request.status === 'resolved' ? 'Answered' : request.status === 'resolved' ? interactionOutcome(request.outcome, request.choices) : request.status === 'expired' ? 'Expired' : 'Unavailable'
+  const status = request.kind === 'question' && request.status === 'resolved' ? request.outcome === 'Delivery unconfirmed' ? 'Unconfirmed' : 'Answered' : request.status === 'resolved' ? interactionOutcome(request.outcome, request.choices) : request.status === 'expired' ? 'Expired' : 'Unavailable'
   return <details className="sa-interaction sa-interaction-resolved" aria-label={request.kind + ': ' + request.title}>
     <summary><span>{heading}</span><small>{status}</small></summary>
     <div className="sa-interaction-detail">
-      {request.status === 'expired' && request.outcome && <p>{request.outcome}</p>}
+      {(request.status === 'expired' || request.outcome === 'Delivery unconfirmed') && request.outcome && <p>{request.outcome === 'Delivery unconfirmed' ? 'Answer delivery was not confirmed. Check the conversation before sending it again.' : request.outcome}</p>}
       {request.kind === 'question' && questions.length
         ? <dl className="sa-question-answers">{questions.map((question) => {
           // The provider records answers by question text on the resolved interaction, so a
           // conversation reloaded from history still reads back what was chosen.
-          const recorded = request.answers?.[question.question]
+          const recorded = request.answers?.[question.id] ?? request.answers?.[question.question]
           const chosen = submittedAnswers?.[question.id] ?? (recorded === undefined ? undefined : Array.isArray(recorded) ? recorded : [recorded])
           return <div key={question.id}><dt>{question.question}</dt><dd>{chosen?.length ? chosen.map((value) => readableAnswerValue(value)).join(', ') : 'No recorded answer'}</dd></div>
         })}</dl>

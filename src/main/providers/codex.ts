@@ -56,6 +56,7 @@ type CachedItem = { name: string; status: ActivityStatus; paths?: string[] }
 const record = (value: unknown): value is Record<string, unknown> => Boolean(value && typeof value === 'object' && !Array.isArray(value))
 const json = (value: unknown): Json => JSON.parse(JSON.stringify(value ?? null)) as Json
 const requestKey = (id: string | number): string => `${typeof id}:${id}`
+const asyncQuestionId = (threadId: string, itemId: string): string => `codex-async:${threadId}:${itemId}`
 const textOutput = (value: unknown): string => typeof value === 'string' ? value : JSON.stringify(value, null, 2)
 const isId = (id: unknown): id is string | number => typeof id === 'string' || (typeof id === 'number' && Number.isFinite(id))
 const statusFor = (status: string, complete: boolean): ActivityStatus => status === 'failed' ? 'failed' : status === 'declined' ? 'rejected' : status === 'interrupted' ? 'interrupted' : complete ? 'completed' : status === 'inProgress' ? 'running' : 'preparing'
@@ -875,6 +876,19 @@ export class CodexAdapter implements ProviderAdapter {
         return // Host persists its captured input only after the matching native receipt.
       case 'agentMessage':
         send({ type: 'text', role: 'assistant', text: item.text, mode: 'snapshot' })
+        // request_user_input_async is an agent message with question metadata, not an
+        // item/tool/requestUserInput server request. Its answer is a later user message.
+        if (item.questions?.length && correlation.nativeSessionId === this.threadId) {
+          const id = asyncQuestionId(this.threadId!, item.id)
+          send({ type: 'interaction', interaction: {
+            id, kind: 'question', title: 'Codex asked you', status: 'pending', choices: [],
+            input: { protocol: 'codex-async-question', threadId: this.threadId!, itemId: item.id },
+            questions: item.questions.map((question, index) => ({
+              id: `${item.id}:${index}`, question: question.title,
+              options: (question.options ?? []).map(label => ({ label })), allowCustom: true
+            }))
+          } }, { requestId: id })
+        }
         return
       case 'reasoning':
         item.summary.forEach((summary, index) => send({ type: 'text', role: 'status', text: summary, mode: 'snapshot' }, { itemId: `${item.id}:summary:${index}` }))

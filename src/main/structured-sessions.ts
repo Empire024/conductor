@@ -117,6 +117,29 @@ const queuedText = (prompts: QueuedPrompt[]): string => prompts.length === 1 ? p
   .map(prompt => `${prompt.origin ? `(${prompt.origin.label}) ` : ''}${prompt.text.trim()}`)
   .join('\n\n\n')
 
+/** Queued messages that may travel as one delivery. Every message pending at drain time goes
+ *  together (in order) so the agent receives one combined message instead of one request each;
+ *  queuedText labels each part with its origin. A remote-peer message carries its own dispatch
+ *  authority, so it only joins messages with that identical origin. The batch stops at the per-message
+ *  attachment and length ceilings; the rest goes on the next drain. */
+const queuedBatch = (candidates: QueuedPrompt[]): QueuedPrompt[] => {
+  const key = (prompt: QueuedPrompt): string => prompt.origin?.authority ? JSON.stringify(prompt.origin) : 'local'
+  const batch: QueuedPrompt[] = []
+  for (const prompt of candidates) {
+    if (batch.length && key(prompt) !== key(batch[0]!)) break
+    const candidate = [...batch, prompt]
+    if (batch.length && (candidate.flatMap(item => item.attachments).length > 20 || queuedText(candidate).length > 60_000)) break
+    batch.push(prompt)
+  }
+  return batch
+}
+/** The origin a combined delivery is recorded under: the shared one, or none when the parts came
+ *  from different senders (each part then carries its own label in the text). */
+const batchOrigin = (batch: QueuedPrompt[]): PromptOrigin | undefined => {
+  const first = JSON.stringify(batch[0]?.origin ?? null)
+  return batch.every(prompt => JSON.stringify(prompt.origin ?? null) === first) ? batch.at(-1)?.origin : undefined
+}
+
 const fallbackAfterRefusal = (provider: StructuredProvider, model: string): { model: string; notice: string } | null => {
   if (provider === 'claude' && /fable/i.test(model)) return { model: 'opus[1m]', notice: 'Fable refused this turn; continuing on Opus 5.5' }
   if (provider === 'claude' && /opus/i.test(model)) return { model: 'sonnet', notice: 'Opus 5.5 refused this turn; continuing on Sonnet 5' }
@@ -656,7 +679,7 @@ export class StructuredSessions {
   async steerAccepted(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = [], origin?: PromptOrigin): Promise<void> {
     return this.followup(id, text, settings, attachments, true, undefined, origin, true)
   }
-  private async followup(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[], steer: boolean, queuedPromptId?: string, origin?: PromptOrigin, requireNativeAcceptance = false): Promise<void> {
+  private async followup(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[], steer: boolean, queuedPromptIds?: readonly string[], origin?: PromptOrigin, requireNativeAcceptance = false): Promise<void> {
     const live = this.get(id), adapter = live.adapter, runtimeId = live.runtimeId, turnId = live.turnId
     const captured = structuredClone(attachments)
     settings = structuredClone(settings)
@@ -690,7 +713,7 @@ export class StructuredSessions {
         const acceptance = requireNativeAcceptance ? this.nativeAcceptanceWaiter(live, inputId) : undefined
         // Transfer ownership before the native attempt. An uncertain response must
         // leave only the pending record, never an automatically drainable copy.
-        if (queuedPromptId) this.setQueue(live, (latest.queuedPrompts ?? (latest.queued ? [latest.queued] : [])).filter(input => input.id !== queuedPromptId))
+        if (queuedPromptIds?.length) this.setQueue(live, (latest.queuedPrompts ?? (latest.queued ? [latest.queued] : [])).filter(input => !queuedPromptIds.includes(input.id)))
         let transport: Promise<void>
         try { transport = Promise.resolve(adapter.steer!(text.trim() + context, settings, captured.filter(item => item.kind === 'image'), inputId)) }
         catch (error) { transport = Promise.reject(error) }
@@ -715,18 +738,18 @@ export class StructuredSessions {
           }
           if (!(error instanceof SteeringUnavailableError)) {
             this.reconcileInput(live, { data: { type: 'input_delivery', inputId, status: 'uncertain' } })
-            throw new Error((error instanceof Error ? error.message : String(error)) + (queuedPromptId ? '. Steering was not confirmed; the pending input was retained. Check the conversation before resending.' : '. Steering was not confirmed; your draft was kept. Check the conversation before resending.'))
+            throw new Error((error instanceof Error ? error.message : String(error)) + (queuedPromptIds?.length ? '. Steering was not confirmed; the pending input was retained. Check the conversation before resending.' : '. Steering was not confirmed; your draft was kept. Check the conversation before resending.'))
           }
           // A transferred queue entry has no composer draft to fall back to.
           // Retain a recoverable cancelled record until fallback queueing is safe.
-          if (queuedPromptId) this.reconcileInput(live, { data: { type: 'input_delivery', inputId, status: 'cancelled' } })
+          if (queuedPromptIds?.length) this.reconcileInput(live, { data: { type: 'input_delivery', inputId, status: 'cancelled' } })
           else this.setSteering(live, (this.database.structured.snapshot(id)?.pendingSteering ?? []).filter(input => input.id !== inputId))
           maySteer = false
           refusal = error.message
         } finally { live.steering = false }
         latest = this.database.structured.snapshot(id)!
         if (live.closed || this.live.get(id) !== live || live.handoff || this.cliOwned(id) || live.adapter !== adapter || live.runtimeId !== runtimeId || !['starting', 'running', 'waiting_input', 'waiting_approval', 'completed', 'idle'].includes(latest.phase)) throw new Error('The turn stopped before this message was queued. Your draft was kept.')
-        if (queuedPromptId) refusedInputId = inputId
+        if (queuedPromptIds?.length) refusedInputId = inputId
       }
       if (requireNativeAcceptance) throw new Error(refusal + '. Native acceptance was not confirmed, so the selected tasks were not claimed.')
       const prompts = latest.queuedPrompts ?? (latest.queued ? [latest.queued] : [])
@@ -850,17 +873,11 @@ export class StructuredSessions {
     const queued = (steerable && state.queuedPrompts?.find(input => input.steer)) || state.queued
     const canSteer = queued.steer && steerable
     const allQueued = state.queuedPrompts ?? (state.queued ? [state.queued] : [])
-    const batch: QueuedPrompt[] = canSteer ? [queued] : []
-    if (!canSteer) {
-      const origin = JSON.stringify(queued.origin ?? null)
-      for (const prompt of allQueued) {
-        if (JSON.stringify(prompt.origin ?? null) !== origin) break
-        const candidate = [...batch, prompt]
-        if (candidate.flatMap(item => item.attachments).length > 20 || queuedText(candidate).length > 60_000) break
-        batch.push(prompt)
-      }
-    }
+    // Everything pending now goes as one delivery: one steer for the steerable entries (explicit
+    // after-turn entries keep waiting), otherwise one turn for the whole queue.
+    const batch = queuedBatch(canSteer ? allQueued.filter(input => input.steer) : allQueued)
     const dispatch = batch.length ? batch : [queued]
+    const dispatchOrigin = batchOrigin(dispatch)
     const dispatchIds = new Set(dispatch.map(prompt => prompt.id))
     // A turn that ended in error is as settled as one that completed, and the queued message is
     // usually the continuation that recovers it — a local model fails its whole turn on a single
@@ -875,11 +892,11 @@ export class StructuredSessions {
     live.dispatchingPromptIds = dispatchIds
     let sent = false
     try {
-      if (canSteer) await this.followup(live.spec.id, queued.text, queued.settings, structuredClone(queued.attachments), true, queued.id, queued.origin)
+      const last = dispatch.at(-1)!
+      if (canSteer) await this.followup(live.spec.id, dispatch.length === 1 ? queued.text : queuedText(dispatch), last.settings, structuredClone(dispatch.flatMap(prompt => prompt.attachments)), true, [...dispatchIds], dispatchOrigin)
       else {
         live.sendAfterInterrupt = false
-        const latest = dispatch.at(-1)!
-        await this.submit(live.spec.id, queuedText(dispatch), latest.settings, structuredClone(dispatch.flatMap(prompt => prompt.attachments)), latest.origin)
+        await this.submit(live.spec.id, queuedText(dispatch), last.settings, structuredClone(dispatch.flatMap(prompt => prompt.attachments)), dispatchOrigin)
       }
       const latest = this.database.structured.snapshot(live.spec.id)!
       this.setQueue(live, (latest.queuedPrompts ?? (latest.queued ? [latest.queued] : [])).filter(prompt => !dispatchIds.has(prompt.id)))
@@ -1092,10 +1109,17 @@ export class StructuredSessions {
   async respond(response: InteractionResponse, reviewedAutomatically = false): Promise<void> {
     if (!response || typeof response.requestId !== 'string' || typeof response.runtimeId !== 'string') throw new Error('Invalid response')
     const live = this.get(response.sessionId), state = this.database.structured.snapshot(response.sessionId)!
-    if (!live.adapter || live.runtimeId !== response.runtimeId || state.runtimeId !== response.runtimeId || live.responses.has(response.requestId)) throw new Error('This request is stale or already submitted')
+    if (live.responses.has(response.requestId)) throw new Error('This request is stale or already submitted')
+    const candidate = state.items.find(item => item.data.type === 'interaction' && item.data.interaction.id === response.requestId && item.data.interaction.status === 'pending')
+    const candidateAsync = candidate?.data.type === 'interaction' && (candidate.data.interaction.input as { protocol?: string } | null)?.protocol === 'codex-async-question'
+    if (!candidateAsync && (live.runtimeId !== response.runtimeId || state.runtimeId !== response.runtimeId)) throw new Error('This request is stale or already submitted')
     const item = state.items.find(item => item.runtimeId === response.runtimeId && item.data.type === 'interaction' && item.data.interaction.id === response.requestId && item.data.interaction.status === 'pending')
     if (!item || item.data.type !== 'interaction') throw new Error('Request is no longer pending')
     const interaction = item.data.interaction
+    const asyncQuestion = (interaction.input as { protocol?: string } | null)?.protocol === 'codex-async-question'
+    if (!asyncQuestion && (!live.adapter || live.runtimeId !== response.runtimeId || state.runtimeId !== response.runtimeId)) throw new Error('This request is stale or already submitted')
+    if (asyncQuestion && (live.spec.provider !== 'codex' || interaction.kind !== 'question' || reviewedAutomatically ||
+      (interaction.input as { threadId?: string } | null)?.threadId !== state.nativeSessionId)) throw new Error('This async question is stale')
     if (interaction.kind === 'approval' && !interaction.choices.some(choice => choice.id === response.decision && (!choice.disabled || reviewedAutomatically && interaction.review))) throw new Error('Unsupported approval scope')
     if (interaction.kind === 'question') {
       if (!response.answers || Object.keys(response.answers).some(key => !interaction.questions?.some(question => question.id === key))) throw new Error('Invalid question answers')
@@ -1108,14 +1132,24 @@ export class StructuredSessions {
     }
     const review = interaction.kind === 'approval' ? await this.approvalGate.reserve(response, reviewedAutomatically, Boolean(interaction.review || this.reviewRouting?.enabled(live.spec))) : undefined
     // The asynchronous target/authority recheck must not race another owner response or restart.
-    if (live.runtimeId !== response.runtimeId || live.responses.has(response.requestId)) throw new Error('This request is stale or already submitted')
+    if ((!asyncQuestion && live.runtimeId !== response.runtimeId) || live.responses.has(response.requestId)) throw new Error('This request is stale or already submitted')
     if (reviewedAutomatically && !review) throw new Error('Automatic review response has no live action binding; response is blocked')
     live.responses.add(response.requestId)
+    const answerRecord = asyncQuestion ? Object.fromEntries((interaction.questions ?? []).map(question => [question.id, response.answers![question.id]!])) : undefined
+    if (asyncQuestion) {
+      // The next call may reconnect (which clears live.responses) or accept a native message
+      // before its acknowledgement is lost. Claim the card durably before either can happen.
+      this.emit(live, { requestId: response.requestId, itemId: item.nativeItemId, data: { type: 'interaction', interaction: { ...interaction, status: 'resolved', outcome: 'Delivery unconfirmed', answers: answerRecord } } })
+      this.flush()
+    }
     try {
-      await live.adapter.respond(response)
+      if (asyncQuestion) {
+        const text = (interaction.questions ?? []).map(question => `${question.question}\nAnswer: ${response.answers![question.id]!.join(', ')}`).join('\n\n')
+        await this.steerOrStart(response.sessionId, text, state.settings)
+      } else await live.adapter!.respond(response)
       if (review) this.approvalGate.finish(review, true)
-      const current = this.database.structured.snapshot(response.sessionId)?.items.find(entry => entry.runtimeId === response.runtimeId && entry.data.type === 'interaction' && entry.data.interaction.id === response.requestId)
-      if (current?.data.type === 'interaction' && current.data.interaction.status === 'pending') this.emit(live, { requestId: response.requestId, itemId: item.nativeItemId, data: { type: 'interaction', interaction: { ...interaction, status: 'resolved', outcome: response.decision ?? 'answered' } } })
+      const current = this.database.structured.snapshot(response.sessionId)?.items.find(entry => (!asyncQuestion ? entry.runtimeId === response.runtimeId : true) && entry.data.type === 'interaction' && entry.data.interaction.id === response.requestId)
+      if (current?.data.type === 'interaction' && (asyncQuestion || current.data.interaction.status === 'pending')) this.emit(live, { requestId: response.requestId, itemId: item.nativeItemId, data: { type: 'interaction', interaction: { ...interaction, status: 'resolved', outcome: response.decision ?? 'answered', ...(asyncQuestion ? { answers: answerRecord } : {}) } } })
     } catch (error) {
       if (review) this.approvalGate.finish(review, false)
       if (error instanceof InteractionResponseRejectedError) {
