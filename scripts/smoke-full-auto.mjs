@@ -50,6 +50,8 @@ const settled = (id, initialSequence) => poll(async () => {
   return ended && (providerReplied || ['failed', 'disconnected', 'interrupted'].includes(state?.phase)) ? state : null
 }, { timeoutMs: 420_000, label: `${id} terminal turn phase` })
 const ownerButton = async label => {
+  await call('tabs.focus', { tabId: worker.id })
+  await workerPane().waitFor({ state: 'visible' })
   const detail = workerPane().locator('.sa-full-auto-details')
   if (!await detail.evaluate(element => element.open)) await detail.locator('summary').click()
   await detail.getByRole('button', { name: label, exact: true }).click()
@@ -177,6 +179,8 @@ try {
     : 'The provider did not expose a completed MCP control refusal; policy stayed false, but native MCP boundary proof is unavailable')
 
   step('synthetic DOM replay cannot activate the owner control')
+  await call('tabs.focus', { tabId: worker.id })
+  await workerPane().waitFor({ state: 'visible' })
   await view.evaluate(() => {
     const detail = document.querySelector('.structured-agent-pane .sa-full-auto-details')
     if (detail) detail.open = true
