@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs'
+import { providerEnvironment } from './provider-environment'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { BrowserWindow } from 'electron'
@@ -688,7 +689,7 @@ export class AgentManager {
         rows: 34,
         cwd: spec.cwd,
         useConptyDll: globalThis.process.platform === 'win32',
-        env: { ...globalThis.process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' } as Record<
+        env: { ...providerEnvironment(globalThis.process.env), TERM: 'xterm-256color', COLORTERM: 'truecolor' } as Record<
           string,
           string
         >

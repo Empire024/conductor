@@ -338,14 +338,24 @@ test('registerRelaunch accepts the app this profile\'s credential names, proven 
 
 test('packaged app-initiated relaunch uses exact executable, profile receipt and version without a build argument', async () => {
   const executable = join(REPO, 'package.json'), hash = createHash('sha256').update(readFileSync(executable)).digest('hex')
+  const rootDir = mkdtempSync(join(realpathSync(tmpdir()), 'conductor-packaged-acceptance-'))
+  const profile = join(rootDir, 'profile'); mkdirSync(profile)
   const inst = relaunchInst()
-  Object.assign(inst, { executable, executableSha256: hash, expectedPackagedVersion: '1.2.3' })
+  const version = '1.2.3'
+  Object.assign(inst, { root: rootDir, profile, executable, executableSha256: hash, expectedPackagedVersion: version,
+    env: { CONDUCTOR_PACKAGED_ACCEPTANCE: '1', CONDUCTOR_TEST_USER_DATA: profile, CONDUCTOR_PROJECTS_ROOT: join(rootDir, 'projects'), CONDUCTOR_PACKAGED_ACCEPTANCE_EXE: executable, CONDUCTOR_PACKAGED_ACCEPTANCE_SHA256: hash, CONDUCTOR_PACKAGED_ACCEPTANCE_VERSION: version } })
   inst.roots[0].executable = executable
   const entry = relaunchedApp({ executable, commandLine: `"${executable}" --remote-debugging-port=1` })
-  await assert.rejects(registerRelaunch(inst, 800, { list: [entry], credential: proofFor({ packaged: true, appVersion: '1.2.2' }) }), /version/)
-  assert.equal(inst.roots.length, 1)
-  await registerRelaunch(inst, 800, { list: [entry], credential: proofFor({ packaged: true, appVersion: '1.2.3' }) })
-  assert.ok(inst.roots.some(item => item.pid === 800))
+  const proof = proofFor({ path: join(profile, 'control-owner.json'), packaged: true, appVersion: version })
+  try {
+    await assert.rejects(registerRelaunch(inst, 800, { list: [entry], credential: { ...proof, appVersion: '1.2.2' } }), /version/)
+    delete inst.env.CONDUCTOR_PACKAGED_ACCEPTANCE
+    await assert.rejects(registerRelaunch(inst, 800, { list: [entry], credential: proof }), /pinned/)
+    assert.equal(inst.roots.length, 1)
+    inst.env.CONDUCTOR_PACKAGED_ACCEPTANCE = '1'
+    await registerRelaunch(inst, 800, { list: [entry], credential: proof })
+    assert.ok(inst.roots.some(item => item.pid === 800))
+  } finally { rmSync(rootDir, { recursive: true, force: true }) }
 })
 
 for (const [name, entry, credential, message] of [

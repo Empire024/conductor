@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createUpdateInstallSeam, INSTALLER_STUB_FILE, INSTALLER_STUB_HISTORY, testInstallProfile } from './update-install-seam'
+import { createUpdateInstallSeam, INSTALLER_STUB_FILE, INSTALLER_STUB_HISTORY, packagedRelaunchGuard, testInstallProfile } from './update-install-seam'
 
 /** Mirrors electron-updater's BaseUpdater: quitAndInstall and the quit handler both go through
  *  install(), which ends in doInstall(), the method that spawns the NSIS installer. */
@@ -28,6 +28,24 @@ const request = { version: '0.1.60-local.5', installerPath: 'C:\\cache\\Conducto
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
 
 describe('update install seam', () => {
+  it('refuses app-initiated packaged relaunch before a lost opt-in, changed profile, or replaced executable can launch', () => {
+    const root = mkdtempSync(join(realpathSync(tmpdir()), 'conductor-packaged-acceptance-')); roots.push(root)
+    const userData = join(root, 'profile'); mkdirSync(userData)
+    const executable = join(root, 'app.exe'); writeFileSync(executable, 'fixture executable')
+    const env: NodeJS.ProcessEnv = { CONDUCTOR_PACKAGED_ACCEPTANCE: '1', CONDUCTOR_TEST_USER_DATA: userData, CONDUCTOR_PROJECTS_ROOT: root }
+    const guard = packagedRelaunchGuard({ isPackaged: true, env, executable })
+    expect(() => guard()).not.toThrow()
+    for (const key of ['CONDUCTOR_PACKAGED_ACCEPTANCE', 'CONDUCTOR_TEST_USER_DATA', 'CONDUCTOR_PROJECTS_ROOT']) {
+      const saved = env[key]; delete env[key]
+      expect(() => guard()).toThrow(/isolation changed/)
+      env[key] = saved
+    }
+    expect(() => guard()).not.toThrow()
+    writeFileSync(executable, 'replaced executable')
+    expect(() => guard()).toThrow(/executable changed/)
+    expect(() => packagedRelaunchGuard({ isPackaged: true, env: {}, executable: 'unused' })()).not.toThrow()
+  })
+
   it('isolates explicit packaged acceptance and blocks every real installer entry point', () => {
     const root = mkdtempSync(join(realpathSync(tmpdir()), 'conductor-packaged-acceptance-')); roots.push(root)
     const userData = join(root, 'profile'); mkdirSync(userData)

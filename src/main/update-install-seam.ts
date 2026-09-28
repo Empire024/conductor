@@ -1,4 +1,5 @@
 import { appendFileSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 
@@ -45,6 +46,26 @@ export function testInstallProfile(options: { isPackaged: boolean; env?: NodeJS.
     return canonical
   }
   return directory ? resolve(directory) : null
+}
+
+/** Capture launch identity once. A packaged fixture must fail before relaunching if its
+ * inherited isolation controls or executable change, including while restart checkpoints await. */
+export function packagedRelaunchGuard(options: { isPackaged: boolean; env?: NodeJS.ProcessEnv; executable?: string }): () => void {
+  const env = options.env ?? process.env
+  if (!options.isPackaged || env.CONDUCTOR_PACKAGED_ACCEPTANCE !== '1') return () => {}
+  const profile = testInstallProfile(options)
+  const keys = ['CONDUCTOR_PACKAGED_ACCEPTANCE', 'CONDUCTOR_TEST_USER_DATA', 'CONDUCTOR_PROJECTS_ROOT',
+    'CONDUCTOR_PACKAGED_ACCEPTANCE_EXE', 'CONDUCTOR_PACKAGED_ACCEPTANCE_SHA256', 'CONDUCTOR_PACKAGED_ACCEPTANCE_VERSION'] as const
+  const pinned = keys.map(key => env[key])
+  const executable = options.executable ?? process.execPath
+  const digest = (): string => createHash('sha256').update(readFileSync(executable)).digest('hex')
+  const expectedDigest = digest()
+  return () => {
+    if (keys.some((key, index) => env[key] !== pinned[index]) || testInstallProfile(options) !== profile) {
+      throw new Error('Packaged acceptance relaunch refused: launch isolation changed')
+    }
+    if (digest() !== expectedDigest) throw new Error('Packaged acceptance relaunch refused: executable changed')
+  }
 }
 
 export interface UpdateInstallSeam {

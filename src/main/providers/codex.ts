@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { providerEnvironment } from '../provider-environment'
 import { execFile } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { SteeringUnavailableError, type AdapterOptions, type ProviderAdapter, type RuntimeDetachment } from './adapter'
@@ -416,7 +417,7 @@ export class CodexAdapter implements ProviderAdapter {
     this.unattended = codexPreset(this.options.settings).unattended
     try {
       const version = await (this.dependencies.version?.() ?? new Promise<string>((resolve, reject) => {
-        execFile(this.options.executable, ['--version'], { cwd: this.options.cwd, env: this.options.environment ?? process.env, windowsHide: true, timeout: 10_000, maxBuffer: 4096 }, (error, stdout) => error ? reject(error) : resolve(stdout.trim()))
+        execFile(this.options.executable, ['--version'], { cwd: this.options.cwd, env: providerEnvironment(this.options.environment ?? process.env), windowsHide: true, timeout: 10_000, maxBuffer: 4096 }, (error, stdout) => error ? reject(error) : resolve(stdout.trim()))
       }))
       this.capabilities.runtimeVersion = version.replace(/^codex-cli\s+/, '')
       if (!/^0\.155\./.test(this.capabilities.runtimeVersion)) throw new Error(`Codex ${this.capabilities.runtimeVersion} is outside the tested 0.155.x protocol baseline; regenerate and verify the adapter before connecting`)

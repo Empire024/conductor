@@ -128,7 +128,7 @@ import { registerAgentCollaborationIpc } from './agent-collaboration-ipc'
 import { ProjectPreviewServer } from './project-preview'
 import { invalidateProjectFiles, searchProjectFiles, type FileSearchResult } from './project-file-search'
 import { UpdateManager } from './update-manager'
-import { testInstallProfile } from './update-install-seam'
+import { packagedRelaunchGuard, testInstallProfile } from './update-install-seam'
 import { LocalUpdateBuilder } from './local-update-build'
 import { localEndpointOverride, localModelAvailability, localTurnsInFlight, onLocalTurnStart, releaseVerdict, setLocalEndpointOverride, slotsProcessing } from './providers/local'
 import { DeliveryService } from './delivery'
@@ -280,6 +280,7 @@ const RESTORE_WINDOWS_AFTER_UPDATE_KEY = 'restoreWindowsAfterUpdate'
 app.setName('Conductor')
 // Isolated automation profile is chosen before the single-instance lock.
 const automationProfile = testInstallProfile({ isPackaged: app.isPackaged })
+const assertRelaunchIsolation = packagedRelaunchGuard({ isPackaged: app.isPackaged })
 if (automationProfile) app.setPath('userData', automationProfile)
 if (app.isPackaged) delete process.env.CONDUCTOR_OFFLINE_TESTS
 /** An automation profile (CONDUCTOR_TEST_USER_DATA). Gates the watchdog below, the dialog guard in
@@ -1018,10 +1019,12 @@ const keepRunningInBackground = async (): Promise<void> => {
 
 /** Restart Conductor the way app.restart does; a downloaded update installs on the way out. */
 const relaunchConductor = async (force: boolean, initiator?: Omit<RestartInitiator, 'at'>): Promise<void> => {
+  assertRelaunchIsolation()
   // A downloaded update installs and relaunches by itself; relaunching as well would start
   // Conductor twice.
   if (updates.getState().phase === 'ready') { await updates.install({ force }, initiator); return }
   await prepareForUpdateInstall(force, initiator)
+  assertRelaunchIsolation()
   // Test profiles only (scripts/smoke-recovery-mode.mjs): the relaunch that failed on 2026-09-25.
   if (app.isPackaged || process.env.CONDUCTOR_RECOVERY_TEST_SKIP_RELAUNCH !== '1') app.relaunch()
   app.quit()

@@ -802,6 +802,7 @@ export function readCredentialProof(inst) {
  * Anything less stays unregistered, is reported by the thrown error, and is never killed.
  */
 export async function registerRelaunch(inst, pid, { list, credential } = {}) {
+  assertPackagedEnvironment(inst)
   const proof = credential ?? readCredentialProof(inst)
   const snapshot = list ?? (await listProcesses()).list
   const entry = snapshot.find(candidate => candidate.pid === pid)

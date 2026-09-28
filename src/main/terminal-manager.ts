@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs'
+import { providerEnvironment } from './provider-environment'
 import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { BrowserWindow } from 'electron'
@@ -302,7 +303,7 @@ export class TerminalManager {
         rows,
         cwd: spec.cwd,
         useConptyDll: globalThis.process.platform === 'win32',
-        env: { ...globalThis.process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' } as Record<
+        env: { ...providerEnvironment(globalThis.process.env), TERM: 'xterm-256color', COLORTERM: 'truecolor' } as Record<
           string,
           string
         >

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { providerEnvironment } from '../provider-environment'
 import { execFile } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, relative, resolve } from 'node:path'
@@ -268,7 +269,7 @@ export class GrokAdapter implements ProviderAdapter {
     this.emit({ data: { type: 'session', phase: 'starting' } })
     this.policy = grokApprovalPolicy(this.options.settings, this.options.approvalReviewer)
     try {
-      const environment = { ...(this.options.environment ?? process.env), GROK_DISABLE_AUTOUPDATER: '1' }
+      const environment = { ...providerEnvironment(this.options.environment ?? process.env), GROK_DISABLE_AUTOUPDATER: '1' }
       const version = await (this.dependencies.version?.() ?? new Promise<string>((resolve, reject) => {
         execFile(this.options.executable, ['--version'], { cwd: this.options.cwd, env: environment, windowsHide: true, timeout: 15_000, maxBuffer: 4096 }, (error, stdout) => error ? reject(error) : resolve(stdout.trim()))
       }))
