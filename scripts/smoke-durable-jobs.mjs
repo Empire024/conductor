@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
 import { stopDurableSmokeServer } from './lib/stop-durable-smoke-server.mjs'
+import { safeClose } from './verify-kit.mjs'
 
 // End-to-end check of durable local-model jobs in the built app (docs/durable-jobs.md). The app
 // runs parked off-screen under CONDUCTOR_TEST_USER_DATA, is driven as the owner through
@@ -109,7 +110,7 @@ git('init', '-q', '-b', 'main'); git('-c', 'user.email=smoke@example.invalid', '
 
 /** Electron processes (main, GPU, renderer, utility) still running on this run's profile. */
 const profileProcesses = () => {
-  const list = execFileSync('powershell', ['-NoProfile', '-Command', `Get-CimInstance Win32_Process -Filter "name='electron.exe'" | ForEach-Object { "$($_.ProcessId)\`t$($_.CommandLine)" }`], { encoding: 'utf8' })
+  const list = execFileSync('powershell', ['-NoProfile', '-Command', `Get-CimInstance Win32_Process -Filter "name='electron.exe'" | ForEach-Object { "$($_.ProcessId)\`t$($_.CommandLine)" }`], { encoding: 'utf8', timeout: 10_000 })
   return list.split(/\r?\n/).filter(line => line.toLowerCase().includes(root.toLowerCase())).map(line => Number(line.split('\t')[0]))
 }
 
@@ -169,21 +170,37 @@ const env = { ...process.env, CONDUCTOR_TEST_USER_DATA: profile, CONDUCTOR_PROJE
   ...(stubEndpoint ? { CONDUCTOR_DURABLE_JOBS_MODEL_ENDPOINT: stubEndpoint } : {}) }
 delete env.ELECTRON_RUN_AS_NODE; delete env.CONDUCTOR_LIVE_TESTS; delete env.CONDUCTOR_OFFLINE_TESTS; delete env.CONDUCTOR_BACKGROUND_WINDOWS
 
-let app, page
+let app, page, owner, projectId, instance
+const credential = async expectedPid => {
+  const path = join(profile, 'control-owner.json')
+  await expect.poll(async () => {
+    try { return JSON.parse(await readFile(path, 'utf8')).pid } catch { return null }
+  }, { timeout: 30_000 }).toBe(expectedPid)
+  return JSON.parse(await readFile(path, 'utf8'))
+}
 const launch = async label => {
   app = await electron.launch({ args: [resolve('out/main/index.js')], env, timeout: 60_000 })
+  const launcherPid = app.process().pid
+  instance = { app, profile, pids: new Set([launcherPid]), closed: false }
+  const mainPid = await app.evaluate(() => process.pid)
+  instance.pids.add(mainPid)
+  owner = await credential(mainPid)
+  assert.equal(owner.pid, mainPid, 'parked owner credential does not name Electron main')
   page = await app.firstWindow()
   page.setDefaultTimeout(20_000)
   page.on('pageerror', error => { if (error.message !== 'Canceled') observe('page error', { message: error.message }) })
   await page.waitForFunction(() => Boolean(window.conductor?.durableJobs))
-  observe(label, { pid: app.process().pid })
+  observe(label, { launcherPid, mainPid })
 }
-const credential = async () => {
-  const path = join(profile, 'control-owner.json')
-  await expect.poll(() => existsSync(path), { timeout: 30_000 }).toBe(true)
-  return JSON.parse(await readFile(path, 'utf8'))
+const closeApp = async label => {
+  if (!instance) return null
+  const closed = await safeClose(instance)
+  observe(label, { cleanup: closed })
+  assert.deepEqual(closed.leftovers, [], `${label}: parked process tree survived cleanup`)
+  await expect.poll(() => profileProcesses().length, { timeout: 10_000 }).toBe(0)
+  instance = null
+  return closed
 }
-let owner, projectId
 const call = async (method, args = {}, { expectError = false } = {}) => {
   const response = await fetch(owner.endpoint, { method: 'POST', headers: { Authorization: 'Bearer ' + owner.token, 'Content-Type': 'application/json' }, body: JSON.stringify({ method, args, ...(projectId ? { scope: { projectId } } : {}) }) })
   const body = await response.json()
@@ -210,11 +227,10 @@ const jobTabIn = async () => page.evaluate(async id => {
 }, projectId)
 
 const STAGE_TIMEOUT = Number(process.env.DURABLE_SMOKE_STAGE_TIMEOUT_MS ?? (realModel ? 20 * 60_000 : 90_000))
-const watchdog = setTimeout(() => { observe('watchdog: giving up'); console.log(JSON.stringify({ root, observations }, null, 2)); process.exit(1) }, Number(process.env.DURABLE_SMOKE_TIMEOUT_MS ?? (realModel ? 90 : 10) * 60_000))
+const watchdog = setTimeout(() => { observe('watchdog: giving up'); process.stdout.write(JSON.stringify({ root, observations }, null, 2) + '\n', () => process.exit(1)) }, Number(process.env.DURABLE_SMOKE_TIMEOUT_MS ?? (realModel ? 90 : 10) * 60_000))
 let failed = null
 try {
   await launch('app launched (parked)')
-  owner = await credential()
   const opened = await call('projects.open', { path: projectPath, name: 'Durable job smoke' })
   projectId = opened.id
   await page.reload()
@@ -251,11 +267,9 @@ try {
     await waitFor(second.id, s => s.status === 'completed', 'second job completed while the first stays blocked', STAGE_TIMEOUT)
     assert.equal((await status(gated.id)).status, 'blocked', 'the blocked job moved while the second ran')
 
-    await Promise.race([app.close().catch(() => {}), new Promise(done => setTimeout(done, 20_000))])
-    try { app.process().kill() } catch { /* exited */ }
+    await closeApp('approval restart cleanup')
     observe('app closed with the approval job blocked')
     await launch('app relaunched on the same profile')
-    owner = await credential()
     const relaunched = await status(gated.id)
     assert.equal(relaunched.status, 'blocked', 'the approval block did not survive the restart')
     assert.equal(relaunched.statusReason, blocked.statusReason, 'the approval reason changed across the restart')
@@ -294,7 +308,6 @@ try {
     await kill('app killed while the stage ran run_command')
 
     await launch('app relaunched (1st restart)')
-    owner = await credential()
     // Reconciliation runs a few seconds after launch; an owner command in that window must not bypass it.
     const early = await call('jobs.pause', { jobId: job.id, reason: 'Smoke early pause' }, { expectError: true })
     observe('owner pause right after relaunch refused', { error: String(early).slice(0, 200) })
@@ -307,7 +320,6 @@ try {
 
     await kill('app killed with the job blocked and its stage still running')
     await launch('app relaunched (2nd restart)')
-    owner = await credential()
     await new Promise(done => setTimeout(done, 8_000))
     const still = await status(job.id)
     assert.equal(still.status, 'blocked', 'the blocked job moved across the second restart')
@@ -441,9 +453,9 @@ try {
   if (flag('kill-server')) {
     await waitFor(job.id, s => s.status === 'running' && Boolean(s.currentStage), 'stage running before kill', STAGE_TIMEOUT)
     const stopped = await stopDurableSmokeServer({
-      call, model, appPid: app.process().pid,
+      call, model, appPid: owner.pid,
       parentPidOf: pid => {
-        const result = execFileSync('powershell', ['-NoProfile', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").ParentProcessId`], { encoding: 'utf8' }).trim()
+        const result = execFileSync('powershell', ['-NoProfile', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").ParentProcessId`], { encoding: 'utf8', timeout: 10_000 }).trim()
         return /^\d+$/.test(result) ? Number(result) : null
       }
     })
@@ -455,11 +467,9 @@ try {
   // --- Optional: restart the app mid-job -------------------------------------------------------
   if (flag('restart-app')) {
     const before = await status(job.id)
-    await Promise.race([app.close().catch(() => {}), new Promise(done => setTimeout(done, 20_000))])
-    try { app.process().kill() } catch { /* exited */ }
+    await closeApp('mid-job restart cleanup')
     observe('app closed mid-job', { status: before.status, stage: before.currentStage?.title })
     await launch('app relaunched on the same profile')
-    owner = await credential()
     const after = await status(job.id)
     assert.equal(after.id, job.id)
     observe('job after relaunch', { status: after.status, recoveries: after.counters.recoveries, lastEvent: after.lastEvent })
@@ -533,10 +543,9 @@ try {
   }
 } finally {
   clearTimeout(watchdog)
-  await Promise.race([app?.close().catch(() => {}), new Promise(done => setTimeout(done, 20_000))])
-  try { app?.process().kill() } catch { /* exited */ }
+  try { await closeApp('final cleanup') } catch (error) { failed ??= error; observe('FAILED cleanup', { message: String(error?.message ?? error).slice(0, 800) }) }
   stub?.close()
 }
-console.log(JSON.stringify({ mode: realModel ? 'real-model' : 'stub', model, root: flag('keep') || failed ? root : '(removed)', stubRequests: stubRequests.length, observations }, null, 2))
 if (!flag('keep') && !failed) await import('node:fs/promises').then(fs => fs.rm(root, { recursive: true, force: true, maxRetries: 5 })).catch(() => {})
-if (failed) process.exit(1)
+await new Promise(done => process.stdout.write(JSON.stringify({ mode: realModel ? 'real-model' : 'stub', model, root: flag('keep') || failed ? root : '(removed)', stubRequests: stubRequests.length, observations }, null, 2) + '\n', done))
+process.exit(failed ? 1 : 0)

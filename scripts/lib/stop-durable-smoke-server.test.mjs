@@ -24,6 +24,17 @@ test('stops the exact owned PID and leaves an unrelated PID alone', async () => 
   assert.deepEqual(args.calls.filter(entry => entry.method === 'local.stop'), [{ method: 'local.stop', args: { pid: 220, force: true } }])
 })
 
+test('a launcher shim PID is refused; the Electron main PID accepts its direct server child', async () => {
+  const shim = fixture()
+  shim.appPid = 90 // cmd.exe launcher; Electron main is 100.
+  shim.parentPidOf = async pid => pid === 220 ? 100 : null
+  await assert.rejects(stopDurableSmokeServer(shim), /not started by the parked app/)
+  assert.equal(shim.calls.some(entry => entry.method === 'local.stop'), false)
+  const main = fixture()
+  main.parentPidOf = shim.parentPidOf
+  assert.deepEqual(await stopDurableSmokeServer(main), { pid: 220, model })
+})
+
 for (const [name, before, parent] of [
   ['missing', [foreign], 100],
   ['ambiguous', [owned, { ...owned, pid: 221 }], 100],
