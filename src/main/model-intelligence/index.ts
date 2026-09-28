@@ -6,12 +6,16 @@ import {
 import { makeId } from '../../shared/models'
 import type { SessionPhase, TimelineItem } from '../../shared/structured-agent'
 import type { DurableJob } from '../../shared/durable-jobs'
+import { localStopOf, type LocalStopReport } from '../../shared/local-stop'
+import type { LocalTelemetryEntry } from '../local-models/agent'
 import { usageWindowAppliesToModel, type AccountLimitWindow, type UsageWindow } from '../../shared/usage-accounting'
 import type { LocalModelRunner } from '../local-assist/contract'
 import type { StageResultInput } from '../durable-jobs/ports'
 import { createApprovalShadow, type ApprovalShadowService } from './approval-shadow'
 import { captureDurableStage } from './capture/durable-job'
+import { captureLocalAgentStop } from './capture/local-agent'
 import { captureTurn } from './capture/turn'
+import { categorize } from './categorize'
 import { DecisionService, type ThresholdSettings } from './decision-service'
 import { createFrontierDecider, type FrontierPort } from './deciders/frontier'
 import { createLocalLlmDecider } from './deciders/local-llm'
@@ -43,6 +47,8 @@ export const EVALUATION_OVERHEAD_SETTING = 'model-intelligence:evaluation-overhe
 const STARTUP_SOURCES: IngestionSourceName[] = ['configured', 'runtime']
 const DAILY_SOURCES: IngestionSourceName[] = ['configured', 'runtime', 'openrouter', 'latest-models', 'benchmarks']
 const SETTLED: ReadonlySet<SessionPhase> = new Set(['completed', 'failed', 'interrupted'])
+/** The prompt origin durable-jobs/structured-runtime.ts gives a stage; stageSettled captures those turns. */
+const DURABLE_JOB_ORIGIN = 'durable-job'
 export const CALLER_DECIDER_ID = 'caller'
 export const LOCAL_DECIDER_UNAVAILABLE = 'local decider unavailable: no local model server is running'
 
@@ -67,8 +73,13 @@ export const DEFAULT_WEEKLY_STOP: Readonly<Record<string, number>> = { claude: 8
 export const ROUTING_FALLBACK_STOP = 95
 export const DEFAULT_EVALUATION_CAPS: EvaluationCaps = { perRunTokens: 60_000, perDayEvaluations: 3, perDayTokens: 150_000, minRunTokens: DEFAULT_FIXED_OVERHEAD_TOKENS + 5_000, weeklyStop: { ...DEFAULT_WEEKLY_STOP } }
 /** The learned fixed overhead of a cloud turn is kept within [OVERHEAD_MIN_TOKENS, the per-run cap less the
- *  suite's smallest one-shot job], so a learned value can never leave a full run unable to hold one job (N14). */
+ *  suite's smallest one-shot job], so batching always has room for one job (N14); admission decides on the raw measurement (N19). */
 export const OVERHEAD_MIN_TOKENS = 5_000
+/** How long a raw overhead measurement decides admission (N19). The native preamble (the CLI's system prompt
+ *  and tools, Conductor's MCP tools, the project context) changes with a CLI or Conductor update, not between
+ *  runs, so within this window a run the measurement says cannot hold a job is refused instead of cut off;
+ *  after it, one run is admitted on the banded value and measures the preamble again. */
+export const OVERHEAD_TRUST_MS = DAILY_MS
 /** What the smallest job a cloud run can grade adds to its batched turn (command-graded jobs are not
  *  gradable in the cloud); null when the suite has none. */
 export function smallestCloudJob(jobs: EvaluationJob[]): number | null {
@@ -314,11 +325,18 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
   }
   /** Each provider's last measured fixed overhead of a cloud evaluation turn (N9): what a native turn
    *  reads before the job itself. Kept in settings so it survives a restart; DEFAULT_FIXED_OVERHEAD_TOKENS until measured. */
-  const overheads = (): Record<string, { tokens: number; at: string }> => {
+  const overheads = (): Record<string, { tokens: number; measured?: number; at: string }> => {
     try {
       const stored: unknown = JSON.parse(options.settings.getSetting(EVALUATION_OVERHEAD_SETTING) ?? '{}')
-      return stored && typeof stored === 'object' && !Array.isArray(stored) ? stored as Record<string, { tokens: number; at: string }> : {}
+      return stored && typeof stored === 'object' && !Array.isArray(stored) ? stored as Record<string, { tokens: number; measured?: number; at: string }> : {}
     } catch { return {} }
+  }
+  /** The raw measurement while it is recent (OVERHEAD_TRUST_MS): what admission charges (N19). An entry
+   *  without `measured` predates first-call measuring and may be a multi-call sum, so it never counts. */
+  const recentMeasured = (provider: string): { tokens: number; at: string; until: string } | null => {
+    const entry = overheads()[provider], measured = entry?.measured, at = Date.parse(typeof entry?.at === 'string' ? entry.at : '')
+    if (typeof measured !== 'number' || !Number.isFinite(measured) || measured < 0 || !Number.isFinite(at) || clock().getTime() - at >= OVERHEAD_TRUST_MS) return null
+    return { tokens: Math.round(measured), at: entry!.at, until: new Date(at + OVERHEAD_TRUST_MS).toISOString() }
   }
   /** The band a learned overhead is kept in: at least OVERHEAD_MIN_TOKENS, and small enough that a full
    *  run still holds the smallest job (`smallestJob`, 0 when unknown). */
@@ -415,6 +433,8 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
         const items = projection()?.items ?? []
         const turnId = event.turnId ?? [...items].reverse().find(item => item.turnId && (!event.runtimeId || item.runtimeId === event.runtimeId))?.turnId
         if (!turnId) return null
+        // A local turn that reported its stop is captured from that report (localTurnStopped), once.
+        if (items.some(item => item.turnId === turnId && localStopOf(item.data))) return null
         return recordOutcome(captureTurn({
           agentSessionId: event.agentSessionId, projectId: binding.projectId, turnId, ...(event.runtimeId ? { runtimeId: event.runtimeId } : {}), phase: event.phase, items,
           provider: binding.key.provider, model: binding.key.model, effort: binding.effort, features: binding.features, decisionId: binding.decisionId, ...(event.limited ? { limited: true } : {})
@@ -429,6 +449,33 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
         if (countersBefore.size > 1_000) countersBefore.delete(countersBefore.keys().next().value!)
         return recordOutcome(captureDurableStage({ job: input.job, stage: input.stage, observation: input.observation, succeeded: input.succeeded, ...(before ? { countersBefore: before } : {}) }))
       } catch (error) { log('durable stage not captured', error); return null }
+    },
+    /** A local agent turn stopped (the local adapter's stop notice, LocalStopReport): its outcome from the
+     *  report and the turn's failed tool-grammar repairs, read from the projection already in memory. A
+     *  dispatched turn keeps its binding's decision and category; any other counts only with a category
+     *  signal, as captureTurn does. Durable-job stages are left to stageSettled. */
+    localTurnStopped(event: { agentSessionId: string; turnId: string; runtimeId?: string; projectId?: string; report: LocalStopReport }, projection: () => { items: TimelineItem[]; settings?: { model?: string } } | null | undefined): ExecutionOutcome | null {
+      try {
+        const binding = service.binding(event.agentSessionId), state = projection()
+        const model = binding ? (binding.key.provider === 'local' ? binding.key.model : undefined) : state?.settings?.model
+        if (!model) return null
+        const items = state?.items ?? [], own = items.filter(item => item.turnId === event.turnId && (!event.runtimeId || item.runtimeId === event.runtimeId) && !item.parentId)
+        // The prompt is the turn's own user item, else the last one before the turn (as captureTurn reads it).
+        const userText = (item: TimelineItem) => item.data.type === 'text' && item.data.role === 'user' ? [item.data] : []
+        const first = Math.min(...own.map(item => item.sequence))
+        const user = own.flatMap(userText)[0] ?? items.filter(item => !item.parentId && item.sequence < first).flatMap(userText).at(-1)
+        if (user?.origin?.agentSessionId === DURABLE_JOB_ORIGIN) return null
+        const features = binding?.features ?? categorize({ prompt: user?.text ?? '', tools: own.flatMap(item => item.data.type === 'tool' ? [item.data.name] : []) })
+        if (!binding && features.category === 'general') return null
+        const repairs = own.flatMap((item): LocalTelemetryEntry[] => {
+          const entry = item.data.type === 'notice' && item.data.payload && typeof item.data.payload === 'object' && !Array.isArray(item.data.payload) ? item.data.payload.localTelemetry as { kind?: unknown } | undefined : undefined
+          return entry?.kind === 'repair' ? [entry as LocalTelemetryEntry] : []
+        })
+        return recordOutcome(captureLocalAgentStop({
+          telemetry: [...repairs, { kind: 'stop', report: event.report }], model, ref: `${event.agentSessionId}:${event.turnId}`, agentSessionId: event.agentSessionId,
+          projectId: binding?.projectId ?? event.projectId ?? null, decisionId: binding?.decisionId ?? null, features, ...(user ? { prompt: user.text } : {}), at: clock().toISOString()
+        }))
+      } catch (error) { log('local stop not captured', error); return null }
     },
 
     /** models.list: registry facts and the best-evidenced reputation dimensions of one catalog entry. */
@@ -487,10 +534,18 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
         const remaining = caps.perDayTokens - spent.tokens - reserved, runCap = Math.min(caps.perRunTokens, remaining), floor = Math.min(caps.minRunTokens, caps.perRunTokens)
         if (runCap < floor) throw new Error(`Cloud evaluations used ${spent.tokens} tokens in the last 24 h${reserved ? ` and ${reserved} more are reserved by a run in progress` : ''}; ${Math.max(0, remaining)} of the daily ${caps.perDayTokens} are left, below the ${floor} a run needs`)
         // A cloud run is one batched turn: it must hold the turn's fixed overhead and at least one job, or it is
-        // refused here, before it counts as one of the day's runs (N14). The overhead is bounded, so a full run always fits.
+        // refused here, before it counts as one of the day's runs (N14). A recent raw measurement is charged as
+        // measured, so a cap below the real preamble refuses instead of starting a turn sure to be cut off (N19).
         if (smallestJob === null) throw new Error(`No job of ${suite.name} can be graded in a cloud run: every one needs a command runner`)
-        const overhead = fixedOverheadTokens(target.provider, smallestJob)
-        if (overhead + smallestJob > runCap) throw new Error(`A ${runCap}-token run cannot hold a ${target.provider} turn's ${overhead} fixed tokens plus the smallest job's ${smallestJob}${runCap < caps.perRunTokens ? `; the day has ${Math.max(0, remaining)} of its ${caps.perDayTokens} left` : ''}; no run was counted`)
+        const banded = fixedOverheadTokens(target.provider, smallestJob), measured = recentMeasured(target.provider)
+        const fromMeasurement = measured !== null && measured.tokens > banded, overhead = fromMeasurement ? measured.tokens : banded, needed = overhead + smallestJob
+        if (needed > runCap) {
+          const why = [
+            ...(runCap < caps.perRunTokens ? [`the day has ${Math.max(0, remaining)} of its ${caps.perDayTokens} left`] : []),
+            ...(needed > caps.perRunTokens ? [`raise perRunTokens in ${EVALUATION_CAPS_SETTING} to at least ${needed}${fromMeasurement ? `, or from ${measured.until} one run measures it again` : ''}`] : [])
+          ]
+          throw new Error(`A ${runCap}-token run cannot hold a ${target.provider} turn's ${overhead} fixed tokens${fromMeasurement ? ` (measured ${measured.at})` : ''} plus the smallest job's ${smallestJob}${why.map(reason => `; ${reason}`).join('')}; no run was counted`)
+        }
         maxTokens = runCap
       }
       const notGradable = command ? [] : suite.jobs.filter(job => job.grader.kind === 'command').map(job => `${job.id} (command: not gradable here)`)

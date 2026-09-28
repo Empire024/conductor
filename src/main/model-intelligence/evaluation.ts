@@ -288,14 +288,16 @@ export function splitBatchAnswer(answer: string, ids: string[]): Record<string, 
     return known.has(raw) ? raw : known.has(trimmed) ? trimmed : undefined
   }
   const matches = [...visible.matchAll(BATCH_HEADER)]
-  // "### JOB 2" means the second task only when the answer never names a task by its id.
-  const byId = matches.some(match => named(match[2]!) !== undefined)
+  // "### JOB 2" means the second task unless another header names that task by its id (N20: mixed styles).
+  const namedIds = new Set(matches.flatMap(match => named(match[2]!) ?? []))
   const headers = matches.flatMap(match => {
-    const id = named(match[2]!) ?? (!byId && /^\d+$/.test(match[2]!) ? ids[Number(match[2]) - 1] : undefined)
-    return id === undefined ? [] : [{ id, match }]
+    const numbered = /^\d+$/.test(match[2]!), nth = numbered ? ids[Number(match[2]) - 1] : undefined
+    const id = named(match[2]!) ?? (nth !== undefined && !namedIds.has(nth) ? nth : undefined)
+    // A numbered header that maps to no task still ends the section before it.
+    return id === undefined && !numbered ? [] : [{ id, match }]
   })
   headers.forEach(({ id, match }, index) => {
-    if (id in sections) return
+    if (id === undefined || id in sections) return
     // A heading line is all title; a bold header may start the answer after its closing marker ("**JOB a** 4+6").
     const rest = match[3]!, close = match[1]!.includes('#') ? -1 : rest.search(/\*\*|__/)
     const inline = close < 0 ? '' : rest.slice(close + 2).replace(/^[ \t]*(?:\([^)\n]*\))?[ \t]*:?[ \t]*/, '')

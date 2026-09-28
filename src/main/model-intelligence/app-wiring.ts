@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { AgentProviderInfo } from '../../shared/models'
+import { localStopOf } from '../../shared/local-stop'
 import type { AgentEvent, TimelineItem } from '../../shared/structured-agent'
 import type { HandoffPort, StageResultInput } from '../durable-jobs/ports'
 import type { LocalModelRunner } from '../local-assist/contract'
@@ -88,13 +89,20 @@ function localFacts(deps: ModelIntelligenceAppDeps): ConfiguredLocalModel[] | nu
   return models && models.map(model => { let vramBytes: number | null = null; try { vramBytes = deps.vramBytes(model) } catch { /* no reviewed envelope */ } return { ...model, vramBytes } })
 }
 
-/** The agent-manager broadcast observer: a settled session phase of a dispatched agent is captured
- *  on the next tick, from the projection the store already keeps in memory. */
-export function turnObserver(service: () => ModelIntelligence | undefined, snapshot: (id: string) => { items: TimelineItem[] } | null | undefined): (channel: string, payload: unknown) => void {
+/** The agent-manager broadcast observer: a settled session phase of a dispatched agent, and the stop
+ *  report of any local agent turn, are captured on the next tick from the projection the store already
+ *  keeps in memory. */
+export function turnObserver(service: () => ModelIntelligence | undefined, snapshot: (id: string) => { items: TimelineItem[]; settings?: { model?: string } } | null | undefined): (channel: string, payload: unknown) => void {
   return (channel, payload) => {
     const current = service()
     if (!current || channel !== 'structured:events' || !Array.isArray(payload)) return
     for (const event of payload as AgentEvent[]) {
+      const report = event?.data ? localStopOf(event.data) : undefined
+      if (report && event.turnId && event.provider === 'local') {
+        const stopped = { agentSessionId: event.sessionId, turnId: event.turnId, runtimeId: event.runtimeId, projectId: event.projectId, report }
+        setImmediate(() => { current.localTurnStopped(stopped, () => snapshot(event.sessionId)) })
+        continue
+      }
       if (event?.data?.type !== 'session' || !['completed', 'failed', 'interrupted'].includes(event.data.phase) || !current.binding(event.sessionId)) continue
       const { phase, limitResumeAt } = event.data
       setImmediate(() => { current.turnSettled({ agentSessionId: event.sessionId, runtimeId: event.runtimeId, ...(event.turnId ? { turnId: event.turnId } : {}), phase, limited: typeof limitResumeAt === 'string' }, () => snapshot(event.sessionId)) })

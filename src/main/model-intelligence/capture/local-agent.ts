@@ -1,7 +1,7 @@
 /**
  * A local agent turn stopped (LocalTelemetryEntry `stop`) → ExecutionOutcome. Pure. The caller
- * (module E, beside the local runtime's telemetry sink) passes the stop entry, or the turn's whole
- * telemetry stream so failed tool-grammar repairs count as tool failures, plus the model and ref.
+ * (service.localTurnStopped, fed the local adapter's stop notice by app-wiring's turnObserver) passes
+ * the stop entry, or the turn's telemetry so failed tool-grammar repairs count as tool failures, plus the model and ref.
  * Stop reasons map onto behaviour: stagnation → looped, context_limit → contextFailure,
  * round_limit → timedOut, empty/truncated output → invalidOutput, unverified_claim → falseCompletion.
  */

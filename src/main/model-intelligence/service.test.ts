@@ -252,7 +252,7 @@ describe('cloud evaluation under the owner caps (gap 8)', () => {
     expect(tight.s.evaluationCaps()).toMatchObject({ perDayTokens: 1000, perRunTokens: 60_000, minRunTokens: 45_000, weeklyStop: { claude: 85, codex: 55 } })
     // A per-run cap below any native turn's overhead can never hold a job: refused, not run.
     const small = cloud(10, values => values.set(EVALUATION_CAPS_SETTING, JSON.stringify({ perRunTokens: 1000, perDayTokens: 1000 })))
-    await expect(small.s.startEvaluation(OPUS, 'mini')).rejects.toThrow(/A 1000-token run cannot hold a claude turn's 5000 fixed tokens plus the smallest job's \d+; no run was counted/)
+    await expect(small.s.startEvaluation(OPUS, 'mini')).rejects.toThrow(/A 1000-token run cannot hold a claude turn's 5000 fixed tokens plus the smallest job's \d+; raise perRunTokens in model-intelligence:evaluation-caps to at least \d+; no run was counted/)
     expect(small.s.store.evaluationSpend('2026-09-27T12:00:00Z').runs).toBe(0)
   })
   it('never lets a learned overhead lock a provider out, and refuses a run that cannot fit before it counts (N14)', async () => {
@@ -276,12 +276,36 @@ describe('cloud evaluation under the owner caps (gap 8)', () => {
     huge.runCloud.mockClear()
     huge.s.store.recordEvaluationSpend({ runId: 'earlier', key: OPUS, at: NOW.toISOString(), tokens: 60_000, jobs: 1, gradedJobs: 1, stoppedBy: null })
     const before = huge.s.store.evaluationSpend('2026-09-27T12:00:00Z')
-    await expect(huge.s.startEvaluation(OPUS, 'mini')).rejects.toThrow(new RegExp(`A ${150_000 - before.tokens}-token run cannot hold a claude turn's ${60_000 - smallest} fixed tokens plus the smallest job's ${smallest}; the day has ${150_000 - before.tokens} of its 150000 left; no run was counted`))
+    await expect(huge.s.startEvaluation(OPUS, 'mini')).rejects.toThrow(new RegExp(`A ${150_000 - before.tokens}-token run cannot hold a claude turn's 250000 fixed tokens \\(measured ${NOW.toISOString()}\\) plus the smallest job's ${smallest}; the day has ${150_000 - before.tokens} of its 150000 left; raise perRunTokens`))
     expect(huge.s.store.evaluationSpend('2026-09-27T12:00:00Z')).toEqual(before)
     expect(huge.runCloud).not.toHaveBeenCalled()
     // And a small learned value is raised to the band's floor.
     const tiny = cloud(10, values => values.set(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ claude: { tokens: 12, at: NOW.toISOString() } })))
     expect(tiny.s.fixedOverheadTokens('claude')).toBe(5_000)
+  })
+  it('admits on the recent raw measurement: a cap below the real overhead refuses instead of starting a doomed turn (N19)', async () => {
+    const smallest = batchJobTokens(suite.jobs[0]!), measuredAt = (hoursAgo: number) => new Date(NOW.getTime() - hoursAgo * 3_600_000).toISOString()
+    const capped = (hoursAgo: number) => cloud(10, values => {
+      values.set(EVALUATION_CAPS_SETTING, JSON.stringify({ perRunTokens: 30_000 }))
+      values.set(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ claude: { tokens: 30_000 - smallest, measured: 39_115, at: measuredAt(hoursAgo) } }))
+    })
+    // reverify4: measured 39,115 two hours ago, the run cap 30k. Refused with the reason; nothing runs or counts.
+    const recent = capped(2)
+    await expect(recent.s.startEvaluation(OPUS, 'mini')).rejects.toThrow(new RegExp(`A 30000-token run cannot hold a claude turn's 39115 fixed tokens \\(measured ${measuredAt(2)}\\) plus the smallest job's ${smallest}; raise perRunTokens in model-intelligence:evaluation-caps to at least ${39_115 + smallest}, or from ${new Date(Date.parse(measuredAt(2)) + 24 * 3_600_000).toISOString()} one run measures it again; no run was counted`))
+    expect(recent.runCloud).not.toHaveBeenCalled()
+    expect(recent.s.store.evaluationSpend('2026-09-27T12:00:00Z').runs).toBe(0)
+    // A day-old measurement may predate a CLI or Conductor update: one run is admitted and measures the preamble again,
+    // and the run after it is refused on that measurement.
+    const stale = capped(25)
+    stale.runCloud.mockImplementation(async () => ({ answer: '', tokens: 39_353, costUsd: null, durationMs: 1, overheadTokens: 39_115 }))
+    const run = await stale.s.startEvaluation(OPUS, 'mini')
+    expect(run.maxTokens).toBe(30_000)
+    await vi.waitFor(() => expect(stale.s.evaluation(run.runId)!.state).not.toBe('running'))
+    await expect(stale.s.startEvaluation(OPUS, 'mini')).rejects.toThrow(/cannot hold a claude turn's 39115 fixed tokens \(measured 2026-/)
+    expect(stale.runCloud).toHaveBeenCalledTimes(1)
+    // A measurement that fits is admitted as before (a legacy entry without `measured` never refuses: the N14 test above).
+    const fits = cloud(10, values => values.set(EVALUATION_OVERHEAD_SETTING, JSON.stringify({ claude: { tokens: 39_115, measured: 39_115, at: measuredAt(1) } })))
+    expect((await fits.s.startEvaluation(OPUS, 'mini')).maxTokens).toBe(60_000)
   })
   it('refuses a cloud run of a suite whose jobs all need a command runner', async () => {
     const onlyCommands: EvaluationSuite = { name: 'commands', jobs: [{ id: 'check', category: 'simple-coding', complexity: 1, prompt: 'Write add.js', grader: { kind: 'command', cmd: 'node', args: ['test.mjs'], expectExit: 0, timeoutSec: 10 } }] }

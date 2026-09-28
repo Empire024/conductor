@@ -282,8 +282,11 @@ describe('batched cloud evaluation (N9)', () => {
     // A fenced block of the last job's own is kept whole; only a fence that closes nothing is dropped.
     expect(splitBatchAnswer('```\n### JOB a\none\n### JOB b\n```json\n{"n": 2}\n```\n```', ['a', 'b'])).toEqual({ a: 'one', b: '```json\n{"n": 2}\n```' })
     expect(splitBatchAnswer('### JOB a\n```js\nx\n```', ['a'])).toEqual({ a: '```js\nx\n```' })
-    // Numbers count only when no header names a task; a heading of 7 hashes or a plain line is not a header.
-    expect(splitBatchAnswer('### JOB a\none\n### JOB 2\ntwo', ['a', 'b'])).toEqual({ a: 'one\n### JOB 2\ntwo' })
+    // A number among id headers is its task when no header names that task (N20); a number whose task is named, or
+    // out of range, still ends the section before it. A heading of 7 hashes or a plain line is not a header.
+    expect(splitBatchAnswer('### JOB a\nA\n### JOB 2\nB\n### JOB c\nC', ['a', 'b', 'c'])).toEqual({ a: 'A', b: 'B', c: 'C' })
+    expect(splitBatchAnswer('### JOB a\none\n### JOB 1\nagain\n### JOB 9\nnine\n### JOB b\ntwo', ['a', 'b'])).toEqual({ a: 'one', b: 'two' })
+    expect(splitBatchAnswer('### JOB b\ntwo\n### JOB 1\none', ['a', 'b'])).toEqual({ a: 'one', b: 'two' })
     expect(splitBatchAnswer('####### JOB a\nx\nJOB b\ny', ['a', 'b'])).toEqual({})
   })
   it('records nothing when no section is found for the whole batch (N15)', async () => {

@@ -12,6 +12,7 @@ import type { AgentControlUiRequest } from '../../shared/agent-control'
 import type { AgentProviderInfo, AgentSpec, PaneTab } from '../../shared/models'
 import type { DecisionRecord, ExecutionOutcome, RouteDecision } from '../../shared/model-routing'
 import type { ProviderCapabilities } from '../../shared/structured-agent'
+import { localStopPayload, type LocalStopReport } from '../../shared/local-stop'
 import type { ProviderAdapter } from '../providers/adapter'
 import { turnObserver } from './app-wiring'
 import { createModelIntelligence, type ModelIntelligence } from './index'
@@ -20,6 +21,13 @@ const dispose: Array<() => void> = []
 afterEach(() => { for (const close of dispose.splice(0).reverse()) close(); vi.unstubAllEnvs() })
 
 const LOCAL = 'local/qwen-test'
+const localStop: LocalStopReport = {
+  reason: 'completed', detail: 'The model finished.', rounds: 4, hardLimit: 40,
+  context: { usedTokens: 9_000, capacityTokens: 28_000, reserveTokens: 4_096, windowTokens: 32_768, percent: 32, estimated: false },
+  compactions: 0, recoveredTokens: 0, loopWarnings: 0, filesChanged: ['src/parser.ts'], commandsRun: 2, excludedOutputChars: 0, timeline: [],
+  acceptance: { command: 'npm test', passed: true, exitCode: 0 },
+  task: { lifecycle: 'completed', requests: 4, recoveries: 0, elapsedMs: 30_000, tokens: 40_000, segmentLimit: 8, maxRounds: 40 }
+}
 /** The whole stack over a temp conductor.db: real AgentControl, StructuredSessions with a zero-
  *  inference adapter, and model intelligence fed by fake sources, as src/main/index.ts wires it. */
 function fixture() {
@@ -46,6 +54,11 @@ function fixture() {
         options.emit({ turnId, data: { type: 'session', phase: 'running' } })
         options.emit({ turnId, itemId: `result-${turn}`, data: { type: 'text', role: 'assistant', text: 'Implemented the parser', mode: 'snapshot' } })
         options.emit({ turnId, itemId: `usage-${turn}`, data: { type: 'usage', inputTokens: 12_000, outputTokens: 900, costUsd: 0.2, scope: 'turn', source: 'provider' } })
+        // The local adapter's telemetry notice and stop notice, as providers/local.ts emits them.
+        if (provider === 'local') {
+          options.emit({ turnId, data: { type: 'notice', message: 'Local run telemetry: repair', payload: { localTelemetry: { kind: 'repair', round: 1, name: 'edit', outcome: 'failed' } } } })
+          options.emit({ turnId, itemId: `${turnId}:stop`, data: { type: 'notice', message: 'Completed', payload: localStopPayload(localStop) } })
+        }
         options.emit({ turnId, data: { type: 'session', phase: 'completed' } })
       }, respond: async () => {}, interrupt: async () => {}, dispose: () => {} }
   })
@@ -149,6 +162,33 @@ describe('model intelligence wiring (fake sources, zero inference)', () => {
     expect(journal.decisions.map(entry => entry.id)).toContain(decisionId)
     expect(journal.decisions.find(entry => entry.id === decisionId)!.systemOne).toMatchObject({ decider: 'scorer' })
     expect(journal.boundaries).toEqual([expect.objectContaining({ kind: 'route', live: true })])
+  })
+
+  it('captures a local agent turn from its stop report, once, and leaves durable-job stages and chat to their own capture', async () => {
+    const f = fixture()
+    const cwd = f.database.getProject(f.scope.projectId)!.path, key = { provider: 'local', model: LOCAL }
+    const open = (id: string) => f.sessions.ensure({ id, projectId: f.scope.projectId, sessionId: f.scope.sessionId, cwd, provider: 'local', title: id, model: LOCAL })
+    const local = () => f.service.store.outcomes({ key, since: '2000-01-01T00:00:00Z', limit: 100 })
+    // An owner's local tab, not dispatched: its stop report is the outcome (acceptance, failed repair, files).
+    open('local-owner')
+    await f.sessions.submit('local-owner', 'Fix the failing parser test', { permission: 'auto', plan: false, model: LOCAL })
+    await vi.waitFor(() => expect(local()).toHaveLength(1))
+    expect(local()[0]).toMatchObject({ source: 'local-agent', ref: 'local-owner:turn-1', agentSessionId: 'local-owner', projectId: f.scope.projectId, category: 'debugging', result: 'success', verifier: 'pass', toolFailures: 1, iterations: 4, tokens: 40_000, decisionId: null })
+    // A dispatched local coworker (bound as router.dispatch binds it): the outcome takes the binding's category and
+    // project, and the settled turn is not captured a second time by turnSettled.
+    open('local-coworker')
+    f.service.bindDispatch('local-coworker', { decisionId: null, features: { category: 'difficult-coding', complexity: 4, risk: 'medium', toolsRequired: [], contextTokens: null }, key, effort: null, projectId: 'bound-project' })
+    await f.sessions.submit('local-coworker', 'Implement the protocol parser', { permission: 'auto', plan: false, model: LOCAL })
+    await vi.waitFor(() => expect(local()).toHaveLength(2))
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(local().filter(outcome => outcome.agentSessionId === 'local-coworker')).toEqual([expect.objectContaining({ source: 'local-agent', category: 'difficult-coding', complexity: 4, projectId: 'bound-project', result: 'success' })])
+    // A durable-job stage (stageSettled captures it) and a chat turn with no category signal record nothing here.
+    open('local-stage')
+    await f.sessions.submit('local-stage', 'Fix the failing parser test', { permission: 'auto', plan: false, model: LOCAL }, [], { agentSessionId: 'durable-job', label: 'Durable job' })
+    open('local-chat')
+    await f.sessions.submit('local-chat', 'hello there', { permission: 'auto', plan: false, model: LOCAL })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(local()).toHaveLength(2)
   })
 
   it('keeps router.dispatch and models.list unchanged without model intelligence, and refuses a route then', async () => {
