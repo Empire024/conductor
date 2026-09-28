@@ -349,8 +349,9 @@ export interface ProductionProfile {
 
 export interface FactCondition {
   fact: FactKey
-  /** `true`/`false` for booleans, `known`/`unknown` for any fact, `includesAny` for string lists, `equals` for enums. */
-  is?: 'true' | 'false' | 'known' | 'unknown'
+  /** `true`/`false` for booleans, `known`/`unknown` for any fact, `includesAny` for string lists, `equals` for enums.
+   *  For list facts: `empty` holds for [], `nonEmpty` for a non-empty list. */
+  is?: 'true' | 'false' | 'known' | 'unknown' | 'empty' | 'nonEmpty'
   equals?: string
   includesAny?: string[]
 }
@@ -499,6 +500,19 @@ export interface RunOperation {
   status: 'intended' | 'done' | 'failed' | 'unknown'
   at: string
   reconciliation?: string
+}
+
+/** A run's journal, in order: what the panel's timeline and the audit trail read. */
+export const RUN_EVENT_KINDS = ['transition', 'step', 'checkpoint', 'operation', 'lease', 'recovery', 'finding', 'waiver', 'model-call', 'note'] as const
+export type ProductionRunEventKind = (typeof RUN_EVENT_KINDS)[number]
+export interface ProductionRunEvent {
+  seq: number
+  id: string
+  runId: string
+  at: string
+  kind: ProductionRunEventKind
+  message: string
+  data?: Record<string, string | number | boolean | null>
 }
 
 export const MODEL_ROLES = ['classify', 'interpret', 'verify-review'] as const
