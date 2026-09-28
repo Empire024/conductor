@@ -7,7 +7,7 @@ import { ConductorDatabase } from './database'
 import { MEMORY_PROTOCOL } from './memory'
 import type { CoworkerBriefingOptions } from './agent-collaboration-store'
 import { COWORKER_OPENED_PREFIX } from './coworker-autoclose'
-import { CONTEXT_RESET, FINISH_HINT, MEMORY_HEADING, LOCAL_ASSIST_HINT, TurnBriefings, handoffNudge, SUCCESSION_HINT, SUCCESSION_PERCENT, SUCCESSION_TURNS, successionNudge, coworkerHint } from './turn-briefing'
+import { CONTEXT_RESET, FINISH_HINT, MEMORY_HEADING, LOCAL_ASSIST_HINT, SHELL_HYGIENE_HINT, TurnBriefings, handoffNudge, SUCCESSION_HINT, SUCCESSION_PERCENT, SUCCESSION_TURNS, successionNudge, coworkerHint } from './turn-briefing'
 
 const roots: string[] = [], databases: ConductorDatabase[] = []
 afterEach(() => {
@@ -134,6 +134,17 @@ describe('what a native runtime is told, and how often', () => {
     const local = fixture('local')
     local.briefings.compose(local.spec, 'Start', 'item-1', 'runtime-1', { percent: 90 })
     expect(local.briefings.compose(local.spec, 'Keep going', 'item-2', 'runtime-1', { percent: 95 })).toBe('')
+  })
+
+  it('tells Claude once per runtime to write scripts with Write and not to sleep-poll', () => {
+    const f = fixture('claude')
+    expect(f.briefings.compose(f.spec, 'Run the tests', 'item-1', '')).toContain(SHELL_HYGIENE_HINT)
+    expect(SHELL_HYGIENE_HINT).toContain('Write tool')
+    expect(SHELL_HYGIENE_HINT).toContain('git.ship.status({waitSeconds})')
+    f.starting('runtime-1')
+    expect(f.briefings.compose(f.spec, 'Again', 'item-2', 'runtime-1')).not.toContain(SHELL_HYGIENE_HINT)
+    const codex = fixture('codex')
+    expect(codex.briefings.compose(codex.spec, 'Run the tests', 'item-1', '')).not.toContain(SHELL_HYGIENE_HINT)
   })
 
   it('tells Claude and Codex once per runtime to hand long output to the local model', () => {

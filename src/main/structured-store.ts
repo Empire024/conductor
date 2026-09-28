@@ -14,15 +14,94 @@ import { anonymousConversations } from './local-models/anonymous'
  *  in the bounded journal `checkpoint` trims below it. */
 const JOURNAL_WINDOW = 20_000
 
-export function sanitizeDiagnostic(value: unknown): unknown {
-  if (typeof value === 'string') return value
+/** Exact credentials a live server hands out (agent-control-server: the owner token and every
+ *  conversation's control token). A 64-hex run anywhere in a stored string that one of these
+ *  recognises is masked, so a token pasted into a `node -e` script is caught with no telltale
+ *  name beside it. A predicate, not a list, so no copy of a secret is kept here. */
+const secretChecks = new Set<(candidate: string) => boolean>()
+export function registerSecretCheck(check: (candidate: string) => boolean): () => void {
+  secretChecks.add(check)
+  return () => { secretChecks.delete(check) }
+}
+const HEX_SECRET = /(?<![a-fA-F0-9])[a-fA-F0-9]{64}(?![a-fA-F0-9])/g
+
+/** Credentials inside one string. `Bearer <x>` was the only control-token form masked, and agents
+ *  also pass it as `CONDUCTOR_CONTROL_TOKEN=<hex>` and `token: '<hex>'` in scripts, which the
+ *  journal kept in clear (harness gap sweep H17). */
+export function maskSecrets(text: string): string {
+  const masked = text
     .replace(/(Bearer\s+)[^\s"']+/gi, '$1[REDACTED]')
     .replace(/\b(?:sk-(?:ant-)?[a-zA-Z0-9_-]{16,}|gh[pousr]_[a-zA-Z0-9]{20,})\b/g, '[REDACTED]')
     .replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|authorization)\s*[=:]\s*)[^\s,;"']+/gi, '$1[REDACTED]')
+    .replace(/(CONDUCTOR_CONTROL_TOKEN["']?\s*[=:]\s*["']?)[^\s"',;)]+/gi, '$1[REDACTED]')
+    .replace(/(token["']?\s*[=:]\s*["']?)[a-fA-F0-9]{64}(?![a-fA-F0-9])/gi, '$1[REDACTED]')
+  return secretChecks.size ? masked.replace(HEX_SECRET, match => [...secretChecks].some(check => check(match)) ? '[REDACTED]' : match) : masked
+}
+
+/** `maskSecrets` over every string in a JSON value, without the key-based redaction
+ *  `sanitizeDiagnostic` adds: the redaction job below rewrites rows that were sanitized when they
+ *  were written, and must not change their shape. */
+function maskStrings<T>(value: T): T {
+  if (typeof value === 'string') return maskSecrets(value) as T
+  if (Array.isArray(value)) return value.map(maskStrings) as T
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, maskStrings(item)])) as T
+  return value
+}
+
+export function sanitizeDiagnostic(value: unknown): unknown {
+  if (typeof value === 'string') return maskSecrets(value)
   if (Array.isArray(value)) return value.map(sanitizeDiagnostic)
   if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, /^(authorization|api_?key|access_?token|refresh_?token|password|secret|env|environment)$/i.test(key) ? '[REDACTED]' : sanitizeDiagnostic(item)]))
   return value
 }
+
+/**
+ * The one-off redaction of rows written before `maskSecrets` knew a form. The journal is several
+ * gigabytes, so it is walked in rowid order a bounded chunk at a time: every chunk is a b-tree seek
+ * plus at most `rows` rows, the candidate test runs inside SQLite so only rows that can hold a
+ * token cross into JavaScript, and the cursor is kept between chunks. Measured on the owner's 6.5 GB
+ * journal (5.1M events, 2026-09-28): about 27k rows/s, so a 200-row chunk holds the main thread
+ * for about 7 ms and the whole walk takes about 45 minutes in the background. Order matters for the store's
+ * memory (see `StructuredAgentStore.redactSecretsStep`): the journal first, then the archive, then
+ * each conversation's projection.
+ */
+export const REDACTION_TARGETS = [
+  { table: 'structured_events', column: 'event_json', rows: 200 },
+  { table: 'structured_transcript_archive', column: 'item_json', rows: 200 },
+  { table: 'structured_sessions', column: 'projection_json', rows: 20 },
+  { table: 'structured_sessions', column: 'spec_json', rows: 200 }
+] as const
+export type RedactionTarget = (typeof REDACTION_TARGETS)[number]
+/** A superset of what `maskSecrets` can change among the forms it newly masks: a named control
+ *  token, or any 64-hex run (a `token:` value or a live credential). */
+const REDACTION_CANDIDATE = (column: string): string => `(${column} LIKE '%control\\_token%' ESCAPE '\\' OR ${column} GLOB ?)`
+const HEX_RUN_GLOB = `*${'[0-9a-fA-F]'.repeat(64)}*`
+export interface RedactionChunk { scanned: number; candidates: number; changed: number; last: number | null; changedKeys: string[] }
+
+/** One chunk of one target after `after` (a rowid). With `write` false nothing is changed: the
+ *  dry run the owner sees before any row is rewritten. */
+export function redactSecretsChunk(db: DatabaseSync, target: RedactionTarget, after: number, write: boolean): RedactionChunk {
+  const key = target.table === 'structured_sessions' ? 'id' : 'session_id'
+  const rows = db.prepare(`SELECT rowid AS rowid, ${key} AS key, CASE WHEN ${REDACTION_CANDIDATE(target.column)} THEN ${target.column} END AS body
+    FROM ${target.table} WHERE rowid>? ORDER BY rowid LIMIT ?`).all(HEX_RUN_GLOB, after, target.rows) as Array<{ rowid: number; key: string; body: string | null }>
+  const chunk: RedactionChunk = { scanned: rows.length, candidates: 0, changed: 0, last: rows.at(-1)?.rowid ?? null, changedKeys: [] }
+  const update = write ? db.prepare(`UPDATE ${target.table} SET ${target.column}=? WHERE rowid=?`) : null
+  for (const row of rows) {
+    if (row.body === null) continue
+    chunk.candidates++
+    let parsed: unknown
+    try { parsed = JSON.parse(row.body) } catch { continue }
+    const masked = JSON.stringify(maskStrings(parsed))
+    if (masked === JSON.stringify(parsed)) continue
+    chunk.changed++
+    chunk.changedKeys.push(row.key)
+    update?.run(masked, row.rowid)
+  }
+  return chunk
+}
+/** structured_meta key holding the redaction cursor, then its completion. */
+const REDACTION_META = 'secret_redaction_v1'
+interface RedactionCursor { target: number; after: number; changed: number; done?: string }
 
 /** Find only searches what the owner actually read: a message. Tool payloads, diffs, ids and
  *  provider internals are in the projection too, and matching them turns a find into noise. */
@@ -74,6 +153,9 @@ export class StructuredAgentStore {
    *  directory, and `forget` drops it all when the tab closes. */
   private volatileSpecs = new Map<string, unknown>()
   private volatileArtifacts = new Map<string, Map<string, { kind: 'diff' | 'output'; data: string }>>()
+  /** Until the one-off secret redaction has finished, events read back from the journal may
+   *  predate `maskSecrets`, so what is rebuilt from them in memory is masked on the way in. */
+  private redactionPending = true
   readonly artifactDirectory: string
   constructor(private db: DatabaseSync, dataDirectory: string) {
     this.artifactDirectory = join(dataDirectory, 'agent-artifacts')
@@ -124,6 +206,7 @@ export class StructuredAgentStore {
       );
     `)
     this.ensureAccountingSchema()
+    this.redactionPending = !this.redactionCursor().done
     // Historical projection is independent of reconnect. Never retry uncertain execution.
     const rows = db.prepare('SELECT id, provider, projection_json FROM structured_sessions').all() as Array<{ id: string; provider: string; projection_json: string }>
     for (const row of rows) {
@@ -303,7 +386,8 @@ export class StructuredAgentStore {
     const cached = this.archiveTails.get(id)
     if (cached) return cached
     const row = this.db.prepare('SELECT archived_through FROM structured_transcript_archive_state WHERE session_id=?').get(id) as { archived_through: number } | undefined
-    const tail = this.events(id, row?.archived_through ?? 0).reduce(growArchiveTail, emptyArchiveTail(id))
+    const events = this.events(id, row?.archived_through ?? 0)
+    const tail = (this.redactionPending ? events.map(maskStrings) : events).reduce(growArchiveTail, emptyArchiveTail(id))
     this.archiveTails.set(id, tail)
     return tail
   }
@@ -600,4 +684,64 @@ export class StructuredAgentStore {
     return (budgets.find(row => row.provider === provider)?.cost_usd ?? 0) >= (limits.find(row => row.provider === provider)?.provider_usd ?? .25) || budgets.reduce((sum, row) => sum + row.cost_usd, 0) >= Math.min(.50, ...limits.map(row => row.suite_usd))
   }
   flush(): void { for (const id of this.projections.keys()) this.checkpoint(id) }
+
+  private redactionCursor(): RedactionCursor {
+    const row = this.db.prepare('SELECT value FROM structured_meta WHERE key=?').get(REDACTION_META) as { value: string } | undefined
+    return row ? JSON.parse(row.value) as RedactionCursor : { target: 0, after: 0, changed: 0 }
+  }
+  /**
+   * One bounded step of the one-off redaction (`redactSecretsChunk`); false once it has finished.
+   * The phases run in this order so nothing masked is unmasked again from an older copy: the
+   * journal, then the archive, then every resident projection and archive tail in memory (which
+   * were rebuilt from rows written before `maskSecrets` knew the form, and are what the next
+   * checkpoint writes), then the stored projection and spec rows. A step and its cursor commit
+   * together, so an interrupted run resumes where it stopped at the next launch.
+   */
+  redactSecretsStep(): boolean {
+    const cursor = this.redactionCursor()
+    if (cursor.done) { this.redactionPending = false; return false }
+    const phase = REDACTION_PHASES[cursor.target]
+    this.db.exec('SAVEPOINT secret_redaction')
+    try {
+      let next: RedactionCursor
+      if (!phase) next = { ...cursor, done: new Date().toISOString() }
+      else {
+        const chunk = phase === 'memory' ? this.redactResident(cursor.after) : redactSecretsChunk(this.db, phase, cursor.after, true)
+        next = chunk.last === null ? { target: cursor.target + 1, after: 0, changed: cursor.changed + chunk.changed } : { target: cursor.target, after: chunk.last, changed: cursor.changed + chunk.changed }
+      }
+      this.db.prepare('INSERT INTO structured_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(REDACTION_META, JSON.stringify(next))
+      this.db.exec('RELEASE secret_redaction')
+      if (next.done) { this.redactionPending = false; console.info(`Stored secret redaction finished: ${next.changed} rows and conversations masked`) }
+      return !next.done
+    } catch (reason) { this.db.exec('ROLLBACK TO secret_redaction'); this.db.exec('RELEASE secret_redaction'); throw reason }
+  }
+  /** Masks the projections and archive tails held in memory for one chunk of conversations. */
+  private redactResident(after: number): RedactionChunk {
+    const rows = this.db.prepare('SELECT rowid AS rowid, id FROM structured_sessions WHERE rowid>? ORDER BY rowid LIMIT 20').all(after) as Array<{ rowid: number; id: string }>
+    const chunk: RedactionChunk = { scanned: rows.length, candidates: 0, changed: 0, last: rows.at(-1)?.rowid ?? null, changedKeys: [] }
+    for (const { id } of rows) {
+      const state = this.projections.get(id), tail = this.archiveTails.get(id)
+      const masked = state && maskStrings(state)
+      const changed = state !== undefined && JSON.stringify(masked) !== JSON.stringify(state)
+      if (changed) this.projections.set(id, masked!)
+      // The tail's settledIds is a Set, which maskStrings would flatten; only its text is masked.
+      if (tail) this.archiveTails.set(id, { ...tail, state: maskStrings(tail.state), settled: maskStrings(tail.settled) })
+      if (changed) { chunk.changed++; chunk.changedKeys.push(id) }
+    }
+    return chunk
+  }
+  /** Runs the redaction in the background, one bounded step every `intervalMs`, until it finishes
+   *  or the returned function stops it. A failure stops it; the cursor resumes it next launch. */
+  startSecretRedaction(intervalMs = 100): () => void {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const schedule = (): void => { timer = setTimeout(tick, intervalMs); timer.unref?.() }
+    const tick = (): void => {
+      try { if (this.redactSecretsStep()) schedule() } catch (error) { console.warn('Stored secret redaction stopped; it resumes at the next launch', error) }
+    }
+    if (!this.redactionCursor().done) schedule()
+    return () => clearTimeout(timer)
+  }
 }
+
+/** The redaction's phases, in the order `redactSecretsStep` runs them. */
+const REDACTION_PHASES: ReadonlyArray<RedactionTarget | 'memory'> = [REDACTION_TARGETS[0], REDACTION_TARGETS[1], 'memory', REDACTION_TARGETS[2], REDACTION_TARGETS[3]]

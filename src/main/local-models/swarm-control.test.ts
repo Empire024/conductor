@@ -172,10 +172,10 @@ describe('local swarms through app control', () => {
 describe('local control surface for swarms', () => {
   it('offers tabs.open, agents.steer and agents.finish only to writable turns, with their fields only', () => {
     expect(LOCAL_CONTROL_METHODS).toEqual(expect.arrayContaining(['tabs.open', 'agents.steer', 'agents.finish']))
-    expect(() => assertLocalControlAllowed('tabs.open', { title: 'x', prompt: 'y' }, true)).toThrow(/unavailable/)
+    expect(() => assertLocalControlAllowed('tabs.open', { title: 'x', prompt: 'y' }, true)).toThrow(/"tabs.open" changes something and this turn is read-only/)
     expect(() => assertLocalControlAllowed('tabs.open', { title: 'x', prompt: 'y' }, false)).not.toThrow()
-    expect(() => assertLocalControlAllowed('tabs.open', { projectId: 'elsewhere' }, false)).toThrow(/cannot be overridden/)
-    expect(() => assertLocalControlAllowed('agents.steer', { agentSessionId: 'a', prompt: 'p', projectId: 'x' }, false)).toThrow(/cannot be overridden/)
+    expect(() => assertLocalControlAllowed('tabs.open', { projectId: 'elsewhere' }, false)).toThrow(/tabs.open does not take projectId; it takes title, prompt.*cannot be passed/)
+    expect(() => assertLocalControlAllowed('agents.steer', { agentSessionId: 'a', prompt: 'p', projectId: 'x' }, false)).toThrow('agents.steer does not take projectId; it takes agentSessionId, prompt.')
     const readOnly = toolSpecs(true, true).find(spec => spec.function.name === 'conductor')!
     expect(JSON.stringify(readOnly)).not.toContain('tabs.open')
     expect(JSON.stringify(toolSpecs(false, true).find(spec => spec.function.name === 'conductor'))).toContain('Local swarm')

@@ -63,7 +63,10 @@ const MUTATING_CONTROL: ReadonlySet<string> = new Set<string>(['memory.remember'
 
 /** Reused at the trusted session boundary so an adapter cannot widen its own authority. */
 export function assertLocalControlAllowed(method: string, args: Record<string, unknown>, readOnly: boolean): void {
-  if (!(LOCAL_CONTROL_METHODS as readonly string[]).includes(method) || (readOnly && MUTATING_CONTROL.has(method))) throw new ToolPolicyError('Conductor method is unavailable in this mode')
+  // Each refusal names the method, and the key or mode that stopped it, with what would work:
+  // a bare "unavailable" was repeated by small models until the run stopped (gap sweep H19).
+  if (!(LOCAL_CONTROL_METHODS as readonly string[]).includes(method)) throw new ToolPolicyError(`"${method}" is not a Conductor method a local model may call; these are: ${LOCAL_CONTROL_METHODS.filter(name => !readOnly || !MUTATING_CONTROL.has(name)).join(', ')}.`)
+  if (readOnly && MUTATING_CONTROL.has(method)) throw new ToolPolicyError(`"${method}" changes something and this turn is read-only, so it cannot run here; say in your answer what should be done, and your controller or the owner will do it. Do not call it again this turn.`)
   if (!args || typeof args !== 'object' || Array.isArray(args)) throw new ToolPolicyError('args must be an object')
   const fields = method === 'memory.remember' ? ['gist', 'kind', 'cues']
     : method === 'memory.recall' ? ['query']
@@ -76,7 +79,8 @@ export function assertLocalControlAllowed(method: string, args: Record<string, u
               : method === 'tabs.open' ? ['title', 'prompt', 'permission', 'repository', 'research', 'contract', 'kind', 'provider', 'model']
                 : method === 'agents.steer' ? ['agentSessionId', 'prompt']
                   : method === 'agents.finish' ? ['agentSessionId'] : []
-  if (Object.keys(args).some(key => !fields.includes(key))) throw new ToolPolicyError('Conductor scope and unsupported arguments cannot be overridden')
+  const unsupported = Object.keys(args).find(key => !fields.includes(key))
+  if (unsupported) throw new ToolPolicyError(`${method} does not take ${unsupported}; ${fields.length ? `it takes ${fields.join(', ')}` : 'it takes no arguments, so pass {}'}. projectId, workspaceId and agentId come from your session and cannot be passed.`)
   // Dolphin sent memory.remember with cues and no gist eleven times, each answered "Invalid gist" (VR9a).
   if (method === 'memory.remember' && (typeof args.gist !== 'string' || !args.gist.trim())) throw new ToolPolicyError('memory.remember needs gist: the one sentence to remember, as {"gist":"<sentence>","kind":"semantic","cues":["<word>"]}. Nothing was saved. Memory is optional: if you have nothing durable to save, carry on with the task instead.')
   if (method === 'agents.report' && (typeof args.text !== 'string' || !args.text.trim() || args.text.length > 2000)) throw new ToolPolicyError('agents.report needs a non-empty text of at most 2000 characters')

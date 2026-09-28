@@ -46,7 +46,7 @@ describe('agents.report over the local control bridge', () => {
   })
 
   it('is refused in read-only mode, like the other methods that write something durable', () => {
-    expect(() => assertLocalControlAllowed('agents.report', { text: 'x' }, true)).toThrow(/unavailable in this mode/)
+    expect(() => assertLocalControlAllowed('agents.report', { text: 'x' }, true)).toThrow('"agents.report" changes something and this turn is read-only')
   })
 
   it('is offered to a local model whose conversation bridges Conductor control', () => {
@@ -56,5 +56,21 @@ describe('agents.report over the local control bridge', () => {
     expect(enumValues).toContain('agents.report')
     const readOnlyTool = toolSpecs(true, true).find(spec => spec.function.name === 'conductor')!
     expect((readOnlyTool.function.parameters!.properties as { method: { enum: string[] } }).method.enum).not.toContain('agents.report')
+  })
+})
+
+describe('local control refusals say what would work (H19)', () => {
+  it('names a method outside the allowlist and lists the ones this turn may call', () => {
+    expect(() => assertLocalControlAllowed('git.ship', {}, false)).toThrow(`"git.ship" is not a Conductor method a local model may call; these are: ${LOCAL_CONTROL_METHODS.join(', ')}.`)
+    const readOnly = (() => { try { assertLocalControlAllowed('git.ship', {}, true) } catch (error) { return (error as Error).message } return '' })()
+    expect(readOnly).toContain('memory.recall')
+    expect(readOnly).not.toContain('tabs.open')
+  })
+  it('tells a read-only turn that a writing method cannot run, not that it does not exist', () => {
+    expect(() => assertLocalControlAllowed('tasks.update', { id: 't', status: 'done' }, true)).toThrow(/"tasks.update" changes something and this turn is read-only.*Do not call it again this turn/)
+  })
+  it('names the refused key and the keys the method takes', () => {
+    expect(() => assertLocalControlAllowed('memory.recall', { query: 'x', projectId: 'p' }, false)).toThrow('memory.recall does not take projectId; it takes query. projectId, workspaceId and agentId come from your session and cannot be passed.')
+    expect(() => assertLocalControlAllowed('tasks.list', { limit: 5 }, false)).toThrow('tasks.list does not take limit; it takes no arguments, so pass {}.')
   })
 })

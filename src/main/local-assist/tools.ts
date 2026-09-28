@@ -82,6 +82,12 @@ const MAX_TIMEOUT_SEC = 1800
  *  background up to its own kill bound. An explicit timeoutSec is the caller asking to wait that
  *  long, so it is honoured in full instead. */
 const DEFAULT_RETURN_SEC = 120
+/** Claude Code's MCP client stops waiting for a call after about a minute (harness gap sweep AC12:
+ *  five `npm test` runs with timeoutSec 1700 cut off at roughly 60 s), and a call it gives up on
+ *  kills its command. Said in the tool description and the server instructions, so a caller does
+ *  not learn it by losing a test run. */
+export const CLIENT_WAIT_SEC = 60
+export const LONG_RUN_HINT = `Your MCP client may stop waiting after about ${CLIENT_WAIT_SEC} s, and that kills the command: for a run longer than about a minute (the full npm test), run it as background Bash writing a log file and summarize_file the log instead.`
 
 const text = (args: Record<string, unknown>, key: string, limit: number, optional = false): string | undefined => {
   const value = args[key]
@@ -476,7 +482,7 @@ export interface LocalAssistToolSpec {
 export const LOCAL_ASSIST_TOOLS: LocalAssistToolSpec[] = [
   {
     name: 'run_and_summarize',
-    description: 'Run a shell command (tests, builds, linters) on this machine in the project directory, save the full output to a log, and return exit code, duration, log path, a local-model summary focused on failures (test names, file:line, first error) and the last 15 raw lines. Use it instead of reading long test/build output. Auto mode only.',
+    description: `Run a shell command (tests, builds, linters) on this machine in the project directory, save the full output to a log, and return exit code, duration, log path, a local-model summary focused on failures (test names, file:line, first error) and the last 15 raw lines. Use it instead of reading long test/build output. Auto mode only. ${LONG_RUN_HINT}`,
     inputSchema: schema({
       command: { type: 'string', description: 'The command, as you would type it in the project directory.' },
       cwd: { type: 'string', description: 'Optional directory inside the project to run in.' },

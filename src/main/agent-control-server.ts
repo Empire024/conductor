@@ -6,6 +6,7 @@ import type { AgentControlScope } from '../shared/agent-control'
 import type { AgentSpec } from '../shared/models'
 import type { AgentControl } from './agent-control'
 import { controlMethodClass, controlMethodFamily } from './control-method-classes'
+import { registerSecretCheck } from './structured-store'
 
 /** Where the owner's own credential is written, and what a process that reads it may claim. */
 export interface OwnerCredentialOptions { path: string; appVersion: string; packaged: boolean }
@@ -57,10 +58,13 @@ export class AgentControlServer {
   /** What control-endpoint.json holds for this launch; absent without a stable endpoint. */
   private kept?: ControlEndpointFile
   private changed = true
+  /** The journal masks any of this server's tokens wherever one lands in a stored string (H17). */
+  private unregisterSecretCheck?: () => void
   constructor(private readonly control: Pick<AgentControl, 'authorize' | 'call' | 'ownerScope'> & Partial<Pick<AgentControl, 'recordActivity' | 'prepareActivity'>>, private readonly disabled = process.env.CONDUCTOR_LIVE_TESTS === '1', private readonly machineNote?: (spec: AgentSpec) => string, private readonly owner?: OwnerCredentialOptions, private readonly stable?: StableEndpointOptions) {}
 
   async start(): Promise<void> {
     if (this.disabled || this.server) return
+    this.unregisterSecretCheck ??= registerSecretCheck(candidate => candidate === this.ownerToken || candidate === this.kept?.ownerToken || [...this.credentials.values()].some(entry => entry.token === candidate))
     const kept = this.stable ? this.readKept() : undefined
     const { server, port } = await this.bind(kept?.port)
     this.server = server
@@ -309,6 +313,7 @@ export class AgentControlServer {
     if (this.owner && this.ownerToken) { try { rmSync(this.owner.path, { force: true }) } catch { /* the token dies with the process either way */ } }
     this.ownerToken = undefined
     this.endpoint = ''; this.credentials.clear(); this.inFlight.clear(); this.mutationTails.clear()
+    this.unregisterSecretCheck?.(); this.unregisterSecretCheck = undefined
     this.server?.closeAllConnections(); this.server?.close(); this.server = undefined
   }
 }

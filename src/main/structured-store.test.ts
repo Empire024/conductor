@@ -3,7 +3,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { StructuredAgentStore, sanitizeDiagnostic } from './structured-store'
+import { REDACTION_TARGETS, StructuredAgentStore, maskSecrets, redactSecretsChunk, registerSecretCheck, sanitizeDiagnostic } from './structured-store'
 import type { AgentEvent, AgentEventData } from '../shared/structured-agent'
 import { emptyProjection } from '../shared/structured-agent-reducer'
 
@@ -312,5 +312,56 @@ describe('staged batches: persist is transactional, ordered, and crash-safe', ()
     const restored = new StructuredAgentStore(reopened, f.root)
     expect(restored.snapshot('one')).toMatchObject({ sequence: 1 })
     expect(restored.events('one').map(entry => entry.sequence)).toEqual([1])
+  })
+})
+
+describe('the control token is masked in every form it is stored in (H17)', () => {
+  const token = 'c0ffee'.repeat(10) + 'beef'
+  const hash = 'ab'.repeat(32)
+  it('masks named, labelled and live tokens and leaves an ordinary hash alone', () => {
+    expect(maskSecrets(`CONDUCTOR_CONTROL_TOKEN=${token} node probe.mjs`)).toBe('CONDUCTOR_CONTROL_TOKEN=[REDACTED] node probe.mjs')
+    expect(maskSecrets(`$env:CONDUCTOR_CONTROL_TOKEN = "${token}"; node probe.mjs`)).toBe('$env:CONDUCTOR_CONTROL_TOKEN = "[REDACTED]"; node probe.mjs')
+    expect(maskSecrets(`node -e "const call = { token: '${token}' }"`)).not.toContain(token)
+    expect(maskSecrets(`sha256 ${hash}`)).toBe(`sha256 ${hash}`)
+    expect(maskSecrets(`const t = '${token}'`)).toContain(token)
+    const unregister = registerSecretCheck(candidate => candidate === token)
+    try {
+      expect(maskSecrets(`const t = '${token}'`)).toBe("const t = '[REDACTED]'")
+      expect(maskSecrets(`sha256 ${hash}`)).toBe(`sha256 ${hash}`)
+    } finally { unregister() }
+    expect(maskSecrets(`const t = '${token}'`)).toContain(token)
+  })
+
+  it('rewrites rows stored before the mask in bounded chunks, after a dry run that changes nothing', () => {
+    const f = fixture()
+    const placeholder = 'PLACEHOLDER-SECRET'
+    f.store.append(event(1, { type: 'text', role: 'assistant', text: `ran ${placeholder} node x.mjs`, mode: 'snapshot' }))
+    f.store.append(event(2, { type: 'notice', message: 'kept', payload: { note: 'shape stays' } }))
+    f.store.checkpoint('one')
+    // Rows as an older build wrote them: the token in clear in the journal and the projection.
+    f.db.prepare('UPDATE structured_events SET event_json=replace(event_json,?,?)').run(placeholder, `CONDUCTOR_CONTROL_TOKEN=${token}`)
+    // A key the write-time sanitizer would redact outright: the rewrite must leave its value alone.
+    f.db.prepare('UPDATE structured_events SET event_json=replace(event_json,?,?)').run('"note":', '"env":')
+    f.db.prepare('UPDATE structured_sessions SET projection_json=replace(projection_json,?,?)').run(placeholder, `CONDUCTOR_CONTROL_TOKEN=${token}`)
+    f.db.close()
+    const db = new DatabaseSync(f.path); databases.push(db)
+    const store = new StructuredAgentStore(db, f.root)
+    expect(JSON.stringify(store.snapshot('one'))).toContain(token)
+    const raw = (): string => (db.prepare('SELECT group_concat(event_json) AS body FROM structured_events').get() as { body: string }).body
+    const before = raw()
+    const dry = redactSecretsChunk(db, REDACTION_TARGETS[0], 0, false)
+    expect(dry).toMatchObject({ scanned: 2, changed: 1, changedKeys: ['one'] })
+    expect(raw()).toBe(before)
+    let steps = 0
+    while (store.redactSecretsStep()) steps++
+    expect(steps).toBeGreaterThan(0)
+    expect(raw()).not.toContain(token)
+    expect(raw()).toContain('CONDUCTOR_CONTROL_TOKEN=[REDACTED]')
+    expect(raw()).toContain('"env":"shape stays"')
+    expect(JSON.stringify(store.snapshot('one'))).not.toContain(token)
+    expect((db.prepare('SELECT projection_json FROM structured_sessions WHERE id=?').get('one') as { projection_json: string }).projection_json).not.toContain(token)
+    expect(store.redactSecretsStep()).toBe(false)
+    // Finished is durable: a reopened store neither repeats the walk nor masks events on read.
+    expect(new StructuredAgentStore(db, f.root).redactSecretsStep()).toBe(false)
   })
 })

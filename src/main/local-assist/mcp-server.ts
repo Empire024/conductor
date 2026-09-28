@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentSpec } from '../../shared/models'
 import { LOCAL_ASSIST_MCP_SERVER_NAME } from './contract.ts'
-import { LOCAL_ASSIST_TOOLS, type LocalAssistTools } from './tools.ts'
+import { LOCAL_ASSIST_TOOLS, LONG_RUN_HINT, type LocalAssistTools } from './tools.ts'
 
 const PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26']
 const MAX_BODY = 256 * 1024
@@ -141,7 +141,7 @@ export class LocalAssistMcpServer {
           protocolVersion: PROTOCOL_VERSIONS.includes(requested) ? requested : PROTOCOL_VERSIONS[0],
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: LOCAL_ASSIST_MCP_SERVER_NAME, title: 'Conductor local assist', version: '1' },
-          instructions: 'Hand bounded reading jobs to the local model on this machine to save your context: run_and_summarize for tests, builds and long logs; local_ask or summarize_file for large files.'
+          instructions: `Hand bounded reading jobs to the local model on this machine to save your context: run_and_summarize for tests, builds and long logs; local_ask or summarize_file for large files. ${LONG_RUN_HINT}`
         } }
       }
       if (message.method === 'ping') return { ...envelope, result: {} }

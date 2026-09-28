@@ -42,6 +42,10 @@ describe('LocalAssistMcpServer', () => {
     const { url, token } = claudeCredential(server.configure(spec('claude', 'mine')))
     const listed = await (await rpc(url, token, { jsonrpc: '2.0', id: 1, method: 'tools/list' })).json()
     expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toEqual(['run_and_summarize', 'local_ask', 'summarize_file'])
+    // H18: the client's wait and the way around it are stated before a caller loses a test run to it.
+    expect(listed.result.tools[0].description).toMatch(/about 60 s.*background Bash.*summarize_file/)
+    const initialized = await (await rpc(url, token, { jsonrpc: '2.0', id: 3, method: 'initialize', params: {} })).json()
+    expect(initialized.result.instructions).toContain('the full npm test')
     const called = await (await rpc(url, token, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'run_and_summarize', arguments: { command: 'npm test' } } })).json()
     expect(called.result.content[0].text).toBe('ran for mine')
     expect(runAndSummarize).toHaveBeenCalledWith('mine', { command: 'npm test' }, expect.any(AbortSignal))

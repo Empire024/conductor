@@ -65,13 +65,13 @@ it('binds LocalAdapter control to durable project memory, live permissions and r
   // this fixture declines — and it cannot be aimed anywhere but the authorized project.
   expect(await broker('app.update.status', {})).toMatchObject({ state: 'idle' })
   await expect(broker('app.update', {})).rejects.toThrow(/declined/)
-  await expect(broker('app.update', { workspace: 'C:/elsewhere' })).rejects.toThrow(/cannot be overridden/)
-  await expect(broker('app.update.authorize', { agentSessionId: spec.id })).rejects.toThrow(/unavailable in this mode/)
+  await expect(broker('app.update', { workspace: 'C:/elsewhere' })).rejects.toThrow('app.update does not take workspace; it takes no arguments')
+  await expect(broker('app.update.authorize', { agentSessionId: spec.id })).rejects.toThrow('"app.update.authorize" is not a Conductor method a local model may call')
   expect(localUpdates.start).not.toHaveBeenCalled()
   const state = database.structured.snapshot(spec.id)!
   database.structured.update(spec.id, { settings: { ...state.settings, permission: 'read-only' } })
-  await expect(broker('memory.remember', { gist: 'REFUSED' })).rejects.toThrow(/unavailable/)
-  await expect(broker('tasks.update', { revision: 'any', id: 'local-1', status: 'todo' })).rejects.toThrow(/unavailable/)
+  await expect(broker('memory.remember', { gist: 'REFUSED' })).rejects.toThrow(/changes something and this turn is read-only/)
+  await expect(broker('tasks.update', { revision: 'any', id: 'local-1', status: 'todo' })).rejects.toThrow(/changes something and this turn is read-only/)
   expect(JSON.stringify(await broker('memory.recall', {}))).toContain('LOCAL_INTEGRATION_DURABLE')
   manager.dispose()
   await expect(broker('memory.recall', {})).rejects.toThrow(/runtime/)

@@ -419,6 +419,8 @@ credential (the store can be given the current token, or the sanitizer a predica
 `token\s*[=:]\s*[a-f0-9]{64}`. Backfill is not required (the DB is 6.4 GB); note it in the doc.
 Files: `src/main/structured-store.ts`, `structured-store.test.ts`.
 
+Done (batch 3, not yet shipped): `maskSecrets` masks `CONDUCTOR_CONTROL_TOKEN=`, `token: <64 hex>` and any 64-hex run a live server recognises (`registerSecretCheck`, registered by agent-control-server). Backfill added after all, on the controller's word: `redactSecretsStep` walks structured_events, the archive, resident projections and archive tails, then projection and spec rows, 200 rowid-ordered rows per step every 100 ms from 60 s after launch, with a durable cursor in structured_meta (`secret_redaction_v1`). Read-only dry run on the owner's 6.5 GB journal (2026-09-28, 209 s, 103 live tokens): events 5,129,180 scanned / 5,559 candidates / 1,488 to rewrite in 59 conversations; archive 1,408 / 18 / 1; projections 778 / 336 / 65; specs 778 / 0 / 0. Not covered: 6 of 1,343 output artifact files (agent-artifacts/*.txt) hold a token.
+
 ### H18 Shell-hygiene hints and the local-assist timeout (S)
 
 Desired: add two sentences to the Claude static block (once per runtime, `turn-briefing.ts`):

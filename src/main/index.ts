@@ -3022,6 +3022,9 @@ app.whenReady().then(async () => {
   })
   // Jobs the previous process left running are reconciled and resumed once the windows are up.
   setTimeout(() => { void durableJobs?.start().catch(error => console.error('Durable jobs could not be reconciled', error)) }, 3000)
+  // Rows stored before the journal masked every form of the control token are rewritten once, a
+  // bounded chunk at a time, after startup has settled (structured-store.ts, redactSecretsStep).
+  setTimeout(() => { database.structured.startSecretRedaction() }, 60_000).unref()
 })
 
 // 'window-all-closed' is owned by the host lifecycle: it quits exactly as before unless this machine
