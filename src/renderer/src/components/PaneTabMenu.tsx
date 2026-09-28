@@ -1,8 +1,9 @@
 import { useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { ChevronsLeftRight, Copy, ExternalLink, FolderPlus, Maximize2, Minus, PanelBottom, PanelLeft, PanelRight, PanelTop, PictureInPicture2, Plus, TimerReset, Trash2, Undo2, X } from 'lucide-react'
+import { ChevronsLeftRight, Copy, ExternalLink, FolderPlus, Maximize2, Minus, PanelBottom, PanelLeft, PanelRight, PanelTop, PictureInPicture2, Pin, PinOff, Plus, TimerReset, Trash2, Undo2, X } from 'lucide-react'
 import type { PaneTab, TabGroup, TabGroupColor } from '../../../shared/models'
 import { TAB_GROUP_COLORS } from '../../../shared/models'
+import { tabPinned } from '../../../shared/workspace-clarity'
 import type { TabGroupAction } from '../layout/tab-groups'
 import type { WorkspaceTabAction } from '../layout/workspace-tab-actions'
 
@@ -90,6 +91,7 @@ export function PaneTabMenu({ x, y, tab, maximized, continuation, canReopen, gro
       <button role="menuitem" onClick={() => run('duplicate')}><Copy size={13} /> Duplicate tab</button>
       <button role="menuitem" onClick={() => run('detach')}><ExternalLink size={13} /> Open as window</button>
       <button role="menuitem" onClick={() => run('maximize')}><Maximize2 size={13} /> {maximized ? 'Restore layout' : 'Maximize tab'}</button>
+      <button role="menuitem" onClick={() => run('pin')}>{tabPinned(tab) ? <PinOff size={13} /> : <Pin size={13} />} {tabPinned(tab) ? 'Unpin tab' : 'Pin tab'}</button>
       {tab.kind === 'agent' && <button role="menuitem" onClick={() => run('continuation')}><TimerReset size={13} /> {continuation ? 'Disable' : 'Enable'} limit continuation</button>}
       <button role="menuitem" disabled={!canReopen} onClick={() => run('reopen')}><Undo2 size={13} /> Retrieve closed tab</button>
       <div role="separator" />

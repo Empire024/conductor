@@ -12,7 +12,10 @@ import { applyTabGroupAction, applyWorkspaceTabAction } from './workspace-tab-ac
 import { mountedTabIds, touchRecentTabs } from './tab-keep-alive'
 import { clearNewTab, useNewTabMarks } from './new-tab-marks'
 import { useSuspendedConversations } from './use-suspended-conversations'
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { distinctTabLabels, type WorkspaceClarity } from '../../../shared/workspace-clarity'
+import { useWorkspaceClarity } from './use-workspace-clarity'
+import { markTabsSeen, moveTabToFront } from './tab-seen'
 import { createPortal, flushSync } from 'react-dom'
 import {
   Bot,
@@ -71,7 +74,7 @@ import {
   type PaneGeometry,
   type TabRect
 } from './tab-drag'
-import { ChevronDown, ChevronRight } from 'lucide-react'
+import { CheckCheck, ChevronDown, ChevronRight } from 'lucide-react'
 import { createPaneTab } from '../panes/pane-factory'
 import { checkProjectPlacement, closePlacedTab, createPlacedTab, defaultPlacement, projectHostName, requiredMachineId } from './machine-placement'
 import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
@@ -92,6 +95,10 @@ import { coworkerCloseTargets, coworkerTabGroups } from './coworker-tab-groups'
 import { ControlledByBadge } from '../components/ControlActivity'
 import { guardTabClose, offerCloseUndo } from './close-work-guard'
 import './coworker-tab-groups.css'
+import './workspace-clarity.css'
+
+/** The workspace's clarity reading (src/shared/workspace-clarity.ts), shared by every pane. */
+const ClarityContext = createContext<WorkspaceClarity | null>(null)
 
 interface PaneWorkspaceProps {
   layout: WorkspaceLayout
@@ -325,12 +332,70 @@ function PaneGroup({
   useSuspendedConversations(group.tabs, mountedIds, workspace.project, workspace.session)
   const menuTab = group.tabs.find(tab => tab.id === menuPosition?.tabId) ?? activeTab
   const menuGroup = tabGroupsOf(group).find(item => item.id === groupMenu?.tabGroupId)
-  const coworkerPresentation = coworkerTabGroups(group.tabs, controlLinks)
+  // Workspace clarity: finished tabs the owner has not looked at since leave the strip (they
+  // stay open, in the sidebar's Done group and Ctrl+K); the one on screen always shows.
+  const clarity = useContext(ClarityContext)
+  const hiddenIds = clarity?.hiddenFromStrip
+  const isHidden = (tab: PaneTab): boolean => Boolean(hiddenIds?.has(tab.id)) && tab.id !== activeTab.id
+  const stripTabs = hiddenIds?.size ? group.tabs.filter(tab => !isHidden(tab)) : group.tabs
+  const hiddenTabs = hiddenIds?.size ? group.tabs.filter(isHidden) : []
+  // A drop index counts the tabs the strip leaves out too: each shown slot also stands for the
+  // hidden run right before it, so a dropped tab lands where it appears to.
+  const hiddenBefore = new Map<string, number>()
+  { let run = 0; for (const tab of group.tabs) { if (isHidden(tab)) run++; else { if (run) hiddenBefore.set(tab.id, run); run = 0 } } }
+  const distinctLabels = distinctTabLabels(stripTabs.map(tab => tab.title))
+  const stripLabels = new Map(stripTabs.map((tab, index) => [tab.id, distinctLabels[index]!]))
+  const mainTabId = clarity?.mainTabId ?? null
+  const coworkerPresentation = coworkerTabGroups(stripTabs, controlLinks)
   const focused = workspace.focusedGroupId === group.id
   const isSourceGroup = dragging?.sourceGroupId === group.id
   const barIndex = dropTarget?.kind === 'bar' && dropTarget.groupId === group.id ? dropTarget.index : null
   const canvasEdge = dropTarget?.kind === 'canvas' && dropTarget.groupId === group.id ? dropTarget.edge : null
   const gapBeforeId = barIndex === null ? undefined : gapAnchorId(group.tabs.map((tab) => tab.id), isSourceGroup ? dragging!.tab.id : null, barIndex)
+
+  // The MAIN leads its pane's strip. Placed once per MAIN, so a tab the owner drags away stays put.
+  const placedMainRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!mainTabId || placedMainRef.current === mainTabId) return
+    const index = group.tabs.findIndex(tab => tab.id === mainTabId)
+    if (index < 0) return
+    placedMainRef.current = mainTabId
+    if (index > 0) workspace.onLayout(layout => moveTabToFront(layout, group.id, mainTabId))
+  }, [mainTabId, group.id, group.tabs])
+  // Tabs the strip has no room for are listed in its "+N" menu, with the finished ones it hides.
+  const tabsRef = useRef<HTMLDivElement>(null)
+  const [overflowIds, setOverflowIds] = useState<string[]>([])
+  const [overflowMenu, setOverflowMenu] = useState<{ x: number; y: number } | null>(null)
+  const stripKey = stripTabs.map(tab => tab.id).join('|')
+  useLayoutEffect(() => {
+    const strip = tabsRef.current
+    if (!strip) return
+    const measure = (): void => {
+      const bounds = strip.getBoundingClientRect()
+      const ids = [...strip.querySelectorAll<HTMLElement>('.pane-tab[data-control-tab-id]')].filter(node => {
+        const rect = node.getBoundingClientRect()
+        return rect.width > 0 && (rect.right > bounds.right + 1 || rect.left < bounds.left - 1)
+      }).map(node => node.dataset.controlTabId!)
+      setOverflowIds(current => current.join('|') === ids.join('|') ? current : ids)
+    }
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(strip)
+    strip.addEventListener('scroll', measure, { passive: true })
+    return () => { observer.disconnect(); strip.removeEventListener('scroll', measure) }
+  }, [stripKey, group.activeTabId])
+  useEffect(() => {
+    if (!overflowMenu) return
+    const close = (event: Event): void => { if (event.target instanceof Element && event.target.closest('.pane-overflow-menu, .pane-overflow-button')) return; setOverflowMenu(null) }
+    const escape = (event: KeyboardEvent): void => { if (event.key === 'Escape') setOverflowMenu(null) }
+    window.addEventListener('mousedown', close); window.addEventListener('keydown', escape)
+    return () => { window.removeEventListener('mousedown', close); window.removeEventListener('keydown', escape) }
+  }, [overflowMenu])
+  const showTab = (tabId: string): void => {
+    setOverflowMenu(null)
+    workspace.onLayout(layout => markTabsSeen(activateTab(layout, group.id, tabId), [tabId, activeTab.id]))
+    requestAnimationFrame(() => tabsRef.current?.querySelector<HTMLElement>(`[data-control-tab-id="${CSS.escape(tabId)}"]`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' }))
+  }
 
   useEffect(() => {
     if (!menuPosition) return
@@ -636,10 +701,11 @@ function PaneGroup({
         key={tab.id}
         data-control-tab-id={tab.id}
         data-control-agent-id={tab.resourceId}
-        {...(dropSlot ? { 'data-drop-slot-id': tab.id } : {})}
-        className={`pane-tab ${tab.id === activeTab.id ? 'active' : ''} ${tabPhase === 'waiting_input' ? 'needs-attention' : ''} ${openingTabIds.has(tab.id) ? 'opening' : ''} ${spotlight?.tabId === tab.id ? 'spotlight' : ''} ${closingTabIds.has(tab.id) ? 'closing' : ''} ${newTabs.has(tab.id) && tab.id !== activeTab.id ? 'is-new' : ''} ${isSourceGroup && dragging!.tab.id === tab.id ? 'drag-lifted' : ''}`}
+        {...(dropSlot ? { 'data-drop-slot-id': tab.id, ...(hiddenBefore.get(tab.id) ? { 'data-drop-span': 1 + hiddenBefore.get(tab.id)! } : {}) } : {})}
+        data-clarity-status={clarity?.statusByTab.get(tab.id)}
+        className={`pane-tab ${tab.id === mainTabId ? 'clarity-main' : ''} ${tab.id === activeTab.id ? 'active' : ''} ${tabPhase === 'waiting_input' ? 'needs-attention' : ''} ${openingTabIds.has(tab.id) ? 'opening' : ''} ${spotlight?.tabId === tab.id ? 'spotlight' : ''} ${closingTabIds.has(tab.id) ? 'closing' : ''} ${newTabs.has(tab.id) && tab.id !== activeTab.id ? 'is-new' : ''} ${isSourceGroup && dragging!.tab.id === tab.id ? 'drag-lifted' : ''}`}
         style={{ marginLeft: gapHere ? dragging!.width : undefined }}
-        onClick={() => workspace.onLayout(layout => activateTab(layout, group.id, tab.id))}
+        onClick={() => workspace.onLayout(layout => markTabsSeen(activateTab(layout, group.id, tab.id), [tab.id, activeTab.id]))}
         onContextMenu={event => showContextMenu(event, tab)}
         onPointerDown={(event) => {
           if (event.button !== 1) return
@@ -653,7 +719,7 @@ function PaneGroup({
         onDragStart={(event) => beginDrag(event, tab)}
       >
         {tab.kind === 'agent' ? <ProviderIcon provider={String(tab.state?.provider ?? 'codex')} model={tab.state?.model as string | undefined} size={14} /> : <Icon size={13} strokeWidth={1.8} />}
-        <span className="pane-tab-title" title={tab.title}>{tab.title}</span>
+        <span className="pane-tab-title" title={tab.title}>{stripLabels.get(tab.id) ?? tab.title}</span>
         {tab.state?.anonymous === true && <span className="pane-tab-anonymous" title="Anonymous: kept only in memory. Closing this tab deletes the conversation for good; files it wrote stay." aria-label="anonymous"><EyeOff size={12} /></span>}
         {newTabs.has(tab.id) && tab.id !== activeTab.id && <span className="pane-tab-new-mark" title="Opened by an agent; not viewed yet" aria-label="new" />}
         {controller && <ControlledByBadge compact controllerTitle={controller.controllerTitle ?? group.tabs.find(candidate => candidate.id === controller.controllerTabId)?.title ?? 'another tab'} />}
@@ -694,21 +760,23 @@ function PaneGroup({
           requestClose(activeTab)
         }}
       >
-        <div className="pane-tabs">
-          {tabStripSlots(group).map((slot) => {
+        <div className="pane-tabs" ref={tabsRef}>
+          {tabStripSlots(stripTabs === group.tabs ? group : { ...group, tabs: stripTabs }).map((slot) => {
             if (slot.kind === 'tab') {
               const coworkerGroup = coworkerPresentation.groupByTabId.get(slot.tab.id)
               if (!coworkerGroup) return renderTab(slot.tab, gapBeforeId === slot.tab.id)
               if (coworkerGroup.insertionTabId !== slot.tab.id) return null
-              const expanded = expandedCoworkers.has(coworkerGroup.controller.id)
+              // The MAIN's coworkers show by default; the set records groups toggled from their default.
+              const expanded = expandedCoworkers.has(coworkerGroup.controller.id) !== (coworkerGroup.controller.id === mainTabId)
               const activeCoworker = coworkerGroup.coworkers.find(tab => tab.id === activeTab.id)
-              const visibleCoworkers = expanded ? coworkerGroup.coworkers : activeCoworker ? [activeCoworker] : []
+              const liveFirst = (tab: PaneTab): number => { const status = clarity?.statusByTab.get(tab.id); return status === 'waiting' ? 0 : status === 'running' ? 1 : 2 }
+              const visibleCoworkers = expanded ? [...coworkerGroup.coworkers].sort((a, b) => liveFirst(a) - liveFirst(b)) : activeCoworker ? [activeCoworker] : []
               const allCount = coworkerGroup.coworkers.length + 1
               return <div
                 key={`coworkers:${coworkerGroup.controller.id}`}
                 className={`coworker-tab-group ${expanded ? 'expanded' : 'collapsed'} ${activeCoworker ? 'has-active-coworker' : ''}`}
                 data-drop-slot-id={!expanded ? coworkerGroup.controller.id : undefined}
-                data-drop-span={!expanded ? allCount : undefined}
+                data-drop-span={!expanded ? allCount + (hiddenBefore.get(coworkerGroup.insertionTabId) ?? 0) : undefined}
                 style={{ marginLeft: gapBeforeId === coworkerGroup.insertionTabId ? dragging!.width : undefined }}
               >
                 {renderTab(coworkerGroup.controller, false, expanded)}
@@ -750,7 +818,7 @@ function PaneGroup({
                 data-tab-group-id={slot.group.id}
                 data-tab-group-color={slot.group.color}
                 style={{ marginLeft: gapBeforeId === runFirstId ? dragging!.width : undefined }}
-                {...(slot.collapsed ? { 'data-drop-slot-id': slot.group.id, 'data-drop-span': count } : {})}
+                {...(slot.collapsed ? { 'data-drop-slot-id': slot.group.id, 'data-drop-span': count + (hiddenBefore.get(runFirstId) ?? 0) } : {})}
               >
                 <button
                   className="tab-group-chip"
@@ -773,6 +841,11 @@ function PaneGroup({
             <Plus size={13} />
           </button>
         </div>
+        {(overflowIds.length > 0 || hiddenTabs.length > 0) && <button type="button" className="pane-overflow-button" aria-haspopup="menu" aria-expanded={Boolean(overflowMenu)}
+          title={[overflowIds.length ? `${overflowIds.length} more tab${overflowIds.length === 1 ? '' : 's'}` : '', hiddenTabs.length ? `${hiddenTabs.length} finished tab${hiddenTabs.length === 1 ? '' : 's'} out of the way (sidebar: Done)` : ''].filter(Boolean).join('; ')}
+          onClick={event => { const rect = event.currentTarget.getBoundingClientRect(); setOverflowMenu(current => current ? null : { x: Math.max(8, Math.min(rect.right - 260, window.innerWidth - 268)), y: rect.bottom + 3 }) }}>
+          {overflowIds.length > 0 ? <span>+{overflowIds.length}</span> : <><CheckCheck size={12} /><span>{hiddenTabs.length}</span></>}
+        </button>}
         <div className="pane-controls">
           <button
             className="pane-drag-handle"
@@ -793,6 +866,12 @@ function PaneGroup({
         ))}
       </div>
     </section>
+    {overflowMenu && createPortal(<div className="cursor-context-menu pane-overflow-menu" role="menu" style={{ left: overflowMenu.x, top: overflowMenu.y }}>
+      {overflowIds.length > 0 && <div className="context-menu-label">More tabs</div>}
+      {overflowIds.flatMap(id => { const tab = group.tabs.find(item => item.id === id); return tab ? [<button key={id} role="menuitem" title={tab.title} onClick={() => showTab(id)}>{tab.kind === 'agent' ? <ProviderIcon provider={String(tab.state?.provider ?? 'codex')} model={tab.state?.model as string | undefined} size={12} /> : null}<span>{tab.title}</span></button>] : [] })}
+      {hiddenTabs.length > 0 && <div className="context-menu-label">Finished, out of the way</div>}
+      {[...hiddenTabs].sort((a, b) => (clarity?.done.findIndex(row => row.tab.id === a.id) ?? 0) - (clarity?.done.findIndex(row => row.tab.id === b.id) ?? 0)).map(tab => <button key={tab.id} role="menuitem" title={tab.title} onClick={() => showTab(tab.id)}>{tab.kind === 'agent' ? <ProviderIcon provider={String(tab.state?.provider ?? 'codex')} model={tab.state?.model as string | undefined} size={12} /> : null}<span>{tab.title}</span><em>{clarity?.statusByTab.get(tab.id) === 'handed-off' ? 'handed off' : clarity?.statusByTab.get(tab.id)}</em></button>)}
+    </div>, document.body)}
     {menuPosition && <PaneTabMenu x={menuPosition.x} y={menuPosition.y} tab={menuTab}
       maximized={workspace.maximizedGroupId === group.id}
       continuation={menuTab.state?.continueOnLimit === undefined ? workspace.session.continueOnLimit : Boolean(menuTab.state.continueOnLimit)}
@@ -1040,6 +1119,7 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
   const maximized = props.maximizedGroupId ? findGroup(props.layout.root, props.maximizedGroupId) : null
   const emptyGroup = props.layout.root.type === 'group' && props.layout.root.tabs.length === 0
   const controlLinks = useAgentControlLinks(props.project.id, props.session.id, !emptyGroup)
+  const clarity = useWorkspaceClarity(props.layout, controlLinks, props.correctedActivityPhases, !emptyGroup)
 
   useEffect(() => {
     let foreignStaleTimer = 0
@@ -1187,8 +1267,9 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
   }
   const DragIcon = dragging ? iconFor(dragging.tab) : FileText
   return (
+    <ClarityContext.Provider value={clarity}>
     <div className={`pane-workspace ${dragging ? 'dragging' : ''}`}>
-      <AgentControlLinks projectId={props.project.id} sessionId={props.session.id} layout={props.layout} />
+      <AgentControlLinks projectId={props.project.id} sessionId={props.session.id} layout={props.layout} mainTabId={clarity.mainTabId} />
       {emptyGroup ? (
         <div className="empty-pane-workspace">
           <div>
@@ -1212,5 +1293,6 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
         document.body
       )}
     </div>
+    </ClarityContext.Provider>
   )
 }

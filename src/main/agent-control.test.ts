@@ -2423,6 +2423,66 @@ describe('agents.finish', () => {
     expect(f.confirm).not.toHaveBeenCalled()
   })
 
+  it('keeps a finished coworker reachable: agents.steer reopens its closed tab in its own project and starts a turn', async () => {
+    const f = fixture(); closer(f)
+    const other = sibling(f)
+    const dropTab = (sessionId: string, tabId: string) => {
+      const current = f.database.getSession(sessionId)!
+      if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+      current.layout.root.tabs = current.layout.root.tabs.filter(tab => tab.id !== tabId)
+      f.database.saveSession(sessionId, current.layout, null, [])
+    }
+    const stranger = agentIn(f, f.project.id, f.workspace.id, 'stranger')
+    for (const projectId of [undefined, other.project.id]) {
+      const workspaceId = projectId ? other.workspace.id : f.workspace.id
+      const child = await f.control.call(f.scope, 'tabs.open', { ...(projectId ? { projectId } : {}), provider: 'claude', title: 'Dispatched worker' }) as AgentControlTab
+      settle(f, child.resourceId!, 'completed')
+      await f.control.call(f.scope, 'agents.finish', { agentSessionId: child.resourceId })
+      expect(closes(f).at(-1)).toMatchObject({ params: { tabId: child.id } })
+      dropTab(workspaceId, child.id) // what the renderer's tabs.close does
+      const listed = await f.control.call(f.scope, 'agents.list') as Array<Record<string, unknown>>
+      expect(listed.filter(entry => entry.agentSessionId === child.resourceId)).toEqual([expect.objectContaining({ finished: true, tabId: null, controlled: true, projectId: projectId ?? f.project.id })])
+      // Nobody else may name it.
+      await expect(f.control.call(stranger, 'agents.steer', { agentSessionId: child.resourceId, prompt: 'Mine now' })).rejects.toThrow(/outside this workspace|another project|does not control/)
+      const before = f.submissions.length
+      const result = await f.control.call(f.scope, 'agents.steer', { agentSessionId: child.resourceId, prompt: 'One more thing' }) as Record<string, unknown>
+      await vi.waitFor(() => expect(f.submissions.length).toBe(before + 1))
+      expect(result).toMatchObject({ agentSessionId: child.resourceId, reopened: true, delivery: 'started', workspaceId })
+      expect(f.submissions.at(-1)!.prompt).toContain('One more thing')
+      expect(f.requests.filter(request => request.action === 'tabs.open').at(-1)).toMatchObject({ sessionId: workspaceId, params: { focus: false } })
+      const layout = f.database.getSession(workspaceId)!.layout.root
+      expect(layout.type === 'group' && layout.tabs.filter(tab => tab.resourceId === child.resourceId)).toHaveLength(1)
+      expect(JSON.parse(f.database.getSetting('agentControlParent:' + child.resourceId)!)).toMatchObject({ controllerAgentSessionId: f.scope.agentSessionId })
+      expect(f.database.getSetting(COWORKER_OPENED_PREFIX + child.resourceId)).toBe(f.scope.agentSessionId)
+    }
+  })
+
+  it('lets the owner and a wizard message a closed conversation of their workspace back open; a plain agent may not', async () => {
+    const f = fixture()
+    const dropTab = (tabId: string) => {
+      const current = f.database.getSession(f.workspace.id)!
+      if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+      current.layout.root.tabs = current.layout.root.tabs.filter(tab => tab.id !== tabId)
+      f.database.saveSession(f.workspace.id, current.layout, null, [])
+    }
+    const owner = f.control.ownerScope({ projectId: f.project.id, workspaceId: f.workspace.id })
+    const bystander = agentIn(f, f.project.id, f.workspace.id, 'bystander')
+    for (const [caller, label] of [[owner, 'owner'], [{ ...bystander, wizard: true }, 'wizard']] as const) {
+      // The owner's own conversation, settled and closed: nobody's coworker.
+      const tab = await f.control.call(owner, 'tabs.open', { provider: 'codex', title: 'Closed by the sweep ' + label }) as AgentControlTab
+      settle(f, tab.resourceId!, 'completed')
+      dropTab(tab.id)
+      await expect(f.control.call(bystander, 'agents.steer', { agentSessionId: tab.resourceId, prompt: 'Not yours' })).rejects.toThrow(/outside this workspace/)
+      const before = f.submissions.length
+      const result = await f.control.call(caller, 'agents.steer', { agentSessionId: tab.resourceId, prompt: 'Back to work ' + label }) as Record<string, unknown>
+      await vi.waitFor(() => expect(f.submissions.length).toBe(before + 1))
+      expect(result).toMatchObject({ agentSessionId: tab.resourceId, reopened: true, delivery: 'started', workspaceId: f.workspace.id })
+      expect(f.requests.filter(request => request.action === 'tabs.open').at(-1)).toMatchObject({ params: { focus: false } })
+      const root = f.database.getSession(f.workspace.id)!.layout.root
+      expect(root.type === 'group' && root.tabs.filter(item => item.resourceId === tab.resourceId)).toHaveLength(1)
+    }
+  })
+
   it('lets the controller close a settled coworker at once, keeping history and releasing its runtime', async () => {
     const f = fixture(), released = closer(f)
     const child = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab

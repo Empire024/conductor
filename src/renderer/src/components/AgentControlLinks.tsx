@@ -7,12 +7,12 @@ import { listGroups } from '../layout/layout-operations'
 import './AgentControlLinks.css'
 
 export type ControlRect = { x: number; y: number; width: number; height: number }
-export type ControlMarker = { id: string; tabId: string; role: 'controller' | 'controlled' | 'both'; x: number; y: number; color: string; title: string; count: number }
+export type ControlMarker = { id: string; tabId: string; role: 'controller' | 'controlled' | 'both'; x: number; y: number; color: string; title: string; count: number; main?: boolean }
 export type ControlPopoverPosition = { left: number; top: number; width: number; maxHeight: number }
 const MARKER_PALETTE = ['--accent', '--blue', '--accent-muted']
 const hashIndex = (id: string, mod: number): number => { let hash = 0; for (let i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) >>> 0; return hash % mod }
 // One labelled relationship marker per tab replaces the old pile of anonymous dots.
-export function computeMarkers(links: AgentControlLink[], rectFor: (id: string) => ControlRect | undefined, titleFor: (id: string, remote?: string) => string): ControlMarker[] {
+export function computeMarkers(links: AgentControlLink[], rectFor: (id: string) => ControlRect | undefined, titleFor: (id: string, remote?: string) => string, mainTabId?: string | null): ControlMarker[] {
   const tabIds = [...new Set(links.flatMap(link => [link.controllerTabId, link.controlledTabId]))]
   return tabIds.flatMap(tabId => {
     const rect = rectFor(tabId)
@@ -33,7 +33,9 @@ export function computeMarkers(links: AgentControlLink[], rectFor: (id: string) 
       ? `${ownTitle} is the main coordinating tab and controls ${count} coworker${count === 1 ? '' : 's'}: ${names.join(', ')}`
       : `${ownTitle} is a coworker controlled by ${names[0] ?? 'the main coordinating tab'}`
     const identity = related[0]?.targetAgentSessionId ?? tabId
-    return [{ id: `${tabId}:${role}`, tabId, role, x: rect.x + rect.width - 8, y: rect.y + 7, color: MARKER_PALETTE[hashIndex(identity, MARKER_PALETTE.length)] ?? '--accent', title, count }]
+    // One MAIN per workspace (workspace clarity): any other controller leads its own coworkers.
+    const main = mainTabId === undefined || mainTabId === tabId
+    return [{ id: `${tabId}:${role}`, tabId, role, main, x: rect.x + rect.width - 8, y: rect.y + 7, color: MARKER_PALETTE[hashIndex(identity, MARKER_PALETTE.length)] ?? '--accent', title, count }]
   })
 }
 
@@ -49,7 +51,7 @@ export function computeControlPopoverPosition(marker: Pick<ControlMarker, 'x' | 
     maxHeight
   }
 }
-export function AgentControlLinks({ projectId, sessionId, layout }: { projectId: string; sessionId: string; layout: WorkspaceLayout }): React.JSX.Element | null {
+export function AgentControlLinks({ projectId, sessionId, layout, mainTabId }: { projectId: string; sessionId: string; layout: WorkspaceLayout; mainTabId?: string | null }): React.JSX.Element | null {
   const [links, setLinks] = useState<AgentControlLink[]>([])
   const [openMarkerTabId, setOpenMarkerTabId] = useState<string | null>(null)
   const [markers, setMarkers] = useState<ControlMarker[]>([])
@@ -80,7 +82,7 @@ export function AgentControlLinks({ projectId, sessionId, layout }: { projectId:
       frame = requestAnimationFrame(() => {
         const headers = [...document.querySelectorAll<HTMLElement>('[data-control-tab-id]')]
         const rect = (id: string): ControlRect | undefined => { const node = headers.find(header => header.dataset.controlTabId === id); return node?.getClientRects().length ? node.getBoundingClientRect() : undefined }
-        setMarkers(computeMarkers(links, rect, titleFor))
+        setMarkers(computeMarkers(links, rect, titleFor, mainTabId))
       })
     }
     measure()
@@ -88,7 +90,7 @@ export function AgentControlLinks({ projectId, sessionId, layout }: { projectId:
     document.querySelectorAll('[data-control-tab-id]').forEach(node => observer.observe(node))
     window.addEventListener('resize', measure); window.addEventListener('scroll', measure, true)
     return () => { observer.disconnect(); cancelAnimationFrame(frame); window.removeEventListener('resize', measure); window.removeEventListener('scroll', measure, true) }
-  }, [links, layout])
+  }, [links, layout, mainTabId])
   const focus = (tabId: string): void => { void window.conductor.agentControl.focusTab(projectId, sessionId, tabId).catch(reason => setError(String(reason))) }
   const release = (id: string): void => { void window.conductor.agentControl.release(id).then(() => { setLinks(current => current.filter(link => link.targetAgentSessionId !== id)); setError('') }).catch(reason => setError(String(reason))) }
   if (!relevant.length) return null
@@ -105,7 +107,7 @@ export function AgentControlLinks({ projectId, sessionId, layout }: { projectId:
       const container = header?.closest<HTMLElement>('.pane-tabs')
       if (!container) return null
       const bounds = container.getBoundingClientRect()
-      return createPortal(<button type="button" key={marker.id} className={'agent-control-marker ' + marker.role} style={{ left: marker.x - bounds.left + container.scrollLeft, top: marker.y - bounds.top + container.scrollTop, color: 'var(' + marker.color + ')', borderColor: 'var(' + marker.color + ')' }} title={`${marker.title}. Select for relationship details.`} aria-label={`${marker.title}; show relationship details`} aria-expanded={openMarkerTabId === marker.tabId} onClick={() => setOpenMarkerTabId(current => current === marker.tabId ? null : marker.tabId)}><span aria-hidden="true">{marker.role === 'controlled' ? <Link2 size={8} /> : <Radio size={8} />}</span><b>{marker.role === 'controller' ? 'MAIN' : marker.role === 'controlled' ? 'COWORKER' : 'COWORKER · MAIN'}</b>{marker.role !== 'controlled' && marker.count > 1 && <em>{marker.count}</em>}</button>, container, marker.id)
+      return createPortal(<button type="button" key={marker.id} className={'agent-control-marker ' + marker.role} style={{ left: marker.x - bounds.left + container.scrollLeft, top: marker.y - bounds.top + container.scrollTop, color: 'var(' + marker.color + ')', borderColor: 'var(' + marker.color + ')' }} title={`${marker.title}. Select for relationship details.`} aria-label={`${marker.title}; show relationship details`} aria-expanded={openMarkerTabId === marker.tabId} onClick={() => setOpenMarkerTabId(current => current === marker.tabId ? null : marker.tabId)}><span aria-hidden="true">{marker.role === 'controlled' ? <Link2 size={8} /> : <Radio size={8} />}</span><b>{marker.role === 'controller' ? (marker.main === false ? 'LEAD' : 'MAIN') : marker.role === 'controlled' ? 'COWORKER' : marker.main === false ? 'COWORKER · LEAD' : 'COWORKER · MAIN'}</b>{marker.role !== 'controlled' && marker.count > 1 && <em>{marker.count}</em>}</button>, container, marker.id)
     })}
     {openMarker && popoverPosition && <div className="agent-control-popover" role="dialog" aria-label={`Agent tab relationships for ${titleFor(openMarker.tabId)}`} style={popoverPosition}>
       <header><Link2 size={12} aria-hidden="true" /><strong>{openMarker.role === 'controller' ? 'Main coordinator' : openMarker.role === 'controlled' ? 'Coworker' : 'Coworker and main coordinator'}</strong><button type="button" aria-label="Close agent tab relationships" title="Close relationship details" onClick={() => setOpenMarkerTabId(null)}><X size={12} /></button></header>

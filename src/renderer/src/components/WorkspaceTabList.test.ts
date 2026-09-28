@@ -87,3 +87,27 @@ describe('persistent main/coworker roles', () => {
     expect(tabRoleLabel({ controlledBy: undefined, controlling: links })).toBe('Main')
   })
 })
+
+describe('workspace clarity in the sidebar', () => {
+  const session = (): SessionRecord => {
+    const base = makeSession()
+    if (base.layout.root.type !== 'group') throw new Error('Expected a tab group')
+    base.layout.root.tabs.push(
+      { id: 'done-a', kind: 'agent', title: 'Finished A', resourceId: 'agent-done-a' },
+      { id: 'done-b', kind: 'agent', title: 'Finished B', resourceId: 'agent-done-b' }
+    )
+    return base
+  }
+  const html = renderToStaticMarkup(createElement(WorkspaceTabList, { session: session(), active: true, expanded: true, activityPhases: new Map<string, AgentActivityPhase>([['agent-resource', 'working'], ['agent-done-a', 'complete'], ['agent-done-b', 'failed']]), onAction: vi.fn(), onGroupAction: vi.fn() }))
+  it('lists live work, and folds finished tabs into one collapsed Done group', () => {
+    expect(html).toContain('data-clarity-row="agent-tab"')
+    expect(html).toContain('data-clarity-row="terminal-tab"')
+    expect(html).toContain('Done (2)')
+    expect(html).toContain('aria-expanded="false"')
+    expect(html).not.toContain('data-clarity-row="done-a"')
+    expect(html).toContain('Close finished')
+  })
+  it('puts running work above other open tabs', () => {
+    expect(html.indexOf('data-clarity-row="agent-tab"')).toBeLessThan(html.indexOf('data-clarity-row="terminal-tab"'))
+  })
+})

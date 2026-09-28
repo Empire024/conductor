@@ -34,6 +34,10 @@ const bridge: ConductorBridge = {
     activateResource: (kind, id) => ipcRenderer.invoke('session-archive:activate-resource', kind, id),
     onChanged: callback => subscribe('session-archive:changed', callback)
   },
+  workspaceClarity: {
+    facts: agentSessionIds => ipcRenderer.invoke('workspace:tab-facts', agentSessionIds),
+    closeFinished: (projectId, sessionId, tabIds) => ipcRenderer.invoke('workspace:close-finished', projectId, sessionId, tabIds)
+  },
   agentControl: {
     openUri: uri => ipcRenderer.invoke('agent-control:open-uri', uri),
     focusTab: (projectId, sessionId, tabId) => ipcRenderer.invoke('agent-control:focus-tab', projectId, sessionId, tabId),
@@ -215,6 +219,8 @@ const bridge: ConductorBridge = {
     setLocalUpdates: (enabled) => ipcRenderer.invoke('settings:set-local-updates', enabled),
     coworkerAutoClose: () => ipcRenderer.invoke('settings:coworker-autoclose'),
     setCoworkerAutoClose: (minutes) => ipcRenderer.invoke('settings:set-coworker-autoclose', minutes),
+    finishedTabSweep: () => ipcRenderer.invoke('settings:finished-tab-sweep'),
+    setFinishedTabSweep: (hours) => ipcRenderer.invoke('settings:set-finished-tab-sweep', hours),
     alwaysOn: (refresh) => ipcRenderer.invoke('always-on:state', refresh === true),
     setStartAtLogin: (enabled) => ipcRenderer.invoke('always-on:set-start-at-login', enabled)
   },

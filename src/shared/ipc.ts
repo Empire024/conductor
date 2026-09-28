@@ -53,6 +53,13 @@ export interface FileSearchOptions { showHidden?: boolean; activeProjectId?: str
 export interface ConductorBridge {
   sessionArchive: import('./session-archive').SessionArchiveBridge
   agentControl: import('./agent-control').AgentControlBridge
+  /** Workspace clarity (src/shared/workspace-clarity.ts). */
+  workspaceClarity: {
+    /** Wizard, handed-off and settled-at facts for these agent conversations. */
+    facts(agentSessionIds: string[]): Promise<Record<string, import('./workspace-clarity').AgentTabFacts>>
+    /** The owner's "Close finished tabs": closes each still-finished one, history kept, naming any it kept. */
+    closeFinished(projectId: string, sessionId: string, tabIds: string[]): Promise<{ closed: number; kept: Array<{ tabId: string; title: string; reason: string }> }>
+  }
   agentConfirm: import('./agent-confirm').AgentConfirmBridge
   remote: import('./remote-control').RemoteControlBridge
   phone: import('./phone-access').PhoneAccessBridge
@@ -115,6 +122,9 @@ export interface ConductorBridge {
     /** Minutes a finished coworker stays open, and a settled CLI stays alive, before Conductor closes or releases it; 0 is Off. */
     coworkerAutoClose(): Promise<number>
     setCoworkerAutoClose(minutes: number): Promise<number>
+    /** Hours a finished tab nobody looked at stays open before it closes itself, history kept; 0 is Off. */
+    finishedTabSweep(): Promise<number>
+    setFinishedTabSweep(hours: number): Promise<number>
     /** "Start Conductor when I log in" and whether this machine comes back unattended (docs/always-on.md). */
     alwaysOn(refresh?: boolean): Promise<AlwaysOnState>
     setStartAtLogin(enabled: boolean): Promise<LoginItemState>

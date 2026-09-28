@@ -64,6 +64,9 @@ import { categorize } from './model-intelligence/categorize'
 import { EvaluationTurnError, evaluationTokens } from './model-intelligence/evaluation-ports'
 
 type Args = Record<string, unknown>
+/** The control link of a coworker whose tab closed as finished, and each controller's list of them. */
+const FINISHED_LINK_PREFIX = 'agentControlFinished:'
+const FINISHED_BY_PREFIX = 'agentControlFinishedBy:'
 const restricted = (settings?: SessionSettings): boolean => settings?.permission === 'read-only' || settings?.sandbox === 'read-only' || settings?.plan === true
 const permissionOrder: SessionSettings['permission'][] = ['read-only', 'default', 'accept-edits', 'auto']
 /** A controlled tab inherits its controller autonomy, never more, and only what the target provider
@@ -174,7 +177,7 @@ const toolSignatures = {
   'tabs.split': '({tabId,direction:"horizontal"|"vertical",projectId?,workspaceId?})',
   'tabs.detach': '({tabId,projectId?,workspaceId?})',
   'tabs.close': '({tabId,projectId?,workspaceId?}) — closes settled agent tabs with history retained; other tabs and active work require owner confirmation; never closes the caller or its ancestors; a coworker this caller controls in a sibling project closes under the same rule and its control link is released',
-  'agents.list': '() — visible native sessions plus live orphans in this workspace (orphaned:true, tabId:null; agents.resume reopens them), with observedAt, workspace/tab IDs, phase and lastActivityAt (phase "viewing" with backgroundTasks N: the turn ended but background tasks it started still run and the agent continues when they finish - not done), including tabs this caller controls in a sibling project (controlled:true) and sibling-project tabs nobody controls (controlled:false); an uncontrolled one may be read with agents.snapshot/status/history and steered with submit/steer/interrupt, and submit/steer take control of it; a controlled one answers every agents.* and tabs.* method as a coworker in this workspace does',
+  'agents.list': '() — visible native sessions plus live orphans in this workspace (orphaned:true, tabId:null; agents.resume reopens them), with observedAt, workspace/tab IDs, phase and lastActivityAt (phase "viewing" with backgroundTasks N: the turn ended but background tasks it started still run and the agent continues when they finish - not done), coworkers this caller dispatched that finished and closed their tab, in any project (finished:true, tabId:null; agents.steer reopens one and starts a turn), including tabs this caller controls in a sibling project (controlled:true) and sibling-project tabs nobody controls (controlled:false); an uncontrolled one may be read with agents.snapshot/status/history and steered with submit/steer/interrupt, and submit/steer take control of it; a controlled one answers every agents.* and tabs.* method as a coworker in this workspace does',
   'agents.snapshot': '({agentSessionId}) — agentSessionId is required and must be one listed by agents.list; observed native state, pending/running tools and recent output/results; refresh to verify older briefing intents',
   'agents.history': '({agentSessionId,afterSequence?}) — incremental native events',
   'agents.artifact': '({agentSessionId,artifactId}) — the full text of a tool output the history only carries a tail of (the outputArtifactId on a tool event), up to 2 MiB',
@@ -182,8 +185,8 @@ const toolSignatures = {
   'agents.compact': '({agentSessionId}) — fold an idle local-model coworker’s transcript into its durable task state (task, constraints, files changed, recent commands, current failure, remaining work) inside the same conversation, so its next turn starts from compact state without a new tab; only a coworker this caller controls, only between turns; returns the tokens recovered',
   'agents.configure': '({agentSessionId,model,effort?}) — while the controlled coworker is idle with no queued input, persist an exact models.list model/effort for its next turn and update its visible tab; provider and permissions never change',
   'agents.grant': '({agentSessionId,repository?,research?}) — switch a local-model coworker’s per-conversation grants: repository (the sandbox may commit and branch, and a plain git push runs for it on the host) and research (web_search plus a larger tool-round budget). These are the conversation’s durable settings, the same toggles as its composer, so its own buttons show the change and it applies from its next turn. Only a non-local coworker may grant, only to a provider-local tab it already controls on this machine, never to itself or an ancestor; an omitted field is left alone, false revokes; returns what is now on and off',
-  'agents.submit': '({agentSessionId,prompt}) — dispatch to a visible native tab with its existing permission settings',
-  'agents.steer': '({agentSessionId,prompt}) — what the user composer does with a message: while a turn is running (or waiting on an approval or a question) it steers the message into that turn where the provider can, else queues it behind the turn; while the conversation is idle, finished, failed, disconnected or interrupted it starts a turn with it exactly as agents.submit does (one turn, same settings, same control link); while a turn is still stopping it is refused, so send it again once it has stopped. The result says which: delivery "started" for a new turn, "queued" for a message steered into or queued behind the running one',
+  'agents.submit': '({agentSessionId,prompt}) — dispatch to a visible native tab with its existing permission settings; a coworker this caller dispatched whose tab closed as finished (or, for the owner or a wizard, any closed conversation of its own workspace) is reopened in the background first (reopened:true)',
+  'agents.steer': '({agentSessionId,prompt}) — what the user composer does with a message: while a turn is running (or waiting on an approval or a question) it steers the message into that turn where the provider can, else queues it behind the turn; while the conversation is idle, finished, failed, disconnected or interrupted it starts a turn with it exactly as agents.submit does (one turn, same settings, same control link); while a turn is still stopping it is refused, so send it again once it has stopped. A coworker this caller dispatched that finished and closed its tab (or, for the owner or a wizard, any closed conversation of its own workspace) is reopened in the background first (reopened:true). The result says which: delivery "started" for a new turn, "queued" for a message steered into or queued behind the running one',
   'agents.interrupt': '({agentSessionId}) — stops the running turn, including one waiting on an approval; queued messages stay held above its composer, as after the owner’s Stop. Interrupting does not take control, here or in a sibling project',
   'agents.resume': '({agentSessionId}) — reopen a live orphan in this workspace without restarting its turn, or reconnect an idle/disconnected native conversation with its existing settings; outside this workspace only a coworker this caller controls. Resuming a failed, interrupted or disconnected one is a recovery: three per conversation in six hours (the owner is not counted), never while it waits on a request, never once it is superseded',
   'agents.supersede': '({agentSessionId,by,reason}) - mark a stopped coworker whose work another conversation (by) took over and delivered, so it reads as superseded rather than unfinished work and is not resumed again; reason up to 300 characters, e.g. what accepted the replacement',
@@ -592,13 +595,16 @@ export class AgentControl {
    * reach; a conversation a paired machine drives keeps the bounds its pairing drew, on either
    * end; and a sandboxed local model does not steer outside its own project.
    */
-  private target(scope: AgentControlScope, id: string, mutate = false, reach: 'read' | 'steer' | null = null, reopenOrphan = false): { tab: AgentControlTab; scope: AgentControlScope } {
+  private target(scope: AgentControlScope, id: string, mutate = false, reach: 'read' | 'steer' | null = null, reopenOrphan: 'any' | 'mine' | false = false): { tab: AgentControlTab; scope: AgentControlScope } {
     const spec = this.deps.database.structured.spec<AgentSpec>(id)
-    const missing = new Error('Agent is outside this workspace or has no visible tab; agents.list returns every agentSessionId this caller may name')
+    const missing = new Error('Agent is outside this workspace or has no visible tab; agents.list returns every agentSessionId this caller may name, and agents.resume reopens a closed tab of this workspace')
     if (!spec) throw missing
     const elsewhere = spec.projectId !== scope.projectId || spec.sessionId !== scope.sessionId
     const link = this.linkFor(id)
-    const sideways = elsewhere && link?.controllerAgentSessionId !== scope.agentSessionId
+    // A coworker this caller dispatched stays its own after it finished and its tab closed.
+    const dispatched = !link && !scope.owner && this.finishedLink(id)?.controllerAgentSessionId === scope.agentSessionId
+    const mine = dispatched || !scope.owner && link?.controllerAgentSessionId === scope.agentSessionId
+    const sideways = elsewhere && link?.controllerAgentSessionId !== scope.agentSessionId && !dispatched
     if (sideways && spec.projectId === scope.projectId) throw missing
     // Even a tab it controls: a link made before a paired machine took this conversation over
     // does not carry that machine past the project it was granted.
@@ -610,9 +616,13 @@ export class AgentControl {
     }
     const target = elsewhere ? { projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: scope.agentSessionId } : scope
     let tab = this.tabs(target).find(tab => tab.kind === 'agent' && tab.resourceId === id)
-    if (!tab && reopenOrphan && !elsewhere) {
+    // The caller's own coworker is reopened wherever it lives, even with nothing left running;
+    // anyone else's tabless conversation only through agents.resume, in the caller's workspace,
+    // except that the owner and a wizard bring one of their own workspace back by messaging it.
+    const commanding = reopenOrphan === 'mine' && sovereign(scope) && !elsewhere
+    if (!tab && reopenOrphan && (mine || commanding || reopenOrphan === 'any' && !elsewhere)) {
       const state = this.deps.database.structured.snapshot(id)
-      if (state && hasSessionWork(state)) tab = { id: '', kind: 'agent', resourceId: id, title: state.title || spec.title, groupId: '', uri: '', state: { provider: spec.provider, model: state.settings.model || spec.model, viewMode: 'visual' } }
+      if (state && (mine || commanding || hasSessionWork(state))) tab = { id: '', kind: 'agent', resourceId: id, title: state.title || spec.title, groupId: '', uri: '', state: { provider: spec.provider, model: state.settings.model || spec.model, viewMode: 'visual' } }
     }
     if (!tab) throw missing
     if (sideways && reach === 'steer' && tab.state?.remotePeerId) throw new Error('That conversation is driven by a paired machine; only that machine steers it')
@@ -734,6 +744,29 @@ export class AgentControl {
     return this.tabs({ projectId, sessionId, agentSessionId: '' }).some(tab => tab.resourceId === link.controllerAgentSessionId) ? link : null
   }
 
+  /** A finished coworker's tab is closed and its live link dropped (closeFinished), but the
+   *  controller that dispatched it must still reach it: steering it reopens the tab and starts a
+   *  turn. The dispatch is kept here, and the controller's list of them feeds agents.list. */
+  private rememberFinished(link: AgentControlLink): void {
+    const { database } = this.deps, index = FINISHED_BY_PREFIX + link.controllerAgentSessionId
+    database.setSetting(FINISHED_LINK_PREFIX + link.targetAgentSessionId, JSON.stringify(link))
+    const ids = this.finishedBy(link.controllerAgentSessionId).filter(id => id !== link.targetAgentSessionId)
+    for (const dropped of ids.splice(0, Math.max(0, ids.length - 49))) database.removeSetting(FINISHED_LINK_PREFIX + dropped)
+    database.setSetting(index, JSON.stringify([...ids, link.targetAgentSessionId]))
+  }
+  private finishedLink(agentSessionId: string): AgentControlLink | null {
+    try {
+      const link = JSON.parse(this.deps.database.getSetting(FINISHED_LINK_PREFIX + agentSessionId) || 'null') as AgentControlLink | null
+      return link?.targetAgentSessionId === agentSessionId ? link : null
+    } catch { return null }
+  }
+  private finishedBy(controllerAgentSessionId: string): string[] {
+    try {
+      const ids = JSON.parse(this.deps.database.getSetting(FINISHED_BY_PREFIX + controllerAgentSessionId) || '[]') as unknown
+      return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : []
+    } catch { return [] }
+  }
+
   listLinks(projectId: string, sessionId: string): AgentControlLink[] {
     const tabs = this.tabs({ projectId, sessionId, agentSessionId: '' }), ids = new Set(tabs.map(tab => tab.resourceId))
     return tabs.flatMap(tab => {
@@ -789,6 +822,7 @@ export class AgentControl {
     if (state === 'attached') {
       const link: AgentControlLink = { projectId: target.projectId, sessionId: target.sessionId, controllerAgentSessionId: scope.agentSessionId, targetAgentSessionId: tab.resourceId!, controllerTabId: source!.id, controlledTabId: tab.id, ...(together ? {} : { controllerProjectId: scope.projectId, controllerSessionId: scope.sessionId }) }
       this.deps.database.setSetting('agentControlParent:' + tab.resourceId, JSON.stringify(link))
+      this.deps.database.removeSetting(FINISHED_LINK_PREFIX + tab.resourceId)
     } else this.deps.database.removeSetting('agentControlParent:' + tab.resourceId)
     this.deps.linksChanged?.(target)
     if (!together) { this.deps.linksChanged?.(scope); return }
@@ -1171,6 +1205,19 @@ export class AgentControl {
     if (args.focus === true) void this.focusWhenIdle(target, { tabId: tab.id }).catch(() => undefined)
   }
 
+  /** Gives a tabless conversation a background tab in its own workspace and takes control of it,
+   *  as agents.resume does. A coworker its controller brings back is a coworker again, so it is
+   *  released once it finishes, like any tab the controller opened. */
+  private async reopen(scope: AgentControlScope, target: AgentControlScope, orphan: AgentControlTab): Promise<AgentControlTab> {
+    const dispatched = this.finishedLink(orphan.resourceId!)?.controllerAgentSessionId === scope.agentSessionId
+    const reopened: PaneTab = { id: makeId('tab'), kind: 'agent', resourceId: orphan.resourceId, title: orphan.title, state: orphan.state }
+    await this.showOpened(scope, target, reopened, { focus: false })
+    const opened = this.tab(target, reopened.id)
+    this.relationship(scope, target, opened, 'attached')
+    if (dispatched) this.deps.database.setSetting(COWORKER_OPENED_PREFIX + orphan.resourceId, scope.agentSessionId)
+    return opened
+  }
+
   /** Brings a tab into view for an agent once the owner pauses typing (AgentControlUi waits). */
   private focusWhenIdle(target: AgentControlScope, args: Args): Promise<unknown> {
     return this.ui(target, 'tabs.focus', { ...args, whenIdle: true })
@@ -1309,10 +1356,19 @@ export class AgentControl {
         if (!state || !hasSessionWork(state)) return []
         return [{ observedAt, source: 'native-session', projectId: scope.projectId, workspaceId: scope.sessionId, tabId: null, agentSessionId: spec.id, title: state.title || spec.title, provider: spec.provider, phase: displaySessionPhase(state.phase, state.backgroundTasks), backgroundTasks: state.backgroundTasks ?? 0, orphaned: true }]
       })
+      // A coworker this caller dispatched that finished and closed its tab, in any project: still
+      // its own to follow up, and agents.steer brings it back.
+      const listed = new Set([...visible, ...orphaned.map(entry => entry.agentSessionId)])
+      const finished = scope.owner ? [] : this.finishedBy(scope.agentSessionId).flatMap(id => {
+        const spec = database.structured.spec<AgentSpec>(id), state = database.structured.snapshot(id)
+        if (!spec || !state || listed.has(id) || this.finishedLink(id)?.controllerAgentSessionId !== scope.agentSessionId || this.linkFor(id)) return []
+        if (this.tabs({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: scope.agentSessionId }).some(tab => tab.resourceId === id)) return []
+        return [{ observedAt, source: 'native-session', projectId: spec.projectId, workspaceId: spec.sessionId, tabId: null, agentSessionId: id, title: state.title || spec.title, provider: spec.provider, phase: displaySessionPhase(state.phase, state.backgroundTasks), backgroundTasks: state.backgroundTasks ?? 0, finished: true, controlled: true, ...(spec.projectId !== scope.projectId ? { crossProject: true } : {}), note: 'Finished and its tab closed; agents.steer reopens it and starts a turn' }]
+      })
       // A tab this caller handed to another open project is still its own work to follow, and it
       // would otherwise be unfindable after the id that came back from tabs.open is forgotten.
       // `controlled: false` marks a sibling-project tab nobody controls yet.
-      return [...own, ...orphaned, ...this.reachableElsewhere(scope).map(({ tab, scope: target, yours }) => ({ ...this.observation(target, tab, database.structured.snapshot(tab.resourceId!), observedAt), crossProject: true, controlled: yours }))]
+      return [...own, ...orphaned, ...finished, ...this.reachableElsewhere(scope).map(({ tab, scope: target, yours }) => ({ ...this.observation(target, tab, database.structured.snapshot(tab.resourceId!), observedAt), crossProject: true, controlled: yours }))]
     }
     if (method === 'agents.finish') return this.finish(scope, args)
     if (method === 'agents.report') {
@@ -1334,7 +1390,9 @@ export class AgentControl {
       if (typeof args.agentSessionId !== 'string' || !args.agentSessionId.trim()) throw new Error(method + ' requires agentSessionId: the exact id of a visible conversation, as returned by agents.list or app.state')
       const id = text(args, 'agentSessionId', 160), mutate = !['agents.snapshot', 'agents.history', 'agents.status', 'agents.artifact'].includes(method)
       const reach = ['agents.snapshot', 'agents.history', 'agents.status', 'agents.artifact'].includes(method) ? 'read' : ['agents.submit', 'agents.steer', 'agents.interrupt'].includes(method) ? 'steer' : null
-      const { tab, scope: target } = this.target(scope, id, mutate, reach, method === 'agents.resume'), state = database.structured.snapshot(id)!
+      const resolved = this.target(scope, id, mutate, reach, method === 'agents.resume' ? 'any' : method === 'agents.submit' || method === 'agents.steer' ? 'mine' : false), state = database.structured.snapshot(id)!
+      const target = resolved.scope
+      let tab = resolved.tab
       if (reach === 'read' && anonymousConversations.has(id) && !scope.owner && !anonymousConversations.has(scope.agentSessionId)) throw new Error('That conversation is anonymous: only the owner and anonymous conversations may read it, because anything read here would be kept in this conversation\'s history')
       if (method === 'agents.artifact') {
         const artifactId = text(args, 'artifactId', 200)
@@ -1402,11 +1460,8 @@ export class AgentControl {
         if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings) && !restricted(state.settings)) throw new Error('A read-only controller cannot resume or fork a writable conversation')
         if (method === 'agents.resume') {
           if (!tab.id) {
-            const reopened: PaneTab = { id: makeId('tab'), kind: 'agent', resourceId: id, title: tab.title, state: tab.state }
-            await this.showOpened(scope, scope, reopened, {})
-            const opened = this.tab(scope, reopened.id)
-            this.relationship(scope, scope, opened, 'attached')
-            return { agentSessionId: id, reopened: true, tabId: opened.id, uri: opened.uri, phase: database.structured.snapshot(id)?.phase }
+            const opened = await this.reopen(scope, target, tab)
+            return { agentSessionId: id, reopened: true, tabId: opened.id, uri: opened.uri, projectId: target.projectId, workspaceId: target.sessionId, phase: database.structured.snapshot(id)?.phase }
           }
           const recoverer = { ...scope, projectId: target.projectId }
           this.recovery().admit(recoverer, id, state.phase)
@@ -1425,7 +1480,10 @@ export class AgentControl {
       if (method === 'agents.submit' || method === 'agents.steer') {
         const prompt = text(args, 'prompt', MAX_PROMPT_CHARS)
         if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings) && !restricted(state.settings)) throw new Error('A read-only controller cannot dispatch to a writable conversation')
-        this.relationship(scope, target, tab, 'attached')
+        // A coworker that finished and closed its tab is brought back before it is prompted.
+        const reopened = !tab.id
+        if (reopened) tab = await this.reopen(scope, target, tab)
+        else this.relationship(scope, target, tab, 'attached')
         // A coordinated prompt is not the owner's message. Record the controlling tab so the
         // conversation attributes it to that coworker instead of to "You".
         const controller = this.tabs(scope).find(candidate => candidate.resourceId === scope.agentSessionId)
@@ -1437,7 +1495,7 @@ export class AgentControl {
           // As the composer does: into (or behind) a running turn, else a new turn of its own.
           else delivery = await sessions.steerOrStart(id, prompt, state.settings, [], origin)
         } catch (error) { this.relationship(scope, target, tab, 'detached'); throw error }
-        return { agentSessionId: id, tabId: tab.id, uri: tab.uri, projectId: target.projectId, workspaceId: target.sessionId, phase: database.structured.snapshot(id)?.phase, ...(method === 'agents.steer' ? { delivery } : {}) }
+        return { agentSessionId: id, tabId: tab.id, uri: tab.uri, projectId: target.projectId, workspaceId: target.sessionId, phase: database.structured.snapshot(id)?.phase, ...(method === 'agents.steer' ? { delivery } : {}), ...(reopened ? { reopened } : {}) }
       }
     }
     if (method === 'files.list') {
@@ -2412,6 +2470,7 @@ export class AgentControl {
     this.deps.linksChanged?.(scope)
     if (!stored) return
     const link = JSON.parse(stored) as AgentControlLink
+    this.rememberFinished(link)
     if (link.controllerProjectId && (link.controllerProjectId !== target.projectId || link.controllerSessionId !== target.sessionId)) { this.deps.linksChanged?.({ projectId: link.controllerProjectId, sessionId: link.controllerSessionId ?? link.sessionId }); return }
     this.deps.collaboration.postMessage({ projectId: target.projectId, sessionId: target.sessionId, agentSessionId: link.controllerAgentSessionId, toAgentSessionId: target.agentSessionId, kind: 'handoff', body: `Finished ${target.title}: its tab is closed with history kept and its CLI released.`, metadata: { control: 'detached', finished: true, controllerTabId: link.controllerTabId, controlledTabId: link.controlledTabId } })
   }

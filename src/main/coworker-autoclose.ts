@@ -227,6 +227,10 @@ export class CoworkerAutoClose {
     for (const id of [...this.idle.keys()]) if (!seen.has(id)) this.idle.delete(id)
   }
 
+  /** Workspace clarity's close (src/main/workspace-clarity.ts): any finished agent tab the owner
+   *  asked to close, or the finished-tab sweep chose, closes and releases exactly as a coworker does. */
+  closeSettled(target: FinishTarget): Promise<void> { return this.closeAndRelease(target) }
+
   private async closeAndRelease(target: FinishTarget): Promise<void> {
     const id = target.agentSessionId
     await this.deps.close(target)

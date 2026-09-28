@@ -2,8 +2,9 @@ import type { SessionRecord } from '../../../shared/models'
 import { makeLauncherTab } from '../../../shared/models'
 import { activateTab, addTab, assignTabsToGroup, closeTab, closeTabGroup, collapseTabGroup, duplicateTab, editTabGroup, findGroup, groupTabs, listGroups, splitGroup, ungroupTabGroup, updateTab } from './layout-operations'
 import type { TabGroupAction } from './tab-groups'
+import { markTabsSeen, togglePinned } from './tab-seen'
 
-export type WorkspaceTabAction = 'focus' | 'left' | 'right' | 'above' | 'below' | 'duplicate' | 'detach' | 'show' | 'maximize' | 'continuation' | 'reopen' | 'close' | 'close-tab-only'
+export type WorkspaceTabAction = 'focus' | 'left' | 'right' | 'above' | 'below' | 'duplicate' | 'detach' | 'show' | 'maximize' | 'continuation' | 'reopen' | 'close' | 'close-tab-only' | 'pin'
 
 /** Operates on the requested workspace, even when another workspace is active. */
 export function applyWorkspaceTabAction(session: SessionRecord, groupId: string, tabId: string, action: WorkspaceTabAction): { session: SessionRecord; focusedGroupId: string } {
@@ -14,7 +15,9 @@ export function applyWorkspaceTabAction(session: SessionRecord, groupId: string,
   let closedTabs = session.closedTabs
   let maximizedGroupId = session.maximizedGroupId
   let focusedGroupId = groupId
-  if (action === 'focus') { layout = activateTab(layout, groupId, tabId); maximizedGroupId = null }
+  // Seen by the owner, and so was the tab it replaces: a finished tab seen after it finished stays in the strip.
+  if (action === 'focus') { layout = markTabsSeen(activateTab(layout, groupId, tabId), [tabId, group.activeTabId]); maximizedGroupId = null }
+  if (action === 'pin') layout = togglePinned(layout, tabId)
   if (['left', 'right', 'above', 'below'].includes(action)) {
     const launcher = makeLauncherTab()
     layout = splitGroup(layout, groupId, action as 'left' | 'right' | 'above' | 'below', launcher)

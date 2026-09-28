@@ -1,0 +1,16 @@
+/* Workspace clarity in the tab strip (src/shared/workspace-clarity.ts): chips keep enough title
+   to tell tabs apart; secondary icons give way first, and what has no room goes to "+N". */
+.pane-tabs .pane-tab { min-width: 118px; }
+.pane-tabs .pane-tab > .pane-tab-title { min-width: 52px; }
+.pane-tabs .pane-tab:not(.active) .tab-limit-continuation,
+.pane-tabs .pane-tab:not(.active) .pane-tab-anonymous { display: none; }
+.pane-tabs .pane-tab:not(.active):not(:hover) .tab-close { display: none; }
+.pane-tabs .pane-tab:not(.active) > svg:first-child { width: 12px; height: 12px; }
+.pane-tabs .pane-tab.clarity-main { font-weight: 600; }
+.pane-tabs .pane-tab.clarity-main::before { content: ''; position: absolute; left: 0; top: 6px; bottom: 6px; width: 2px; border-radius: 2px; background: var(--accent); }
+
+.pane-overflow-button { flex: 0 0 auto; align-self: center; height: 22px; min-width: 30px; margin: 0 2px 0 4px; padding: 0 7px; display: inline-flex; align-items: center; gap: 3px; border: 1px solid var(--border-soft); border-radius: 7px; background: var(--surface-1); color: var(--text-2); font-size: 10px; font-weight: 600; cursor: pointer; }
+.pane-overflow-button:hover, .pane-overflow-button[aria-expanded="true"] { color: var(--text); background: var(--surface-hover); }
+.pane-overflow-menu { width: 260px; max-height: min(420px, 70vh); overflow-y: auto; }
+.pane-overflow-menu button > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pane-overflow-menu button > em { flex: 0 0 auto; color: var(--text-3); font-style: normal; font-size: 8.5px; text-transform: uppercase; letter-spacing: .04em; }

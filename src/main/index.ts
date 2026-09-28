@@ -128,6 +128,8 @@ import { LocalUpdateBuilder } from './local-update-build'
 import { localEndpointOverride, localModelAvailability, localTurnsInFlight, onLocalTurnStart, releaseVerdict, setLocalEndpointOverride, slotsProcessing } from './providers/local'
 import { DeliveryService } from './delivery'
 import { COWORKER_AUTOCLOSE_SETTING, CoworkerAutoClose, coworkerAutoCloseMinutes, normalizeCoworkerAutoCloseMinutes } from './coworker-autoclose'
+import { FinishedTabs, agentTabFacts, findLayoutTab } from './workspace-clarity'
+import { FINISHED_TAB_SWEEP_SETTING, finishedTabSweepHours, normalizeFinishedTabSweepHours, type AgentTabFacts } from '../shared/workspace-clarity'
 import { registerDeliveryIpc } from './delivery-ipc'
 import { registerLogicLoopsIpc } from './logic-loops/ipc'
 import { gitHubCredential } from './github-credential'
@@ -168,6 +170,7 @@ let disposeDurableJobsGate: (() => void) | undefined
 let disposeScheduleIpc: (() => void) | undefined
 let disposeDeliveryIpc: (() => void) | undefined
 let coworkerAutoClose: CoworkerAutoClose | undefined
+let finishedTabs: FinishedTabs | undefined
 /** The owner's Ideas inbox (src/main/ideas/register.ts); undefined until the app is ready. */
 let ideasRegistration: IdeasRegistration | undefined
 let disposeIdeasIpc: (() => void) | undefined
@@ -709,7 +712,7 @@ const disposeRuntimeServices = (): void => {
     ['ideas', () => { disposeIdeasIpc?.(); ideasRegistration?.dispose() }],
     ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); browserMcp?.close(); localAssist?.close(); permissionGrants?.close(); browserViews?.dispose(); projectFileChanges?.close() }],
     ['model intelligence', () => { disposeModelObserver?.(); modelIntelligence?.dispose(); modelIntelligence = undefined }],
-    ['coworker auto-close', () => coworkerAutoClose?.dispose()],
+    ['coworker auto-close', () => { coworkerAutoClose?.dispose(); finishedTabs?.dispose() }],
     ['terminals', () => terminals?.dispose()],
     ['agents', () => agents?.dispose()],
     ['schedule runner', () => scheduleRunner?.stop()],
@@ -1882,6 +1885,30 @@ const registerIpc = (): void => {
     database.setSetting(COWORKER_AUTOCLOSE_SETTING, String(normalizeCoworkerAutoCloseMinutes(minutes)))
     return coworkerAutoCloseMinutes(key => database.getSetting(key))
   })
+  ipcMain.handle('settings:finished-tab-sweep', (event) => { trustedStructured(event); return finishedTabSweepHours(key => database.getSetting(key)) })
+  ipcMain.handle('settings:set-finished-tab-sweep', (event, hours: unknown) => {
+    trustedStructured(event)
+    database.setSetting(FINISHED_TAB_SWEEP_SETTING, String(normalizeFinishedTabSweepHours(hours)))
+    return finishedTabSweepHours(key => database.getSetting(key))
+  })
+  // Workspace clarity (src/shared/workspace-clarity.ts): what the sidebar and tab strip need to
+  // know about each agent tab beyond its phase, and the owner's "Close finished tabs".
+  ipcMain.handle('workspace:tab-facts', (event, agentSessionIds: unknown) => {
+    trustedStructured(event)
+    if (!Array.isArray(agentSessionIds) || agentSessionIds.length > 500 || agentSessionIds.some(id => typeof id !== 'string')) throw new Error('Invalid agent list')
+    const facts: Record<string, AgentTabFacts> = {}
+    for (const id of agentSessionIds as string[]) {
+      const state = database.structured.snapshot(id), provider = database.structured.spec<AgentSpec>(id)?.provider
+      if (state) facts[id] = agentTabFacts(state, Boolean(provider && provider !== 'local' && wizardActive(state.settings, provider)))
+    }
+    return facts
+  })
+  ipcMain.handle('workspace:close-finished', async (event, projectId: unknown, sessionId: unknown, tabIds: unknown) => {
+    trustedStructured(event)
+    if (typeof projectId !== 'string' || typeof sessionId !== 'string' || !Array.isArray(tabIds) || tabIds.some(id => typeof id !== 'string') || tabIds.length > 500) throw new Error('Invalid close request')
+    if (!finishedTabs) throw new Error('Closing finished tabs is not available yet')
+    return finishedTabs.closeFinished(projectId, sessionId, tabIds as string[])
+  })
   ipcMain.handle('settings:set-local-updates', (event, enabled: unknown) => {
     trustedStructured(event)
     if (typeof enabled !== 'boolean') throw new Error('Invalid local update setting')
@@ -2836,6 +2863,18 @@ app.whenReady().then(async () => {
   control.setCoworkerAutoClose(coworkerAutoClose)
   delivery.onChanged(run => coworkerAutoClose?.noteDelivery(run))
   coworkerAutoClose.start()
+  // Finished tabs nobody looked at for the owner's age close themselves (default a day), and the
+  // sidebar's "Close finished tabs" closes a workspace's at once; both keep history.
+  const sweepOverride = !app.isPackaged && process.env.CONDUCTOR_TEST_USER_DATA ? Number(process.env.CONDUCTOR_TEST_FINISHED_TAB_SWEEP_MS) || undefined : undefined
+  const autoClose = coworkerAutoClose
+  finishedTabs = new FinishedTabs({
+    settings: database, snapshot: id => database.structured.snapshot(id),
+    targets: () => control.finishTargets(),
+    layoutTab: target => { const session = database.listSessions(target.projectId).find(item => item.id === target.sessionId); return session ? findLayoutTab(session.layout.root, target.tabId) : undefined },
+    close: target => autoClose.closeSettled(target),
+    ...(sweepOverride ? { ageOverrideMs: sweepOverride } : {})
+  })
+  finishedTabs.start()
   // A finished latest-models run is new registry evidence (model-intelligence latest-models source).
   const latestModelsChanged = latestModelsWatcher(() => latestModelsFromSchedules(schedules), () => modelIntelligence?.latestModelsRan())
   // Scheduled tasks (docs/schedules.md): scripts at night and in idle windows, local churn through
