@@ -2423,6 +2423,7 @@ const registerIpc = (): void => {
   ipcMain.handle('agent:list-events', (_event, id: string) => database.listAgentEvents(id))
   ipcMain.handle('agent:list-providers', () => agents.listProviders())
   ipcMain.handle('runtime:list-processes', (_event, projectId?: string) => database.listProcesses(projectId))
+  ipcMain.handle('usage:limits', () => agents.structured.providerAllowance())
   ipcMain.handle('usage:weekly', async () => {
     const report = await weeklyUsage.readAsync(), saved = localAssist?.savings(report.days)
     return saved ? { ...report, localSavings: { tokensSaved: saved.tokensSaved, calls: saved.calls, modelCalls: saved.modelCalls, localInputTokens: saved.localInputTokens, localOutputTokens: saved.localOutputTokens } } : report

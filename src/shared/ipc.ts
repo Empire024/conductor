@@ -1,5 +1,6 @@
 import type { UsageCapScope, UsageCapSetting, UsageCapSnapshot } from './usage-accounting'
 import type { WeeklyModelUsageReport } from './weekly-model-usage'
+import type { ProviderAllowanceRow } from './provider-allowance'
 import type { AlwaysOnState, LoginItemState } from './always-on'
 import type {
   AppSettings,
@@ -248,7 +249,13 @@ export interface ConductorBridge {
     read(agentSessionId?: string, workspaceId?: string): Promise<UsageCapSnapshot>
     write(scope: UsageCapScope, id: string | null, setting: UsageCapSetting | null): Promise<void>
   }
-  usage: { weekly(): Promise<WeeklyModelUsageReport> }
+  usage: {
+    weekly(): Promise<WeeklyModelUsageReport>
+    /** Recently used cloud providers' reported weekly and short-window percentages (no provider call). */
+    limits(): Promise<ProviderAllowanceRow[]>
+    /** Fires when any conversation reports its provider allowance. */
+    onLimitsChanged(callback: () => void): () => void
+  }
   /** Agent activity for every project, including those whose panes are not mounted. */
   activity: {
     projects(): Promise<ProjectActivitySnapshot>

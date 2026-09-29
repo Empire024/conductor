@@ -94,7 +94,7 @@ function fixture(aliasedRoot = false, permissionsByProvider?: Partial<Record<Str
   }
   const deps = { database, sessions, orchestration, collaboration, backlogs, ui, confirm, fileChanged, localUpdates, delivery, providers: () => providers }
   const control = new AgentControl(deps)
-  return { root, project, workspace, database, sessions, orchestration, collaboration, submissions, scope, spec, rootTab, requests, ui, confirm, fileChanged, localUpdates, delivery, control, deps }
+  return { root, project, workspace, database, sessions, broadcast, orchestration, collaboration, submissions, scope, spec, rootTab, requests, ui, confirm, fileChanged, localUpdates, delivery, control, deps }
 }
 
 /** Give an agent session a visible tab, so its checklist claims count as live. */
@@ -2300,6 +2300,15 @@ describe('control catalog and dispatch repairs', () => {
     dispose.push(() => restarted.dispose())
     const codexAfter = restarted.usageLimits().find(entry => entry.provider === 'codex')!
     expect(codexAfter.windows.map(window => [window.key, window.usedPercent, window.observedAt])).toEqual(byProvider.codex!.windows.map(window => [window.key, window.usedPercent, window.observedAt]))
+    // The sidebar strip reads the same record plus its persisted line: provider-wide windows only
+    // (the Fable bucket is model-scoped), and the sparse Codex update is the line's second point.
+    const rows = restarted.providerAllowance()
+    expect(rows.map(row => [row.provider, row.weekly?.usedPercent, row.short?.usedPercent, row.short?.windowMinutes])).toEqual([['claude', 61.5, 42, 300], ['codex', 96, 12, 300]])
+    expect(rows[1]!.short!.points.map(([, percent]) => percent)).toEqual([10, 12])
+    expect(rows[1]!.planType).toBe('pro')
+    // Every report tells the windows once a second at most, so the strip re-reads without polling.
+    await new Promise(resolve => setTimeout(resolve, 1100))
+    expect(f.broadcast.mock.calls.filter(([channel]) => channel === 'usage:limits-changed')).toHaveLength(1)
   })
 
   it('dispatches a local model read-only without a sandbox mode it does not have, and keeps its writes refused', async () => {

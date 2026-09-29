@@ -20,6 +20,7 @@ import { validateLiveTurn } from './live-test-policy'
 import { activeUsageCap, isUsageLimitMessage, parseUsageLimitReset, usageCapKey } from './usage-limit'
 import { isPastedText } from '../shared/pasted-text'
 import { carriesAccountLimits, describeAccountLimits, describeUsageCap, evaluateUsageCap, recordAccountLimits, summarizeContext, summarizeUsageRun, type AccountLimitRecord, type AccountLimitsReport, type UsageCapStatus } from '../shared/usage-accounting'
+import { recordAllowanceHistory, summarizeProviderAllowance, type AllowanceHistory, type ProviderAllowanceRow } from '../shared/provider-allowance'
 import { LiveRuntimeBudget } from './live-runtime-budget'
 import { sanitizeDiagnostic } from './structured-store'
 import { rememberedBrowserTools, rememberBrowserTools, rememberedPermission, rememberPermission } from './app-settings'
@@ -105,6 +106,8 @@ const active = new Set<SessionPhase>(['starting', 'running', 'waiting_approval',
 export type SteerDelivery = 'started' | 'steered' | 'queued'
 /** Settings row holding the newest reported allowance per provider and bucket (`usageLimits`). */
 const ACCOUNT_LIMITS_KEY = 'usageLimits.latest'
+/** Settings row holding a bounded week of each provider's headline percentages, for the sidebar's lines. */
+const ALLOWANCE_HISTORY_KEY = 'usageLimits.history'
 /** The most events one `structured:events` IPC message carries. A burst can stage tens of
  *  thousands of events in one synchronous pass; broadcasting them in one message serializes and
  *  posts the whole array at once, blocking the process for its full size. Bounded batches sent a
@@ -1355,7 +1358,30 @@ export class StructuredSessions {
       if (!next) return
       this.accountLimitRecord = next
       this.database.setSetting(ACCOUNT_LIMITS_KEY, JSON.stringify(next))
+      const history = recordAllowanceHistory(this.allowanceHistory(), describeAccountLimits(next, live.spec.provider as StructuredProvider))
+      if (history) { this.allowanceHistoryRecord = history; this.database.setSetting(ALLOWANCE_HISTORY_KEY, JSON.stringify(history)) }
+      this.announceAllowance()
     } catch { /* A usage record never breaks the event pipeline it observes. */ }
+  }
+  private allowanceHistoryRecord?: AllowanceHistory
+  private allowanceHistory(): AllowanceHistory {
+    if (!this.allowanceHistoryRecord) {
+      try { this.allowanceHistoryRecord = JSON.parse(this.database.getSetting(ALLOWANCE_HISTORY_KEY) ?? '{}') as AllowanceHistory }
+      catch { this.allowanceHistoryRecord = {} }
+    }
+    return this.allowanceHistoryRecord
+  }
+  private allowanceTimer?: ReturnType<typeof setTimeout>
+  /** Tells every window a provider reported its allowance. Claude reports it with every message of a
+   *  turn, so one signal per second at most; the view then reads the in-memory record, no journal. */
+  private announceAllowance(): void {
+    if (this.allowanceTimer) return
+    this.allowanceTimer = setTimeout(() => { this.allowanceTimer = undefined; this.broadcast('usage:limits-changed', null) }, 1000)
+    this.allowanceTimer.unref?.()
+  }
+  /** Each recently used cloud provider's weekly and short-window percentage with its recent line. */
+  providerAllowance(now = Date.now()): ProviderAllowanceRow[] {
+    return summarizeProviderAllowance(this.usageLimits(), this.allowanceHistory(), now)
   }
   /** How many conversations are mid-turn right now: the scheduler's "Conductor is busy" signal
    *  (src/main/schedule-gate.ts). A conversation waiting on the owner is not counted. */
