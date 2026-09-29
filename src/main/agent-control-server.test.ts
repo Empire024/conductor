@@ -181,7 +181,7 @@ describe('control method classes', () => {
       'agents.list', 'agents.snapshot', 'agents.history', 'agents.artifact', 'agents.status', 'agents.compact', 'agents.configure', 'agents.grant', 'agents.submit', 'agents.steer', 'agents.interrupt', 'agents.resume', 'agents.supersede', 'agents.fork', 'agents.release', 'agents.handoff', 'agents.report', 'agents.finish', 'agents.await',
       'files.list', 'files.read', 'files.write', 'files.open', 'tasks.list', 'tasks.update', 'memory.recall', 'memory.remember', 'memory.forget',
       'orchestration.snapshot', 'orchestration.tasks.create', 'orchestration.tasks.update', 'orchestration.routines.save', 'workspace.rename',
-      'app.update', 'app.update.status', 'app.update.authorize', 'git.status', 'git.ship', 'git.ship.status', 'local.servers', 'local.stop', 'usage.limits',
+      'app.update', 'app.update.offer', 'app.update.status', 'app.update.authorize', 'git.status', 'git.ship', 'git.ship.status', 'local.servers', 'local.stop', 'usage.limits',
       'loops.list', 'loops.get', 'loops.history', 'loops.run', 'loops.record', 'loops.propose', 'loops.apply', 'loops.reject', 'loops.proposals',
       'router.start', 'router.dispatch', 'jobs.create', 'jobs.list', 'jobs.status', 'jobs.events', 'jobs.pause', 'jobs.resume', 'jobs.cancel', 'jobs.report',
       'schedules.list', 'schedules.get', 'schedules.create', 'schedules.update', 'schedules.pause', 'schedules.resume', 'schedules.runNow', 'schedules.delete', 'schedules.scripts.save', 'schedules.scripts.delete',

@@ -1854,13 +1854,14 @@ export function App(): React.JSX.Element {
           updateState={updateState}
           onSetLocalUpdates={(enabled) => void window.conductor.settings.setLocalUpdates(enabled).then(setAppSettings).catch((error: unknown) => setToast(String(error)))}
           onCheckForUpdates={() => void checkForUpdates()}
+          onUpdateAction={() => void runUpdateAction()}
           onOpenDebugConsole={() => {
             setDebugConsoleOpen(true)
             setSettingsOpen(false)
           }}
         />
       )}
-      {updateState.availableVersion && updateState.availableVersion !== dismissedUpdateVersion && ['available', 'downloading', 'ready', 'installing', 'error'].includes(updateState.phase) && (
+      {(updateState.source !== 'local' || updateState.promptAllowed === true) && updateState.availableVersion && updateState.availableVersion !== dismissedUpdateVersion && ['available', 'downloading', 'ready', 'installing', 'error'].includes(updateState.phase) && (
         <UpdatePrompt
           state={updateState}
           autoDownload={autoDownload}

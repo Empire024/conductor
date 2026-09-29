@@ -2040,7 +2040,7 @@ const registerIpc = (): void => {
   ipcMain.handle('model-upgrades:set-wizard', (event, enabled: unknown) => { trustedStructured(event); if (typeof enabled !== 'boolean') throw new Error('enabled must be true or false'); return modelUpgrades?.setWizardMayAccept(enabled) ?? null })
   ipcMain.handle('model-upgrades:promoted', (event) => { trustedStructured(event); return promotedModels() })
   ipcMain.handle('updates:download', (event) => { trustedStructured(event); return updates.download() })
-  ipcMain.handle('updates:install', (event) => { trustedStructured(event); return updates.install() })
+  ipcMain.handle('updates:install', (event, options?: { whenIdle?: boolean }) => { trustedStructured(event); return updates.install({ safe: true, whenIdle: options?.whenIdle === true }) })
   // The owner answering a wizard's restart request when no update is waiting to install.
   ipcMain.handle('updates:restart', async (event) => {
     trustedStructured(event)
@@ -3194,7 +3194,8 @@ app.whenReady().then(async () => {
     allowDevelopmentUpdates: process.env.CONDUCTOR_UPDATE_DEV === '1',
     localBuildDirectory: join(app.getPath('userData'), 'local-updates'),
     currentModels: () => (configuredModelCatalog() ?? []) as RestorePoint['models'],
-    beforeInstall: prepareForUpdateInstall
+    beforeInstall: prepareForUpdateInstall,
+    installBlockers: (caller) => control.installBlockers(caller ? { agentSessionId: caller, projectId: '' } : undefined).map(tab => ({ id: tab.agentSessionId, title: tab.title }))
   })
   updates.setRestartRequest(readRestartRequest())
   try {

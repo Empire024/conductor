@@ -138,7 +138,7 @@ export class UpdateStore {
     void this.perform('download')
   }
 
-  private async perform(action: UpdateAction): Promise<void> {
+  private async perform(action: UpdateAction, whenIdle = false): Promise<void> {
     // This guard also blocks two clicks in the same tick.
     if (this.inFlight || ['checking', 'downloading', 'installing'].includes(this.state.phase)) return
     const requestId = ++this.nextRequestId
@@ -154,8 +154,16 @@ export class UpdateStore {
     try {
       let response: AppUpdateState
       if (action === 'install') {
-        await bridge.install()
+        await bridge.install(whenIdle ? { whenIdle: true } : undefined)
         response = await bridge.getState()
+        // A click-time blocker leaves the update ready rather than starting a restart.
+        if (response.phase === 'ready') {
+          this.inFlight = null
+          this.state = response
+          this.pendingQuitConfirm = response.installWhenIdle ? null : response.installBlockers?.length ? response.installBlockers : null
+          this.publish()
+          return
+        }
       } else {
         response = await bridge[action]()
       }
@@ -177,6 +185,14 @@ export class UpdateStore {
 
   private async proceedToInstall(): Promise<void> {
     if (this.resolvingQuitConfirm) return
+    const authoritative = await this.resolveBridge().getState()
+    if (authoritative.installBlockers !== undefined) {
+      if (authoritative.installBlockers.length) {
+        this.pendingQuitConfirm = authoritative.installBlockers
+        this.publish()
+      } else await this.perform('install')
+      return
+    }
     const running = this.runningTabIds()
     if (running.length === 0) { await this.perform('install'); return }
     this.resolvingQuitConfirm = true
@@ -212,7 +228,7 @@ export class UpdateStore {
     if (!this.pendingQuitConfirm) return
     this.pendingQuitConfirm = null
     this.publish()
-    await this.perform('install')
+    await this.perform('install', true)
   }
 
   cancelQuitConfirm(): void {

@@ -6,8 +6,9 @@ import { UpdateQuitConfirm } from './UpdateQuitConfirm'
 import './AppUpdateButton.css'
 
 export const isUpdateActionVisible = (state: AppUpdateState): boolean =>
-  ['available', 'downloading', 'ready', 'installing'].includes(state.phase) ||
-  (state.phase === 'error' && Boolean(state.availableVersion))
+  !(state.source === 'local' && state.promptAllowed !== true) && (
+    ['available', 'downloading', 'ready', 'installing'].includes(state.phase) ||
+    (state.phase === 'error' && Boolean(state.availableVersion)))
 
 /** A wizard tab's app.restart.request, as the owner's update control shows it. */
 export const restartRequestLabel = (state: AppUpdateState): string | undefined =>
@@ -111,7 +112,7 @@ export function AppUpdateButton({ state, onAction }: { state: AppUpdateState; on
   }} />
   const extras = <>{menu}{versionError && <span className="update-version-error" role="alert">{versionError}</span>}{confirm}</>
   if (!isUpdateActionVisible(state)) {
-    if (!requested) return extras
+    if (!requested || state.source === 'local' && state.promptAllowed !== true) return extras
     return <>
       <button className="statusbar-update ready" onClick={() => void window.conductor.updates.restart()} title={requested}>
         <RotateCcw size={11} /><span aria-live="polite">{requested.length > 90 ? requested.slice(0, 89) + '…' : requested}</span>

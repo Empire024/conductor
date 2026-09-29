@@ -12,6 +12,12 @@ const state = (phase: AppUpdateState['phase'], availableVersion?: string): AppUp
 })
 
 describe('bottom-bar update action', () => {
+  it('keeps local builds quiet unless the main process opens the gate', () => {
+    const local = { ...state('ready', '0.1.4-local.1'), source: 'local' as const }
+    expect(isUpdateActionVisible(local)).toBe(false)
+    expect(isUpdateActionVisible({ ...local, promptAllowed: false })).toBe(false)
+    expect(isUpdateActionVisible({ ...local, promptAllowed: true })).toBe(true)
+  })
   it('appears for actionable update states', () => {
     expect(isUpdateActionVisible(state('available', '0.1.4'))).toBe(true)
     expect(isUpdateActionVisible(state('downloading', '0.1.4'))).toBe(true)

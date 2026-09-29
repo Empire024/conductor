@@ -6,7 +6,7 @@ import { AppUpdateButton } from './AppUpdateButton'
 import { UpdatePrompt } from './UpdatePrompt'
 
 const state = (phase: AppUpdateState['phase'], extra: Partial<AppUpdateState> = {}): AppUpdateState => ({
-  phase, currentVersion: '0.1.4', availableVersion: '0.1.5-local.1', configured: true, source: 'local', ...extra
+  phase, currentVersion: '0.1.4', availableVersion: '0.1.5-local.1', configured: true, source: 'local', promptAllowed: true, ...extra
 })
 const prompt = (value: AppUpdateState): string => renderToStaticMarkup(createElement(UpdatePrompt, {
   state: value, autoDownload: false, onAutoDownload() {}, onAction() {}, onDismiss() {}

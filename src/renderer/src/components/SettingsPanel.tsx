@@ -33,6 +33,7 @@ export function SettingsPanel({
   updateState,
   onSetLocalUpdates,
   onCheckForUpdates,
+  onUpdateAction,
   initialSection
 }: {
   initialSection?: SettingsSectionId
@@ -51,6 +52,7 @@ export function SettingsPanel({
   updateState: AppUpdateState
   onSetLocalUpdates(enabled: boolean): void
   onCheckForUpdates(): void
+  onUpdateAction?(): void
 }): React.JSX.Element {
   const [activeSection, setActiveSection] = useState(() => resolveSettingsSection(initialSection, rememberedSection))
   const [query, setQuery] = useState('')
@@ -261,8 +263,11 @@ export function SettingsPanel({
                 <div className="update-status-setting">
                   <span>
                     <strong>Conductor {updateState.currentVersion || '—'}</strong>
-                    <small>{updateState.message ?? 'Update status unavailable.'}</small>
+                    <small>{updateState.installWhenIdle ? 'Will install when all tabs are idle.' : updateState.quietReason ?? updateState.message ?? 'Update status unavailable.'}</small>
                   </span>
+                  {updateState.availableVersion && ['available', 'ready', 'error'].includes(updateState.phase) && onUpdateAction && <button onClick={onUpdateAction} disabled={updateState.installWhenIdle}>
+                    {updateState.installWhenIdle ? 'Waiting for idle' : updateState.phase === 'ready' ? 'Restart to update' : 'Download update'}
+                  </button>}
                   <button
                     disabled={!updateState.configured || ['checking', 'downloading', 'installing'].includes(updateState.phase)}
                     onClick={onCheckForUpdates}

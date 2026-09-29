@@ -47,6 +47,7 @@ import { MacZipUpdater } from './mac-zip-updater'
 import { CliVersionStore, pinnedCliExecutable } from './cli-versions'
 import { RestorePointStore } from './restore-points'
 import { createUpdateInstallSeam } from './update-install-seam'
+import { writeLocalUpdateOffer } from './local-update-offer'
 const managers: UpdateManager[] = []
 const roots: string[] = []
 const updateDir = (): string => { const root = mkdtempSync(join(tmpdir(), 'conductor-update-manager-')); roots.push(root); return root }
@@ -63,6 +64,46 @@ beforeEach(() => {
 })
 afterEach(() => { managers.splice(0).forEach(value => value.dispose()); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); vi.useRealTimers() })
 describe('installed updater source ownership — mocked transport, no installation', () => {
+  it('keeps a local build quiet until verified, offered and idle, without gating releases', async () => {
+    const directory = updateDir()
+    let blockers = [{ id: 'fake', title: 'Fake busy tab' }]
+    const m = new UpdateManager({ currentVersion: '0.1.4', isPackaged: true, localBuildDirectory: directory, beforeInstall: vi.fn(), installBlockers: () => blockers })
+    managers.push(m); m.configure(''); await m.check()
+    expect(m.getState().promptAllowed).toBe(false)
+    writeLocalUpdateOffer(directory, { version: f.localVersion, builder: 'test', verified: true, offered: true })
+    expect(m.getState()).toMatchObject({ promptAllowed: false, quietReason: expect.stringContaining('1 tab is working') })
+    blockers = []
+    expect(m.getState().promptAllowed).toBe(true)
+    f.remoteVersion = '0.1.6'; blockers = [{ id: 'fake', title: 'Fake busy tab' }]
+    await m.check()
+    expect(m.getState()).toMatchObject({ source: 'release', promptAllowed: true })
+  })
+  it('rechecks at click time and installs a queued version once idle', async () => {
+    vi.useFakeTimers()
+    let blockers = [{ id: 'fake', title: 'Fake busy tab' }]
+    const beforeInstall = vi.fn()
+    const m = new UpdateManager({ currentVersion: '0.1.4', isPackaged: true, localBuildDirectory: updateDir(), beforeInstall, installBlockers: () => blockers })
+    managers.push(m); m.configure(''); await m.check(); await m.download()
+    await m.install({ safe: true })
+    expect(m.getState().phase).toBe('ready'); expect(beforeInstall).not.toHaveBeenCalled()
+    await m.install({ safe: true, whenIdle: true })
+    expect(m.getState().installWhenIdle).toBe(true)
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(beforeInstall).not.toHaveBeenCalled()
+    blockers = []
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(beforeInstall).toHaveBeenCalledTimes(1)
+  })
+  it('rechecks after asynchronous renderer preparation too', async () => {
+    let blockers: Array<{ id: string; title: string }> = []
+    const beforeInstall = vi.fn()
+    const m = new UpdateManager({ currentVersion: '0.1.4', isPackaged: true, localBuildDirectory: updateDir(), beforeInstall, installBlockers: () => blockers })
+    managers.push(m); m.configure(''); await m.check(); await m.download()
+    vi.spyOn(m as any, 'prepareRenderers').mockImplementation(async () => { blockers = [{ id: 'race', title: 'Started during flush' }] })
+    await m.install({ safe: true })
+    expect(beforeInstall).not.toHaveBeenCalled()
+    expect(m.getState()).toMatchObject({ phase: 'ready', installBlockers: blockers })
+  })
   it('discovers local builds automatically shortly after startup', async () => {
     vi.useFakeTimers()
     const m = manager()

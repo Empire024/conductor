@@ -211,6 +211,11 @@ export interface AppUpdateState {
   lastCheckedAt?: string
   source?: 'local' | 'release'
   localBuildWarning?: string
+  /** Local updates are quiet until verified, explicitly offered, and all work is idle. */
+  promptAllowed?: boolean
+  quietReason?: string
+  installBlockers?: Array<{ id: string; title: string }>
+  installWhenIdle?: boolean
   /** A wizard tab asked the owner to restart (app.restart.request); cleared by the next launch. */
   restartRequest?: { title: string; reason: string; at: string }
 }

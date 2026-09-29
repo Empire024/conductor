@@ -282,7 +282,8 @@ const toolSignatures = {
   'orchestration.tasks.update': '({id,title?,description?,priority?,status?,assignedAgentId?}) — id is the taskId router.dispatch returned (taskId is accepted as its alias); a worker marks its task done with {id,status:"done"}. Results go in agents.report, not here',
   'orchestration.routines.save': '({id?,name,description?,steps:[{title,instructions?,assignedAgentId?}]})',
   'workspace.rename': '({title})',
-  'app.update': '({commit?,smoke?:[names]}) — build this Conductor checkout and publish it to the installed app’s local update feed, the same work as `npm run update:local`; returns at once, so poll app.update.status. Without commit the working tree is built as it is, other agents’ unfinished edits included (dirty). With commit (a sha, or HEAD) exactly that commit is built in a clean detached worktree under ../conductor-candidates/ with a real copy of node_modules (an existing clean one at that commit is reused; a dirty one, or one with a junction, is refused) and the feed records it with dirty=false; smoke names scripts/smoke-*.mjs files (e.g. ["smoke-permission-grant"]) run after the build from that worktree through smoke-lock, one at a time and parked, and a failed smoke leaves the update built but not verified. A native coworker in Auto builds without asking; below Auto, and for a local model, the owner confirms each build unless a non-local coworker has pre-authorized this conversation with app.update.authorize. No installer is ever run: the app offers “Update pending” and the owner (or a wizard tab) installs it',
+  'app.update': '({commit?,smoke?:[names],offer?:boolean}) — build this Conductor checkout and publish it to the installed app’s local update feed, the same work as `npm run update:local`; returns at once, so poll app.update.status. Without commit the working tree is built as it is, other agents’ unfinished edits included (dirty). With commit (a sha, or HEAD) exactly that commit is built in a clean detached worktree under ../conductor-candidates/ with a real copy of node_modules (an existing clean one at that commit is reused; a dirty one, or one with a junction, is refused) and the feed records it with dirty=false; smoke names scripts/smoke-*.mjs files (e.g. ["smoke-permission-grant"]) run after the build from that worktree through smoke-lock, one at a time and parked, and a failed smoke leaves the update built but not verified. A native coworker in Auto builds without asking; below Auto, and for a local model, the owner confirms each build unless a non-local coworker has pre-authorized this conversation with app.update.authorize. No installer is ever run. Local builds stay quiet in Settings until verified and explicitly offered with offer:true (or app.update.offer); the owner prompt also waits for all tabs and live background work to become idle',
+  'app.update.offer': '() — builder or wizard: offer the verified local build to the owner; the prompt waits until all tabs and background work are idle.',
   'app.update.status': '({waitSeconds?}) — state, stage (worktree, dependencies, build, smoke, done), commit, worktree, version, log tail, per-smoke results and verified of the local update build; waitSeconds (at most 50) returns as soon as the state, stage or a smoke changes',
   'git.status': '() — branch, ahead/behind, head and changed files of this project’s repository, and whether a release workflow is verified after a push',
   'git.ship': '({message,paths?,publish?,mac?,waitSeconds?}) — deliver finished work in one call. Conductor freezes changed paths as Git blobs, verifies that snapshot with parallel tests/build, and commits those exact blobs as a local commit on the host with the owner’s credentials; later disk edits stay uncommitted and are reported. Nothing is pushed or released unless publish: true — for the owner, a wizard tab or a controller publishing a finished batch, never a dispatched coworker — also pushes, starts the release workflow (with the Mac build unless mac: false) and checks its Windows and Mac assets. Never escalate your sandbox for git/gh or run these steps yourself. Returns the run; waitSeconds (max ' + SHIP_WAIT_SECONDS + MCP_WAIT_NOTE + ', capped with waitCapped in the result) blocks until it settles or that time passes, then keep polling git.ship.status. A ship while another delivery of this project runs is queued, never refused: it returns status:"queued" with runId, behind (the run ahead of it) and position, starts by itself when that settles, and runs its own preflight then. Only a failed stage carries its log (last 15 lines); a running test stage carries passedFiles, failedFiles and its failing lines so far, another running stage its last 15 lines',
@@ -2772,17 +2773,17 @@ export class AgentControl {
   /** The conversations an unforced app.update.install waits for, across every project: a live
    *  turn, or background tasks a connected runtime still runs. The caller's own turn is the one
    *  asking, so only its background tasks count; a dead tab's leftover count never does. */
-  private installBlockers(scope: AgentControlScope): Array<{ agentSessionId: string; title: string; project: string | null; work: string }> {
+  installBlockers(scope?: Pick<AgentControlScope, 'agentSessionId' | 'projectId'>): Array<{ agentSessionId: string; title: string; project: string | null; work: string }> {
     const busy: Array<{ agentSessionId: string; title: string; project: string | null; work: string }> = []
     for (const process of this.deps.database.listProcesses()) {
       if (process.kind !== 'agent') continue
       const state = this.deps.database.structured.snapshot(process.id)
       if (!state) continue
-      const inTurn = process.id !== scope.agentSessionId && ['running', 'waiting_approval', 'waiting_input', 'interrupting'].includes(state.phase) && this.deps.sessions.hasRuntime(process.id)
+      const inTurn = process.id !== scope?.agentSessionId && ['running', 'waiting_approval', 'waiting_input', 'interrupting'].includes(state.phase) && this.deps.sessions.hasRuntime(process.id)
       const { backgroundTasks } = this.background(process.id, state)
       if (!inTurn && !backgroundTasks) continue
       const work = [inTurn ? (state.phase === 'running' ? 'mid-turn' : `mid-turn, ${state.phase.replace('_', ' ')}`) : '', backgroundTasks ? `${backgroundTasks} background task${backgroundTasks === 1 ? '' : 's'} running` : ''].filter(Boolean).join(', ')
-      busy.push({ agentSessionId: process.id, title: state.title || process.title, project: process.projectId === scope.projectId ? null : this.deps.database.getProject(process.projectId)?.name ?? process.projectId, work })
+      busy.push({ agentSessionId: process.id, title: state.title || process.title, project: process.projectId === scope?.projectId ? null : this.deps.database.getProject(process.projectId)?.name ?? process.projectId, work })
     }
     return busy
   }
@@ -2866,6 +2867,12 @@ export class AgentControl {
   private async localUpdate(scope: AgentControlScope, source: AgentSpec, method: string, args: Args): Promise<unknown> {
     const builder = this.deps.localUpdates
     if (!builder) throw new Error('Local update builds are unavailable in this Conductor')
+    if (method === 'app.update.offer') {
+      validateArgs(method, args, [])
+      if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly(method))
+      if (!builder.offer) throw new Error('Local update offers are unavailable in this Conductor')
+      return builder.offer(scope.agentSessionId, sovereign(scope))
+    }
     if (method === 'app.update.status') {
       validateArgs(method, args, ['waitSeconds'])
       const wait = args.waitSeconds === undefined ? 0 : Number(args.waitSeconds)
@@ -2893,9 +2900,10 @@ export class AgentControl {
     }
     if (method !== 'app.update') throw new Error(this.unknownMethod(method))
     if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly(method))
-    validateArgs(method, args, ['commit', 'smoke'])
+    validateArgs(method, args, ['commit', 'smoke', 'offer'])
+    if (args.offer !== undefined && typeof args.offer !== 'boolean') throw new Error('offer must be true or false')
     if (args.smoke !== undefined && (!Array.isArray(args.smoke) || args.smoke.some(name => typeof name !== 'string'))) throw new Error('smoke must be a list of scripts/smoke-*.mjs names, e.g. ["smoke-permission-grant"]')
-    const request = { ...(args.commit === undefined ? {} : { commit: text(args, 'commit', 100) }), ...(args.smoke === undefined ? {} : { smoke: args.smoke as string[] }) }
+    const request = { builder: scope.agentSessionId, offer: args.offer === true, ...(args.commit === undefined ? {} : { commit: text(args, 'commit', 100) }), ...(args.smoke === undefined ? {} : { smoke: args.smoke as string[] }) }
     const unsupported = builder.unsupported(source.cwd)
     if (unsupported) throw new Error(unsupported)
     const running = builder.status()

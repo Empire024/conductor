@@ -143,7 +143,7 @@ export interface ConductorBridge {
     getState(): Promise<AppUpdateState>
     check(): Promise<AppUpdateState>
     download(): Promise<AppUpdateState>
-    install(): Promise<void>
+    install(options?: { whenIdle?: boolean }): Promise<void>
     versions(): Promise<RestorePoint[]>
     pinVersion(version: string, pinned: boolean): Promise<RestorePoint>
     /** What rolling back changes (app and CLIs, or the CLIs only), shown before the owner confirms. */

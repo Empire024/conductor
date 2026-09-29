@@ -31,6 +31,7 @@ Conductor is a local desktop application for its owner. GitHub is used only as t
 - Running installed windows must discover releases automatically and show `Update pending`.
 - A newly launched installed app must check shortly after startup and offer the update.
 - Users may opt into automatic update downloads; downloaded updates install on normal app exit or via `Restart to update`.
+- Local agent builds stay quiet in Settings → Updates until verified and explicitly offered with `app.update({commit, smoke, offer:true})` or `app.update.offer({})` by their builder or a wizard. Their prompt appears only when every tab and live background task is idle. GitHub releases retain automatic prompts. Owner restart clicks recheck work and offer **Install when idle** if work started meanwhile; they never authorize cutting work. See `docs/local-update-safety.md`.
 
 ## Ask the owner only when asking is the shortest path
 

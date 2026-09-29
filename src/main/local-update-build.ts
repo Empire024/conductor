@@ -3,6 +3,7 @@ import { createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, readF
 import { basename, delimiter, dirname, join, resolve } from 'node:path'
 import { lowerSpawned } from './background-priority'
 import { RestorePointStore } from './restore-points'
+import { readLocalUpdateOffer, writeLocalUpdateOffer } from './local-update-offer'
 
 /** Where a candidate build is: making its worktree, copying node_modules into it, building,
  *  running its smokes, or done. Null for a build of the working tree itself. */
@@ -45,7 +46,7 @@ export interface LocalUpdateBuildStatus {
 
 /** app.update({commit, smoke}): build that commit in a clean worktree instead of the working tree,
  *  then run the named scripts/smoke-*.mjs against it. */
-export interface LocalUpdateRequest { commit?: string; smoke?: string[] }
+export interface LocalUpdateRequest { commit?: string; smoke?: string[]; offer?: boolean; builder?: string }
 
 export interface LocalUpdateBuildService {
   /** Null when this workspace can produce a local update; otherwise why it cannot. */
@@ -54,6 +55,7 @@ export interface LocalUpdateBuildService {
   validate?(workspace: string, request: LocalUpdateRequest): void
   status(): LocalUpdateBuildStatus
   start(workspace: string, request?: LocalUpdateRequest): LocalUpdateBuildStatus
+  offer?(agent: string, sovereign: boolean): LocalUpdateBuildStatus
 }
 
 const LOG_LINES = 40
@@ -167,6 +169,17 @@ export class LocalUpdateBuilder implements LocalUpdateBuildService {
   private current: LocalUpdateBuildStatus = idle()
   private child: ChildProcess | null = null
   private disposed = false
+  private request: LocalUpdateRequest = {}
+
+  offer(agent: string, sovereign: boolean): LocalUpdateBuildStatus {
+    const { feedDirectory, version } = this.current
+    if (!feedDirectory || !version) throw new Error('No local build to offer. Build one with app.update first.')
+    const offer = readLocalUpdateOffer(feedDirectory, version)
+    if (!offer || (!sovereign && offer.builder !== agent)) throw new Error('Only the builder or a wizard may offer this local update.')
+    if (!offer.verified) throw new Error('This build has not passed verification yet. Poll app.update.status.')
+    writeLocalUpdateOffer(feedDirectory, { ...offer, offered: true })
+    return this.status()
+  }
 
   /** `feedDirectory` overrides where the build publishes; a test instance passes its own profile's
    *  feed so its builds never reach the installed app's (see update-install-seam.ts).
@@ -194,6 +207,7 @@ export class LocalUpdateBuilder implements LocalUpdateBuildService {
   start(workspace: string, request: LocalUpdateRequest = {}): LocalUpdateBuildStatus {
     if (this.current.state === 'running') return this.status()
     const root = resolve(workspace)
+    this.request = request
     const reason = this.unsupported(root)
     if (reason) throw new Error(reason)
     const plan = request.commit !== undefined || request.smoke !== undefined ? this.plan(root, request) : null
@@ -276,6 +290,7 @@ export class LocalUpdateBuilder implements LocalUpdateBuildService {
     }
     this.pruneRestorePoints()
     if (!plan.smokes.length) {
+      this.current.verified = true
       this.current.stage = 'done'
       return this.finish(0, `Local update ${this.current.version ?? ''} built from ${short} (dirty=false) in ${plan.worktree} and published; Conductor offers “Update pending”. Nothing was installed: app.update.install does that once no tab is mid-turn.`)
     }
@@ -390,5 +405,11 @@ export class LocalUpdateBuilder implements LocalUpdateBuildService {
   private finish(code: number | null, message: string): void {
     if (this.disposed) return
     this.current = { ...this.current, state: code === 0 ? 'succeeded' : 'failed', exitCode: code, finishedAt: new Date().toISOString(), message }
+    if (this.current.feedDirectory && this.current.version) {
+      writeLocalUpdateOffer(this.current.feedDirectory, {
+        version: this.current.version, builder: this.request.builder ?? '', commit: this.current.commit,
+        verified: code === 0 && this.current.verified === true, offered: this.request.offer === true
+      })
+    }
   }
 }

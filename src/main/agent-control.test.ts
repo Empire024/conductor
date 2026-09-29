@@ -120,6 +120,16 @@ const seedClaudeModels = (f: ReturnType<typeof fixture>): void => {
 }
 
 describe('authorized native app control', () => {
+  it('records explicit local update intent and only offers through the builder service', async () => {
+    const f = fixture()
+    f.confirm.mockResolvedValueOnce(true)
+    await f.control.call(f.scope, 'app.update', { commit: 'HEAD', offer: true })
+    expect(f.localUpdates.start).toHaveBeenCalledWith(f.project.path, { builder: f.scope.agentSessionId, offer: true, commit: 'HEAD' })
+    const offer = vi.fn(() => f.localUpdates.status())
+    const control = new AgentControl({ ...f.deps, localUpdates: { ...f.localUpdates, offer } })
+    await control.call(f.scope, 'app.update.offer', {})
+    expect(offer).toHaveBeenCalledWith(f.scope.agentSessionId, false)
+  })
   it('builds a local app update only for the owner’s confirmation or a non-sandboxed coworker’s standing grant', async () => {
     const f = fixture()
     const local: AgentSpec = { ...f.spec, id: 'local-worker', provider: 'local', title: 'Local worker' }
@@ -134,7 +144,7 @@ describe('authorized native app control', () => {
     await expect(f.control.call(f.scope, 'app.update.authorize', { agentSessionId: f.spec.id })).rejects.toThrow('itself')
     expect(await f.control.call(f.scope, 'app.update.authorize', { agentSessionId: local.id })).toMatchObject({ authorized: true })
     expect(await f.control.call(localScope, 'app.update')).toMatchObject({ state: 'running', workspace: f.project.path, authorizedBy: f.spec.id })
-    expect(f.localUpdates.start).toHaveBeenCalledWith(f.project.path, {})
+    expect(f.localUpdates.start).toHaveBeenCalledWith(f.project.path, { builder: local.id, offer: false })
     expect(f.confirm).toHaveBeenCalledTimes(1)
     // A project that cannot build Conductor says so instead of spawning anything.
     f.localUpdates.unsupported.mockReturnValueOnce('This project is not the Conductor desktop app, so it cannot build a Conductor update.')
@@ -3136,7 +3146,7 @@ describe('B5-D: app.update builds an exact commit and an unforced install waits 
     expect(f.confirm).not.toHaveBeenCalled()
     f.confirm.mockResolvedValueOnce(true)
     expect(await control.call(f.scope, 'app.update', { commit: 'abc1234', smoke: ['smoke-permission-grant'] })).toMatchObject({ state: 'running' })
-    expect(f.localUpdates.start).toHaveBeenCalledWith(f.project.path, { commit: 'abc1234', smoke: ['smoke-permission-grant'] })
+    expect(f.localUpdates.start).toHaveBeenCalledWith(f.project.path, { builder: f.scope.agentSessionId, offer: false, commit: 'abc1234', smoke: ['smoke-permission-grant'] })
   })
 
   it('app.update.status waits for the build to move on, within the control wait cap', async () => {

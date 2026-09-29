@@ -83,6 +83,7 @@ describe('local update builds', () => {
     const worktree = join(candidates, head.slice(0, 7))
     expect(status).toMatchObject({ state: 'succeeded', commit: head, worktree, stage: 'done', version: '0.1.1-local.7', verified: false })
     expect(status.message).toMatch(/NOT verified: smoke-bad failed/)
+    expect(() => builder.offer('wizard', true)).toThrow(/not passed verification/)
     expect(status.smokes.map(smoke => [smoke.name, smoke.state, smoke.exitCode])).toEqual([['smoke-ok', 'passed', 0], ['smoke-bad', 'failed', 1]])
     expect(status.smokes[1]!.tail!.at(-1)).toBe('FAIL: the grant card never appeared')
     expect(status.smokes[1]!.tail!.length).toBeLessThanOrEqual(20)
@@ -91,10 +92,13 @@ describe('local update builds', () => {
     expect(existsSync(join(worktree, 'node_modules', 'electron-builder', 'cli.js'))).toBe(true)
 
     // A second build of the same commit reuses that worktree; all smokes passing verifies it.
-    builder.start(root, { commit: head, smoke: ['smoke-ok'] })
+    builder.start(root, { commit: head, smoke: ['smoke-ok'], builder: 'test-builder' })
     await vi.waitFor(() => expect(builder.status().state).not.toBe('running'), { timeout: 60_000, interval: 200 })
     expect(builder.status()).toMatchObject({ state: 'succeeded', worktree, verified: true, stage: 'done' })
     expect(builder.status().log.join('\n')).toMatch(/Reusing the clean worktree/)
+    expect(() => builder.offer('other-agent', false)).toThrow(/Only the builder or a wizard/)
+    expect(builder.offer('test-builder', false).verified).toBe(true)
+    expect(builder.offer('wizard', true).verified).toBe(true)
   }, 150_000)
 
   it('refuses a candidate it cannot build faithfully before building anything', async () => {

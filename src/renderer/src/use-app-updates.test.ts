@@ -49,6 +49,22 @@ async function startedStore(initial: AppUpdateState, lookupTitle: (id: string) =
 }
 
 describe('one-click restart, gated only by work still in progress', () => {
+  it('uses main-process blockers across windows and offers an idle install', async () => {
+    const { store, bridge } = await startedStore(ready)
+    bridge.getState.mockResolvedValue({ ...ready, installBlockers: [{ id: 'other-project', title: 'Background render' }] })
+    await store.runUpdateAction()
+    expect(bridge.install).not.toHaveBeenCalled()
+    expect(store.getSnapshot().pendingQuitConfirm).toEqual([{ id: 'other-project', title: 'Background render' }])
+    await store.confirmQuitAndInstall()
+    expect(bridge.install).toHaveBeenCalledWith({ whenIdle: true })
+  })
+  it('handles a click-time race by returning to ready with an idle-install choice', async () => {
+    const { store, bridge } = await startedStore(ready)
+    bridge.getState.mockResolvedValueOnce({ ...ready, installBlockers: [] }).mockResolvedValue({ ...ready, installBlockers: [{ id: 'new-turn', title: 'New work' }] })
+    await store.runUpdateAction()
+    expect(store.getSnapshot().state.phase).toBe('ready')
+    expect(store.getSnapshot().pendingQuitConfirm).toEqual([{ id: 'new-turn', title: 'New work' }])
+  })
   it('cascades all the way from available to installed with a single call when nothing is running', async () => {
     const { store, bridge } = await startedStore(available)
     await store.runUpdateAction()

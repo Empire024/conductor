@@ -14,8 +14,10 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { createUpdateInstallSeam, type InstallRequest, type UpdateInstallSeam } from './update-install-seam'
 import { MacZipUpdater } from './mac-zip-updater'
+import { localUpdateGate, readLocalUpdateOffer } from './local-update-offer'
 
 interface UpdateManagerOptions {
+  installBlockers?(caller?: string): Array<{ id: string; title: string }>
   currentVersion: string
   isPackaged: boolean
   allowDevelopmentUpdates?: boolean
@@ -70,11 +72,24 @@ export class UpdateManager {
   private readonly currentVersion: string
   private downloaded: Omit<InstallRequest, 'reason'> | null = null
   private installReason: InstallRequest['reason'] = 'update'
+  private idleTimer: NodeJS.Timeout | null = null
+  private queuedVersion: string | null = null
+  private lastGate = ''
 
   constructor(private readonly options: UpdateManagerOptions) {
     this.seam = options.installSeam ?? createUpdateInstallSeam({ isPackaged: options.isPackaged, relaunch: () => { app.relaunch(); app.quit() } })
     this.currentVersion = this.seam.reportedVersion(options.currentVersion)
     this.state = { phase: 'disabled', currentVersion: this.currentVersion, configured: false, message: 'Connecting to update sources.' }
+    this.idleTimer = setInterval(() => {
+      const state = this.getState(), gate = JSON.stringify([state.promptAllowed, state.quietReason, state.installBlockers, state.installWhenIdle])
+      if (gate !== this.lastGate) { this.lastGate = gate; this.setState(this.state) }
+      if (this.queuedVersion && this.queuedVersion !== state.availableVersion) this.queuedVersion = null
+      if (this.queuedVersion && state.phase === 'ready' && !state.installBlockers?.length) {
+        this.queuedVersion = null
+        void this.install({ safe: true }).catch(error => console.warn('Idle update install failed', error))
+      }
+    }, 1000)
+    this.idleTimer.unref()
     if (options.localBuildDirectory) {
       this.localFeed = new LocalUpdateFeed(options.localBuildDirectory)
       this.restorePoints = new RestorePointStore(options.localBuildDirectory)
@@ -99,7 +114,12 @@ export class UpdateManager {
   getState(): AppUpdateState {
     const request = this.restartRequest
     const current = request && Date.now() - Date.parse(request.at) <= RESTART_REQUEST_MAX_AGE_MS
-    return { ...this.state, ...(current ? { restartRequest: { title: request.title, reason: request.reason, at: request.at } } : {}) }
+    const installBlockers = this.options.installBlockers?.() ?? []
+    const gate = this.state.source === 'local' ? localUpdateGate(
+      this.options.localBuildDirectory && this.state.availableVersion ? readLocalUpdateOffer(this.options.localBuildDirectory, this.state.availableVersion) : null,
+      installBlockers.length) : { promptAllowed: true }
+    return { ...this.state, ...gate, installBlockers, installWhenIdle: this.queuedVersion === this.state.availableVersion,
+      ...(current ? { restartRequest: { title: request.title, reason: request.reason, at: request.at } } : {}) }
   }
   /** A wizard's app.restart.request, shown on the owner's update control until the next launch. */
   setRestartRequest(request: RestartRequest | null): void { this.restartRequest = request; this.setState(this.state) }
@@ -283,11 +303,19 @@ export class UpdateManager {
     try { await this.install() } finally { this.installReason = 'update' }
     return plan
   }
-  async install(options: { force?: boolean } = {}, initiator?: Omit<RestartInitiator, 'at'>): Promise<void> {
+  async install(options: { force?: boolean; safe?: boolean; whenIdle?: boolean } = {}, initiator?: Omit<RestartInitiator, 'at'>): Promise<void> {
     if (!this.updater || this.state.phase !== 'ready') return
+    const blocked = (): boolean => Boolean(this.options.installBlockers?.(initiator?.agentSessionId).length)
+    const defer = (): void => {
+      if (options.whenIdle) this.queuedVersion = this.state.availableVersion ?? null
+      this.setState({ ...this.state, phase: 'ready', message: options.whenIdle ? 'The update will install when all tabs are idle.' : 'Work started before the restart. Choose Install when idle to wait safely.' })
+    }
+    if (options.safe && blocked()) { defer(); return }
     this.setState({ ...this.state, phase: 'installing', message: 'Saving windows and stopping processes…' })
     try {
       await this.prepareRenderers()
+      // Renderer flushing is asynchronous: a turn may have started since the click.
+      if (options.safe && blocked()) { defer(); return }
       await (initiator ? this.options.beforeInstall(options.force === true, initiator) : this.options.beforeInstall(options.force === true))
       const version = this.state.availableVersion ?? this.downloaded?.version ?? ''
       const downloaded = this.downloaded?.version === version ? this.downloaded : null
@@ -311,6 +339,8 @@ export class UpdateManager {
   }
 
   dispose(): void {
+    if (this.idleTimer) clearInterval(this.idleTimer)
+    this.idleTimer = null
     this.clearTimer()
     if (this.cliSnapshotTimer) clearTimeout(this.cliSnapshotTimer)
     this.cliSnapshotTimer = null
