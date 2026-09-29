@@ -150,12 +150,28 @@ before rows.
 ## Regression guard
 
 ```
-node scripts/smoke-lock.mjs --priority normal --timeout-min 60 -- node scripts/perf-input.mjs --label=guard --load=swarm --repeat=3 --throttle=4 --assert
+node scripts/smoke-lock.mjs --priority normal --timeout-min 60 -- node scripts/perf-input.mjs --label=guard --load=launch,swarm --repeat=3 --throttle=4 --assert
 ```
 
-About 15 minutes. It exits 1 when, over the three rounds, the median p95 or the median p99 under the
-swarm load is more than 25 ms (`--bound-ms`) above the same-run quiet median. Before the fix p99 was
-+108.6 ms, more than four times the bound; with priority alone +12.3 ms on a calm machine and
-+29.2 ms on a busy one (a miss); with bounded workers too +6.2 ms. Not wired into `git.ship`
-(too slow); the verifier brief queues it overnight after any change to launch paths, smoke-lock,
-verify-kit or parked-window code.
+About 20 minutes. It exits 1 when, over the three rounds, the median p95 or the median p99 under a
+load is too far above the same-run quiet median:
+- **launch** (one parked instance building and starting, what every smoke does): more than 8 ms
+  (`--launch-bound-ms`). Starting a test instance must not show in the owner's typing at all.
+- **swarm**: more than 25 ms (`--bound-ms`).
+
+History of the swarm number:
+- Before the fix, p99 was +108.6 ms, more than four times the bound.
+- With priority alone: +12.3 ms on a calm machine, +29.2 ms on a busy one (a miss).
+- With bounded workers too: +6.2 ms.
+
+On 2026-09-29 (docs/verification/2026-09-29-typing.md):
+- launch: p99 −0.2 ms, p95 +0.6 ms.
+- swarm: p99 +24.2 ms on a busy machine.
+- The normal-priority control failed the guard: swarm p99 +39.9 ms, worst key 200 ms.
+
+Not wired into `git.ship` (too slow). The verifier brief queues it overnight after any change to
+launch paths, smoke-lock, verify-kit or parked-window code.
+
+Still open: Playwright Chromium, launched by the Production agent's audit-browser tests, raises its
+own GPU process to above normal, whatever its parent's priority. A vitest run holds up to nine of
+them; see the verification doc.

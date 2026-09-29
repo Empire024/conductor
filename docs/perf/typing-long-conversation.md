@@ -110,3 +110,18 @@ With every CSS animation disabled (a diagnostic, not a fix), the same case measu
   p95 bound. Keys over 50 ms went from 82 to 0.
 - **The tab-switch step of perf-input fails on HEAD itself** (`.pane-tab[data-control-tab-id]`
   click times out). It now records `switching.error` instead of discarding the typing numbers.
+
+## The composer itself (2026-09-29, 2892a5b)
+
+At rest, what was left was the composer:
+- the conversation pane rendered on every key;
+- React rewrote the controlled textarea's `defaultValue` (its child text node) on every render;
+- a present placeholder cost a style recalc per key.
+
+The textarea is now uncontrolled, the pane renders from a view of the draft that typing leaves
+unchanged, and the placeholder is present only while the draft is empty. A keystroke commits
+nothing in React: 25–30 commits per 300 keys, all periodic, instead of about 325.
+
+Result on the idle 10k conversation at 4x: p95 11.6–11.9 / 11.6–11.9 / 12.5–12.6 ms at 1 / 11 / 26
+tabs in two runs, against HEAD's 15.8–16.9 / 16.1–16.9 / 15.3–15.4. The probe, the numbers and what
+was tried are in docs/verification/2026-09-29-typing.md.

@@ -70,8 +70,10 @@ import { killTree } from './smoke-lock.mjs'
 // With --assert, a load fails when the median over the rounds of its p95 or p99 exceeds the quiet
 // median by more than --bound-ms (default 25): the regression guard. Before the fix a swarm load
 // missed it by 4x (p99 +108 ms), after it passes with room (+12 ms); docs/perf/typing-under-load.md.
+// A launch load (one parked instance starting, what every smoke does) is held to --launch-bound-ms
+// (default 8): starting a test instance must not show in the owner's typing at all.
 //   node scripts/smoke-lock.mjs --priority normal --timeout-min 60 -- node scripts/perf-input.mjs
-//     --label=under-load --load=launch,vitest --repeat=3 --throttle=1 --assert
+//     --label=guard --load=launch,swarm --repeat=3 --throttle=4 --assert
 const args = Object.fromEntries(process.argv.slice(2).filter(arg => arg.startsWith('--')).map(arg => {
   const [key, value = 'true'] = arg.slice(2).split('=')
   return [key, value]
@@ -106,6 +108,7 @@ const loadPriority = args['load-priority'] === 'normal' ? 'normal' : 'background
 const loadSeconds = Number(args['load-seconds'] ?? 60)
 const loadIdleSeconds = Number(args['load-idle'] ?? 8)
 const boundMs = Number(args['bound-ms'] ?? 25)
+const launchBoundMs = Number(args['launch-bound-ms'] ?? 8)
 const output = resolve('artifacts/perf-input')
 await mkdir(output, { recursive: true })
 // The measuring process and the stand-in it launches play the owner's app: normal priority, even
@@ -504,7 +507,7 @@ const misses = (result) => {
 }
 try {
   if (loads.length) {
-    results.config.load = { kinds: loads, repeat, priority: loadPriority, loadSeconds, loadIdleSeconds, boundMs, standIn: standInPriority }
+    results.config.load = { kinds: loads, repeat, priority: loadPriority, loadSeconds, loadIdleSeconds, boundMs, launchBoundMs, standIn: standInPriority }
     results.load = await scenario(tabCounts[0])
     for (const row of results.load.summary) console.log(`${row.kind}: p95 ${row.p95.join(' / ')} (median ${row.medianP95}) · p99 ${row.p99.join(' / ')} (median ${row.medianP99}) · max ${row.max.join(' / ')} ms · machine CPU ${row.cpuPercent.join(' / ')}%${row.misses.length ? ' · MISSED: ' + row.misses.join(', ') : ''}`)
     if (assert && results.load.summary.some(row => row.misses.length)) process.exitCode = 1
@@ -607,7 +610,7 @@ function round2(value) { return Number(value.toFixed(2)) }
 function median(values) { const sorted = [...values].sort((a, b) => a - b); return sorted.length ? round2(sorted[Math.floor((sorted.length - 1) / 2)]) : 0 }
 
 /** Per kind: every round's p95/p99, their medians, and what --assert holds a load to: its median p95
- *  and p99 each within --bound-ms of the quiet medians. */
+ *  and p99 each within --bound-ms of the quiet medians (a launch within --launch-bound-ms). */
 function summarizeLoadRows(rows) {
   const kinds = [...new Set(rows.map(row => row.kind))]
   const summary = kinds.map(kind => {
@@ -618,8 +621,9 @@ function summarizeLoadRows(rows) {
   for (const row of summary) {
     if (!rows.filter(item => item.kind === row.kind).every(item => item.textIntact)) row.misses.push('typed text was not intact')
     if (row === quiet || !quiet) continue
-    if (row.medianP99 > quiet.medianP99 + boundMs) row.misses.push(`median p99 ${row.medianP99} ms > quiet ${quiet.medianP99} + ${boundMs} ms`)
-    if (row.medianP95 > quiet.medianP95 + boundMs) row.misses.push(`median p95 ${row.medianP95} ms > quiet ${quiet.medianP95} + ${boundMs} ms`)
+    const bound = row.kind === 'launch' ? launchBoundMs : boundMs
+    if (row.medianP99 > quiet.medianP99 + bound) row.misses.push(`median p99 ${row.medianP99} ms > quiet ${quiet.medianP99} + ${bound} ms`)
+    if (row.medianP95 > quiet.medianP95 + bound) row.misses.push(`median p95 ${row.medianP95} ms > quiet ${quiet.medianP95} + ${bound} ms`)
   }
   return summary
 }
