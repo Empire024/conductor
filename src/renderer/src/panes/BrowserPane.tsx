@@ -114,7 +114,10 @@ function ProjectBrowserPane({
     const frame = frameRef.current
     if (!frame || !browserViewId) return null
     const rect = frame.getBoundingClientRect()
-    const payload: BrowserSurfaceRequest = { projectId, surfaceId: browserViewId, initialUrl: startingUrl, bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, viewport: { width: viewport.width, height: viewport.height }, visible: visible && !occluded && rect.width > 0 && rect.height > 0 }
+    // The frame has a fixed pixel size, so an ancestor hidden with `visibility: hidden` or clipped
+    // to zero width still reports a real rect; ask whether it is actually rendered.
+    const rendered = frame.checkVisibility?.({ visibilityProperty: true }) !== false
+    const payload: BrowserSurfaceRequest = { projectId, surfaceId: browserViewId, initialUrl: startingUrl, bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, viewport: { width: viewport.width, height: viewport.height }, visible: visible && rendered && !occluded && rect.width > 0 && rect.height > 0 }
     lastPayload.current = payload
     return payload
   }, [browserViewId, occluded, projectId, startingUrl, viewport.height, viewport.width, visible])

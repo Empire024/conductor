@@ -341,6 +341,7 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
       <aside className="sidebar" aria-hidden={props.collapsed || undefined}>
         <WorkspaceSidebarPanel
           mode={sidebarMode}
+          collapsed={props.collapsed}
           projects={props.projects}
           project={props.projects.find((project) => project.id === props.activeProjectId) ?? null}
           onOpenFile={props.onOpenFile}

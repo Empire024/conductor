@@ -7,6 +7,8 @@ import { persistMountedBrowserProjects, savedMountedBrowserProjects } from './br
 
 interface WorkspaceSidebarPanelProps {
   mode: WorkspaceSidebarMode
+  /** The rail-only sidebar keeps this panel mounted at zero width, so it must say so itself. */
+  collapsed?: boolean
   project: ProjectRecord | null
   projects?: ProjectRecord[]
   workspace: ReactNode
@@ -22,6 +24,7 @@ interface WorkspaceSidebarPanelProps {
  */
 export function WorkspaceSidebarPanel({
   mode,
+  collapsed = false,
   project,
   projects,
   workspace,
@@ -53,7 +56,11 @@ export function WorkspaceSidebarPanel({
     // The whole record, not just the id: a project that lives on a host previews that host's
     // registered services rather than this computer's localhost, and the pane cannot tell the
     // difference from an id alone.
-    .map(item => <BrowserSidebar key={`browser:${item.id}`} project={item} projectId={item.id} active={mode === 'browser' && item.id === project?.id} />)
+    // The browser is a native view painted over the window, not DOM: collapsing the sidebar hides
+    // it with `visibility: hidden; width: 0`, which the view never sees, while the device frame
+    // keeps its fixed pixel size. Unless a closed sidebar counts as inactive, the page stays
+    // painted over the workspace at its last bounds after the owner closes it.
+    .map(item => <BrowserSidebar key={`browser:${item.id}`} project={item} projectId={item.id} active={mode === 'browser' && !collapsed && item.id === project?.id} />)
   // Every explicitly opened project browser remains one mounted guest. Hiding the sidebar or
   // selecting another project changes only presentation, so background agent work retains its
   // page, cookies, console buffer and project partition without opening a workspace tab.
