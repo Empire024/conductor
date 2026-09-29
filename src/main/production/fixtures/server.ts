@@ -1,7 +1,8 @@
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { extname, join, resolve, sep } from 'node:path'
+import { dirname, extname, join, resolve, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 /**
  * Local fixture sites for the Production agent's tests and the fixture suite
@@ -33,7 +34,7 @@ import { extname, join, resolve, sep } from 'node:path'
  * `http://localhost:<port>`, a different origin from `127.0.0.1:<port>`, for off-allowlist tests).
  */
 
-export const FIXTURE_SITES_DIR = join(__dirname, 'sites')
+export const FIXTURE_SITES_DIR = join(dirname(fileURLToPath(import.meta.url)), 'sites')
 
 export interface SiteDirectives {
   setCookie?: Record<string, string[]>

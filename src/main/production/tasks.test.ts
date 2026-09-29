@@ -15,6 +15,7 @@ function seedFindings() {
   const findings = store.upsertFindings(run.id, OWNER, [
     { draft: finding('C03', 'consent', 'tracker', { severity: 'critical' }), applicability },
     { draft: finding('C03', 'consent', 'minor', { severity: 'low' }), applicability },
+    { draft: finding('C03', 'consent', 'medium-one', { severity: 'medium' }), applicability },
   ])
   return { run, findings }
 }
@@ -24,6 +25,7 @@ describe('fix tasks', () => {
     const board = fakeBoard()
     const { findings } = seedFindings()
     const auto = autoTaskFindings(findings)
+    // Only critical and high findings are filed by the report step; a medium one waits for createFixTasks.
     expect(auto.map(item => item.key)).toEqual(['tracker'])
     const first = ensureFixTasks(temp.store, board, 'project-a', auto)
     expect(first).toEqual([{ findingId: auto[0]!.id, taskId: 'task-1', created: true, reopened: false }])

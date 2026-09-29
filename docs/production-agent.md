@@ -519,6 +519,29 @@ app mid-run and assert resume, and assert the panel shows the gate badge. Fixtur
 prints one row per fixture site with expected vs actual control status and exits non-zero on
 any mismatch (this is the "prove the feature works" artefact).
 
+*As built (M8).* `control.ts` holds the method table and caller rules; `app-wiring.ts` builds the
+service in the app (routing through `AgentControl.routeForHost`, cloud calls as lean evaluation
+turns, `classify` on the local-assist runner with `noStart` during an interactive local turn, the
+orchestration board, a recursive file watcher, and the `production-drift` schedule created disabled
+and kept in step with the profile's drift settings). An offline test profile
+(`CONDUCTOR_OFFLINE_TESTS=1`) asks no model at all, and a parked test profile logs evidence and
+report paths instead of opening them. Wizard decisions applied on 2026-09-29:
+- **Gate.** A completed run that found an unwaived FAIL is `BLOCKED`, even the first run (below
+  STALE, above NEEDS_REVIEW; the reasons list every blocker). `NOT_AUDITED` means no run completed,
+  and names a run that could not complete.
+- **Fix tasks.** The report step files critical and high findings only; medium and lower are filed
+  with `production.tasks.create`.
+- **Human-review answers.** `production.review.answer({itemId,answer,note?})` (sovereign) stores
+  `confirmed` or `rejected` per project, environment and item id in `production_review_answers`.
+  `applyReviewAnswers` lays them over a run's results: an answer carries to a later run's item with
+  the same id unless a change since invalidated the control; once every item of a control is
+  answered its NEEDS_HUMAN_REVIEW cap lifts to the worst of its checks, and a rejection makes it
+  FAIL. The panel answers them in its Human review section.
+- A re-test or verification asked for while a run is active is refused with the next step (it
+  would otherwise coalesce into a plain audit and lose its finding ids).
+- The store's 10,000-finding bound measures the query thread's CPU time, so a loaded machine delays
+  it without failing it; the index-plan assertions are unchanged.
+
 Order and capacity: W1 (M1, M2, M3) → W2 (M4, M5, M6) → W3 (M7) → W4 (M8) → wizard integration,
 `git.ship`, `app.update({commit, smoke:["smoke-production"]})`, then the first real audit of
 Haftheme from the Haftheme project once its owner questions are answered.

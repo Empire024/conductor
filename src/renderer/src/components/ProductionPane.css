@@ -63,6 +63,12 @@
 .production-question-answer { display: flex; gap: 5px; margin-top: 3px; }
 .production-question-answer input { flex: 1; }
 .production-blocks { color: var(--accent) !important; }
+.production-review-control { display: grid; gap: 6px; }
+.production-review-control h4 { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0; color: var(--text-2); font-size: 10px; text-transform: none; }
+.production-review[data-answer='confirmed'], .production-review[data-answer='rejected'] { background: var(--surface-0); }
+.production-review-answered { display: grid; gap: 2px; margin-top: 2px; }
+.production-review-answered .production-chips { margin-top: 0; }
+.production-review-answered button.production-link { justify-self: start; }
 .production-settled summary, .production-add-environment summary, .production-writes-grant summary { cursor: pointer; color: var(--text-3); font-size: 10px; }
 
 /* Tables */

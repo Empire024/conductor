@@ -1,8 +1,8 @@
 import {
-  CONTROL_RESULT_SEVERITY, ENVIRONMENT_KINDS, MUTATION_KINDS, RUN_TRANSITIONS, SEVERITIES,
-  type ControlResultStatus, type EnvironmentKind, type Finding, type GateState, type MutationKind, type ProductionBridge,
+  CONTROL_RESULT_SEVERITY, ENVIRONMENT_KINDS, MUTATION_KINDS, REVIEW_ANSWERS, RUN_TRANSITIONS, SEVERITIES,
+  type ControlResult, type ControlResultStatus, type EnvironmentKind, type Finding, type GateState, type MutationKind, type ProductionBridge,
   type ProductionEnvironment, type ProductionProjectSnapshot, type ProductionQueueEntry, type ProductionRunSummary, type ProjectAuditState,
-  type RunStatus, type TargetFingerprint, type WaiverRequest, type WriteAuthorizationRequest
+  type ReviewAnswer, type ReviewAnswerRecord, type RunStatus, type TargetFingerprint, type WaiverRequest, type WriteAuthorizationRequest
 } from '../../../../shared/production'
 
 /**
@@ -39,7 +39,7 @@ export function gateSummary(gate: GateState): string {
     case 'VERIFIED_WITH_WAIVERS': return `Passed the configured audit scope${at}, with ${gate.activeWaivers} waived finding${gate.activeWaivers === 1 ? '' : 's'}.`
     case 'NOT_AUDITED': return 'No completed audit for this environment.'
     case 'AUDITING': return 'An audit is running for this environment.'
-    case 'BLOCKED': return 'The last run could not finish; see the reasons.'
+    case 'BLOCKED': return 'A failure was found or the last audit could not finish; see the reasons.'
     case 'STALE': return `The target changed since the last audit${gate.staleControls.length ? `; ${gate.staleControls.length} control${gate.staleControls.length === 1 ? '' : 's'} need a re-test` : ''}.`
     case 'NEEDS_REVIEW': return 'Open findings, questions or unverified controls need attention.'
   }
@@ -64,6 +64,17 @@ export const STATUS_TONE: Readonly<Record<ControlResultStatus, Tone>> = {
 }
 export const STATUS_LABEL: Readonly<Record<ControlResultStatus, string>> = {
   PASS: 'Pass', FAIL: 'Fail', WARN: 'Warn', NOT_APPLICABLE: 'Not applicable', UNVERIFIED: 'Unverified', NEEDS_HUMAN_REVIEW: 'Needs human review',
+}
+
+export const REVIEW_ANSWER_LABEL: Readonly<Record<ReviewAnswer, { label: string; tone: Tone }>> = {
+  confirmed: { label: 'Confirmed', tone: 'good' }, rejected: { label: 'Rejected', tone: 'bad' },
+}
+
+/** Human-review items of the last run's results: how many there are and how many the owner answered. */
+export function reviewCounts(results: readonly Pick<ControlResult, 'humanReview'>[]): { total: number; answered: number; unanswered: number } {
+  const items = results.flatMap(result => result.humanReview)
+  const answered = items.filter(item => item.answer).length
+  return { total: items.length, answered, unanswered: items.length - answered }
 }
 
 /** Worst first, then control id: the table reads from what needs work to what passed. */
@@ -230,6 +241,14 @@ export function validateWrites(draft: WritesDraft, environments: readonly Produc
 export async function answerQuestion(bridge: Pick<ProductionBridge, 'answerQuestion'>, projectId: string, questionId: string, answer: string): Promise<void> {
   if (!answer.trim()) throw new Error('Type an answer first.')
   await bridge.answerQuestion(projectId, questionId, answer.trim())
+}
+
+/** Answers a human-review item; the note is optional, trimmed, and kept short like a reason. */
+export async function answerReview(bridge: Pick<ProductionBridge, 'answerReview'>, projectId: string, itemId: string, answer: ReviewAnswer, note: string): Promise<ReviewAnswerRecord> {
+  if (!REVIEW_ANSWERS.includes(answer)) throw new Error('Answer confirmed or rejected.')
+  const text = note.trim()
+  if (text.length > 500) throw new Error('Keep the note under 500 characters.')
+  return bridge.answerReview(projectId, itemId, answer, text || undefined)
 }
 
 export async function waiveFinding(bridge: Pick<ProductionBridge, 'waive'>, projectId: string, findingId: string, draft: WaiverDraft, now: number): Promise<WaiverErrors> {

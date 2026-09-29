@@ -5,7 +5,7 @@ import {
   CONTROL_IDS,
   type Adapters, type AuditRequest, type AuditRun, type AuditTrigger, type BrowserAvailability, type ChangeClass, type ControlCheck, type ControlRegistry,
   type CredentialRef, type DriftSettings, type Finding, type GateState, type NetworkPolicy, type ProductionEnvironment, type ProductionProfile,
-  type ProductionProjectSnapshot, type ProductionQueueEntry, type ProductionRunSummary, type ProfileUpdate, type SandboxWriteAuthorization,
+  type ControlResult, type ProductionProjectSnapshot, type ProductionQueueEntry, type ProductionRunSummary, type ProfileUpdate, type ReviewAnswer, type ReviewAnswerRecord, type SandboxWriteAuthorization,
   type SourceTree, type TargetFingerprint, type Waiver, type WaiverRequest, type WriteAuthorizationRequest,
 } from '../../shared/production'
 import { createCapturedMailAdapter } from './adapters/mailpit'
@@ -20,7 +20,7 @@ import { recordsAdapter } from './checks/commerce-support'
 import { createFsSourceTree } from './discovery'
 import { runDrift, type DriftOutcome, type DriftPorts } from './drift'
 import { classifyChange, computeFingerprint, hashFiles, normalisePolicyText, type FingerprintFile } from './fingerprint'
-import { computeGate } from './gate'
+import { applyReviewAnswers, computeGate } from './gate'
 import type { InterpreterPorts } from './interpret'
 import {
   answerQuestion as answerProfileQuestion, applyProfileUpdate, authorizeWrites as addWriteAuthorization, designate as designateProfile,
@@ -127,6 +127,9 @@ export function createProductionService(deps: ProductionDeps) {
     return { ...base, commit: commit ?? base.commit, profileVersion: auditVersion(profile), registryVersion: REGISTRY.version, computedAt: clock().toISOString() }
   }
 
+  /** A run's results with the owner's human-review answers laid over them (gate.ts applyReviewAnswers). */
+  const answeredResults = (run: AuditRun): ControlResult[] => applyReviewAnswers(store.results(run.id), store.reviewAnswers(run.projectId, run.environmentId), run.fingerprint)
+
   const gateFor = (projectId: string, environmentId: string | null, after?: AuditRun): GateState => {
     const profile = store.profile(projectId)
     const envId = environmentId ?? environmentOf(profile)?.id ?? null
@@ -136,7 +139,7 @@ export function createProductionService(deps: ProductionDeps) {
     if (profile && completed && fp) fp = { ...fp, profileVersion: auditVersion(profile), registryVersion: REGISTRY.version }
     else if (profile && completed) fp = { ...completed.fingerprint, profileVersion: auditVersion(profile), registryVersion: REGISTRY.version }
     return computeGate({
-      projectId, environmentId: envId, runs, results: completed ? store.results(completed.id) : [],
+      projectId, environmentId: envId, runs, results: completed ? answeredResults(completed) : [],
       findings: envId ? store.findings(projectId, { environmentId: envId, status: ['open', 'reopened', 'disputed', 'waived'], limit: 2_000 }) : [],
       waivers: store.waivers(projectId, { limit: 500 }), questions: profile?.questions ?? [], currentFingerprint: fp, now: clock(),
     })
@@ -222,6 +225,8 @@ export function createProductionService(deps: ProductionDeps) {
 
   const service = {
     runner,
+    /** A run as the panel and the control methods show it (progress, ledger, report paths). */
+    summary: (run: AuditRun): ProductionRunSummary => summary(run),
     registry: (): ControlRegistry => REGISTRY,
 
     start(): ReconcileRunOutcome[] {
@@ -251,7 +256,7 @@ export function createProductionService(deps: ProductionDeps) {
       return {
         projectId, profile, gate: gateFor(projectId, environment?.id ?? null), activeRun: active ? summary(active) : null, runs: runs.map(summary),
         findings: environment ? store.findings(projectId, { environmentId: environment.id, limit: 500 }) : [], waivers: store.waivers(projectId, { limit: 200 }),
-        results: completed ? store.results(completed.id) : [], registryVersion: REGISTRY.version, browser: availability,
+        results: completed ? answeredResults(completed) : [], registryVersion: REGISTRY.version, browser: availability,
       }
     },
 
@@ -293,6 +298,24 @@ export function createProductionService(deps: ProductionDeps) {
     dismissQuestion: (projectId: string, questionId: string, reason: string, actor: Actor = OWNER_ACTOR): ProductionProfile =>
       store.mutateProfile(projectId, actorName(actor), current => dismissProfileQuestion(current, questionId, reason, actorName(actor), clock())),
 
+    /**
+     * Answers one human-review item of the environment's last completed run (the owner or a wizard;
+     * the control layer checks who). The answer is kept per item id and carried to later runs until
+     * a change invalidates the control; results and findings are never edited.
+     */
+    answerReview(projectId: string, request: { itemId: string; answer: ReviewAnswer; note?: string | null; environmentId?: string | null }, actor: Actor = OWNER_ACTOR): ReviewAnswerRecord {
+      if (request.answer !== 'confirmed' && request.answer !== 'rejected') throw new Error('answer must be confirmed or rejected')
+      const { environment } = requireEnvironment(projectId, request.environmentId)
+      const completed = store.lastCompletedRun(projectId, environment.id)
+      if (!completed) throw new Error(`Environment ${environment.id} has no completed audit; human-review items come from a completed run`)
+      const item = store.results(completed.id).flatMap(result => result.humanReview).find(entry => entry.id === request.itemId)
+      if (!item) throw new Error(`No human-review item ${request.itemId} in run ${completed.id}; production.status lists the items under results[].humanReview`)
+      return store.answerReview({
+        projectId, environmentId: environment.id, itemId: item.id, controlId: item.controlId, answer: request.answer, note: request.note?.trim() ? request.note.trim() : null,
+        answeredBy: actorName(actor), answeredAt: clock().toISOString(), runId: completed.id, fingerprint: completed.fingerprint,
+      })
+    },
+
     async audit(projectId: string, request: AuditRequest = {}, actor: Actor = OWNER_ACTOR): Promise<RunRequestOutcome> {
       const unknown = (request.controls ?? []).filter(id => !CONTROL_IDS.includes(id))
       if (unknown.length) throw new Error(`Unknown control ids: ${unknown.join(', ')}`)
@@ -302,11 +325,13 @@ export function createProductionService(deps: ProductionDeps) {
 
     async retest(projectId: string, findingIds: string[], actor: Actor = OWNER_ACTOR): Promise<RunRequestOutcome> {
       const findings = requireFindings(projectId, findingIds)
+      requireIdle(projectId, findings[0]!.environmentId, 'A re-test')
       return startRun(projectId, findings[0]!.environmentId, 'retest', actorTrigger('retest', actor, `Re-test of ${findings.length} finding(s)`), { findingIds: findings.map(finding => finding.id) })
     },
 
     async verify(projectId: string, findingIds: string[], actor: Actor = OWNER_ACTOR): Promise<RunRequestOutcome> {
       const findings = requireFindings(projectId, findingIds)
+      requireIdle(projectId, findings[0]!.environmentId, 'Verification')
       return startRun(projectId, findings[0]!.environmentId, 'verify', actorTrigger('verify', actor, `Independent verification of ${findings.length} finding(s)`), { findingIds: findings.map(finding => finding.id) })
     },
 
@@ -316,6 +341,9 @@ export function createProductionService(deps: ProductionDeps) {
     run: (projectId: string, runId: string): AuditRun => projectRun(projectId, runId),
     runs: (projectId: string, limit = 20): ProductionRunSummary[] => store.runs(projectId, { limit }).map(summary),
     findings: (projectId: string, filter: Parameters<ProductionStore['findings']>[1] = {}): Finding[] => store.findings(projectId, filter),
+    findingsByIds: (projectId: string, findingIds: string[]): Finding[] => store.findingsByIds(projectId, findingIds),
+    /** The run's newest journal entries, oldest first. */
+    events: (projectId: string, runId: string, limit = 50) => { projectRun(projectId, runId); return store.latestEvents(runId, limit) },
 
     createFixTasks(projectId: string, findingIds: string[]): FixTaskOutcome[] {
       if (!deps.board) throw new Error('The orchestration board is not available')
@@ -371,6 +399,12 @@ export function createProductionService(deps: ProductionDeps) {
     reportPaths: (projectId: string, runId: string): { markdown: string; json: string } | null => projectRun(projectId, runId).reportPaths,
   }
   return service
+
+  /** A re-test or verification names findings; coalesced into an active run it would come back as a plain audit, so it waits instead. */
+  function requireIdle(projectId: string, environmentId: string, what: string): void {
+    const active = store.activeRun(projectId, environmentId)
+    if (active) throw new Error(`${what} needs its own run, and run ${active.id} (${active.kind}) is ${active.status} for this environment; ask again when it has finished (production.status shows its progress)`)
+  }
 
   function requireFindings(projectId: string, findingIds: string[]): Finding[] {
     if (!findingIds.length) throw new Error('Name at least one finding')

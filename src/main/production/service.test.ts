@@ -61,10 +61,10 @@ describe('audit runs end to end (fake ports)', () => {
     expect(report.evidence.map((ref: { id: string; path: string }) => ref.path)).toEqual(['attempt-1/evidence/0001-log.json'])
     expect(existsSync(join(run.artifactsDir, 'attempt-1', 'evidence', '0001-log.json'))).toBe(true)
     const gate = w.service.gate('project-a')
-    expect(gate).toMatchObject({ state: 'NEEDS_REVIEW', openCriticalOrHigh: 1, runId: run.id })
+    expect(gate).toMatchObject({ state: 'BLOCKED', openCriticalOrHigh: 1, runId: run.id })
     // Designating or toggling drift does not change what is tested: not STALE.
     w.service.setDrift('project-a', { enabled: true })
-    expect(w.service.gate('project-a').state).toBe('NEEDS_REVIEW')
+    expect(w.service.gate('project-a').state).toBe('BLOCKED')
     // A profile fact change does.
     w.service.updateProfile('project-a', { facts: { analytics: true } })
     expect(w.service.gate('project-a').state).toBe('STALE')

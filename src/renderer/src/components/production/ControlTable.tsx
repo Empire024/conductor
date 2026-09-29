@@ -1,5 +1,11 @@
 import { CONTROL_TITLES, type ControlId, type ControlResult, type GateState } from '../../../../shared/production'
-import { sortResults, STATUS_LABEL, STATUS_TONE } from './production-model'
+import { reviewCounts, sortResults, STATUS_LABEL, STATUS_TONE } from './production-model'
+
+/** The items themselves are answered in the Human review section; the table only counts them. */
+const reviewLine = (result: ControlResult): string => {
+  const { total, answered } = reviewCounts([result])
+  return `${total} human-review item${total === 1 ? '' : 's'}, ${answered} answered${answered < total ? ' (answer under Human review)' : ''}`
+}
 
 const coverageText = (result: ControlResult): string => {
   const { tested, sampled, excluded, unobservable } = result.coverage
@@ -10,7 +16,7 @@ const coverageText = (result: ControlResult): string => {
 
 /**
  * One row per control of the last run: status, the applicability rationale, route coverage counts
- * and any human-review items. A control a later change invalidated is marked stale. Two columns,
+ * and how many human-review items it has answered. A control a later change invalidated is marked stale. Two columns,
  * because the drawer is narrow: what the control is and its status, then why and how far it was tested.
  */
 export function ControlTable({ results, gate }: { results: ControlResult[]; gate: GateState }): React.JSX.Element {
@@ -40,9 +46,7 @@ export function ControlTable({ results, gate }: { results: ControlResult[]; gate
         {result.rationale && <small className="production-rationale">{result.rationale}</small>}
         <small>{result.applicability.status}: {result.applicability.rationale}</small>
         <small data-fact="coverage">{coverageText(result)}</small>
-        {result.humanReview.length > 0 && <details><summary>{result.humanReview.length} human-review item{result.humanReview.length === 1 ? '' : 's'}</summary>
-          <ul>{result.humanReview.map(item => <li key={item.id}>{item.question}{item.route ? ` (${item.route})` : ''}<small>{item.why}</small></li>)}</ul>
-        </details>}
+        {result.humanReview.length > 0 && <small data-fact="human-review">{reviewLine(result)}</small>}
       </td>
     </tr>)}</tbody>
   </table>

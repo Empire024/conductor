@@ -405,10 +405,13 @@ describe('findings', () => {
   })
 
   // The spec's target is 50 ms per query on an unloaded machine. A wall-clock bound cannot hold while
-  // the suite runs a dozen headless browsers beside this test, so the timing bound is the median of
-  // five runs under 200 ms, and the guarantee that keeps the queries fast on the owner's multi-gigabyte
-  // conductor.db is asserted directly: each hot query's plan searches an index, never scans the table.
-  it('answers the hot queries from indexes with 10,000 findings (median under 200 ms)', () => {
+  // the suite runs a dozen headless browsers beside this test (the counts query took 314 ms of wall
+  // time in a fully parallel run and well under the bound alone), so the timing bound is the median of
+  // five runs of this thread's CPU time under 200 ms: other processes on the machine delay the query
+  // but do not add to the work it does. The guarantee that keeps the queries fast on the owner's
+  // multi-gigabyte conductor.db is asserted directly: each hot query's plan searches an index, never
+  // scans the table.
+  it('answers the hot queries from indexes with 10,000 findings (median under 200 ms of CPU)', () => {
     const f = fixture()
     const store = f.open()
     withEnvironments(store, f.projectId)
@@ -456,13 +459,15 @@ describe('findings', () => {
       expect(onTable[0], `${name} does not seek its index: ${plan.join(' | ')}`).toMatch(new RegExp(`^SEARCH production_findings USING (COVERING )?INDEX ${INTENDED_INDEX[name]} \\(`))
     }
 
+    // node:sqlite runs on the calling thread, so its CPU time is the query's own work.
+    const cpuMs = (): number => { const usage = (process as { threadCpuUsage?: () => NodeJS.CpuUsage }).threadCpuUsage?.() ?? process.cpuUsage(); return (usage.user + usage.system) / 1_000 }
     const median = (work: () => unknown): number => {
-      const samples = Array.from({ length: 5 }, () => { const begin = performance.now(); work(); return performance.now() - begin }).sort((a, b) => a - b)
+      const samples = Array.from({ length: 5 }, () => { const begin = cpuMs(); work(); return cpuMs() - begin }).sort((a, b) => a - b)
       return samples[2]!
     }
     median(queries.recent!)
     const timings = Object.fromEntries(Object.entries(queries).map(([name, query]) => [name, median(query)]))
-    for (const [name, ms] of Object.entries(timings)) expect(ms, `${name}: median ${ms.toFixed(1)} ms`).toBeLessThan(200)
+    for (const [name, ms] of Object.entries(timings)) expect(ms, `${name}: median ${ms.toFixed(1)} ms of CPU`).toBeLessThan(200)
     expect(store.findingCounts(f.projectId, 'prod').reduce((sum, row) => sum + row.count, 0)).toBe(10_000)
     expect(store.findings(f.projectId, { limit: 5_000 })).toHaveLength(2_000)
   }, 30_000)

@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { BadgeCheck, FileSearch, FileText, ListOrdered, ListPlus, Play, Radar, RotateCcw, TriangleAlert } from 'lucide-react'
 import type {
-  DriftSettings, ProductionBridge, ProductionEnvironment, ProductionProjectSnapshot, WaiverRequest, WriteAuthorizationRequest
+  DriftSettings, ProductionBridge, ProductionEnvironment, ProductionProjectSnapshot, ReviewAnswer, WaiverRequest, WriteAuthorizationRequest
 } from '../../../shared/production'
 import { GateBadge } from './production/GateBadge'
 import { QuestionList } from './production/QuestionList'
 import { ControlTable } from './production/ControlTable'
+import { ReviewItems } from './production/ReviewItems'
 import { FindingList } from './production/FindingList'
 import { FindingDetail } from './production/FindingDetail'
 import { WaiverForm, WaiverList } from './production/WaiverForm'
@@ -14,12 +15,12 @@ import { EnvironmentForm, EnvironmentList } from './production/EnvironmentForm'
 import { WriteAuthorizations } from './production/WriteAuthorizations'
 import { DriftSettingsForm } from './production/DriftSettingsForm'
 import { ReasonForm } from './production/ReasonForm'
-import { answerQuestion, chosenEnvironment, errorText, isOpenFinding, pendingId, reportRun, type PendingAction } from './production/production-model'
+import { answerQuestion, answerReview, chosenEnvironment, errorText, isOpenFinding, pendingId, reportRun, reviewCounts, type PendingAction } from './production/production-model'
 import './ProductionPane.css'
 
 /**
  * The Production drawer (docs/production-agent.md section 9): one project's designation, audit
- * gate with its reasons, owner questions, control results, findings, waivers, runs, environments,
+ * gate with its reasons, owner questions, human-review answers, control results, findings, waivers, runs, environments,
  * sandbox write authorizations and drift checks. The renderer is the owner's window, so every
  * action here acts with owner authority; sovereign gating applies to control-method callers.
  */
@@ -47,6 +48,10 @@ export interface ProductionHandlers {
   onOpenQueue(): void
   onOpenTasks(): void
   onAnswer(questionId: string, answer: string): void
+  /** Answers (or re-answers) a human-review item of the last completed run. */
+  onAnswerReview(itemId: string, answer: ReviewAnswer, note: string): void
+  /** Opens (or closes, with null) the form that changes an answered review item. */
+  onChangeReview(itemId: string | null): void
   /** Opens (or closes, with null) the in-panel confirmation of a settling action. */
   onPending(action: PendingAction | null): void
   /** The confirmed actions; each runs only from its ReasonForm. */
@@ -74,6 +79,8 @@ export interface ProductionViewProps extends ProductionHandlers {
   openFindingId: string | null
   waivingFindingId: string | null
   driftOpen: boolean
+  /** The answered human-review item whose answer is being changed, if any. */
+  changingReviewId?: string | null
   /** The settling action awaiting confirmation in the panel, if any. */
   pending?: PendingAction | null
   busy: string
@@ -111,6 +118,7 @@ export function ProductionView(props: ProductionViewProps): React.JSX.Element {
     : !environment ? 'Add an environment first; readiness always names one'
       : designatedHere ? `Production-ready since ${designation?.at ?? 'unknown'}; uncheck to withdraw` : `Mark ${environment.label} production-ready and start the first audit`
   const failureAt = (scope: string): string => failure?.scope === scope ? failure.message : ''
+  const reviewFailure = failure?.scope.startsWith('review:') ? { id: failure.scope.slice('review:'.length), message: failure.message } : null
   const activeHere = snapshot.activeRun && snapshot.activeRun.environmentId === envId ? snapshot.activeRun : null
   const gateForOther = snapshot.gate.environmentId && envId && snapshot.gate.environmentId !== envId
   const pending = props.pending ?? null
@@ -165,6 +173,10 @@ export function ProductionView(props: ProductionViewProps): React.JSX.Element {
             reasonLabel="Why dismiss it" reasonRequired confirmLabel="Dismiss question" busy={busy === `dismiss:${dismissing}`} error={failureAt('pending')}
             onSubmit={reason => props.onDismiss(dismissing, reason)} onCancel={closePending} />} />
       </Section>
+      <Section title="Human review" count={reviewCounts(snapshot.results).unanswered}>
+        <ReviewItems results={snapshot.results} busy={busy} error={reviewFailure?.message ?? ''} errorId={reviewFailure?.id ?? null}
+          changingId={props.changingReviewId ?? null} onAnswer={props.onAnswerReview} onChange={props.onChangeReview} />
+      </Section>
       <Section title="Controls">
         <ControlTable results={snapshot.results} gate={snapshot.gate} />
       </Section>
@@ -215,6 +227,7 @@ export function ProductionPane({ projectId, bridge = window.conductor.production
   const [openFindingId, setOpenFindingId] = useState<string | null>(null)
   const [waivingFindingId, setWaivingFindingId] = useState<string | null>(null)
   const [driftOpen, setDriftOpen] = useState(false)
+  const [changingReviewId, setChangingReviewId] = useState<string | null>(null)
   const [pending, setPending] = useState<PendingAction | null>(null)
   const [busy, setBusy] = useState('')
   const [failure, setFailure] = useState<Failure | null>(null)
@@ -239,7 +252,7 @@ export function ProductionPane({ projectId, bridge = window.conductor.production
   useEffect(() => {
     shownProject.current = projectId
     setSnapshot(null); setEnvironmentId(null); setSelected(new Set()); setOpenFindingId(null); setWaivingFindingId(null)
-    setDriftOpen(false); setPending(null); setBusy(''); setFailure(null); setNotice('')
+    setDriftOpen(false); setChangingReviewId(null); setPending(null); setBusy(''); setFailure(null); setNotice('')
     void load()
   }, [projectId, load])
   useEffect(() => bridge.onChanged(changed => { if (changed === projectId) void load() }), [bridge, load, projectId])
@@ -277,7 +290,7 @@ export function ProductionPane({ projectId, bridge = window.conductor.production
 
   return <ProductionView
     snapshot={snapshot} environmentId={environment?.id ?? null} selected={selected} openFindingId={openFindingId} waivingFindingId={waivingFindingId}
-    driftOpen={driftOpen} pending={pending} busy={busy} failure={failure} notice={notice} now={now}
+    driftOpen={driftOpen} changingReviewId={changingReviewId} pending={pending} busy={busy} failure={failure} notice={notice} now={now}
     onEnvironment={id => { setEnvironmentId(id); clearSelection(); setOpenFindingId(null); setWaivingFindingId(null) }}
     onDesignate={productionReady => void act('designate', 'pane', () => bridge.designate(projectId, {
       productionReady, environmentId: environment?.id ?? null, note: productionReady ? 'Designated from the Production panel' : 'Withdrawn from the Production panel'
@@ -298,6 +311,11 @@ export function ProductionPane({ projectId, bridge = window.conductor.production
     onOpenQueue={() => window.dispatchEvent(new CustomEvent(OPEN_PRODUCTION_QUEUE_EVENT))}
     onOpenTasks={() => window.dispatchEvent(new CustomEvent(OPEN_PROJECT_TASKS_EVENT))}
     onAnswer={(questionId, answer) => void act(`answer:${questionId}`, 'questions', () => answerQuestion(bridge, projectId, questionId, answer))}
+    onAnswerReview={(itemId, answer, note) => void act(`review:${itemId}:${answer}`, `review:${itemId}`, async () => {
+      await answerReview(bridge, projectId, itemId, answer, note)
+      setChangingReviewId(null)
+    })}
+    onChangeReview={itemId => { setFailure(null); setChangingReviewId(itemId) }}
     onPending={action => { setFailure(null); setPending(action) }}
     onDismiss={(questionId, reason) => void settle(`dismiss:${questionId}`, () => bridge.dismissQuestion(projectId, questionId, reason))}
     onToggleFinding={id => setSelected(current => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next })}

@@ -3,8 +3,8 @@ import {
   type AuditRequest, type AuditRun, type AuditTrigger, type BudgetLedger, type ControlId, type ControlRegistry, type ControlResult,
   type FactKey, type Finding, type GateState, type OwnerQuestion, type ProductionBridge, type ProductionEnvironment,
   type ProductionProfile, type ProductionProjectSnapshot, type ProductionQueueEntry, type ProductionRunSummary, type ProfileFacts,
-  type ProfileUpdate, type RouteCoverage, type RunKind, type RunStatus, type SandboxWriteAuthorization, type TargetFingerprint,
-  type Waiver, type WaiverRequest, type WriteAuthorizationRequest
+  type ProfileUpdate, type ReviewAnswer, type ReviewAnswerRecord, type RouteCoverage, type RunKind, type RunStatus, type SandboxWriteAuthorization,
+  type TargetFingerprint, type Waiver, type WaiverRequest, type WriteAuthorizationRequest
 } from './production'
 
 /**
@@ -315,6 +315,37 @@ export class FakeProductionBridge implements ProductionBridge {
     this.recount(snapshot)
     this.emit(projectId)
     return result
+  }
+
+  /**
+   * Answers a human-review item of the last completed run's results. The lift rule is the simple
+   * one the panel needs: once every item of the control is answered, a rejection makes it FAIL and
+   * otherwise a NEEDS_HUMAN_REVIEW control becomes PASS (the real gate lives in gate.ts).
+   */
+  async answerReview(projectId: string, itemId: string, answer: ReviewAnswer, note?: string): Promise<ReviewAnswerRecord> {
+    this.log('answerReview', [projectId, itemId, answer, note])
+    const snapshot = this.require(projectId)
+    if (answer !== 'confirmed' && answer !== 'rejected') throw new Error(`A review answer is confirmed or rejected, not ${String(answer)}`)
+    const result = snapshot.results.find(candidate => candidate.humanReview.some(item => item.id === itemId))
+    const item = result?.humanReview.find(candidate => candidate.id === itemId)
+    if (!result || !item) throw new Error(`No human-review item ${itemId} in the last completed run of project ${projectId}`)
+    const at = this.now()
+    Object.assign(item, { answer, note: note?.trim() || null, answeredBy: 'owner', answeredAt: at })
+    if (result.humanReview.every(candidate => candidate.answer)) {
+      if (result.humanReview.some(candidate => candidate.answer === 'rejected')) result.status = 'FAIL'
+      else if (result.status === 'NEEDS_HUMAN_REVIEW') result.status = 'PASS'
+    }
+    const gateResult = snapshot.gate.results.find(candidate => candidate.controlId === result.controlId)
+    if (gateResult) gateResult.status = result.status
+    snapshot.gate.humanReviewPending = snapshot.results.reduce((count, candidate) => count + candidate.humanReview.filter(entry => !entry.answer).length, 0)
+    const run = snapshot.runs.find(candidate => candidate.id === result.runId)
+    const record: ReviewAnswerRecord = {
+      projectId, environmentId: run?.environmentId ?? snapshot.gate.environmentId ?? 'env-prod', itemId, controlId: result.controlId,
+      answer, note: item.note ?? null, answeredBy: 'owner', answeredAt: at, runId: result.runId, fingerprint: structuredClone(run?.fingerprint ?? fakeFingerprint())
+    }
+    this.recount(snapshot)
+    this.emit(projectId)
+    return record
   }
 
   async audit(projectId: string, request: AuditRequest): Promise<ProductionRunSummary> {

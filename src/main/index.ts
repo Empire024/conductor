@@ -106,7 +106,9 @@ import { loadConfig as loadLocalConfig, readApiKey as readLocalApiKey } from './
 import { DECIDER_MODEL, DeciderServer, deciderPaths } from './local-models/decider-server'
 import { localRoot } from './local-models/paths'
 import type { ScheduleRunner } from './schedule-runner'
-import { createScheduledTasks, latestModelsBuiltin } from './schedule-wiring'
+import { createScheduledTasks, latestModelsBuiltin, registerScheduleKindExecutor } from './schedule-wiring'
+import { createProductionApp, type ProductionApp } from './production/app-wiring'
+import { registerProductionIpc } from './production-ipc'
 import { registerScheduleIpc } from './schedule-ipc'
 import { registerIdeas, type IdeasRegistration } from './ideas/register'
 import { registerIdeaRuns, type IdeaRunsRegistration } from './idea-runs/register'
@@ -190,6 +192,9 @@ let disposeIdeasIpc: (() => void) | undefined
 /** The idea autopilot (src/main/idea-runs/register.ts); undefined until the app is ready. */
 let ideaRunsRegistration: IdeaRunsRegistration | undefined
 let disposeIdeaRunsIpc: (() => void) | undefined
+/** Production audits (src/main/production/app-wiring.ts); undefined until the app is ready. */
+let productionApp: ProductionApp | undefined
+let disposeProductionIpc: (() => void) | undefined
 let disposeLogicLoopsIpc: (() => void) | undefined
 let collaboration: AgentCollaborationStore
 let disposeCollaborationIpc: (() => void) | undefined
@@ -726,6 +731,8 @@ const disposeRuntimeServices = (): void => {
     ['cloud runs', () => cloud?.dispose()],
     ['idea-runs', () => { disposeIdeaRunsIpc?.(); ideaRunsRegistration?.dispose() }],
     ['ideas', () => { disposeIdeasIpc?.(); ideasRegistration?.dispose() }],
+    // A run in flight stops at its lease; it resumes from its checkpoint on the next launch.
+    ['production', () => { disposeProductionIpc?.(); void productionApp?.dispose(); productionApp = undefined }],
     ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); browserMcp?.close(); localAssist?.close(); permissionGrants?.close(); browserViews?.dispose(); projectFileChanges?.close() }],
     ['model intelligence', () => { disposeModelObserver?.(); modelIntelligence?.dispose(); modelIntelligence = undefined; deciderServer?.dispose() }],
     ['coworker auto-close', () => { coworkerAutoClose?.dispose(); finishedTabs?.dispose(); tokenBurnMeter?.dispose() }],
@@ -1782,6 +1789,13 @@ const registerIpc = (): void => {
     assignScripts: (projectId, schedule) => scheduledTasks.assignScripts(projectId, schedule), changed: projectId => scheduledTasks.control.changed(projectId),
     authorize: (event, projectId) => { trustedStructured(event); requireLocalProject(database, projectId, 'Schedules') },
     reveal: path => shell.showItemInFolder(path) })
+  if (productionApp) disposeProductionIpc = registerProductionIpc({ service: productionApp.service,
+    trusted: event => trustedStructured(event),
+    authorize: (event, projectId) => { trustedStructured(event); requireLocalProject(database, projectId, 'Production') },
+    // A parked test profile never opens Explorer or an editor over the owner's screen; it logs the path.
+    open: async path => { if (process.env.CONDUCTOR_TEST_USER_DATA) { console.log(`[production-test] open ${path}`); return } const error = await shell.openPath(path); if (error) throw new Error(error) },
+    reveal: path => { if (process.env.CONDUCTOR_TEST_USER_DATA) console.log(`[production-test] reveal ${path}`); else shell.showItemInFolder(path) },
+    changed: projectId => { for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed()) window.webContents.send('production:changed', projectId) } })
   disposeDeliveryIpc = registerDeliveryIpc({ service: delivery,
     authorize: (event, projectId) => { trustedStructured(event); requireLocalProject(database, projectId, 'Source control') },
     projectPath: projectId => localProject(database, projectId, 'Source control').path })
@@ -3025,6 +3039,28 @@ app.whenReady().then(async () => {
     offline: process.env.CONDUCTOR_OFFLINE_TESTS === '1'
   })
   control.setIdeaRuns(ideaRunsRegistration.control)
+  // Production audits (docs/production-agent.md): production.* app control, the Production panel
+  // and the opt-in production-drift schedule. Interpretation routes through model intelligence,
+  // cloud calls are lean evaluation turns, classification uses the local model only.
+  try {
+    productionApp = createProductionApp({
+      databasePath, userData: app.getPath('userData'), orchestration, schedules,
+      projectRoot: projectId => database.getProject(projectId)?.path ?? null,
+      projectName: projectId => database.getProject(projectId)?.name ?? projectId,
+      route: (projectId, features, constraints) => control.routeForHost({ projectId }, features, constraints, 'production-audit'),
+      evaluationTurn: (key, prompt, signal, maxTokens) => control.evaluationTurn(key, prompt, signal, { maxTokens }),
+      localRunner: () => localAssist?.runner ?? null,
+      localTurnsInFlight: () => localTurnsInFlight() > 0,
+      weeklyStop: provider => modelIntelligence?.weeklyStop(provider) ?? null,
+      usagePercent: provider => ['claude', 'codex', 'grok'].includes(provider) ? weeklyUsagePercent(agents.structured.usageLimits(provider as 'claude' | 'codex' | 'grok').flatMap(report => report.windows)) : null,
+      registerScheduleKindExecutor,
+      schedulesChanged: projectId => publish('schedules:changed', projectId),
+      offline: process.env.CONDUCTOR_OFFLINE_TESTS === '1'
+    })
+    control.setProduction(productionApp.service)
+  } catch (error) {
+    console.warn('Production audits are unavailable', error)
+  }
   // The owner's own credential lives beside the app's data (docs/overseer.md): a supervisor
   // outside the app reads it to drive this Conductor with the window's authority and finds a fresh
   // one after every restart.
@@ -3174,6 +3210,8 @@ app.whenReady().then(async () => {
   })
   // Jobs the previous process left running are reconciled and resumed once the windows are up.
   setTimeout(() => { void durableJobs?.start().catch(error => console.error('Durable jobs could not be reconciled', error)) }, 3000)
+  // Production runs the previous process left in flight resume from their checkpoints the same way.
+  setTimeout(() => { try { productionApp?.service.start() } catch (error) { console.error('Production runs could not be reconciled', error) } }, 3000)
   // Rows stored before the journal masked every form of the control token are rewritten once, a
   // bounded chunk at a time, after startup has settled (structured-store.ts, redactSecretsStep).
   setTimeout(() => { database.structured.startSecretRedaction() }, 60_000).unref()

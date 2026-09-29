@@ -13,10 +13,12 @@ import { WaiverForm } from './WaiverForm'
 import { DriftSettingsForm } from './DriftSettingsForm'
 import { WriteAuthorizations } from './WriteAuthorizations'
 import { ReasonForm } from './ReasonForm'
+import { ReviewItems } from './ReviewItems'
+import { ControlTable } from './ControlTable'
 import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
-  answerQuestion, GATE_LABELS, validateReason, orderQueue, progressText, runControls, validateEnvironment, validateWaiver, validateWrites, waiveFinding
+  answerQuestion, answerReview, GATE_LABELS, reviewCounts, validateReason, orderQueue, progressText, runControls, validateEnvironment, validateWaiver, validateWrites, waiveFinding
 } from './production-model'
 
 const NOW = Date.parse('2026-09-29T09:00:00.000Z')
@@ -24,7 +26,7 @@ const noop = (): void => {}
 
 const handlers = (): Omit<ProductionViewProps, 'snapshot' | 'environmentId' | 'selected' | 'openFindingId' | 'waivingFindingId' | 'driftOpen' | 'busy' | 'failure' | 'notice' | 'now'> => ({
   onEnvironment: noop, onDesignate: noop, onAudit: noop, onRetest: noop, onVerify: noop, onCreateTasks: noop, onOpenEvidence: noop,
-  onOpenReport: noop, onOpenQueue: noop, onOpenTasks: noop, onAnswer: noop, onPending: noop, onDismiss: noop, onToggleFinding: noop, onOpenFinding: noop,
+  onOpenReport: noop, onOpenQueue: noop, onOpenTasks: noop, onAnswer: noop, onAnswerReview: noop, onChangeReview: noop, onPending: noop, onDismiss: noop, onToggleFinding: noop, onOpenFinding: noop,
   onStartWaive: noop, onWaive: noop, onRevokeWaiver: noop, onPause: noop, onResume: noop, onCancel: noop, onAddEnvironment: noop,
   onRemoveEnvironment: noop, onDriftForm: noop, onSaveDrift: noop, onGrantWrites: noop, onRevokeWrites: noop
 })
@@ -98,7 +100,7 @@ describe('production panel', () => {
   it('renders every section of the design from one snapshot', async () => {
     const { snapshot } = story()
     const html = view(await snapshot(), { openFindingId: 'f-tracker' })
-    for (const section of ['Owner questions', 'Controls', 'Findings', 'Waivers', 'Runs', 'Environments', 'Sandbox write authorizations']) expect(html).toContain(`aria-label="${section}"`)
+    for (const section of ['Owner questions', 'Human review', 'Controls', 'Findings', 'Waivers', 'Runs', 'Environments', 'Sandbox write authorizations']) expect(html).toContain(`aria-label="${section}"`)
     for (const action of ['Audit', 'Re-test', 'Verify', 'Create fix tasks', 'Open evidence', 'Open report', 'Enable drift checks', 'Queue']) expect(html).toContain(action)
     // Header: designation, environment picker, gate, fingerprint.
     expect(html).toMatch(/<input type="checkbox" aria-label="Production-ready" checked=""/)
@@ -226,6 +228,122 @@ describe('owner questions', () => {
     expect(html).toContain('aria-label="Answer: analytics"')
     expect(html).toContain('Answer analytics with yes or no')
     expect(html).toMatch(/<button type="submit" class="primary" disabled="">Answer<\/button>/)
+  })
+})
+
+describe('human review', () => {
+  /** A control held at NEEDS_HUMAN_REVIEW by two items, beside the story's C13 item. */
+  function reviewStory(): ReturnType<typeof story> {
+    const built = story()
+    built.bridge.update('shop', current => {
+      current.results.push(fakeControlResult('C12', {
+        status: 'NEEDS_HUMAN_REVIEW', rationale: 'Pricing copy needs a human read',
+        humanReview: [
+          { id: 'hr-price', controlId: 'C12', question: 'Is the shown price the final price?', why: 'Taxes are added in a script', route: '/product/a', evidence: ['ev-price-1'] },
+          { id: 'hr-ship', controlId: 'C12', question: 'Are shipping costs shown before checkout?', why: 'Only the cart page states them', route: null, evidence: [] }
+        ]
+      }))
+      current.gate.results.push({ controlId: 'C12', status: 'NEEDS_HUMAN_REVIEW' })
+    })
+    return built
+  }
+  const items = (snapshot: ProductionProjectSnapshot, changingId: string | null = null, error = '', errorId: string | null = null): string =>
+    renderToStaticMarkup(createElement(ReviewItems, { results: snapshot.results, busy: '', error, errorId, changingId, onAnswer: noop, onChange: noop }))
+
+  it('shows each unanswered item with its question, why, route and a Confirm / Reject form', async () => {
+    const { snapshot } = reviewStory()
+    const html = items(await snapshot())
+    expect(html).toContain('data-review-id="hr-price" data-answer="none"')
+    expect(html).toContain('Is the shown price the final price?')
+    expect(html).toContain('Taxes are added in a script')
+    expect(html).toContain('Route /product/a')
+    expect(html).toContain('Evidence ev-price-1')
+    expect(html).toContain('aria-label="Review Is the shown price the final price?"')
+    expect(html).toContain('aria-label="Note (optional)"')
+    expect(html).toMatch(/class="primary"[^>]*>Confirm<\/button>/)
+    expect(html).toMatch(/class="danger"[^>]*>Reject<\/button>/)
+    expect(html).not.toContain('Change answer')
+    // NEEDS_HUMAN_REVIEW sorts before PASS.
+    expect(html.indexOf('data-review-control="C12"')).toBeLessThan(html.indexOf('data-review-control="C13"'))
+    const panel = view(await snapshot())
+    expect(panel).toMatch(/aria-label="Human review"><h3>Human review<span class="production-count">3<\/span>/)
+    expect(panel).toContain('2 human-review items, 0 answered (answer under Human review)')
+    // The question text appears once (the form names it only in its aria-label), so a smoke's getByText stays unambiguous.
+    expect(panel.match(/>Is the shown price the final price\?</g)).toHaveLength(1)
+  })
+
+  it('answers an item confirmed over the bridge and shows it answered, with the note, who and when', async () => {
+    const { bridge, snapshot } = reviewStory()
+    const changed: string[] = []
+    bridge.onChanged(projectId => changed.push(projectId))
+    const record = await answerReview(bridge, 'shop', 'hr-1', 'confirmed', '  Reading order matches the visual order  ')
+    expect(bridge.calls.at(-1)).toEqual({ method: 'answerReview', args: ['shop', 'hr-1', 'confirmed', 'Reading order matches the visual order'] })
+    expect(record).toMatchObject({ projectId: 'shop', environmentId: 'env-prod', itemId: 'hr-1', controlId: 'C13', answer: 'confirmed', note: 'Reading order matches the visual order', answeredBy: 'owner', runId: 'run-1' })
+    expect(changed).toEqual(['shop'])
+    const after = await snapshot()
+    expect(after.results.find(result => result.controlId === 'C13')!.humanReview[0]).toMatchObject({ answer: 'confirmed', answeredBy: 'owner', answeredAt: '2026-09-29T09:00:00.000Z' })
+    const html = items(after)
+    expect(html).toContain('data-review-id="hr-1" data-answer="confirmed"')
+    expect(html).toContain('>Confirmed<')
+    expect(html).toContain('Note: Reading order matches the visual order')
+    expect(html).toContain('By owner · 2026-09-29 09:00 UTC')
+    expect(html).toContain('>Change answer</button>')
+    expect(html).not.toContain('aria-label="Review Check screen reader order on checkout"')
+    expect(reviewCounts(after.results)).toEqual({ total: 3, answered: 1, unanswered: 2 })
+    // Changing the answer reopens the form for that item, with a way back.
+    const changing = items(after, 'hr-1')
+    expect(changing).toContain('aria-label="Review Check screen reader order on checkout"')
+    expect(changing).toContain('>Keep answer</button>')
+    expect(changing).not.toContain('>Change answer</button>')
+    // Answering again replaces the answer.
+    await answerReview(bridge, 'shop', 'hr-1', 'rejected', '')
+    const again = (await snapshot()).results.find(result => result.controlId === 'C13')!
+    expect(again.humanReview[0]).toMatchObject({ answer: 'rejected', note: null })
+    expect(again.status).toBe('FAIL')
+  })
+
+  it('lifts a NEEDS_HUMAN_REVIEW control once every item is confirmed', async () => {
+    const { bridge, snapshot } = reviewStory()
+    await answerReview(bridge, 'shop', 'hr-price', 'confirmed', '')
+    let c12 = (await snapshot()).results.find(result => result.controlId === 'C12')!
+    expect(c12.status).toBe('NEEDS_HUMAN_REVIEW')
+    await answerReview(bridge, 'shop', 'hr-ship', 'confirmed', 'Shown on the product page too')
+    const after = await snapshot()
+    c12 = after.results.find(result => result.controlId === 'C12')!
+    expect(c12.status).toBe('PASS')
+    expect(after.gate.results.find(result => result.controlId === 'C12')!.status).toBe('PASS')
+    expect(after.gate.humanReviewPending).toBe(1)
+    const table = renderToStaticMarkup(createElement(ControlTable, { results: after.results, gate: after.gate }))
+    expect(table).toMatch(/data-control="C12" data-status="PASS"/)
+    expect(table).toContain('2 human-review items, 2 answered<')
+  })
+
+  it('fails the control when an item is rejected', async () => {
+    const { bridge, snapshot } = reviewStory()
+    await answerReview(bridge, 'shop', 'hr-price', 'rejected', 'Tax is added at checkout')
+    await answerReview(bridge, 'shop', 'hr-ship', 'confirmed', '')
+    const after = await snapshot()
+    expect(after.results.find(result => result.controlId === 'C12')!.status).toBe('FAIL')
+    const html = items(after)
+    expect(html).toContain('data-review-id="hr-price" data-answer="rejected"')
+    expect(html).toContain('>Rejected<')
+    expect(html).toContain('data-review-control="C12" data-status="FAIL"')
+    expect(view(after)).not.toContain('%')
+  })
+
+  it('refuses an unknown item and shows the refusal inline', async () => {
+    const { bridge, snapshot } = reviewStory()
+    await expect(answerReview(bridge, 'shop', 'hr-nope', 'confirmed', '')).rejects.toThrow('No human-review item hr-nope')
+    await expect(answerReview(bridge, 'shop', 'hr-1', 'confirmed', 'x'.repeat(501))).rejects.toThrow('Keep the note under 500 characters.')
+    const before = await snapshot()
+    const onItem = items(before, null, 'The run was superseded', 'hr-price')
+    const itemStart = onItem.indexOf('data-review-id="hr-price"')
+    expect(onItem.indexOf('The run was superseded')).toBeGreaterThan(itemStart)
+    expect(onItem.indexOf('The run was superseded')).toBeLessThan(onItem.indexOf('data-review-id="hr-ship"'))
+    const unknown = items(before, null, 'No human-review item hr-nope', 'hr-nope')
+    expect(unknown).toMatch(/^<div class="production-questions production-reviews"><p class="production-error" role="alert">No human-review item hr-nope<\/p>/)
+    expect(view(before, { failure: { scope: 'review:hr-price', message: 'The run was superseded' } })).toContain('The run was superseded')
+    expect(renderToStaticMarkup(createElement(ReviewItems, { results: [], busy: '', error: '', onAnswer: noop, onChange: noop }))).toContain('No human-review items in the last run.')
   })
 })
 

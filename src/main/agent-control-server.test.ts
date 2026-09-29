@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AgentSpec } from '../shared/models'
+import { PRODUCTION_CONTROL_METHODS } from '../shared/production'
 import { AgentControlServer } from './agent-control-server'
 import { CONTROL_METHOD_CLASSES, MUTATION_FAMILIES, controlMethodClass, controlMethodFamily } from './control-method-classes'
 
@@ -190,7 +191,8 @@ describe('control method classes', () => {
       'nodes.list', 'nodes.jobs', 'nodes.job', 'nodes.log', 'nodes.probe', 'nodes.run', 'nodes.cancel', 'nodes.register', 'nodes.remove',
       'cloud.start', 'cloud.list', 'cloud.status', 'cloud.transcript', 'cloud.send', 'cloud.interrupt', 'cloud.stop', 'cloud.attach', 'cloud.fetch',
       'permissions.request', 'permissions.list', 'permissions.revoke', 'permissions.decide', 'agents.approvals', 'agents.approve',
-      'models.registry', 'models.route', 'decisions.list', 'decisions.get', 'models.refresh', 'models.outcome', 'models.evaluate', 'decisions.live'
+      'models.registry', 'models.route', 'decisions.list', 'decisions.get', 'models.refresh', 'models.outcome', 'models.evaluate', 'decisions.live',
+      ...PRODUCTION_CONTROL_METHODS
     ]
     const f = await fixture(async method => method === 'tools.list'
       ? Object.fromEntries(advertised.map(name => [name, 'signature']))

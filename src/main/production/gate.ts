@@ -1,7 +1,7 @@
 import {
   CONTROL_RESULT_SEVERITY,
   type ApplicabilityDecision, type AuditRun, type CheckOutcome, type ControlDefinition, type ControlResult, type ControlResultStatus,
-  type Finding, type GateState, type OwnerQuestion, type TargetFingerprint, type Waiver,
+  type Finding, type GateState, type HumanReviewItem, type OwnerQuestion, type ReviewAnswerRecord, type TargetFingerprint, type Waiver,
 } from '../../shared/production'
 import { classifyChange } from './fingerprint'
 import { controlsInvalidatedBy } from './registry'
@@ -12,7 +12,9 @@ import { controlsInvalidatedBy } from './registry'
  *
  * Precedence: AUDITING (a run in flight) > NOT_AUDITED (no completed run) > BLOCKED (the newest run
  * ended failed or is blocked for the owner) > STALE (the target moved since the last completed run)
- * > NEEDS_REVIEW > VERIFIED_WITH_WAIVERS > VERIFIED. `reasons` names every blocker; there is no
+ * > BLOCKED (the last completed run found an unwaived FAIL, even on the first run) > NEEDS_REVIEW
+ * > VERIFIED_WITH_WAIVERS > VERIFIED. NOT_AUDITED means no run completed; its reasons name a run
+ * that could not complete. `reasons` names every blocker; there is no
  * percentage, and VERIFIED means "passed the configured audit scope at this fingerprint", never a
  * certification.
  */
@@ -39,6 +41,36 @@ export function controlStatus(definition: Pick<ControlDefinition, 'humanReviewAl
   if (options.budgetExhausted && status === 'PASS') status = 'UNVERIFIED'
   if (definition.humanReviewAlways && CONTROL_RESULT_SEVERITY[status] < CONTROL_RESULT_SEVERITY.NEEDS_HUMAN_REVIEW) status = 'NEEDS_HUMAN_REVIEW'
   return status
+}
+
+/**
+ * The owner's answers laid over a run's results (production.review.answer). An answer counts for
+ * the item it answered, and for a later run's item with the same id unless a change between the
+ * target it answered and this run's target invalidates the control. Once every item of a control
+ * is answered, its NEEDS_HUMAN_REVIEW cap lifts to the worst of its checks (a check's own
+ * human-review floor counts as PASS); any `rejected` answer makes the control FAIL instead.
+ */
+export function applyReviewAnswers(results: readonly ControlResult[], answers: readonly ReviewAnswerRecord[], runFingerprint: TargetFingerprint | null): ControlResult[] {
+  if (!answers.length) return [...results]
+  const byItem = new Map(answers.map(answer => [answer.itemId, answer]))
+  return results.map(result => {
+    if (!result.humanReview.length) return result
+    const holds = (answer: ReviewAnswerRecord): boolean => answer.runId === result.runId || !runFingerprint
+      || !controlsInvalidatedBy(classifyChange(answer.fingerprint, runFingerprint)).includes(result.controlId)
+    const items: HumanReviewItem[] = result.humanReview.map(item => {
+      const answer = byItem.get(item.id)
+      return answer && answer.controlId === result.controlId && holds(answer) ? { ...item, answer: answer.answer, note: answer.note, answeredBy: answer.answeredBy, answeredAt: answer.answeredAt } : item
+    })
+    const decorated = { ...result, humanReview: items }
+    if (items.some(item => !item.answer) || result.status === 'NOT_APPLICABLE' || result.status === 'UNVERIFIED') return decorated
+    const rejected = items.filter(item => item.answer === 'rejected')
+    if (rejected.length) {
+      return { ...decorated, status: 'FAIL' as const, rationale: `${result.rationale}\nRejected on human review: ${rejected.map(item => `${item.question}${item.note ? ` (${item.note})` : ''}`).join('; ')}`.slice(0, 8_000) }
+    }
+    if (result.status !== 'NEEDS_HUMAN_REVIEW') return decorated
+    const lifted = worst(result.checks.map(check => check.status === 'NEEDS_HUMAN_REVIEW' || check.status === 'NOT_APPLICABLE' ? 'PASS' : check.status).concat(['PASS']))
+    return { ...decorated, status: lifted, rationale: `${result.rationale}\nEvery human-review item was confirmed (${[...new Set(items.map(item => item.answeredBy))].join(', ')}).`.slice(0, 8_000) }
+  })
 }
 
 export interface GateInput {
@@ -91,7 +123,7 @@ export function computeGate(input: GateInput): GateState {
   const openBlocking = input.findings.filter(finding => (UNWAIVED_OPEN.includes(finding.status) || (finding.status === 'waived' && !liveWaiver(finding))))
   const openCriticalOrHigh = openBlocking.filter(finding => finding.severity === 'critical' || finding.severity === 'high').length
   const unverifiedControls = input.results.filter(result => result.status === 'UNVERIFIED').map(result => result.controlId)
-  const humanReviewPending = input.results.reduce((sum, result) => sum + (result.status === 'NOT_APPLICABLE' ? 0 : result.humanReview.length), 0)
+  const humanReviewPending = input.results.reduce((sum, result) => sum + (result.status === 'NOT_APPLICABLE' ? 0 : result.humanReview.filter(item => !item.answer).length), 0)
   const activeWaivers = input.waivers.filter(waiver => !waiver.revokedAt && Date.parse(waiver.expiresAt) > input.now.getTime()).length
   const common: Partial<GateState> = { runId: completed.id, fingerprint: completed.fingerprint, openCriticalOrHigh, unverifiedControls, humanReviewPending, activeWaivers, results }
 
@@ -110,20 +142,27 @@ export function computeGate(input: GateInput): GateState {
   if (confirmed.length) reasons.push(`${confirmed.length} open confirmed critical/high finding(s): ${confirmed.slice(0, 5).map(finding => `${finding.controlId} ${finding.title}`).join('; ')}${confirmed.length > 5 ? '; …' : ''}`)
   for (const result of input.results) {
     if (result.status === 'UNVERIFIED') reasons.push(`${result.controlId} could not be verified: ${firstLine(result.rationale)}`)
-    else if (result.status === 'NEEDS_HUMAN_REVIEW') reasons.push(`${result.controlId} needs human review (${result.humanReview.length} item(s)).`)
+    else if (result.status === 'NEEDS_HUMAN_REVIEW') {
+      const open = result.humanReview.filter(item => !item.answer).length
+      reasons.push(`${result.controlId} needs human review (${open === result.humanReview.length ? `${open} item(s)` : `${open} of ${result.humanReview.length} item(s) unanswered`}).`)
+    }
   }
   const blockingQuestions = input.questions.filter(question => question.status === 'open' && question.blocksControls.length)
   for (const question of blockingQuestions) reasons.push(`Owner question open (blocks ${question.blocksControls.join(', ')}): ${question.question}`)
   const expired = input.findings.filter(finding => expiredWaiver(finding))
   for (const finding of expired) reasons.push(`The waiver of ${finding.controlId} "${finding.title}" expired.`)
   // A FAIL or WARN control passes only when every one of its findings is covered by a live waiver.
+  // A completed run that found an unwaived FAIL blocks the gate, even on the first run.
+  let failing = 0
   for (const result of input.results) {
     if (result.status !== 'FAIL' && result.status !== 'WARN') continue
     const mine = input.findings.filter(finding => finding.controlId === result.controlId && finding.status !== 'fixed')
     const unwaived = mine.filter(finding => !(finding.status === 'waived' && liveWaiver(finding)))
     if (unwaived.length) reasons.push(`${result.controlId} is ${result.status} with ${unwaived.length} unwaived finding(s): ${unwaived.slice(0, 3).map(finding => finding.title).join('; ')}`)
     else if (!mine.length) reasons.push(`${result.controlId} is ${result.status}: ${firstLine(result.rationale)}`)
+    if (result.status === 'FAIL' && (unwaived.length || !mine.length)) failing++
   }
+  if (failing) return base('BLOCKED', reasons, common)
   if (reasons.length) return base('NEEDS_REVIEW', reasons, common)
   const waivedControls = input.results.filter(result => result.status === 'FAIL' || result.status === 'WARN')
   if (waivedControls.length) return base('VERIFIED_WITH_WAIVERS', waivedControls.map(result => `${result.controlId} is ${result.status}; every finding is covered by a live waiver.`), common)
@@ -140,7 +179,7 @@ export function gateSummary(gate: Pick<GateState, 'state' | 'fingerprint'>): str
     case 'VERIFIED_WITH_WAIVERS': return `Passed the configured audit scope at ${at}, with waivers.`
     case 'NEEDS_REVIEW': return `Needs review at ${at}.`
     case 'STALE': return `Results are stale: the target changed after ${at}.`
-    case 'BLOCKED': return 'Blocked: the last audit could not finish.'
+    case 'BLOCKED': return `Blocked at ${at}: a failure was found or the last audit could not finish.`
     case 'AUDITING': return 'An audit is running.'
     case 'NOT_AUDITED': return 'Not audited yet.'
   }

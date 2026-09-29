@@ -53,6 +53,8 @@ import { scheduleCall, scheduleMethods, scheduleSignatures, type ScheduleControl
 import { LogicLoops, type LoopRecordInput } from './logic-loops'
 import { ideaMethods, ideaSignatures, type IdeasControlCaller } from './ideas/control'
 import { ideaRunMethods, ideaRunSignatures, type IdeaRunsControlCaller } from './idea-runs/control'
+import { productionCall, productionMethods, productionSignatures } from './production/control'
+import type { ProductionService } from './production/index'
 import { callNodeMethod, nodeMethods, nodeSignatures, withNodes } from './remote-jobs/control'
 import { callCloudMethod, cloudCatalogEntry, cloudMethods, cloudSignatures } from './cloud/control'
 import type { CloudRuns } from './cloud/runs'
@@ -67,7 +69,7 @@ import { isControlActivityNotice, type AppControlEntry, type ControlTarget } fro
 import { ArgumentError, modelError, pickModel, resolveModel, unknownMethodError, validateArgs } from './control-args'
 import { readHistory } from './agent-history'
 import type { ApprovalReviewRouting } from './approval-review-gate'
-import type { ModelKey, RegistryRecord, RouteDecision, TaskFeatures } from '../shared/model-routing'
+import type { ModelKey, RegistryRecord, RouteConstraints, RouteDecision, TaskFeatures } from '../shared/model-routing'
 import { callModelMethod, modelMethods, modelSignatures, routeFeatures, type ModelControlCaller } from './model-intelligence/control'
 import { routeConstraints, routeUsage, type ModelIntelligence } from './model-intelligence'
 import { categorize } from './model-intelligence/categorize'
@@ -360,7 +362,7 @@ const jobKeys: Record<string, string[]> = {
 }
 /** Every method some caller of this build can reach, for the unknown-method refusal: a method
  *  that is merely unavailable here (no job controller, not the owner) keeps its own refusal. */
-const KNOWN_METHODS = new Set<string>([...Object.keys(toolSignatures), ...Object.keys(ownerSignatures), ...Object.keys(jobSignatures), ...Object.keys(nodeSignatures), ...Object.keys(cloudSignatures), ...Object.keys(scheduleSignatures), ...Object.keys(ideaSignatures), ...Object.keys(ideaRunSignatures), ...Object.keys(modelSignatures), ...modelMethods, ...PERMISSION_METHODS, ...WIZARD_APPROVAL_METHODS])
+const KNOWN_METHODS = new Set<string>([...Object.keys(toolSignatures), ...Object.keys(ownerSignatures), ...Object.keys(jobSignatures), ...Object.keys(nodeSignatures), ...Object.keys(cloudSignatures), ...Object.keys(scheduleSignatures), ...Object.keys(ideaSignatures), ...Object.keys(ideaRunSignatures), ...Object.keys(productionSignatures), ...Object.keys(modelSignatures), ...modelMethods, ...PERMISSION_METHODS, ...WIZARD_APPROVAL_METHODS])
 const strings = (value: unknown, key: string, count: number, length: number): string[] => {
   if (!Array.isArray(value) || value.length > count || value.some(item => typeof item !== 'string' || !item.trim() || item.length > length || item.includes('\0'))) throw new Error(`${key} must be a list of at most ${count} non-empty strings of up to ${length} characters`)
   return value as string[]
@@ -395,6 +397,8 @@ export interface AgentControlDependencies {
   ideas?: { call(caller: IdeasControlCaller, method: string, args: unknown): Promise<unknown> }
   /** The idea autopilot (src/main/idea-runs/register.ts); plugged in with AgentControl.setIdeaRuns. */
   ideaRuns?: { call(caller: IdeaRunsControlCaller, method: string, args: unknown): Promise<unknown> }
+  /** Production audits (src/main/production); plugged in with AgentControl.setProduction. */
+  production?: ProductionService
   /** conductor-local MCP tools (src/main/local-assist/wiring.ts); plugged in with
    *  AgentControl.setLocalAssist, so construction order does not matter. */
   localAssist?: { savings(days?: number): SavingsSummary }
@@ -1677,7 +1681,7 @@ export class AgentControl {
     // Naming another project is only meaningful for the methods that were opened to a sibling;
     // everywhere else it is still an attempt to act outside the authorized scope.
     if (args.projectId !== undefined && args.projectId !== scope.projectId && !crossProjectMethods.includes(method)) throw new Error('This method only runs in the authorized project. Use projects.list to see what else is open, and hand work to a sibling project with tabs.open({projectId}).')
-    if (method === 'tools.list') return filterSignatures({ ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.cloud ? cloudSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(this.deps.ideaRuns ? ideaRunSignatures : {}), ...(this.deps.modelIntelligence ? modelSignatures : {}), ...(sovereign(scope) ? { ...ownerSignatures, ...WIZARD_APPROVAL_SIGNATURES } : {}), ...(this.deps.permissionGrants ? { ...PERMISSION_METHOD_SIGNATURES, ...(sovereign(scope) ? PERMISSION_OWNER_SIGNATURES : {}) } : {}) }, args)
+    if (method === 'tools.list') return filterSignatures({ ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.cloud ? cloudSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(this.deps.ideaRuns ? ideaRunSignatures : {}), ...(this.deps.production ? productionSignatures : {}), ...(this.deps.modelIntelligence ? modelSignatures : {}), ...(sovereign(scope) ? { ...ownerSignatures, ...WIZARD_APPROVAL_SIGNATURES } : {}), ...(this.deps.permissionGrants ? { ...PERMISSION_METHOD_SIGNATURES, ...(sovereign(scope) ? PERMISSION_OWNER_SIGNATURES : {}) } : {}) }, args)
     if (PERMISSION_METHODS.includes(method)) {
       if (!this.deps.permissionGrants) throw new Error('Permission grants are not available in this Conductor')
       const approver = { agentSessionId: scope.agentSessionId, projectId: scope.projectId, owner: scope.owner === true, wizard: scope.wizard === true }
@@ -2066,6 +2070,7 @@ export class AgentControl {
     if (scheduleMethods.has(method)) return this.scheduledTasks(scope, source, method, args)
     if (ideaMethods.has(method)) return this.ideasMethod(scope, source, method, args)
     if (ideaRunMethods.has(method)) return this.ideaRunsMethod(scope, source, method, args)
+    if (productionMethods.has(method)) return this.productionMethod(scope, source, method, args)
     if (modelMethods.has(method)) return this.modelsMethod(scope, source, method, args)
     throw new Error(this.unknownMethod(method))
   }
@@ -2262,6 +2267,31 @@ export class AgentControl {
 
   /** Plugs in the idea autopilot once it is constructed (src/main/index.ts). */
   setIdeaRuns(service: AgentControlDependencies['ideaRuns']): void { this.deps.ideaRuns = service }
+
+  /** Plugs in production audits once they are constructed (src/main/index.ts). */
+  setProduction(service: ProductionService | undefined): void { this.deps.production = service }
+
+  /** production.* (src/main/production/control.ts): who may call what is decided there from these
+   *  facts, which come from the authorized scope and durable settings, never from the caller. */
+  private productionMethod(scope: AgentControlScope, source: AgentSpec, method: string, args: Args): Promise<unknown> {
+    const service = this.deps.production
+    if (!service) throw new Error('Production audits are unavailable in this Conductor')
+    const settings = scope.owner ? undefined : this.deps.database.structured.snapshot(scope.agentSessionId)?.settings
+    return productionCall(service, {
+      projectId: scope.projectId, agentSessionId: scope.owner ? '' : scope.agentSessionId, title: source.title, owner: scope.owner === true, wizard: scope.wizard === true,
+      sovereign: sovereign(scope), local: !scope.owner && source.provider === 'local', readOnly: !scope.owner && restricted(settings)
+    }, method, args)
+  }
+
+  /** Routing for host code with no conversation of its own (production audit interpretation): the
+   *  same live facts a caller in this project gets, journaled as a decision of its requester. */
+  async routeForHost(scope: { projectId: string; workspaceId?: string }, features: TaskFeatures, constraints: Partial<RouteConstraints>, requester: string): Promise<{ decisionId: string; key: ModelKey; effort: string | null }> {
+    const service = this.deps.modelIntelligence
+    if (!service) throw new Error('model intelligence is not running yet')
+    const owner = this.ownerScope(scope)
+    const { decision } = await service.route(features, constraints, await this.routeLive(owner), { requester, projectId: owner.projectId })
+    return { decisionId: decision.decisionId, key: decision.selected.key, effort: decision.selected.effort }
+  }
 
   /** ideas.run* (src/main/idea-runs/control.ts): reads for everyone, changes like ideas.*, and the
    *  owner's answers (plan approval, checkpoints) only from the owner's own credential. */

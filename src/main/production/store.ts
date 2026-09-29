@@ -5,7 +5,7 @@ import { makeId } from '../../shared/models'
 import {
   MODEL_ROLES, PRODUCTION_RUN_RETENTION, PRODUCTION_TABLES as T, RUN_TRANSITIONS, TERMINAL_RUN_STATUSES,
   type ApplicabilityDecision, type AuditBudget, type ProductionRunEvent, type ProductionRunEventKind, type AuditRun, type AuditTrigger, type BudgetLedger, type ControlId, type ControlResult,
-  type Finding, type FindingDraft, type FindingStatus, type ModelCallRecord, type ModelRole, type MutationKind, type ProductionProfile,
+  type Finding, type FindingDraft, type FindingStatus, type ModelCallRecord, type ReviewAnswerRecord, type ModelRole, type MutationKind, type ProductionProfile,
   type RouteCoverage, type RunCheckpoint, type RunKind, type RunOperation, type RunStatus, type RunStep, type Severity, type StepKind,
   type VerificationRecord, type Waiver, type WaiverRequest
 } from '../../shared/production'
@@ -234,6 +234,14 @@ export class ProductionStore {
         data TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS ${T.events}_run_idx ON ${T.events}(run_id, seq);
+      CREATE TABLE IF NOT EXISTS ${T.reviewAnswers} (
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        environment_id TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        answered_at TEXT NOT NULL,
+        data TEXT NOT NULL,
+        PRIMARY KEY (project_id, environment_id, item_id)
+      );
     `)
   }
 
@@ -717,6 +725,23 @@ export class ProductionStore {
       ? this.db.prepare(`SELECT data FROM ${T.operations} WHERE run_id = ? AND status = ? ORDER BY at, rowid LIMIT ${MAX_LIST}`).all(runId, status)
       : this.db.prepare(`SELECT data FROM ${T.operations} WHERE run_id = ? ORDER BY at, rowid LIMIT ${MAX_LIST}`).all(runId)
     return (rows as Row[]).map(row => json<RunOperation>(row.data))
+  }
+
+  // ---- human-review answers ---------------------------------------------------------------------
+
+  /** Records (or replaces) the answer to one human-review item; results and findings stay as they were. */
+  answerReview(record: ReviewAnswerRecord): ReviewAnswerRecord {
+    return this.tx(record.projectId, () => {
+      const saved: ReviewAnswerRecord = { ...record, note: record.note === null ? null : text(record.note, 2_000) }
+      this.db.prepare(`INSERT INTO ${T.reviewAnswers} (project_id, environment_id, item_id, answered_at, data) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (project_id, environment_id, item_id) DO UPDATE SET answered_at = excluded.answered_at, data = excluded.data`)
+        .run(saved.projectId, saved.environmentId, saved.itemId, saved.answeredAt, JSON.stringify(saved))
+      return saved
+    })
+  }
+
+  reviewAnswers(projectId: string, environmentId: string, limit = 1_000): ReviewAnswerRecord[] {
+    return (this.db.prepare(`SELECT data FROM ${T.reviewAnswers} WHERE project_id = ? AND environment_id = ? ORDER BY item_id LIMIT ?`).all(projectId, environmentId, bound(limit, 1_000)) as Row[]).map(row => json<ReviewAnswerRecord>(row.data))
   }
 
   // ---- control results --------------------------------------------------------------------------

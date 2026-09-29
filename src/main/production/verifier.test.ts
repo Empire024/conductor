@@ -75,6 +75,7 @@ describe.skipIf(!engine.available)('Production Verifier on fixture sites (real a
     // Nothing was mutated on either site.
     expect(server.mutations()).toEqual([])
     expect(board.tasks.get(tracker.taskId!)!.status).toBe('done')
-    expect(service.gate('project-a').state).toBe('NEEDS_REVIEW')
+    // The tracker still fires: C03 is FAIL, so the gate stays blocked.
+    expect(service.gate('project-a').state).toBe('BLOCKED')
   })
 })

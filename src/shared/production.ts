@@ -630,6 +630,10 @@ export interface EvidenceRef {
   redacted: boolean
 }
 
+/** How the owner (or a wizard) answered a human-review item: the reviewed behaviour holds, or it does not. */
+export const REVIEW_ANSWERS = ['confirmed', 'rejected'] as const
+export type ReviewAnswer = (typeof REVIEW_ANSWERS)[number]
+
 export interface HumanReviewItem {
   id: string
   controlId: ControlId
@@ -637,6 +641,31 @@ export interface HumanReviewItem {
   why: string
   route: string | null
   evidence: string[]
+  /**
+   * Set once a sovereign caller answered the item (production.review.answer). Answers are kept per
+   * project, environment and item id, and carried to a later run's item with the same id unless a
+   * change since the answer invalidated the control. When every item of a control is answered the
+   * gate lifts its NEEDS_HUMAN_REVIEW cap; a `rejected` answer makes the control FAIL.
+   */
+  answer?: ReviewAnswer | null
+  note?: string | null
+  answeredBy?: string | null
+  answeredAt?: string | null
+}
+
+/** A stored answer to a human-review item (table `production_review_answers`). */
+export interface ReviewAnswerRecord {
+  projectId: string
+  environmentId: string
+  itemId: string
+  controlId: ControlId
+  answer: ReviewAnswer
+  note: string | null
+  answeredBy: string
+  answeredAt: string
+  /** The run whose item was answered, and the target it described. */
+  runId: string
+  fingerprint: TargetFingerprint
 }
 
 export interface ControlResult {
@@ -1137,6 +1166,8 @@ export interface ProductionBridge {
   updateProfile(projectId: string, update: ProfileUpdate): Promise<ProductionProfile>
   answerQuestion(projectId: string, questionId: string, answer: string): Promise<ProductionProfile>
   dismissQuestion(projectId: string, questionId: string, reason: string): Promise<ProductionProfile>
+  /** Answers a human-review item of the environment's last completed run (owner authority). */
+  answerReview(projectId: string, itemId: string, answer: ReviewAnswer, note?: string): Promise<ReviewAnswerRecord>
   audit(projectId: string, request: AuditRequest): Promise<ProductionRunSummary>
   retest(projectId: string, findingIds: string[]): Promise<ProductionRunSummary>
   verify(projectId: string, findingIds: string[]): Promise<ProductionRunSummary>
@@ -1162,6 +1193,7 @@ export const PRODUCTION_IPC = {
   updateProfile: 'production:update-profile',
   answerQuestion: 'production:answer-question',
   dismissQuestion: 'production:dismiss-question',
+  answerReview: 'production:answer-review',
   audit: 'production:audit',
   retest: 'production:retest',
   verify: 'production:verify',
@@ -1183,7 +1215,7 @@ export const PRODUCTION_IPC = {
 export const PRODUCTION_CONTROL_METHODS = [
   'production.status', 'production.queue', 'production.registry', 'production.runs', 'production.run',
   'production.findings', 'production.report', 'production.evidence', 'production.profile.get',
-  'production.profile.update', 'production.designate', 'production.answer', 'production.audit',
+  'production.profile.update', 'production.designate', 'production.answer', 'production.review.answer', 'production.audit',
   'production.retest', 'production.verify', 'production.pause', 'production.resume', 'production.cancel',
   'production.tasks.create', 'production.waive', 'production.waivers.revoke', 'production.writes.authorize',
   'production.writes.revoke', 'production.drift',
@@ -1192,7 +1224,7 @@ export type ProductionControlMethod = (typeof PRODUCTION_CONTROL_METHODS)[number
 
 /** Methods that need the owner credential or a wizard tab; a coworker or local model is refused with the route. */
 export const PRODUCTION_SOVEREIGN_METHODS: readonly ProductionControlMethod[] = [
-  'production.designate', 'production.answer', 'production.waive', 'production.waivers.revoke',
+  'production.designate', 'production.answer', 'production.review.answer', 'production.waive', 'production.waivers.revoke',
   'production.writes.authorize', 'production.writes.revoke', 'production.drift',
 ]
 
@@ -1216,6 +1248,7 @@ export const PRODUCTION_TABLES = {
   waivers: 'production_waivers',
   modelCalls: 'production_model_calls',
   events: 'production_run_events',
+  reviewAnswers: 'production_review_answers',
 } as const
 
 export const PRODUCTION_ARTIFACTS_DIR = 'production-audits'

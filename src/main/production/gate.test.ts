@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import type { AuditRun, ControlId, ControlResult, ControlResultStatus, Finding, OwnerQuestion, Waiver } from '../../shared/production'
-import { computeGate, controlStatus, gateSummary, type GateInput } from './gate'
+import type { AuditRun, ControlId, ControlResult, ControlResultStatus, Finding, HumanReviewItem, OwnerQuestion, ReviewAnswerRecord, Waiver } from '../../shared/production'
+import { applyReviewAnswers, computeGate, controlStatus, gateSummary, type GateInput } from './gate'
 import { emptyLedger } from './store'
 import { ENV_ID, fingerprint } from './testkit'
 
@@ -89,10 +89,22 @@ describe('computeGate states', () => {
     expect(gate({ currentFingerprint: null }).state).toBe('VERIFIED')
   })
 
-  it('NEEDS_REVIEW for a confirmed critical/high open finding, an UNVERIFIED or NEEDS_HUMAN_REVIEW control, a blocking question, an expired waiver, or an unwaived FAIL/WARN', () => {
-    const confirmed = gate({ results: [result('C03', 'FAIL', { findingIds: ['f'] })], findings: [finding('f', 'C03')] })
-    expect(confirmed).toMatchObject({ state: 'NEEDS_REVIEW', openCriticalOrHigh: 1 })
+  it('BLOCKED when the last completed run found an unwaived FAIL, even on the first run, with every reason listed', () => {
+    const confirmed = gate({ results: [result('C03', 'FAIL', { findingIds: ['f'] }), result('C13', 'UNVERIFIED', { rationale: 'axe unavailable' })], findings: [finding('f', 'C03')] })
+    expect(confirmed).toMatchObject({ state: 'BLOCKED', openCriticalOrHigh: 1, runId: 'r1' })
     expect(confirmed.reasons[0]).toMatch(/1 open confirmed critical\/high finding/)
+    expect(confirmed.reasons.join('\n')).toMatch(/C13 could not be verified: axe unavailable/)
+    expect(confirmed.reasons.join('\n')).toMatch(/C03 is FAIL with 1 unwaived finding/)
+    // A likely (not confirmed) high finding on a FAIL control blocks too: it is not waived.
+    const likely = gate({ results: [result('C03', 'FAIL')], findings: [finding('l', 'C03', { confidence: 'likely' })] })
+    expect(likely.state).toBe('BLOCKED')
+    // A FAIL without findings (a rejected human review) blocks as well.
+    expect(gate({ results: [result('C01', 'FAIL', { rationale: 'Rejected on human review' })] }).state).toBe('BLOCKED')
+    // A target change since then is STALE first: the fix may already be deployed.
+    expect(gate({ results: [result('C03', 'FAIL')], findings: [finding('l', 'C03')], currentFingerprint: fingerprint({ commit: 'beef' }) }).state).toBe('STALE')
+  })
+
+  it('NEEDS_REVIEW for an UNVERIFIED or NEEDS_HUMAN_REVIEW control, a blocking question, an expired waiver, or an unwaived WARN', () => {
 
     const unverified = gate({ results: [result('C03', 'UNVERIFIED', { rationale: 'budget exhausted (maxRequests)' })] })
     expect(unverified).toMatchObject({ state: 'NEEDS_REVIEW', unverifiedControls: ['C03'] })
@@ -108,10 +120,9 @@ describe('computeGate states', () => {
     expect(expired.state).toBe('NEEDS_REVIEW')
     expect(expired.reasons.join('\n')).toMatch(/waiver of C04 .* expired/)
 
-    // A likely (not confirmed) high finding on a FAIL control still needs review: it is not waived.
-    const likely = gate({ results: [result('C03', 'FAIL')], findings: [finding('l', 'C03', { confidence: 'likely' })] })
-    expect(likely.state).toBe('NEEDS_REVIEW')
-    expect(likely.reasons[0]).toMatch(/C03 is FAIL with 1 unwaived finding/)
+    const warn = gate({ results: [result('C04', 'WARN')], findings: [finding('m', 'C04', { severity: 'medium' })] })
+    expect(warn.state).toBe('NEEDS_REVIEW')
+    expect(warn.reasons[0]).toMatch(/C04 is WARN with 1 unwaived finding/)
     // A WARN with no finding at all is not silently VERIFIED either.
     expect(gate({ results: [result('C04', 'WARN', { rationale: 'remote fonts' })] }).reasons[0]).toMatch(/C04 is WARN: remote fonts/)
   })
@@ -121,7 +132,7 @@ describe('computeGate states', () => {
     const withWaiver = gate({ results: [result('C03', 'FAIL', { findingIds: ['f'] }), result('C04', 'PASS')], findings: [waived], waivers: [waiver('wv', 'f', '2026-12-31T00:00:00.000Z')] })
     expect(withWaiver).toMatchObject({ state: 'VERIFIED_WITH_WAIVERS', activeWaivers: 1, openCriticalOrHigh: 0 })
     const revoked = gate({ results: [result('C03', 'FAIL', { findingIds: ['f'] })], findings: [waived], waivers: [waiver('wv', 'f', '2026-12-31T00:00:00.000Z', NOW.toISOString())] })
-    expect(revoked.state).toBe('NEEDS_REVIEW')
+    expect(revoked.state).toBe('BLOCKED')
   })
 
   it('VERIFIED otherwise, with no reasons, a fixed finding ignored, and the scope wording (never a percentage or certification)', () => {
@@ -156,5 +167,44 @@ describe('controlStatus', () => {
     expect(controlStatus(always, applicable, [{ status: 'WARN' }])).toBe('NEEDS_HUMAN_REVIEW')
     expect(controlStatus(always, applicable, [{ status: 'FAIL' }])).toBe('FAIL')
     expect(controlStatus(always, applicable, [{ status: 'UNVERIFIED' }])).toBe('UNVERIFIED')
+  })
+})
+
+describe('human-review answers', () => {
+  const item = (id: string, controlId: ControlId = 'C01'): HumanReviewItem => ({ id, controlId, question: `${id}?`, why: '', route: null, evidence: [] })
+  const answer = (itemId: string, value: ReviewAnswerRecord['answer'], overrides: Partial<ReviewAnswerRecord> = {}): ReviewAnswerRecord => ({
+    projectId: 'p', environmentId: ENV_ID, itemId, controlId: 'C01', answer: value, note: null, answeredBy: 'owner', answeredAt: NOW.toISOString(), runId: 'r1', fingerprint: fingerprint(), ...overrides,
+  })
+  const capped = result('C01', 'NEEDS_HUMAN_REVIEW', { humanReview: [item('C01:legal-adequacy'), item('C01:placement')], checks: [{ checkId: 'policies', status: 'PASS', reason: null, durationMs: 1 }] })
+
+  it('lifts the cap only once every item is answered, and counts only unanswered items as pending', () => {
+    const half = applyReviewAnswers([capped], [answer('C01:legal-adequacy', 'confirmed')], fingerprint())
+    expect(half[0]).toMatchObject({ status: 'NEEDS_HUMAN_REVIEW' })
+    expect(half[0]!.humanReview[0]).toMatchObject({ answer: 'confirmed', answeredBy: 'owner' })
+    const partly = gate({ results: [...clean, half[0]!] })
+    expect(partly).toMatchObject({ state: 'NEEDS_REVIEW', humanReviewPending: 1 })
+    expect(partly.reasons.join('\n')).toMatch(/1 of 2 item\(s\) unanswered/)
+    const all = applyReviewAnswers([capped], [answer('C01:legal-adequacy', 'confirmed'), answer('C01:placement', 'confirmed')], fingerprint())
+    expect(all[0]).toMatchObject({ status: 'PASS' })
+    expect(gate({ results: [...clean, all[0]!] })).toMatchObject({ state: 'VERIFIED', humanReviewPending: 0 })
+  })
+
+  it('a rejected answer makes the control FAIL (and the gate BLOCKED); a WARN check stays WARN when confirmed', () => {
+    const rejected = applyReviewAnswers([capped], [answer('C01:legal-adequacy', 'rejected', { note: 'no controller named' }), answer('C01:placement', 'confirmed')], fingerprint())
+    expect(rejected[0]).toMatchObject({ status: 'FAIL' })
+    expect(rejected[0]!.rationale).toMatch(/Rejected on human review: C01:legal-adequacy\? \(no controller named\)/)
+    expect(gate({ results: [...clean, rejected[0]!] }).state).toBe('BLOCKED')
+    const warned = { ...capped, checks: [{ checkId: 'policies', status: 'WARN' as const, reason: null, durationMs: 1 }] }
+    expect(applyReviewAnswers([warned], [answer('C01:legal-adequacy', 'confirmed'), answer('C01:placement', 'confirmed')], fingerprint())[0]!.status).toBe('WARN')
+  })
+
+  it('carries an answer to a later run unless a change since invalidated the control', () => {
+    const later = { ...capped, runId: 'r2' }
+    const answers = [answer('C01:legal-adequacy', 'confirmed'), answer('C01:placement', 'confirmed')]
+    expect(applyReviewAnswers([later], answers, fingerprint({ dependencyHash: 'dep2' }))[0]!.status).toBe('PASS')
+    // A policy change invalidates C01: the answers no longer hold for the new run.
+    const moved = applyReviewAnswers([later], answers, fingerprint({ policyHash: 'changed' }))
+    expect(moved[0]).toMatchObject({ status: 'NEEDS_HUMAN_REVIEW' })
+    expect(moved[0]!.humanReview.every(entry => !entry.answer)).toBe(true)
   })
 })

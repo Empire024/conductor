@@ -21,8 +21,8 @@ export interface FixTaskOutcome { findingId: string; taskId: string; created: bo
 
 const PRIORITY: Readonly<Record<Severity, OrchestrationTaskPriority>> = { critical: 'urgent', high: 'high', medium: 'normal', low: 'low', info: 'low' }
 const CLOSED: readonly OrchestrationTask['status'][] = ['done', 'cancelled']
-/** Findings the report step files automatically; lower severities are filed only on request. */
-export const AUTO_TASK_SEVERITIES: readonly Severity[] = ['critical', 'high', 'medium']
+/** Findings the report step files automatically; medium and lower are filed only on request (createFixTasks). */
+export const AUTO_TASK_SEVERITIES: readonly Severity[] = ['critical', 'high']
 const OPEN: readonly Finding['status'][] = ['open', 'reopened', 'disputed']
 
 export function taskTitle(finding: Finding): string {
@@ -63,7 +63,7 @@ export function ensureFixTasks(store: ProductionStore, board: FixTaskBoard, proj
   return out
 }
 
-/** The findings the report step files: open, unwaived, severity at least medium. */
+/** The findings the report step files: open, unwaived, critical or high. */
 export function autoTaskFindings(findings: readonly Finding[]): Finding[] {
   return findings.filter(finding => OPEN.includes(finding.status) && AUTO_TASK_SEVERITIES.includes(finding.severity))
 }

@@ -10,6 +10,7 @@ export const productionBridge: ProductionBridge = {
   updateProfile: (projectId, update) => ipcRenderer.invoke(channel.updateProfile, projectId, update),
   answerQuestion: (projectId, questionId, answer) => ipcRenderer.invoke(channel.answerQuestion, projectId, questionId, answer),
   dismissQuestion: (projectId, questionId, reason) => ipcRenderer.invoke(channel.dismissQuestion, projectId, questionId, reason),
+  answerReview: (projectId, itemId, answer, note) => ipcRenderer.invoke(channel.answerReview, projectId, itemId, answer, note),
   audit: (projectId, request) => ipcRenderer.invoke(channel.audit, projectId, request),
   retest: (projectId, findingIds) => ipcRenderer.invoke(channel.retest, projectId, findingIds),
   verify: (projectId, findingIds) => ipcRenderer.invoke(channel.verify, projectId, findingIds),
