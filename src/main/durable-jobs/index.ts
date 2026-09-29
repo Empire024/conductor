@@ -5,7 +5,7 @@ import { canonicalRelative } from '../canonical-path'
 import { makeId } from '../../shared/models'
 import { DEFAULT_DURABLE_JOB_BUDGETS, DURABLE_STAGE_KINDS, TERMINAL_JOB_STATUSES, type CreateDurableJobInput, type DurableJobCheckpoint, type DurableJob, type DurableJobBudgets, type DurableJobEvent, type DurableJobReport, type DurableJobsService, type DurableJobStage, type DurableJobStatus, type DurableJobSummary } from '../../shared/durable-jobs'
 import { DurableJobController, operationKindForTool } from './controller'
-import { alwaysReadyServer, defaultHandoffPort, jsonReportPort, noopWatchdog, repeatedErrorLoopGuard, type CompletionCheckPort, type HandoffPort, type LoopGuardPort, type LocalExecutionView, type ReportPort, type ServerLifecyclePort, type StageRuntime, type WatchdogPort } from './ports'
+import { alwaysReadyServer, defaultHandoffPort, jsonReportPort, noopWatchdog, repeatedErrorLoopGuard, type CompletionCheckPort, type HandoffPort, type LoopGuardPort, type LocalExecutionView, type ReportPort, type ServerLifecyclePort, type StageConclusion, type StageRuntime, type WatchdogPort } from './ports'
 import { reconcileJobs, type ReconcileOutcome } from './reconcile'
 import { collectDurableJobEvents } from './report'
 import { DurableJobStore, type StoredJob } from './store'
@@ -26,6 +26,8 @@ export interface DurableJobsServiceOptions {
   watchdog?: WatchdogPort
   server?: ServerLifecyclePort
   loopGuard?: LoopGuardPort
+  /** After a completed stage: whether the job went on or stopped for the owner (observation only). */
+  stageConcluded?: (conclusion: StageConclusion) => void
   report?: ReportPort
   worktrees?: WorktreeOps
   completion?: CompletionCheckPort
@@ -96,7 +98,7 @@ export class DurableJobsServiceImpl implements DurableJobsService {
       loopGuard: options.loopGuard ?? repeatedErrorLoopGuard, worktrees: this.worktrees, completion: options.completion,
       ownerId: this.ownerId, clock: this.clock, sleep: options.sleep, pollMs: options.pollMs,
       leaseTtlMs: options.leaseTtlMs, maxConcurrent: options.maxConcurrent, maxImplicitStages: options.maxImplicitStages,
-      interruptGraceMs: options.interruptGraceMs,
+      interruptGraceMs: options.interruptGraceMs, stageConcluded: options.stageConcluded,
       finished: jobId => { void this.report(jobId).catch(error => console.warn(`Durable job ${jobId}: report failed`, error)) }
     })
     this.disposeStore = options.store.onChange(jobId => {

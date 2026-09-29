@@ -10,11 +10,18 @@
 //   C. local.servers lists the decider (CPU, not the GPU server); a GPU model then starts and answers a
 //      real turn while the decider stays up with the same pid, and nvidia-smi never shows the decider.
 //   D. After the GPU start, another approval is still shadowed by the same decider.
-// Needs the decider set up (scripts/local-models/setup-decider.ps1) and a built out/ with this change.
-// CONDUCTOR_TEST_USER_DATA parks the window.
-//   node scripts/smoke-lock.mjs -- node scripts/smoke-cpu-shadow-decider.mjs [--gpu-model local/qwen3.5-9b] [--restore local/dolphin-x1-8b]
+//   E. (--no-gpu) Durable jobs on a loopback stub model (CONDUCTOR_DURABLE_JOBS_MODEL_ENDPOINT, no llama-server): a
+//      failed attempt journals the loop guard's retry verdict, and every completed stage journals the
+//      controller's go-on-or-stop answer (escalate), both "continue" and "escalate"; then decisions.list
+//      reports the decider for approval, retry, escalate, completion and classify.
+// Needs the decider set up (scripts/local-models/setup-decider.ps1) and a built out/ with this change
+// (or CONDUCTOR_SMOKE_MAIN=<worktree>/out/main/index.js). CONDUCTOR_TEST_USER_DATA parks the window.
+// --no-gpu runs E instead of C (and --restore) while another run holds the GPU: the stub endpoint takes every
+// local conversation of the launch, so C's real GPU turn and E never share one. The decider is CPU only.
+//   node scripts/smoke-lock.mjs -- node scripts/smoke-cpu-shadow-decider.mjs [--gpu-model local/qwen3.5-9b] [--restore local/dolphin-x1-8b] [--no-gpu]
 import { _electron as electron, expect } from '@playwright/test'
 import { execFileSync } from 'node:child_process'
+import { createServer } from 'node:http'
 import { existsSync } from 'node:fs'
 import { appendFile, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -25,6 +32,8 @@ const argument = (name, fallback) => process.argv.includes(name) ? process.argv[
 const runLabel = argument('--run', String(Date.now()))
 const GPU_MODEL = argument('--gpu-model', 'local/qwen3.5-9b')
 const RESTORE = argument('--restore', '')
+const NO_GPU = process.argv.includes('--no-gpu')
+const JOB_MODEL = argument('--job-model', 'local/qwen3.6-35b-a3b')
 const root = await mkdtemp(join(tmpdir(), 'conductor-cpu-decider-'))
 const output = resolve('artifacts/cpu-shadow-decider')
 await mkdir(output, { recursive: true })
@@ -86,9 +95,49 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
 })
 `)
 
-// Offline: the Claude CLI is the fixture above. The local provider has no CLI to fake and talks to llama.cpp as always.
+// E's stand-in local model (OpenAI-compatible, as scripts/smoke-verify-vr3-durable.mjs): the reply is chosen by
+// the marker in the stage objective and the attempt. It serves only durable-job stages; the app then starts no
+// llama-server. Only with --no-gpu: the override takes every local conversation, which C must not have.
+const stubSeen = []
+const stub = createServer((request, response) => {
+  const chunks = []
+  request.on('data', chunk => chunks.push(chunk))
+  request.on('end', () => {
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') : {}
+    const send = payload => { response.writeHead(200, { 'Content-Type': 'application/json' }); response.end(JSON.stringify(payload)) }
+    if (request.url?.startsWith('/health')) return send({ status: 'ok' })
+    if (request.url?.startsWith('/v1/models')) return send({ object: 'list', data: [{ id: JOB_MODEL, object: 'model' }] })
+    const messages = Array.isArray(body.messages) ? body.messages : []
+    const task = String(messages.find(message => message.role === 'user')?.content ?? '')
+    const objective = /THIS STAGE\s*([\s\S]*?)\s*STAGE IS COMPLETE WHEN/.exec(task)?.[1] ?? task
+    const marker = /CPU-[A-Z0-9-]+/.exec(objective)?.[0] ?? 'none'
+    // A retried attempt is told about the previous one (controller.test.ts, "did not finish").
+    const retried = /previous attempt at this stage did not finish/i.test(task)
+    stubSeen.push({ at: Date.now(), marker, retried })
+    const content =
+      // First attempt answers nothing (never a success), the retry reports done.
+      marker === 'CPU-RETRY' ? (retried ? 'Wrote nothing new; the step is done.\nJOB STATUS: DONE' : '')
+      // An open-ended stage that says neither done nor what comes next: the controller stops for the owner.
+      : marker === 'CPU-NOSTATUS' ? 'I looked at the parser and did some things.'
+      : 'Nothing to change for this stage.\nJOB STATUS: DONE'
+    const usage = { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 }
+    setTimeout(() => {
+      if (!body.stream) return send({ id: 'stub', object: 'chat.completion', created: Math.floor(Date.now() / 1000), model: JOB_MODEL, choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }], usage })
+      response.writeHead(200, { 'Content-Type': 'text/event-stream' })
+      const chunk = payload => response.write(`data: ${JSON.stringify({ id: 'stub', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: JOB_MODEL, ...payload })}\n\n`)
+      chunk({ choices: [{ index: 0, delta: { role: 'assistant', content }, finish_reason: null }] })
+      chunk({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
+      chunk({ choices: [], usage })
+      response.end('data: [DONE]\n\n')
+    }, 200)
+  })
+})
+await new Promise(done => stub.listen(0, '127.0.0.1', done))
+
+// Offline: the Claude CLI is the fixture above. The local provider talks to llama.cpp as always, except durable-job stages (the stub).
 const env = { ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_EMPTY_HISTORY: '1', CONDUCTOR_TEST_USER_DATA: profile, CONDUCTOR_PROJECTS_ROOT: join(root, 'projects'),
-  CONDUCTOR_TEST_FIXTURE_DIR: fixtures, CONDUCTOR_TEST_CONTROL_CAPTURE: capture, CONDUCTOR_TEST_NODE_EXECUTABLE: process.execPath, CONDUCTOR_TEST_DECIDER: '1' }
+  CONDUCTOR_TEST_FIXTURE_DIR: fixtures, CONDUCTOR_TEST_CONTROL_CAPTURE: capture, CONDUCTOR_TEST_NODE_EXECUTABLE: process.execPath, CONDUCTOR_TEST_DECIDER: '1',
+  ...(NO_GPU ? { CONDUCTOR_DURABLE_JOBS_MODEL_ENDPOINT: `http://127.0.0.1:${stub.address().port}` } : {}) }
 delete env.ELECTRON_RUN_AS_NODE; delete env.CONDUCTOR_LIVE_TESTS; delete env.CONDUCTOR_BACKGROUND_WINDOWS
 
 const checks = [], evidence = {}
@@ -104,7 +153,7 @@ const gpuPids = () => { try { return execFileSync('nvidia-smi', ['--query-comput
 const childPids = pid => execFileSync('powershell.exe', ['-NoProfile', '-Command', `@(Get-CimInstance Win32_Process -Filter "ParentProcessId=${pid}" | ForEach-Object { $_.ProcessId }) -join ','`], { encoding: 'utf8' }).trim().split(',').map(Number).filter(Boolean)
 const workingSetMb = pid => Math.round(Number(execFileSync('powershell.exe', ['-NoProfile', '-Command', `(Get-Process -Id ${pid}).WorkingSet64`], { encoding: 'utf8' }).trim()) / 2 ** 20)
 
-const app = await electron.launch({ args: [resolve('out/main/index.js')], env, timeout: 30000 })
+const app = await electron.launch({ args: [process.env.CONDUCTOR_SMOKE_MAIN ?? resolve('out/main/index.js')], env, timeout: 30000 })
 // The main process's decider and model-intelligence lines, kept with the run.
 const mainLines = []
 for (const stream of [app.process().stdout, app.process().stderr]) stream?.on('data', chunk => { for (const line of String(chunk).split(/\r?\n/)) if (/\[decider\]|\[model-intelligence\]/.test(line)) mainLines.push(line.slice(0, 400)) })
@@ -205,39 +254,71 @@ try {
   evidence.completion = { id: completion.id, choice: completion.choice, laya: completion.systemOne }
   check(`The dispatch also journaled classify (${classify.choice} vs Laya ${classify.systemOne.choice}) and the routed turn's completion (${completion.choice} vs Laya ${completion.systemOne.choice}), all in shadow`)
 
-  // C. A GPU model starts and answers while the decider stays up.
-  const servers = await ok(owner, 'local.servers', {}, scope)
-  evidence.gpuBefore = servers.filter(server => server.role !== 'decider').map(server => ({ model: server.model, pid: server.pid }))
-  const local = await ok(owner, 'tabs.open', { kind: 'agent', provider: 'local', model: GPU_MODEL, title: 'GPU beside the decider' }, scope)
-  const localId = local.resourceId ?? local.agentSessionId
-  const startedC = Date.now()
-  await ok(owner, 'agents.submit', { agentSessionId: localId, prompt: 'Reply with exactly one word: ready' })
-  await expect.poll(async () => (await snapshot(localId))?.phase, { timeout: 300000, intervals: [1000, 2000, 5000] }).toBe('completed')
-  const localState = await snapshot(localId)
-  const reply = localState.items.filter(item => item.data.type === 'text' && item.data.role === 'assistant').map(item => item.data.text).join(' ')
-  assert.match(reply, /ready/i, `the GPU model answered: ${reply.slice(0, 200)}`)
-  const after = await ok(owner, 'local.servers', {}, scope)
-  const gpuServer = after.find(server => server.model === GPU_MODEL)
-  const deciderAfter = after.find(server => server.role === 'decider')
-  assert.ok(gpuServer?.pid, `${GPU_MODEL} is running`)
-  assert.equal(deciderAfter.state, 'running'); assert.equal(deciderAfter.pid, running.pid, 'the decider kept its process through the GPU start')
-  const gpuNow = gpuPids()
-  if (gpuNow) { assert.ok(gpuNow.includes(gpuServer.pid), 'the GPU model is on the GPU'); assert.ok(![running.pid, ...interpreters].some(pid => gpuNow.includes(pid)), 'the decider is still not on the GPU') }
-  evidence.gpu = { model: GPU_MODEL, pid: gpuServer.pid, turnMs: Date.now() - startedC, reply: reply.slice(0, 80), deciderPid: deciderAfter.pid }
-  check(`${GPU_MODEL} started (pid ${gpuServer.pid}) and answered "${reply.trim().slice(0, 40)}" in ${Math.round(evidence.gpu.turnMs / 1000)} s while the decider stayed up as pid ${deciderAfter.pid}`)
+  if (!NO_GPU) {
+    // C. A GPU model starts and answers while the decider stays up.
+    const servers = await ok(owner, 'local.servers', {}, scope)
+    evidence.gpuBefore = servers.filter(server => server.role !== 'decider').map(server => ({ model: server.model, pid: server.pid }))
+    const local = await ok(owner, 'tabs.open', { kind: 'agent', provider: 'local', model: GPU_MODEL, title: 'GPU beside the decider' }, scope)
+    const localId = local.resourceId ?? local.agentSessionId
+    const startedC = Date.now()
+    await ok(owner, 'agents.submit', { agentSessionId: localId, prompt: 'Reply with exactly one word: ready' })
+    await expect.poll(async () => (await snapshot(localId))?.phase, { timeout: 300000, intervals: [1000, 2000, 5000] }).toBe('completed')
+    const localState = await snapshot(localId)
+    const reply = localState.items.filter(item => item.data.type === 'text' && item.data.role === 'assistant').map(item => item.data.text).join(' ')
+    assert.match(reply, /ready/i, `the GPU model answered: ${reply.slice(0, 200)}`)
+    const after = await ok(owner, 'local.servers', {}, scope)
+    const gpuServer = after.find(server => server.model === GPU_MODEL)
+    const deciderAfter = after.find(server => server.role === 'decider')
+    assert.ok(gpuServer?.pid, `${GPU_MODEL} is running`)
+    assert.equal(deciderAfter.state, 'running'); assert.equal(deciderAfter.pid, running.pid, 'the decider kept its process through the GPU start')
+    const gpuNow = gpuPids()
+    if (gpuNow) { assert.ok(gpuNow.includes(gpuServer.pid), 'the GPU model is on the GPU'); assert.ok(![running.pid, ...interpreters].some(pid => gpuNow.includes(pid)), 'the decider is still not on the GPU') }
+    evidence.gpu = { model: GPU_MODEL, pid: gpuServer.pid, turnMs: Date.now() - startedC, reply: reply.slice(0, 80), deciderPid: deciderAfter.pid }
+    check(`${GPU_MODEL} started (pid ${gpuServer.pid}) and answered "${reply.trim().slice(0, 40)}" in ${Math.round(evidence.gpu.turnMs / 1000)} s while the decider stayed up as pid ${deciderAfter.pid}`)
+  } else console.log('SKIP C (--no-gpu): no GPU model is started')
 
-  // D. The decider keeps deciding with the GPU model loaded.
+  // D. The decider keeps deciding (with the GPU model loaded, unless --no-gpu).
   await ask('npx tsc --noEmit')
   const second = await journaled('approval', record => record.id !== approval.id && record.systemOne?.decider?.startsWith('laya:') && record.agentSessionId === coworker && !record.systemOne.failed)
   evidence.secondApproval = { id: second.id, laya: second.systemOne }
-  check(`With ${GPU_MODEL} loaded, the next approval is shadowed by the same decider (Laya ${second.systemOne.choice} at ${second.systemOne.confidence.toFixed(2)})`)
+  check(`${NO_GPU ? 'Later' : `With ${GPU_MODEL} loaded`}, the next approval is shadowed by the same decider (Laya ${second.systemOne.choice} at ${second.systemOne.confidence.toFixed(2)})`)
+
+  if (NO_GPU) {
+    // E. Durable jobs on the stub: retry (loop guard after a failed attempt) and escalate (the controller's answer
+    // after every completed stage), each journaled beside Laya's verdict.
+    const settledJob = async jobId => { let status; await expect.poll(async () => { status = await ok(owner, 'jobs.status', { jobId }, scope); return ['completed', 'failed', 'cancelled', 'blocked'].includes(status.status) ? status.status : 'running' }, { timeout: 180000, intervals: [500, 1000, 2000] }).not.toBe('running'); return status }
+    const create = args => ok(owner, 'jobs.create', { model: JOB_MODEL, isolateWorktree: false, ...args }, scope)
+    const planned = await create({ title: 'CPU decider planned', objective: 'Two planned steps, the first retried once', budgets: { maxStageAttempts: 3 }, stages: [
+      { title: 'Retried step', objective: 'CPU-RETRY: tidy the README heading', completionCriteria: ['the stage reports done'] },
+      { title: 'Second step', objective: 'CPU-DONE: confirm nothing else changed', completionCriteria: ['the stage reports done'] }] })
+    const plannedStatus = await settledJob(planned.id ?? planned.jobId)
+    assert.equal(plannedStatus.status, 'completed', `the planned job completed: ${JSON.stringify(plannedStatus).slice(0, 400)}`)
+    const open = await create({ title: 'CPU decider open-ended', objective: 'CPU-NOSTATUS: look at the parser' })
+    const openStatus = await settledJob(open.id ?? open.jobId)
+    assert.equal(openStatus.status, 'blocked', `the open-ended job stopped for the owner: ${JSON.stringify(openStatus).slice(0, 400)}`)
+    evidence.jobs = { planned: { id: planned.id ?? planned.jobId, status: plannedStatus.status }, open: { id: open.id ?? open.jobId, status: openStatus.status, reason: openStatus.statusReason ?? null }, stubRequests: stubSeen.length, stubRetried: stubSeen.filter(entry => entry.retried).length }
+    const layaOf = record => record.systemOne?.decider?.startsWith('laya:') && !record.systemOne.failed
+    const retry = await journaled('retry', record => record.requester === 'durable-jobs' && layaOf(record), 120000)
+    assert.equal(retry.choice, 'retry', 'the loop guard chose to retry the empty first attempt')
+    const escalated = await journaled('escalate', record => record.requester === 'durable-jobs' && record.choice === 'escalate' && layaOf(record), 120000)
+    const wentOn = await journaled('escalate', record => record.requester === 'durable-jobs' && record.choice === 'continue' && layaOf(record), 120000)
+    const escalateAll = (await ok(owner, 'decisions.list', { kind: 'escalate', since: new Date(Date.now() - 86_400_000).toISOString(), limit: 50 }, scope)).decisions.filter(record => record.requester === 'durable-jobs')
+    // Two completed planned stages (go on, then done) and the open-ended stage (stop for the owner).
+    assert.equal(escalateAll.length, 3, `one escalate decision per completed stage: ${JSON.stringify(escalateAll.map(record => record.choice))}`)
+    evidence.retry = { id: retry.id, choice: retry.choice, decidedBy: retry.decidedBy, laya: retry.systemOne }
+    evidence.escalate = escalateAll.map(record => ({ id: record.id, choice: record.choice, decidedBy: record.decidedBy, laya: record.systemOne }))
+    check(`Durable jobs on the stub: the failed attempt journaled retry (${retry.decidedBy} ${retry.choice} vs Laya ${retry.systemOne.choice}); every completed stage journaled escalate: ${escalateAll.map(record => `${record.choice} vs Laya ${record.systemOne?.choice}`).join(', ')} (${escalated.decidedBy}; ${wentOn.decidedBy})`)
+  }
 
   const listed = await ok(owner, 'decisions.list', { since: new Date(Date.now() - 86_400_000).toISOString(), limit: 50 }, scope)
   evidence.agreement = listed.decider
   assert.ok(Array.isArray(listed.decider) && listed.decider.some(entry => entry.asked > 0), 'decisions.list reports the decider per kind')
-  check(`decisions.list reports the decider per kind: ${listed.decider.filter(entry => entry.asked).map(entry => `${entry.kind} ${entry.agreed}/${entry.cases} (median ${entry.medianMs} ms)`).join(', ')}`)
+  const shadowKinds = NO_GPU ? ['approval', 'retry', 'escalate', 'completion', 'classify'] : ['approval', 'completion', 'classify']
+  const unasked = shadowKinds.filter(kind => !listed.decider.some(entry => entry.kind === kind && entry.asked > 0))
+  assert.deepEqual(unasked, [], `decisions.list shows the decider asked for every kind: ${JSON.stringify(listed.decider)}`)
+  check(`decisions.list reports the decider per kind: ${listed.decider.filter(entry => entry.asked).map(entry => `${entry.kind} asked ${entry.asked}, ${entry.agreed}/${entry.cases} (median ${entry.medianMs} ms)`).join(', ')}`)
 
-  if (RESTORE) {
+  if (RESTORE && !NO_GPU) {
     const restore = await ok(owner, 'tabs.open', { kind: 'agent', provider: 'local', model: RESTORE, title: 'Restore' }, scope)
     const restoreId = restore.resourceId ?? restore.agentSessionId
     await ok(owner, 'agents.submit', { agentSessionId: restoreId, prompt: 'Reply with exactly one word: ready' })
@@ -256,6 +337,7 @@ try {
   // Bounded: a close whose Electron already exited can leave the promise unsettled and hold the smoke lock.
   await Promise.race([app.close().catch(() => undefined), new Promise(done => setTimeout(done, 20_000))])
   await writeFile(join(output, `main-${runLabel}.log`), mainLines.join('\n'))
+  stub.close()
 }
 console.log(JSON.stringify({ ok: !failed, checks: checks.length, evidence }, null, 2))
 process.exit(failed ? 1 : 0)

@@ -3,7 +3,7 @@ import { makeId } from '../../shared/models'
 import type { DurableJob, DurableJobOperation, DurableJobStage } from '../../shared/durable-jobs'
 import { unmetCriteria, mechanicalCompletionCheck } from './completion-check'
 import { visibleContent } from './handoff'
-import type { CompletionCheckPort, HandoffPort, LoopGuardPort, ServerLifecyclePort, StageObservation, StageRuntime, WatchdogPort } from './ports'
+import type { CompletionCheckPort, HandoffPort, LoopGuardPort, ServerLifecyclePort, StageConclusion, StageObservation, StageRuntime, WatchdogPort } from './ports'
 import { StaleEpochError, type DurableJobStore, type StoredJob, type WriteGuard } from './store'
 import type { WorktreeOps } from './worktree'
 
@@ -54,6 +54,8 @@ export interface ControllerOptions {
   serverRetryMs?: number
   /** A job reached a terminal status (the service writes its report). */
   finished?: (jobId: string) => void
+  /** After a completed stage: whether the job went on or stopped for the owner (the escalate shadow). */
+  stageConcluded?: (conclusion: StageConclusion) => void
 }
 
 interface Run {
@@ -398,12 +400,18 @@ export class DurableJobController {
         this.store.saveStage(job.id, guard, completed, { kind: 'stage', message: `Stage ${stage.index + 1} "${stage.title}" completed after ${stage.attempt} attempt(s)`, data: { filesChanged: observation.filesChanged.slice(0, 100), nextAction: decision.handoff.nextAction, promptTokens: observation.report?.context.usedTokens ?? null, peakPromptTokens: observation.report?.timeline.length ? Math.max(...observation.report.timeline.map(round => round.promptTokens)) : null, windowTokens: observation.report?.context.windowTokens ?? null, rounds: observation.report?.rounds ?? null } })
         this.store.count(job.id, guard, { stagesCompleted: 1 })
       })
-      if (allStages.some(candidate => candidate.index > stage.index && candidate.status === 'pending')) return 'continue'
-      if (decision.jobDone || (latest.planned && !decision.nextStage)) return 'continue'
+      // Go on or stop for the owner: the controller's answer, told to observers once it is made.
+      const concluded = (escalated: boolean, detail: string): void => {
+        try { this.options.stageConcluded?.({ job: latest, stage: completed, observation, escalated, detail }) } catch (error) { console.warn('Durable job stage conclusion observer failed', error) }
+      }
+      if (allStages.some(candidate => candidate.index > stage.index && candidate.status === 'pending')) { concluded(false, 'the next planned stage follows'); return 'continue' }
+      if (decision.jobDone || (latest.planned && !decision.nextStage)) { concluded(false, 'the job is done'); return 'continue' }
       if (decision.nextStage) {
         const limit = this.options.maxImplicitStages ?? 40
         if (allStages.length >= limit) {
-          this.block(run, `The job planned ${allStages.length} stages for itself, the most it may without the owner`, decision.handoff.nextAction || 'Review the report so far and resume to allow more stages, or cancel.')
+          const reason = `The job planned ${allStages.length} stages for itself, the most it may without the owner`
+          this.block(run, reason, decision.handoff.nextAction || 'Review the report so far and resume to allow more stages, or cancel.')
+          concluded(true, reason)
           return 'stop'
         }
         // A stage that just declines a disallowed step in its own words (CONTINUE, no files
@@ -414,15 +422,20 @@ export class DurableJobController {
           const priorResults = allStages.filter(candidate => candidate.status === 'completed' && candidate.index < stage.index).slice(-2).map(candidate => candidate.result ?? '')
           const stall = this.options.loopGuard.assess({ job: latest, stage: completed, stages: allStages, observation, error: completed.result ?? '', previousErrors: priorResults })
           if (stall.loop) {
-            this.block(run, `Stage ${stage.index + 1} is not making progress: ${stall.detail}`, decision.handoff.nextAction || `Grant or perform the step yourself (the job never widens its own permissions), then resume the job.`, stall.kind === 'approval' ? 'approval' : 'loop-detected')
+            const reason = `Stage ${stage.index + 1} is not making progress: ${stall.detail}`
+            this.block(run, reason, decision.handoff.nextAction || `Grant or perform the step yourself (the job never widens its own permissions), then resume the job.`, stall.kind === 'approval' ? 'approval' : 'loop-detected')
+            concluded(true, reason)
             return 'stop'
           }
         }
         const index = Math.max(...allStages.map(candidate => candidate.index)) + 1
         this.store.addStage(job.id, guard, { id: makeId('jobstage'), jobId: job.id, index, title: decision.nextStage.title, objective: decision.nextStage.objective, completionCriteria: decision.nextStage.completionCriteria, inputs: decision.nextStage.inputs ?? [], status: 'pending', attempt: 0 })
+        concluded(false, `the stage planned its next step: ${decision.nextStage.objective.slice(0, 300)}`)
         return 'continue'
       }
-      this.block(run, `Stage ${stage.index + 1} finished without saying whether the objective is met or what comes next`, decision.handoff.nextAction || 'Read the last stage result, then resume with a clearer objective or cancel.')
+      const reason = `Stage ${stage.index + 1} finished without saying whether the objective is met or what comes next`
+      this.block(run, reason, decision.handoff.nextAction || 'Read the last stage result, then resume with a clearer objective or cancel.')
+      concluded(true, reason)
       return 'stop'
     }
     // Failed attempt.

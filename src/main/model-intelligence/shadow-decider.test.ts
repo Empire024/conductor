@@ -127,11 +127,29 @@ describe('shadow for the app\'s own decisions', () => {
     const failed = { ...stage, status: 'pending' } as DurableJobStage
     expect(ports.loopGuard.assess({ job, stage: failed, stages: [failed], observation, error: 'tests fail', previousErrors: [] })).toEqual({ loop: false })
     expect(ports.loopGuard.assess({ job, stage: failed, stages: [failed], observation, error: 'tests fail', previousErrors: ['tests fail', 'tests fail'] })).toMatchObject({ loop: true })
+    // The guard's stall check of a completed stage is part of the controller's conclusion, journaled once from there.
     const completed = { ...stage, status: 'completed' } as DurableJobStage
     ports.loopGuard.assess({ job, stage: completed, stages: [completed], observation, error: 'nothing to do', previousErrors: [] })
     await vi.waitFor(async () => { await s.shadowsSettled(); expect(s.store.decisions({ kind: 'retry', since: '2026-09-01T00:00:00Z', limit: 5 })).toHaveLength(2) })
     expect(s.store.decisions({ kind: 'retry', since: '2026-09-01T00:00:00Z', limit: 5 }).map(record => [record.choice, record.systemOne?.choice])).toEqual([['escalate', 'escalate'], ['retry', 'escalate']])
-    expect(s.store.decisions({ kind: 'escalate', since: '2026-09-01T00:00:00Z', limit: 5 }).map(record => [record.choice, record.decidedBy])).toEqual([['continue', 'durable-jobs-loop-guard']])
+    expect(s.store.decisions({ kind: 'escalate', since: '2026-09-01T00:00:00Z', limit: 5 })).toEqual([])
+    s.dispose()
+  })
+  it('journals the controller\'s go-on-or-stop answer after every completed stage as the escalate shadow, through the wrapped ports', async () => {
+    const laya = fakeLaya(() => ({ continue: 0.35, escalate: 0.65 }))
+    const { s } = service(laya.port)
+    const ports = withStageCapture({ handoff: { stagePrompt: () => '', afterStage: () => ({ handoff: {} as never, jobDone: false, result: '' }) } }, () => {}, undefined, conclusion => s.stageConcluded(conclusion))
+    const completed = { ...stage, status: 'completed', result: 'Added parse().' } as DurableJobStage
+    ports.stageConcluded!({ job, stage: completed, observation, escalated: false, detail: 'the next planned stage follows' })
+    ports.stageConcluded!({ job, stage: { ...completed, id: 'st-2', index: 1 }, observation, escalated: true, detail: 'Stage 2 is not making progress: the same permission refusal' })
+    await vi.waitFor(async () => { await s.shadowsSettled(); expect(s.store.decisions({ kind: 'escalate', since: '2026-09-01T00:00:00Z', limit: 5 })).toHaveLength(2) })
+    const records = s.store.decisions({ kind: 'escalate', since: '2026-09-01T00:00:00Z', limit: 5 })
+    expect(records.map(record => [record.choice, record.decidedBy, record.systemOne?.choice])).toEqual([['escalate', 'durable-jobs-controller', 'escalate'], ['continue', 'durable-jobs-controller', 'escalate']])
+    expect(records[0]).toMatchObject({ requester: 'durable-jobs', escalationReason: expect.stringContaining('mode shadow'), systemOne: { decider: 'laya:typed-decisions' } })
+    // The model reads the stage and its result, never the controller's reason.
+    expect(laya.calls[0]!.state).toMatchObject({ stage: 'Write the parser: Add parse() to src/parse.ts', result: 'Added parse().' })
+    expect(JSON.stringify(laya.calls.map(call => call.state))).not.toContain('not making progress')
+    expect(s.deciderAgreement(['escalate'])).toEqual([expect.objectContaining({ kind: 'escalate', asked: 2, cases: 2, agreed: 1 })])
     s.dispose()
   })
   it('journals the category of every dispatched task and the completion of its settled turns', async () => {

@@ -10,7 +10,7 @@ import { localStopOf, type LocalStopReport } from '../../shared/local-stop'
 import type { LocalTelemetryEntry } from '../local-models/agent'
 import { usageWindowAppliesToModel, type AccountLimitWindow, type UsageWindow } from '../../shared/usage-accounting'
 import type { LocalModelRunner } from '../local-assist/contract'
-import type { LoopAssessment, StageResultInput } from '../durable-jobs/ports'
+import type { LoopAssessment, StageConclusion, StageResultInput } from '../durable-jobs/ports'
 import { createApprovalShadow, type ApprovalShadowService } from './approval-shadow'
 import { captureDurableStage } from './capture/durable-job'
 import { captureLocalAgentStop } from './capture/local-agent'
@@ -547,20 +547,30 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
         return captured
       } catch (error) { log('durable stage not captured', error); return null }
     },
-    /** The durable-job loop guard answered: after a failed attempt, retry it or stop for the owner (kind retry); after
-     *  a completed stage that changed nothing, go on or stop for the owner (kind escalate). Shadow only. */
+    /** The durable-job loop guard answered after a failed attempt: retry it or stop for the owner (kind retry).
+     *  Its stall check of a completed stage is part of the controller's answer, journaled by stageConcluded. Shadow only. */
     loopAssessed(input: { job: DurableJob; stage: DurableJobStage; observation: StageResultInput['observation']; error: string; previousErrors: string[] }, verdict: LoopAssessment): void {
+      if (input.stage.status === 'completed') return
       try {
-        const completed = input.stage.status === 'completed', stop = verdict.loop ? 'escalate' : completed ? 'continue' : 'retry'
         shadowDecide({
-          kind: completed ? 'escalate' : 'retry', requester: 'durable-jobs', impact: 'routine',
-          question: completed ? 'The stage finished without changing any file and planned another step. Go on, or stop and ask the owner?' : 'This attempt at the stage failed. Try it again, or stop and ask the owner?',
-          options: completed ? [{ id: 'continue', label: 'go on with the next step' }, { id: 'escalate', label: 'stop the job and ask the owner' }]
-            : [{ id: 'retry', label: 'try the stage again' }, { id: 'escalate', label: 'stop the job and ask the owner' }],
+          kind: 'retry', requester: 'durable-jobs', impact: 'routine', question: 'This attempt at the stage failed. Try it again, or stop and ask the owner?',
+          options: [{ id: 'retry', label: 'try the stage again' }, { id: 'escalate', label: 'stop the job and ask the owner' }],
           state: { ...stageState(input.stage, input.observation), error: clipText(input.error, 600), previousErrors: input.previousErrors.slice(-3).map(error => clipText(error, 300)) },
           projectId: input.job.projectId
-        }, { choice: stop, by: 'durable-jobs-loop-guard', rationale: verdict.loop ? `the loop guard stopped the job: ${verdict.detail}` : 'the loop guard saw no loop' })
+        }, { choice: verdict.loop ? 'escalate' : 'retry', by: 'durable-jobs-loop-guard', rationale: verdict.loop ? `the loop guard stopped the job: ${verdict.detail}` : 'the loop guard saw no loop' })
       } catch (error) { log('loop verdict not shadowed', error) }
+    },
+    /** The durable-job controller answered after a completed stage: go on (next stage, or finish) or stop and ask the
+     *  owner (kind escalate). The state is the stage and its result, never the controller's reason. Shadow only. */
+    stageConcluded(conclusion: StageConclusion): void {
+      try {
+        shadowDecide({
+          kind: 'escalate', requester: 'durable-jobs', impact: 'routine', question: 'The stage finished. Go on with the job, or stop and ask the owner?',
+          options: [{ id: 'continue', label: 'go on: the next stage, or finish the job' }, { id: 'escalate', label: 'stop the job and ask the owner' }],
+          state: { ...stageState(conclusion.stage, conclusion.observation), result: clipText(conclusion.stage.result ?? '', 600) },
+          projectId: conclusion.job.projectId
+        }, { choice: conclusion.escalated ? 'escalate' : 'continue', by: 'durable-jobs-controller', rationale: conclusion.escalated ? `the controller stopped the job for the owner: ${conclusion.detail}` : `the controller went on: ${conclusion.detail}` })
+      } catch (error) { log('stage conclusion not shadowed', error) }
     },
     /** Per kind, how the decision model did (asked, failed, agreement, median time), or null without one. */
     deciderAgreement(kinds: readonly DecisionKind[]): Array<ReturnType<ModelIntelligenceStore['deciderAgreement']>> | null {

@@ -133,6 +133,9 @@ export interface LoopGuardPort {
   /** `error` is this attempt's failure as recorded; `previousErrors` the stage's earlier ones, oldest first. */
   assess(input: { job: DurableJob; stage: DurableJobStage; stages: DurableJobStage[]; observation: StageObservation; error: string; previousErrors: string[] }): LoopAssessment
 }
+/** The controller's answer after a completed stage: go on (the next stage, or finishing the job) or
+ *  stop and ask the owner (`escalated`); `detail` says why. Observation only, told after the answer. */
+export interface StageConclusion { job: DurableJob; stage: DurableJobStage; observation: StageObservation; escalated: boolean; detail: string }
 
 export interface ReportInput {
   job: DurableJob

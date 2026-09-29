@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { CreateDurableJobInput } from '../../shared/durable-jobs'
+import type { StageConclusion } from './ports'
 import { DurableJobsServiceImpl } from './index'
 import { stageSucceeded } from './controller'
 import { DurableJobStore } from './store'
@@ -17,12 +18,12 @@ afterEach(async () => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
-function setup(script: ScriptedOutcome[] = [], options: { worktrees?: FakeWorktrees; store?: DurableJobStore; runtime?: FakeRuntime; ownerId?: string; clock?: () => Date } = {}) {
+function setup(script: ScriptedOutcome[] = [], options: { worktrees?: FakeWorktrees; store?: DurableJobStore; runtime?: FakeRuntime; ownerId?: string; clock?: () => Date; stageConcluded?: (conclusion: StageConclusion) => void } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'durable-controller-')); dirs.push(dir)
   const store = options.store ?? new DurableJobStore(':memory:', options.clock)
   const runtime = options.runtime ?? new FakeRuntime(script)
   const worktrees = options.worktrees ?? new FakeWorktrees()
-  const service = new DurableJobsServiceImpl({ store, runtime, worktrees, logRoot: dir, projectPath: () => dir, ownerId: options.ownerId ?? 'pid:test', sleep: tick, pollMs: 0, interruptGraceMs: 200, ...(options.clock ? { clock: options.clock } : {}) })
+  const service = new DurableJobsServiceImpl({ store, runtime, worktrees, logRoot: dir, projectPath: () => dir, ownerId: options.ownerId ?? 'pid:test', sleep: tick, pollMs: 0, interruptGraceMs: 200, ...(options.clock ? { clock: options.clock } : {}), ...(options.stageConcluded ? { stageConcluded: options.stageConcluded } : {}) })
   services.push(service)
   return { service, store, runtime, worktrees, dir }
 }
@@ -166,6 +167,30 @@ describe('durable job controller', () => {
     const created = await service.create(input())
     await until(() => service.status(created.id).status === 'blocked')
     expect(service.status(created.id).statusReason).toContain('without saying whether the objective is met')
+  })
+
+  it('tells the stage-conclusion observer, after every completed stage, whether the job went on or stopped for the owner', async () => {
+    const answers = (script: ScriptedOutcome[], extra: Partial<CreateDurableJobInput>, settled: 'completed' | 'blocked') => async () => {
+      const seen: Array<[string, boolean, string]> = []
+      const { service } = setup(script, { stageConcluded: conclusion => { seen.push([conclusion.stage.status, conclusion.escalated, conclusion.detail]) } })
+      const created = await service.create(input(extra))
+      await until(() => service.status(created.id).status === settled)
+      return seen
+    }
+    // A planned job: the next planned stage follows, then the job is done.
+    expect(await answers([{ kind: 'answer', text: 'one', filesChanged: ['a.ts'] }, { kind: 'answer', text: 'two', filesChanged: ['b.ts'] }], { stages: planned(2) }, 'completed')())
+      .toEqual([['completed', false, 'the next planned stage follows'], ['completed', false, 'the job is done']])
+    // An open-ended job that keeps declining the same step: two stages go on, the third stops for the owner.
+    const decline = { kind: 'answer' as const, text: 'The sandbox refuses npm install: there is no network access.\nJOB STATUS: CONTINUE: ask the owner to install it' }
+    const stalled = await answers([decline, decline, decline], {}, 'blocked')()
+    expect(stalled.map(([status, escalated]) => [status, escalated])).toEqual([['completed', false], ['completed', false], ['completed', true]])
+    expect(stalled[0]![2]).toBe('the stage planned its next step: ask the owner to install it')
+    expect(stalled[2]![2]).toContain('Stage 3 is not making progress')
+    // A stage that says neither done nor what comes next stops for the owner.
+    expect(await answers([{ kind: 'answer', text: 'I did some things.' }], {}, 'blocked')())
+      .toEqual([['completed', true, 'Stage 1 finished without saying whether the objective is met or what comes next']])
+    // A failed attempt is not a conclusion (the loop guard's retry verdict covers it).
+    expect(await answers([{ kind: 'answer', text: '' }], { budgets: { maxStageAttempts: 1 } }, 'blocked')()).toEqual([])
   })
 
   it('blocks with an approval event when the conversation needs an approval, never answering it', async () => {

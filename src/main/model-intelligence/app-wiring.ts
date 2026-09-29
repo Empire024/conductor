@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import type { AgentProviderInfo } from '../../shared/models'
 import { localStopOf } from '../../shared/local-stop'
 import type { AgentEvent, TimelineItem } from '../../shared/structured-agent'
-import type { HandoffPort, LoopAssessment, LoopGuardPort, StageResultInput } from '../durable-jobs/ports'
+import type { HandoffPort, LoopAssessment, LoopGuardPort, StageConclusion, StageResultInput } from '../durable-jobs/ports'
 import type { LocalModelRunner } from '../local-assist/contract'
 import type { LocalModelConfig } from '../local-models/config'
 import type { ThresholdSettings } from './decision-service'
@@ -128,12 +128,15 @@ export function turnObserver(service: () => ModelIntelligence | undefined, snaps
 
 /** The durable-jobs handoff port with stage capture after afterStage; the job controller sees the
  *  same decision, and capture runs after it on its own, never failing the stage. With `assessed`, the loop
- *  guard's verdicts (retry or stop for the owner) are handed on the same way, after the controller has them. */
+ *  guard's verdicts (retry or stop for the owner) are handed on the same way, after the controller has them; with
+ *  `concluded`, so is the controller's go-on-or-stop answer after each completed stage (stageConcluded). */
 export function withStageCapture<T extends { handoff: HandoffPort; loopGuard?: LoopGuardPort }>(ports: T, settled: (input: StageResultInput) => void,
-  assessed?: (input: Parameters<LoopGuardPort['assess']>[0], verdict: LoopAssessment) => void): T {
+  assessed?: (input: Parameters<LoopGuardPort['assess']>[0], verdict: LoopAssessment) => void,
+  concluded?: (conclusion: StageConclusion) => void): T & { stageConcluded?: (conclusion: StageConclusion) => void } {
   const handoff = ports.handoff, loopGuard = ports.loopGuard
   return {
     ...ports,
+    ...(concluded ? { stageConcluded: (conclusion: StageConclusion) => { queueMicrotask(() => { try { concluded(conclusion) } catch (error) { console.warn('[model-intelligence] stage conclusion capture failed', error) } }) } } : {}),
     ...(loopGuard && assessed ? { loopGuard: {
       assess: input => {
         const verdict = loopGuard.assess(input)

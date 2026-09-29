@@ -2929,7 +2929,7 @@ app.whenReady().then(async () => {
         const result = await llamaHealth(port, apiKey, 4000)
         return { healthy: result.ok, processing: result.ok ? await slotsProcessing(port, apiKey) : false, ...(result.detail ? { detail: result.detail } : {}) }
       }
-    }), input => { modelIntelligence?.stageSettled(input) }, (input, verdict) => { modelIntelligence?.loopAssessed(input, verdict) })
+    }), input => { modelIntelligence?.stageSettled(input) }, (input, verdict) => { modelIntelligence?.loopAssessed(input, verdict) }, conclusion => { modelIntelligence?.stageConcluded(conclusion) })
   })
   control.setDurableJobs(durableJobs)
   if (localMachineReadiness) control.setLocalReadiness(localMachineReadiness)
