@@ -49,8 +49,10 @@ describe('DecisionService validation and thresholds', () => {
     const { service: decisions } = service([])
     expect(decisions.thresholds('route')).toEqual({ mode: 'live', minConfidence: 0.55, minMargin: 0.15, highImpact: 'escalate-when-unsure', frontierOnly: [] })
     expect(decisions.thresholds('approval')).toEqual({ mode: 'shadow', minConfidence: 0.9, minMargin: 0.3, highImpact: 'always-escalate', frontierOnly: ['deny'] })
-    for (const kind of ['retry', 'escalate', 'completion', 'fallback'] as const) expect(decisions.thresholds(kind)).toMatchObject({ mode: 'live', minConfidence: 0.7, minMargin: 0.2 })
-    expect(decisions.thresholds('classify')).toMatchObject({ mode: 'live', minConfidence: 0.5, minMargin: 0 })
+    // The kinds the local decision model answers start in shadow; fallback is the scorer's, live like route.
+    for (const kind of ['retry', 'escalate', 'completion'] as const) expect(decisions.thresholds(kind)).toMatchObject({ mode: 'shadow', minConfidence: 0.7, minMargin: 0.2 })
+    expect(decisions.thresholds('fallback')).toMatchObject({ mode: 'live', minConfidence: 0.7, minMargin: 0.2 })
+    expect(decisions.thresholds('classify')).toMatchObject({ mode: 'shadow', minConfidence: 0.5, minMargin: 0 })
   })
   it('stores validated patches under the settings key, ignores corrupt settings and resets with null', () => {
     const { service: decisions, store } = service([], { [THRESHOLDS_SETTING]: '{"approval":{"mode":"live","minConfidence":7}}' })
@@ -68,14 +70,14 @@ describe('DecisionService escalation', () => {
   it('lets a confident system-one decide in live mode and journals it', async () => {
     const local = fixed('local', 'system-one', { a: 0.9, b: 0.1 }), frontier = fixed('frontier', 'frontier', { b: 1 })
     const { service: decisions, journal } = service([local, frontier])
-    const record = await decisions.decide(request('retry'))
+    const record = await decisions.decide(request('fallback'))
     expect(record).toMatchObject({ choice: 'a', confidence: 0.9, decidedBy: 'local', escalated: false, escalationReason: null, at: '2026-09-28T12:00:00.000Z' })
     expect(frontier.calls).toBe(0)
     expect(journal).toEqual([record])
   })
   it('escalates low confidence and a narrow margin to the frontier, which decides', async () => {
     const { service: decisions } = service([fixed('local', 'system-one', { a: 0.55, b: 0.45 }), fixed('frontier', 'frontier', { b: 1 })])
-    const record = await decisions.decide(request('retry'))
+    const record = await decisions.decide(request('fallback'))
     expect(record).toMatchObject({ choice: 'b', confidence: 1, decidedBy: 'frontier', escalated: true })
     expect(record.escalationReason).toMatch(/confidence 0\.55 < 0\.70; margin 0\.10 < 0\.20/)
     expect(record.verdicts.map(verdict => verdict.decider)).toEqual(['local', 'frontier'])
@@ -106,7 +108,7 @@ describe('DecisionService escalation', () => {
   })
   it('lets the frontier decide when system-one fails, and returns choice null when both fail', async () => {
     const { service: decisions } = service([fixed('local', 'system-one', 'bad JSON'), fixed('frontier', 'frontier', { a: 0.2, b: 0.8 })])
-    expect(await decisions.decide(request('retry'))).toMatchObject({ choice: 'b', escalationReason: 'system-one failed: bad JSON' })
+    expect(await decisions.decide(request('fallback'))).toMatchObject({ choice: 'b', escalationReason: 'system-one failed: bad JSON' })
     const { service: broken, journal } = service([fixed('local', 'system-one', 'timed out'), fixed('frontier', 'frontier', 'reviewer unavailable')])
     const record = await broken.decide(request('retry'))
     expect(record).toMatchObject({ choice: null, confidence: 0, decidedBy: 'none', escalated: true, probabilities: {} })
@@ -150,7 +152,7 @@ describe('DecisionService escalation', () => {
   it('keeps the decision when the journal fails', async () => {
     const failures: unknown[] = []
     const decisions = new DecisionService({ deciders: [fixed('local', 'system-one', { a: 1 })], journal: { record: () => { throw new Error('database is locked') } }, settings: settings(), journalFailed: error => failures.push(error) })
-    expect(await decisions.decide(request('retry'))).toMatchObject({ choice: 'a' })
+    expect(await decisions.decide(request('fallback'))).toMatchObject({ choice: 'a' })
     expect(failures).toHaveLength(1)
   })
 })

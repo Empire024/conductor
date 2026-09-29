@@ -33,6 +33,7 @@ export function explainDecision(record: DecisionRecord): string {
     `Confidence ${record.confidence.toFixed(2)} (margin ${record.margin.toFixed(2)}), decided by ${record.decidedBy}`,
     `Escalated: ${record.escalated ? record.escalationReason ?? 'yes' : record.escalationReason ? `no (${record.escalationReason})` : 'no'}`,
     ...(record.systemOne ? [`System-one: ${record.systemOne.decider} ${record.systemOne.choice === null ? `gave no choice (${short(record.systemOne.failed ?? 'failed')})` : `chose ${labelOf(record.systemOne.choice)} at ${record.systemOne.confidence.toFixed(2)}`}`] : []),
+    ...(record.shadow ? [`Shadow (${record.shadow.decider}, journaled only): ${record.shadow.choice === null ? `no choice (${short(record.shadow.failed ?? 'failed')})` : `${labelOf(record.shadow.choice)} at ${record.shadow.confidence.toFixed(2)}${record.choice !== null ? record.shadow.choice === record.choice ? ', agrees' : ', disagrees' : ''}; ${record.shadow.elapsedMs} ms`}`] : []),
     ...(record.route ? [
       `Selected: ${via(record.route.selected)}`, target('Fallback', record.route.fallback), target('Escalation', record.route.escalation),
       'Reasons:', ...record.route.reasons.map(reason => `- ${reason}`),

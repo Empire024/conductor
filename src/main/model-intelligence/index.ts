@@ -1,22 +1,23 @@
 import type { DatabaseSync } from 'node:sqlite'
 import {
-  modelKeyId, TASK_CATEGORIES, type Decider, type DeciderOutcome, type DecisionRecord, type DecisionRequest, type ExecutionOutcome, type ModelKey, type RegistryRecord,
+  modelKeyId, TASK_CATEGORIES, type Decider, type DeciderOutcome, type DecisionKind, type DecisionRecord, type DecisionRequest, type ExecutionOutcome, type ModelKey, type RegistryRecord,
   type RouteConstraints, type RouteDecision, type RouteDetails, type TaskCategory, type TaskFeatures
 } from '../../shared/model-routing'
 import { makeId } from '../../shared/models'
 import type { SessionPhase, TimelineItem } from '../../shared/structured-agent'
-import type { DurableJob } from '../../shared/durable-jobs'
+import type { DurableJob, DurableJobStage } from '../../shared/durable-jobs'
 import { localStopOf, type LocalStopReport } from '../../shared/local-stop'
 import type { LocalTelemetryEntry } from '../local-models/agent'
 import { usageWindowAppliesToModel, type AccountLimitWindow, type UsageWindow } from '../../shared/usage-accounting'
 import type { LocalModelRunner } from '../local-assist/contract'
-import type { StageResultInput } from '../durable-jobs/ports'
+import type { LoopAssessment, StageResultInput } from '../durable-jobs/ports'
 import { createApprovalShadow, type ApprovalShadowService } from './approval-shadow'
 import { captureDurableStage } from './capture/durable-job'
 import { captureLocalAgentStop } from './capture/local-agent'
 import { captureTurn } from './capture/turn'
 import { categorize } from './categorize'
-import { DecisionService, type ThresholdSettings } from './decision-service'
+import { DecisionService, normaliseProbabilities, topChoice, type ThresholdSettings } from './decision-service'
+import { LAYA_DECIDER_ID } from './deciders/laya'
 import { createFrontierDecider, type FrontierPort } from './deciders/frontier'
 import { createLocalLlmDecider } from './deciders/local-llm'
 import { createScorerDecider, defaultUsageStop, SCORER_TEMPERATURE, softmax } from './deciders/scorer'
@@ -56,6 +57,10 @@ const SETTLED: ReadonlySet<SessionPhase> = new Set(['completed', 'failed', 'inte
 const DURABLE_JOB_ORIGIN = 'durable-job'
 export const CALLER_DECIDER_ID = 'caller'
 export const LOCAL_DECIDER_UNAVAILABLE = 'local decider unavailable: no local model server is running'
+/** Shadow decisions in flight at once; more are skipped (logged once), never queued behind real work. */
+export const SHADOW_PENDING_MAX = 32
+const SHADOW_TEXT_MAX = 1_500
+const clipText = (text: string, max = SHADOW_TEXT_MAX): string => text.length > max ? text.slice(0, max - 1) + '…' : text
 
 /** Model keys routing and evaluation never use: a JSON array of glob patterns (`*`, `?`) on the key
  *  id (`provider/model`), matched case-insensitively. The owner wants no Fable spend. */
@@ -100,6 +105,11 @@ export interface ModelIntelligenceOptions {
   /** Whether a local model server is already running. The local decider only ever uses one that
    *  is; it never starts one. Absent: the decider may start a server as the runner allows. */
   localServerRunning?(): boolean
+  /** The CPU decision model (deciders/laya.ts over local-models/decider-server.ts): the system-one decider for every
+   *  kind the scorer does not decide (it replaces the local-llm decider), and a shadow verdict beside every route. */
+  decider?: Decider | null
+  /** Whether the decision model is set up on this machine; its server starts on the first decision. */
+  deciderAvailable?(): boolean
   /** A one-shot frontier call for non-approval kinds. Without one, route and fallback close calls
    *  go to the caller (CALLER_DECIDER_ID): no model is asked. */
   frontier?: FrontierPort | null
@@ -147,6 +157,14 @@ const defaultTimers = {
 
 export const CLOSE_CANDIDATES_MAX = 3
 
+/** What the decision model reads about a durable-job stage: its objective and criteria, what the attempt said and did. */
+function stageState(stage: DurableJobStage, observation: StageResultInput['observation']): Record<string, unknown> {
+  return {
+    stage: clipText(`${stage.title}: ${stage.objective}`, 600), criteria: stage.completionCriteria.slice(0, 6).map(criterion => clipText(criterion, 200)), attempt: stage.attempt,
+    lastAnswer: clipText(observation.lastAnswer), stop: observation.stop ? `${observation.stop.reason}: ${clipText(observation.stop.detail, 300)}` : null,
+    filesChanged: observation.filesChanged.length, ...(observation.lastError ? { lastError: clipText(observation.lastError, 400) } : {})
+  }
+}
 /** The close set of a route request: at most CLOSE_CANDIDATES_MAX options whose utility is within
  *  `minMargin` of the top utility, best first; `probability` is each one's scorer softmax. */
 export function closeCandidates(request: Pick<DecisionRequest, 'options'>, minMargin: number, rank: (id: string) => number): Array<{ id: string; probability: number; capabilityRank: number; utility: number }> {
@@ -251,7 +269,9 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
     ? { ask: request => localAvailable() ? options.localRunner!.ask({ ...request, noStart: true }) : Promise.resolve({ ok: false, reason: LOCAL_DECIDER_UNAVAILABLE }) } : null
   const rank = (id: string): number => { const key = parseKeyId(id); if (!key) return 0; const record = registry.get(key); return record?.capabilityRank ?? rankOf(key, record?.family ?? null) }
   let decisions: DecisionService
-  const deciders = [createScorerDecider(), ...(localRunner ? [createLocalLlmDecider(localRunner)] : []),
+  const decider = options.decider ?? null
+  const deciderReady = (): boolean => { try { return Boolean(decider) && (options.deciderAvailable?.() ?? true) } catch { return false } }
+  const deciders = [createScorerDecider(), ...(decider ? [decider] : localRunner ? [createLocalLlmDecider(localRunner)] : []),
     ...(options.frontier ? [createFrontierDecider(options.frontier, { kinds: ['route', 'retry', 'escalate', 'completion', 'fallback', 'classify'] })] : [callerFrontier(() => decisions.thresholds('route').minMargin, rank)])]
   decisions = new DecisionService({
     deciders, settings: options.settings, now: clock,
@@ -314,7 +334,41 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
   }
 
   const liveBoundaries = createLiveBoundaries({ store, decisions, settings: options.settings, now: clock, log })
-  const shadow: ApprovalShadowService = createApprovalShadow({ decisions, store, recordOutcome, log, now: clock, localAvailable: () => Boolean(localRunner) && localAvailable(), boundaries: liveBoundaries })
+  const shadow: ApprovalShadowService = createApprovalShadow({ decisions, store, recordOutcome, log, now: clock, localAvailable: () => decider ? deciderReady() : Boolean(localRunner) && localAvailable(), boundaries: liveBoundaries })
+
+  /** Shadow decisions run after the real one, in the background, at most SHADOW_PENDING_MAX at a time; a failure
+   *  is logged and journaled as the verdict's failure, never raised into the caller. */
+  const pendingShadows = new Set<Promise<unknown>>()
+  let shadowsDropped = 0
+  const inBackground = (what: string, work: () => Promise<unknown>): void => {
+    if (!deciderReady()) return
+    if (pendingShadows.size >= SHADOW_PENDING_MAX) { if (!shadowsDropped++) log(`shadow ${what} skipped: ${SHADOW_PENDING_MAX} shadow decisions are still running`); return }
+    const running: Promise<unknown> = Promise.resolve().then(work).catch(error => log(`shadow ${what} failed`, error)).finally(() => { pendingShadows.delete(running) })
+    pendingShadows.add(running)
+  }
+  /** The decision model's verdict on a decision already made and journaled (a route): stored beside it. */
+  const shadowVerdict = (decisionId: string): void => inBackground('route verdict', async () => {
+    const record = store.decision(decisionId)
+    if (!record || !decider?.supports(record.kind)) return
+    const started = clock().getTime(), ids = record.options.map(option => option.id)
+    const request: DecisionRequest = { kind: record.kind, question: record.question, options: record.options, state: record.state, impact: 'routine', requester: record.requester }
+    let outcome: DeciderOutcome
+    try { outcome = await decider.decide(request) } catch (error) { outcome = { ok: false, decider: decider.id, reason: error instanceof Error ? error.message : String(error) } }
+    const probabilities = outcome.ok ? normaliseProbabilities(outcome.verdict.probabilities, ids) : null
+    const at = clock().toISOString()
+    if (outcome.ok && probabilities) {
+      const top = topChoice(probabilities, ids)
+      store.recordShadowVerdict(decisionId, { decider: outcome.verdict.decider, choice: top.choice, confidence: top.confidence, probabilities, elapsedMs: outcome.verdict.elapsedMs, at })
+    } else store.recordShadowVerdict(decisionId, { decider: outcome.ok ? outcome.verdict.decider : outcome.decider, choice: null, confidence: 0, probabilities: {}, elapsedMs: clock().getTime() - started, at, failed: outcome.ok ? 'no probability for any option' : outcome.reason })
+  })
+  /** A decision the app made its own way (the durable-job controller, the dispatch classifier, a settled turn), journaled
+   *  with the decision model's verdict as system-one and the app's choice as the frontier verdict: shadow only. */
+  const shadowDecide = (request: DecisionRequest, actual: { choice: string; by: string; rationale: string }): void => {
+    if (!request.options.some(option => option.id === actual.choice)) { log(`shadow ${request.kind}: the actual choice ${actual.choice} is not an option`); return }
+    const made: Decider = { id: actual.by, tier: 'frontier', supports: () => true,
+      decide: async () => ({ ok: true, verdict: { decider: actual.by, probabilities: Object.fromEntries(request.options.map(option => [option.id, option.id === actual.choice ? 1 : 0])), rationale: actual.rationale.slice(0, 600), tokens: null, elapsedMs: 0 } }) }
+    inBackground(request.kind, () => decisions.decide(request, { frontier: made, mode: 'shadow' }))
+  }
 
   /** The weekly stops, defaults overlaid with the setting's valid percents; an unreadable setting keeps the defaults. */
   const weeklyStops = (): Record<string, number> => {
@@ -424,6 +478,8 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
         ? closeCandidates({ options: record.options }, decisions.thresholds('route').minMargin, rank).map(({ utility: _utility, ...entry }) => entry) : undefined
       const details: RouteDetails = { selected: decision.selected, fallback: decision.fallback, escalation: decision.escalation, reasons: decision.reasons, ...(close?.length ? { closeCandidates: close } : {}) }
       try { store.recordRouteDetails(decision.decisionId, details) } catch (error) { log('route details not stored', error) }
+      // The decision model's verdict is asked only now, after the route stands, and journaled beside it.
+      shadowVerdict(decision.decisionId)
       return { decision, explanation: explainRoute(decision) }
     },
     /** One open attempt of a routed dispatch (the choice, then its fallback), journaled with the decision. */
@@ -436,6 +492,13 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
      *  also after a restart (the store keeps BINDINGS_MAX bindings for BINDING_TTL_DAYS). */
     bindDispatch(agentSessionId: string, binding: Omit<DispatchBinding, 'at'>): void {
       try { store.saveBinding(agentSessionId, { ...binding, key: registryKey(binding.key), at: clock().getTime() }) } catch (error) { log('dispatch binding not stored', error) }
+      // The task's category as dispatch labelled it (the caller's, else categorize()), with the decision model's beside it.
+      const summary = binding.features?.summary
+      if (summary) shadowDecide({
+        kind: 'classify', requester: 'dispatch', impact: 'routine', question: 'Which kind of work is this task?',
+        options: TASK_CATEGORIES.map(category => ({ id: category, label: category.replace(/-/g, ' ') })),
+        state: { task: clipText(summary) }, projectId: binding.projectId, agentSessionId
+      }, { choice: binding.features.category, by: 'dispatch-features', rationale: `router.dispatch labelled the task ${binding.features.category} (complexity ${binding.features.complexity}, risk ${binding.features.risk})` })
     },
     binding(agentSessionId: string): DispatchBinding | undefined {
       try { return store.binding(agentSessionId) ?? undefined } catch { return undefined }
@@ -451,10 +514,21 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
         if (!turnId) return null
         // A local turn that reported its stop is captured from that report (localTurnStopped), once.
         if (items.some(item => item.turnId === turnId && localStopOf(item.data))) return null
-        return recordOutcome(captureTurn({
+        const captured = recordOutcome(captureTurn({
           agentSessionId: event.agentSessionId, projectId: binding.projectId, turnId, ...(event.runtimeId ? { runtimeId: event.runtimeId } : {}), phase: event.phase, items,
           provider: binding.key.provider, model: binding.key.model, effort: binding.effort, features: binding.features, decisionId: binding.decisionId, ...(event.limited ? { limited: true } : {})
         }))
+        // Did the dispatched worker finish? The turn's own ending is the decision made; the model reads only the words.
+        if (captured && captured.result !== 'cancelled') {
+          const answer = [...items].reverse().find(item => item.turnId === turnId && !item.parentId && item.data.type === 'text' && item.data.role === 'assistant')
+          shadowDecide({
+            kind: 'completion', requester: 'turn-capture', impact: 'routine', question: 'Did the worker finish the task it was given?',
+            options: [{ id: 'finished', label: 'finished the task' }, { id: 'unfinished', label: 'did not finish: it failed, stopped early or left work open' }],
+            state: { task: clipText(binding.features.summary ?? binding.features.category, 400), lastAnswer: answer && answer.data.type === 'text' ? clipText(answer.data.text) : '', toolFailures: captured.toolFailures ?? 0, retries: captured.retries ?? 0 },
+            projectId: binding.projectId, agentSessionId: event.agentSessionId
+          }, { choice: event.phase === 'completed' ? 'finished' : 'unfinished', by: 'turn-phase', rationale: `the turn settled ${event.phase} (${captured.result})` })
+        }
+        return captured
       } catch (error) { log('turn not captured', error); return null }
     },
     /** A durable-job stage settled (the handoff port's afterStage); deltas are exact from the second stage on. */
@@ -463,9 +537,39 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
         const before = countersBefore.get(input.job.id)
         countersBefore.set(input.job.id, { ...input.job.counters })
         if (countersBefore.size > 1_000) countersBefore.delete(countersBefore.keys().next().value!)
-        return recordOutcome(captureDurableStage({ job: input.job, stage: input.stage, observation: input.observation, succeeded: input.succeeded, ...(before ? { countersBefore: before } : {}) }))
+        const captured = recordOutcome(captureDurableStage({ job: input.job, stage: input.stage, observation: input.observation, succeeded: input.succeeded, ...(before ? { countersBefore: before } : {}) }))
+        // The controller's own verdict on the stage (its stop report and the checked completion criteria).
+        shadowDecide({
+          kind: 'completion', requester: 'durable-jobs', impact: 'routine', question: 'Did this stage of the job meet its objective?',
+          options: [{ id: 'finished', label: 'the stage met its objective' }, { id: 'unfinished', label: 'the stage did not meet its objective' }],
+          state: stageState(input.stage, input.observation), projectId: input.job.projectId
+        }, { choice: input.succeeded ? 'finished' : 'unfinished', by: 'durable-jobs-controller', rationale: `the controller judged stage ${input.stage.index + 1} ${input.succeeded ? 'completed' : 'not completed'}` })
+        return captured
       } catch (error) { log('durable stage not captured', error); return null }
     },
+    /** The durable-job loop guard answered: after a failed attempt, retry it or stop for the owner (kind retry); after
+     *  a completed stage that changed nothing, go on or stop for the owner (kind escalate). Shadow only. */
+    loopAssessed(input: { job: DurableJob; stage: DurableJobStage; observation: StageResultInput['observation']; error: string; previousErrors: string[] }, verdict: LoopAssessment): void {
+      try {
+        const completed = input.stage.status === 'completed', stop = verdict.loop ? 'escalate' : completed ? 'continue' : 'retry'
+        shadowDecide({
+          kind: completed ? 'escalate' : 'retry', requester: 'durable-jobs', impact: 'routine',
+          question: completed ? 'The stage finished without changing any file and planned another step. Go on, or stop and ask the owner?' : 'This attempt at the stage failed. Try it again, or stop and ask the owner?',
+          options: completed ? [{ id: 'continue', label: 'go on with the next step' }, { id: 'escalate', label: 'stop the job and ask the owner' }]
+            : [{ id: 'retry', label: 'try the stage again' }, { id: 'escalate', label: 'stop the job and ask the owner' }],
+          state: { ...stageState(input.stage, input.observation), error: clipText(input.error, 600), previousErrors: input.previousErrors.slice(-3).map(error => clipText(error, 300)) },
+          projectId: input.job.projectId
+        }, { choice: stop, by: 'durable-jobs-loop-guard', rationale: verdict.loop ? `the loop guard stopped the job: ${verdict.detail}` : 'the loop guard saw no loop' })
+      } catch (error) { log('loop verdict not shadowed', error) }
+    },
+    /** Per kind, how the decision model did (asked, failed, agreement, median time), or null without one. */
+    deciderAgreement(kinds: readonly DecisionKind[]): Array<ReturnType<ModelIntelligenceStore['deciderAgreement']>> | null {
+      if (!decider) return null
+      const since = new Date(clock().getTime() - 90 * DAILY_MS).toISOString()
+      try { return kinds.map(kind => store.deciderAgreement({ kind, decider: LAYA_DECIDER_ID, since })) } catch (error) { log('decider agreement unavailable', error); return null }
+    },
+    /** Settles once every shadow decision started so far has been journaled (tests and smokes). */
+    async shadowsSettled(): Promise<void> { while (pendingShadows.size) await Promise.allSettled([...pendingShadows]) },
     /** A local agent turn stopped (the local adapter's stop notice, LocalStopReport): its outcome from the
      *  report and the turn's failed tool-grammar repairs, read from the projection already in memory. A
      *  dispatched turn keeps its binding's decision and category; any other counts only with a category

@@ -80,7 +80,8 @@ export function createApprovalShadow(deps: {
   recordOutcome(outcome: ExecutionOutcome | null): ExecutionOutcome | null
   log(message: string, error?: unknown): void
   now(): Date
-  /** A local decider exists and a model server is already running; otherwise the shadow only records the skip. */
+  /** A local decider can answer: the CPU decision model is set up (it starts on demand), or the GPU decider's model
+   *  server is already running. Otherwise the shadow only records the skip. */
   localAvailable?(): boolean
   /** Which boundaries are live, and the automatic revert once a decision's final answer is known. */
   boundaries?: Pick<LiveBoundaries, 'isLive' | 'status' | 'check'>
@@ -104,7 +105,7 @@ export function createApprovalShadow(deps: {
   }
   const skip = (): void => {
     // D6: the shadow never loads a model onto the GPU; it notes the skip and does nothing else.
-    if (!skipped || Date.parse(lastSkip ?? '') < deps.now().getTime() - 3_600_000) deps.log('approval shadow: local decider unavailable (no local model server is running); reviews are not shadowed')
+    if (!skipped || Date.parse(lastSkip ?? '') < deps.now().getTime() - 3_600_000) deps.log('approval shadow: local decider unavailable (the CPU decision model is not set up and no local model server is running); reviews are not shadowed')
     skipped++; lastSkip = deps.now().toISOString()
   }
   return {

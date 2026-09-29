@@ -14,6 +14,7 @@ What this computer can carry, so that agents, local models and swarms stay insid
 ## What that means for local models
 
 - One llama.cpp server at a time is the rule. The Qwen 3.5 9B Q4_K_M server holds about 8 GB of the 12 GB VRAM; a second server would spill to system RAM and slow both.
+- The CPU decision model (Laya typed-decisions, docs/model-routing.md "CPU decider") is not a model server in this sense: it runs on 4 CPU threads at BelowNormal priority with about 2 GB of RAM, never touches the GPU and stays up beside the one llama.cpp server.
 - Models that fit comfortably: dense models up to about 9-14B at Q4, and mixture-of-experts models with about 3B active parameters (Qwen 3.6 35B-A3B at Q4 is 19 GB on disk, so it runs mostly from RAM with the KV cache and some layers on the GPU). Anything dense above about 24B at Q4 does not fit the GPU and is slow.
 - Context still costs memory, less than the rule of thumb says: the configured Qwen 3.5 9B keeps a KV cache on 8 of its 32 layers (hybrid attention), about 0.27 GB per 8k tokens and 1.07 GB at the configured 32k; the 35B-A3B about 0.17 GB per 8k (derived from the models' config.json, see docs/local-model-shortlist.md). Prefer prompt-cache reuse over larger windows all the same: a longer prompt is re-evaluated whenever its prefix changes.
 - Downloads are multi-gigabyte; propose the command, do not start one on the owner's behalf.

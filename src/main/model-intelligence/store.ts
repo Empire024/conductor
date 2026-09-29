@@ -5,7 +5,7 @@ import { makeId } from '../../shared/models'
 import {
   modelKeyId, OUTCOME_RETENTION_DAYS,
   type BenchmarkResult, type DecisionKind, type DecisionRecord, type ExecutionOutcome, type FieldObservation, type ModelKey, type ModelStatus,
-  type OutcomeResult, type RegistryChange, type RegistryField, type RegistryRecord, type RegistryValue, type RouteDetails, type SourceKind, type SourceRef, type TaskCategory, type TaskFeatures
+  type OutcomeResult, type RegistryChange, type RegistryField, type RegistryRecord, type RegistryValue, type RouteDetails, type ShadowVerdict, type SourceKind, type SourceRef, type TaskCategory, type TaskFeatures
 } from '../../shared/model-routing'
 import { familyOf } from './registry'
 
@@ -489,6 +489,16 @@ export class ModelIntelligenceStore {
     })
   }
 
+  /** The CPU decider's shadow verdict on a decision already made (routes), kept in the record itself. */
+  recordShadowVerdict(id: string, shadow: ShadowVerdict): DecisionRecord | null {
+    return this.transaction(() => {
+      const row = this.db.prepare('SELECT record_json FROM routing_decisions WHERE id = ?').get(id) as Row | undefined
+      if (!row) return null
+      this.db.prepare('UPDATE routing_decisions SET record_json = ? WHERE id = ?').run(JSON.stringify({ ...json<DecisionRecord>(row.record_json), shadow: { ...shadow, at: iso(shadow.at, 'at') } }), id)
+      return this.decision(id)
+    })
+  }
+
   updateDecisionOutcome(id: string, outcome: NonNullable<DecisionRecord['outcome']> | null): DecisionRecord | null {
     const value = outcome ? { ...outcome, at: iso(outcome.at, 'at') } : null
     const changed = this.db.prepare('UPDATE routing_decisions SET outcome_json = ? WHERE id = ?').run(value ? JSON.stringify(value) : null, id).changes
@@ -536,6 +546,32 @@ export class ModelIntelligenceStore {
       if (systemOne.choice === final) agreed++
     }
     return { kind: query.kind, ...(query.boundary !== undefined ? { boundary: query.boundary } : {}), since: iso(query.since, 'since'), cases, agreed, rate: cases ? agreed / cases : null }
+  }
+
+  /**
+   * How one decider (by id prefix, e.g. `laya`) did on one kind, wherever it was asked: as the system-one or as
+   * the shadow. A case is a verdict with a choice and a final answer that is not its own (the owner's answer, else
+   * the decision the app made); failures and the median answer time are reported beside it. Dry runs are not cases.
+   */
+  deciderAgreement(query: { kind: DecisionKind; decider: string; since: string; limit?: number }): { kind: DecisionKind; decider: string; asked: number; failed: number; cases: number; agreed: number; rate: number | null; medianMs: number | null } {
+    let asked = 0, failed = 0, cases = 0, agreed = 0
+    const times: number[] = []
+    const ours = (decider: string | undefined) => !!decider && (decider === query.decider || decider.startsWith(`${query.decider}:`))
+    for (const record of this.decisions({ kind: query.kind, since: query.since, limit: query.limit ?? 2_000 })) {
+      const systemOne = systemOneOf(record)
+      const verdict = record.shadow && ours(record.shadow.decider) ? { choice: record.shadow.choice, failed: record.shadow.failed, elapsedMs: record.shadow.elapsedMs }
+        : systemOne && ours(systemOne.decider) ? { choice: systemOne.choice, failed: systemOne.failed, elapsedMs: record.verdicts.flatMap(entry => 'failed' in entry || !ours(entry.decider) ? [] : [entry.elapsedMs])[0] } : null
+      if (!verdict) continue
+      asked++
+      if (verdict.failed || !verdict.choice) { failed++; continue }
+      if (typeof verdict.elapsedMs === 'number') times.push(verdict.elapsedMs)
+      const final = record.outcome?.answer ?? (ours(record.decidedBy) ? null : record.choice)
+      if (!final) continue
+      cases++
+      if (verdict.choice === final) agreed++
+    }
+    times.sort((a, b) => a - b)
+    return { kind: query.kind, decider: query.decider, asked, failed, cases, agreed, rate: cases ? agreed / cases : null, medianMs: times.length ? times[Math.floor(times.length / 2)]! : null }
   }
 
   /** One evaluation run's spend, journaled once per run (evaluation.ts recordSpend), so the owner's

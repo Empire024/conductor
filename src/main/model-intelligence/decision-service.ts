@@ -12,12 +12,14 @@ import {
 
 export const THRESHOLDS_SETTING = 'model-routing:thresholds:v1'
 const DECISION_KINDS: DecisionKind[] = ['route', 'approval', 'retry', 'escalate', 'completion', 'fallback', 'classify']
-const routine = (minConfidence: number, minMargin: number): DecisionThresholds => ({ minConfidence, minMargin, highImpact: 'escalate-when-unsure', frontierOnly: [], mode: 'live' })
+const routine = (minConfidence: number, minMargin: number, mode: DecisionThresholds['mode'] = 'live'): DecisionThresholds => ({ minConfidence, minMargin, highImpact: 'escalate-when-unsure', frontierOnly: [], mode })
+/** route and fallback are the scorer's (deterministic, live). The kinds the local decision model answers start in
+ *  shadow: its verdict is journaled beside the decision the app made and goes live only through decisions.live. */
 export const DEFAULT_THRESHOLDS: Readonly<Record<DecisionKind, DecisionThresholds>> = {
   route: routine(0.55, 0.15),
   approval: { minConfidence: 0.9, minMargin: 0.3, highImpact: 'always-escalate', frontierOnly: ['deny'], mode: 'shadow' },
-  retry: routine(0.7, 0.2), escalate: routine(0.7, 0.2), completion: routine(0.7, 0.2), fallback: routine(0.7, 0.2),
-  classify: routine(0.5, 0),
+  retry: routine(0.7, 0.2, 'shadow'), escalate: routine(0.7, 0.2, 'shadow'), completion: routine(0.7, 0.2, 'shadow'), fallback: routine(0.7, 0.2),
+  classify: routine(0.5, 0, 'shadow'),
 }
 
 export interface ThresholdSettings { getSetting(key: string): string | null; setSetting(key: string, value: string): void }

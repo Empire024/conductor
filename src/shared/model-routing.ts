@@ -273,6 +273,9 @@ export interface DecisionRecord {
   outcome: { result: OutcomeResult; at: string; detail?: string; /** The owner's chosen option id, when the owner answered. */ answer?: string } | null
   /** The system-one verdict (the local one in shadow), null when there was none. Old records derive it from verdicts[0]. */
   systemOne?: { decider: string; choice: string | null; confidence: number; failed?: string } | null
+  /** The CPU decision model's verdict, asked after the decision was made and journaled beside it (shadow
+   *  only: it never changed or delayed the decision). Set on decisions whose system-one is another decider (routes). */
+  shadow?: ShadowVerdict
   projectId: string | null
   agentSessionId: string | null
   /** Route decisions: what the router made of the choice, stored with it (decisions.get). */
@@ -280,6 +283,8 @@ export interface DecisionRecord {
   /** A models.route dry run: journaled, but left out of decisions.list by default. */
   dryRun?: boolean
 }
+
+export interface ShadowVerdict { decider: string; choice: string | null; confidence: number; probabilities: Record<string, number>; elapsedMs: number; at: string; failed?: string }
 
 export interface RouteDetails {
   selected: { key: ModelKey; effort: string | null }

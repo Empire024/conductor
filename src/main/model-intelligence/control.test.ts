@@ -73,8 +73,8 @@ describe('decision go-live control (owner rule: switched by the owner or a wizar
     expect(listed.switches.map(entry => [entry.boundary, entry.live, entry.by, entry.reason])).toEqual([['workspace-write', false, 'wizard-1', 'switched back to shadow'], ['workspace-write', true, 'wizard-1', '96.7% over 30 cases']])
     await expect(f.call('decisions.live', { kind: 'nope', live: true })).rejects.toThrow(/kind must be one of/)
     await expect(f.call('decisions.live', { kind: 'approval', live: 'yes' })).rejects.toThrow(/live must be true or false/)
-    // Another kind is one boundary, switched through its DecisionService mode.
-    expect(await f.call('decisions.live', { kind: 'retry', live: false })).toMatchObject({ boundary: 'all', live: false, previous: true })
+    // Another kind is one boundary, switched through its DecisionService mode (retry starts in shadow).
+    expect(await f.call('decisions.live', { kind: 'retry', live: false })).toMatchObject({ boundary: 'all', live: false, previous: false })
     expect(f.service.decisions.thresholds('retry').mode).toBe('shadow')
   })
   it('reverts a live boundary to shadow by itself, journaled, once its agreement falls below the rule; never flips one live, and leaves default-live kinds alone', async () => {

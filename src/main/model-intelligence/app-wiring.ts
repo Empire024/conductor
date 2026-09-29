@@ -4,10 +4,11 @@ import { join } from 'node:path'
 import type { AgentProviderInfo } from '../../shared/models'
 import { localStopOf } from '../../shared/local-stop'
 import type { AgentEvent, TimelineItem } from '../../shared/structured-agent'
-import type { HandoffPort, StageResultInput } from '../durable-jobs/ports'
+import type { HandoffPort, LoopAssessment, LoopGuardPort, StageResultInput } from '../durable-jobs/ports'
 import type { LocalModelRunner } from '../local-assist/contract'
 import type { LocalModelConfig } from '../local-models/config'
 import type { ThresholdSettings } from './decision-service'
+import { createLayaDecider, type LayaPort } from './deciders/laya'
 import { cloudRunPort, dockerCommandPort, hostCommandPort, localRunPort, type CloudTurn } from './evaluation-ports'
 import { bundledSuites, createModelIntelligence, type ModelIntelligence } from './index'
 import type { ConfiguredLocalModel } from './ingest/configured'
@@ -48,6 +49,8 @@ export interface ModelIntelligenceAppDeps {
   cloudTurn?: CloudTurn
   /** A provider's current weekly usage percent, null when unknown. */
   weeklyUsage(provider: string): number | null
+  /** The CPU decision model's sidecar (local-models/decider-server.ts), null where it is not wired. */
+  decider?: { port: LayaPort; available(): boolean } | null
 }
 
 /** Public benchmark scores the owner keeps beside the app (ingest/benchmarks.ts format); none are
@@ -62,6 +65,9 @@ export async function startModelIntelligence(deps: ModelIntelligenceAppDeps): Pr
   const run = localRunPort(model => ({ ask: async request => (await runnerFor(model)).ask(request) }))
   const service = createModelIntelligence({
     dbPath: deps.dbPath, settings: deps.settings, localRunner: deps.localRunner,
+    // The CPU decision model is system-one for every kind the scorer does not decide, in shadow; routes get its
+    // verdict beside the scorer's. Where it is set up, the GPU local-llm decider is not used.
+    ...(deps.decider ? { decider: createLayaDecider(deps.decider.port), deciderAvailable: () => deps.decider!.available() } : {}),
     // The decider only uses a server that is already up; the shadow never loads a model (D6).
     localServerRunning: () => deps.runningLocalModels().length > 0,
     sources: {
@@ -121,11 +127,20 @@ export function turnObserver(service: () => ModelIntelligence | undefined, snaps
 }
 
 /** The durable-jobs handoff port with stage capture after afterStage; the job controller sees the
- *  same decision, and capture runs after it on its own, never failing the stage. */
-export function withStageCapture<T extends { handoff: HandoffPort }>(ports: T, settled: (input: StageResultInput) => void): T {
-  const handoff = ports.handoff
+ *  same decision, and capture runs after it on its own, never failing the stage. With `assessed`, the loop
+ *  guard's verdicts (retry or stop for the owner) are handed on the same way, after the controller has them. */
+export function withStageCapture<T extends { handoff: HandoffPort; loopGuard?: LoopGuardPort }>(ports: T, settled: (input: StageResultInput) => void,
+  assessed?: (input: Parameters<LoopGuardPort['assess']>[0], verdict: LoopAssessment) => void): T {
+  const handoff = ports.handoff, loopGuard = ports.loopGuard
   return {
     ...ports,
+    ...(loopGuard && assessed ? { loopGuard: {
+      assess: input => {
+        const verdict = loopGuard.assess(input)
+        queueMicrotask(() => { try { assessed(input, verdict) } catch (error) { console.warn('[model-intelligence] loop verdict capture failed', error) } })
+        return verdict
+      }
+    } satisfies LoopGuardPort } : {}),
     handoff: {
       stagePrompt: input => handoff.stagePrompt(input),
       afterStage: input => {
