@@ -198,24 +198,38 @@ says to inspect the native denial, rule matching and effective settings before d
     also hand the rule to every other Claude tab of that project and outlive the grant, which the
     boundary above rules out. The SDK-style answer (`canUseTool` with `updatedPermissions`) does not
     apply either: a classifier refusal in Auto leaves no pending permission request to answer.
-  - Whether a matching allow rule then also beats the classifier in Auto was not settled by a clean
-    A/B. The classifier would not refuse on demand. One observation leans yes: this Conductor tab's
-    own approved call, a simple `node … | tail` pipeline, ran mid-turn before its "retry it now"
-    turn arrived. But its whole-command rule did not match (see the first point), so the classifier
-    let it through in context, and that observation says nothing about rule precedence.
+- **Precedence, settled (2026-09-29, claude 2.1.282): a matching allow rule decides before the
+  classifier is consulted.** `scripts/probe-classifier-precedence.mjs` (headless, harmless commands)
+  reads the CLI's own `permissionDecisionMs`:
+  - With the exact rule, the decision took 4–13 ms, from `--settings` or live through
+    `apply_flag_settings`, including a `… < file 2>&1 | tail` pipeline with the rule set
+    `nativeGrantRules` builds.
+  - Without it, 848–1481 ms: the classifier round-trip.
+  - The binary agrees. The Auto path returns at once when rule evaluation says `allow`, and the
+    classifier runs only on `ask`. The Auto allow list keeps `flagSettings` and `session` rules.
+  - Exceptions, all CLI-side:
+    - interpreter or wildcard rules are dropped (Conductor never makes them);
+    - `autoMode.classifyAllShell: true` in user, flag or policy settings drops every Bash rule;
+    - a compound command with any part allowed only by the read-only allowlist is held for the
+      server classifier. Conductor therefore adds a rule for every `|` part, read-only ones too.
+  - The `serverClassifierRequest` id cited in the haftheme evidence above is on every assistant
+    message in Auto, rule-allowed calls included. It does not show that the classifier judged a
+    call.
+  - Evidence: `docs/verification/2026-09-29-approvals-residual.md`.
 
 ## UNCONFIRMED
 
-- **Precedence, what is still open:** whether an allow rule that does match (see Rule matching)
-  is honoured before the Auto classifier judges the call. The haftheme case never had a matching
-  rule, so it does not answer this. A clean A/B needs a call the classifier refuses reliably in a
-  fresh context, and none was found. Conductor still detects a grant that does not take effect
-  (`ineffective`) and still delivers the approval as a user turn of its own.
+- **Precedence in later CLI versions:** the behaviour above is claude 2.1.282's. Rerun
+  `CONDUCTOR_REAL_CLAUDE=1 node scripts/probe-classifier-precedence.mjs` after a CLI upgrade.
+  Conductor still detects a grant that does not take effect (`ineffective`), and still delivers the
+  approval as a user turn of its own, which the classifier sees as the owner's consent when no rule
+  decides.
 - Whether the classifier also judges `conductor` MCP tool calls (`send_message` and the rest), and
   with which reasons. A message is no longer a `curl` command line, which removes the shape that
   was refused as `[Auto-Mode Bypass]`. The topic of a message may still be judged.
 - **Not built:** a per-project "Edit inside this project's folders" setting. It only makes sense
-  once precedence is confirmed; until then a standing rule might not work, and Edit mode already
+  once precedence is confirmed (it now is, for exact rules in 2.1.282; a folder-wide rule is a
+  broader question for the owner), and Edit mode already
   gives the owner that choice per conversation.
 
 ## For the haftheme controller

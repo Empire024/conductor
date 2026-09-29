@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { autoModeDenialMessage, autoModeDenialOf, autoModeDenialPayload, autoModeDenialSummary, parseAutoModeDenialReason } from './auto-mode-denial'
+import { autoModeDenialMessage, autoModeDenialOf, autoModeDenialPayload, autoModeDenialSummary, hookDenialReason, isClassifierOutage, parseAutoModeDenialReason } from './auto-mode-denial'
 
 // The exact wording claude 2.1.280 puts in the tool_result of a tool its auto-mode classifier refused.
 const denied = (reason: string): string => `Permission for this action was denied by the Claude Code auto mode classifier. Reason: [${reason}]. If you have other tasks that don't depend on this action, continue working on those. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish this goal, e.g. using head instead of cat.`
@@ -16,6 +16,14 @@ describe('claude auto-mode classifier denial text', () => {
     expect(parseAutoModeDenialReason('Permission for this action has been denied. Reason: the user rejected it')).toBeUndefined()
     expect(parseAutoModeDenialReason('Error: ENOENT: no such file or directory')).toBeUndefined()
     expect(parseAutoModeDenialReason('')).toBeUndefined()
+  })
+
+  it('treats the server-side verdict without a category as a refusal, not a classifier outage', () => {
+    // claude 2.1.282, 2026-09-28 (haftheme) and 2026-09-29 (docs/verification/2026-09-29-approvals-residual.md).
+    const reason = 'The server-side auto mode classifier judged this action dangerous (it gave no explanation)'
+    expect(parseAutoModeDenialReason(`Permission for this action was denied by the Claude Code auto mode classifier. Reason: ${reason}. If you have other tasks that don't depend on this action, continue working on those.`)).toBe(reason)
+    expect(hookDenialReason(reason)).toBe(reason)
+    expect(isClassifierOutage(reason)).toBe(false)
   })
 
   it('round-trips the notice payload and words the message so the owner blames the right decider', () => {

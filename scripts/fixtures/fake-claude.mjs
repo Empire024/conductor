@@ -83,8 +83,15 @@ const classifierCalls = {
   OTHER: () => ({ tool: 'Bash', input: { command: "ssh -o BatchMode=yes -o ConnectTimeout=3 root@192.0.2.10 'lswsctrl restart'" } }),
   LOCAL: () => ({ tool: 'Write', input: { file_path: resolve('notes/todo.md'), content: '- tidy the README\n' }, local: true }),
   // The live call of 2026-09-28, with a documentation address: a read-only check over ssh.
-  PROBE: () => ({ tool: 'Bash', input: { command: "ssh -o BatchMode=yes root@192.0.2.20 'bash -s -- --check' < prod/fix-pool.sh 2>&1 | tail -40" } })
+  PROBE: () => ({ tool: 'Bash', input: { command: "ssh -o BatchMode=yes root@192.0.2.20 'bash -s -- --check' < prod/fix-pool.sh 2>&1 | tail -40" } }),
+  // REPLAY: the 2026-09-28 refusal as claude 2.1.282 streamed it (haftheme-denial-2026-09-28.json):
+  // its exact command shape (cd … && ssh … < file | tail) and input fields, the system/permission_denied
+  // message before the PermissionDenied hook, and the recorded tool_result. REPLAYFIX: the same stream
+  // for the command without the cd, the form a card can grant.
+  REPLAY: () => ({ tool: 'Bash', input: { command: replayDenial.replayCommand.replace('{project}', posixPath(process.cwd())), ...replayDenial.toolInput }, replay: true }),
+  REPLAYFIX: () => ({ tool: 'Bash', input: { command: replayDenial.correctedCommand, ...replayDenial.toolInput }, replay: true })
 }
+const replayDenial = JSON.parse(readFileSync(new URL('./haftheme-denial-2026-09-28.json', import.meta.url), 'utf8'))
 const escapeRule = content => content.replaceAll('\\', '\\\\').replaceAll('(', '\\(').replaceAll(')', '\\)')
 const posixPath = path => { const drive = /^([A-Za-z]):[/\\]/.exec(path); return drive ? '/' + drive[1].toLowerCase() + path.slice(2).replaceAll('\\', '/') : path.replaceAll('\\', '/') }
 const ruleFor = call => call.tool === 'Write' ? `Edit(${escapeRule('/' + posixPath(call.input.file_path))})` : `${call.tool}(${escapeRule(call.input.command)})`
@@ -100,9 +107,10 @@ const classify = (call, busy = false) => {
   declare(id, call.tool, call.input)
   if (call.local || flagAllow.has(ruleFor(call)) && (!approvalTurnClassifier || approvalTurn?.includes(ruleFor(call)))) { pending = `${id}-pre`; hook(pending, 'conductor_before', id, call.tool, call.input); return }
   lastRefused = call
+  const denial = call.replay ? replayDenial : recordedDenial
   const refuse = () => {
-    result(id, recordedDenial.toolResult, true)
-    text(`SYNTHETIC classifier refused ${call.tool} (${recordedDenial.reason}); nothing ran.`)
+    result(id, denial.toolResult, true)
+    text(`SYNTHETIC classifier refused ${call.tool} (${denial.reason}); nothing ran.`)
     pending = undefined; classified = undefined
     const end = () => { busyTurn = undefined; emit({ type: 'result', subtype: 'success', is_error: false, usage: {}, permission_denials: [{ tool_name: call.tool, tool_input: call.input, tool_use_id: id }] }) }
     if (!busy) { end(); return }
@@ -110,10 +118,12 @@ const classify = (call, busy = false) => {
     busyTurn = setTimeout(() => { steeringTimers.delete(busyTurn); end() }, Number(process.env.CONDUCTOR_TEST_BUSY_MS ?? 6000))
     steeringTimers.add(busyTurn)
   }
+  if (call.replay) emit({ ...replayDenial.system, tool_name: call.tool, tool_use_id: id, message: replayDenial.toolResult })
   if (!deniedHookRegistered) { refuse(); return }
   pending = `${id}-denied`
   classified.refuse = refuse
-  send({ type: 'control_request', request_id: pending, request: { subtype: 'hook_callback', callback_id: 'conductor_denied', tool_use_id: id, input: { hook_event_name: 'PermissionDenied', tool_use_id: id, tool_name: call.tool, tool_input: call.input, reason: recordedDenial.reason } } })
+  const common = call.replay ? { session_id: nativeSessionId, transcript_path: resolve('synthetic-transcript.jsonl'), cwd: process.cwd(), permission_mode: permissionMode } : {}
+  send({ type: 'control_request', request_id: pending, request: { subtype: 'hook_callback', callback_id: 'conductor_denied', tool_use_id: id, input: { ...common, hook_event_name: 'PermissionDenied', tool_use_id: id, tool_name: call.tool, tool_input: call.input, reason: denial.reason } } })
 }
 
 // One turn that writes where a real agent writes: a memory file under the owner's profile, a
@@ -255,7 +265,7 @@ for await (const line of input) {
       text(`SYNTHETIC: planned ${planned}; nothing tried yet.`); finish(); continue
     }
     if (prompt.startsWith('SYNTHETIC CLASSIFIER ')) {
-      const [, busy, scenario] = /^SYNTHETIC CLASSIFIER (BUSY )?(WRITE|OTHER|LOCAL|PROBE|RETRY)\b/.exec(prompt) ?? []
+      const [, busy, scenario] = /^SYNTHETIC CLASSIFIER (BUSY )?(WRITE|OTHER|LOCAL|PROBE|REPLAYFIX|REPLAY|RETRY)\b/.exec(prompt) ?? []
       if (!scenario) throw new Error('Unknown synthetic classifier scenario')
       if (scenario === 'RETRY' && !lastRefused) throw new Error('Synthetic fixture has no refused call to retry')
       emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263', permissionMode })
