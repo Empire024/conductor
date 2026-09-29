@@ -5,7 +5,8 @@ import { handedOffIn } from '../shared/workspace-clarity'
 /**
  * The main-process half of waiting for results (src/shared/awaiting-results.ts): the durable
  * record per waiting conversation, and whether it is waiting right now. AgentControl declares and
- * cancels; every status change of a waiting conversation consumes its new arrivals (index.ts);
+ * cancels; a delivered message from another conversation, and every status change of a waiting
+ * conversation, consumes its new arrivals (index.ts);
  * workspace clarity, the finished-tab sweep, the coworker auto-close sweep and the tab archiver
  * read fact() so a waiting tab stays in the active group and is never closed on a timer.
  */
@@ -22,8 +23,6 @@ export interface AwaitingResultsDependencies extends AwaitedLookup {
   snapshot(id: string): SessionProjection | null
   /** The durable event journal, `from` <= sequence < `to` (StructuredStore.journalRange). */
   journal?(id: string, from: number, to: number, limit: number): AgentEvent[]
-  /** Its oldest retained sequence (StructuredStore.journalFloor). */
-  journalFloor?(id: string): number | null
   /** Its work was taken over (agents.supersede, a successor): no longer waiting on its own account. */
   superseded?(id: string): boolean
   now?(): number
@@ -79,28 +78,36 @@ export class AwaitingResults {
     if (!record) return null
     const state = this.deps.snapshot(waiter)
     if (!state) return record
-    const arrived = new Set<string>()
-    let through = record.sinceSequence
-    if (this.deps.journal) {
-      const floor = this.deps.journalFloor?.(waiter) ?? null
-      // Trimmed past the cursor (or never journaled): the projection is all there is to read.
-      if (floor === null || floor > through + 1) arrivedFrom(through, state.items, arrived)
-      for (let page = 0; page < MAX_PAGES && through < state.sequence; page++) {
-        const events = this.deps.journal(waiter, through + 1, state.sequence + 1, PAGE)
-        if (!events.length) { through = state.sequence; break }
-        arrivedFrom(through, events, arrived)
-        through = events[events.length - 1]!.sequence
-        if (events.length < PAGE) { through = state.sequence; break }
-      }
-    } else {
-      arrivedFrom(through, state.items, arrived)
-      through = state.sequence
+    // The projection also holds events staged but not yet written to the journal (the newest ones),
+    // so both are read: the journal for everything durable since the cursor, the projection for
+    // the staged tail and for anything the journal no longer holds.
+    const arrived = arrivedFrom(record.sinceSequence, state.items)
+    let through = record.sinceSequence, exhausted = !this.deps.journal
+    for (let page = 0; this.deps.journal && page < MAX_PAGES && through < state.sequence; page++) {
+      const events = this.deps.journal(waiter, through + 1, state.sequence + 1, PAGE)
+      arrivedFrom(through, events, arrived)
+      if (events.length) through = events[events.length - 1]!.sequence
+      if (events.length < PAGE) { exhausted = true; break }
     }
+    if (through >= state.sequence) exhausted = true
+    // The cursor moves past the journal's end only once the journal was read to its end: then
+    // every later event is in the projection, which was just read. Otherwise it stops at the last
+    // durable event read, and the next consume continues from there.
+    if (exhausted) through = Math.max(through, state.sequence)
     const owed = evaluateAwaiting(record, arrived, this.deps).owed
     if (!owed.length) { this.clear(waiter); return null }
     const next: AwaitingRecord = { ...record, agents: owed, sinceSequence: Math.max(record.sinceSequence, through) }
     if (next.sinceSequence !== record.sinceSequence || owed.length !== record.agents.length) this.save(waiter, next)
     return next
+  }
+
+  /** Journal events as they are broadcast (already durable): a message from another conversation
+   *  consumes its recipient's wait at once, even when it joins a running turn and no status change
+   *  follows. Only user messages with an origin are looked at. */
+  noteEvents(events: ReadonlyArray<{ sessionId: string; data: { type: string; role?: string; origin?: { agentSessionId?: string } } }>): void {
+    const touched = new Set<string>()
+    for (const event of events) if (event.data.type === 'text' && event.data.role === 'user' && event.data.origin?.agentSessionId) touched.add(event.sessionId)
+    for (const waiter of touched) if (this.deps.settings.getSetting(this.key(waiter)) !== null) this.consume(waiter)
   }
 
   /** Whether it is waiting now, and on whom. */

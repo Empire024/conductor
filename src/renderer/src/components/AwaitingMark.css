@@ -1,0 +1,2 @@
+/* A tab waiting for others' results (AwaitingMark.tsx): the same slot as the activity ring. */
+.tab-awaiting { width: 18px; height: 18px; flex: 0 0 18px; display: grid; place-items: center; color: var(--blue); }

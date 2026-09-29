@@ -3,6 +3,7 @@ import type { CSSProperties } from 'react'
 import { WorkspaceTabList, WorkspaceTabToggle } from './WorkspaceTabList'
 import { RemoveProjectDialog } from './RemoveProjectDialog'
 import { ProcessStatusSummary } from './ProcessStatusSummary'
+import { NeedsAttention } from './NeedsAttention'
 import type { TabGroupAction } from '../layout/tab-groups'
 import type { BulkTabAction } from '../layout/tab-selection'
 import type { WorkspaceTabAction } from '../layout/workspace-tab-actions'
@@ -492,6 +493,7 @@ ${project.path} (on ${project.remote!.machineName})` : project.path}
           </div>
         </section>
 
+        <NeedsAttention />
         <ProcessStatusSummary projects={props.projects} onOpen={() => props.onUtilityPanel(props.utilityPanel === 'processes' ? null : 'processes')} />
           </>}
         />

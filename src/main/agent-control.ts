@@ -1334,7 +1334,7 @@ export class AgentControl {
     const projectOf = (id: string): string => database.structured.spec<AgentSpec>(id)?.projectId ?? ''
     return this.awaitingLedger ??= new AwaitingResults({
       settings: database, snapshot: id => database.structured.snapshot(id),
-      journal: (id, from, to, limit) => database.structured.journalRange(id, from, to, limit), journalFloor: id => database.structured.journalFloor(id),
+      journal: (id, from, to, limit) => database.structured.journalRange(id, from, to, limit),
       open: id => this.describeTarget({ agentSessionId: id })?.title,
       successors: id => this.successorsOf(projectOf(id), id),
       superseded: id => Boolean(this.recovery().status(projectOf(id), id).superseded)
@@ -1345,6 +1345,12 @@ export class AgentControl {
    *  answered dependency is recorded durably before the bounded projection can drop the reply. */
   noteAwaitingStatus(agentSessionId: string): void {
     try { if (this.awaiting().record(agentSessionId)) this.awaiting().consume(agentSessionId) } catch (error) { console.warn('Waiting-for-results consume failed', error) }
+  }
+
+  /** Journal events as they are broadcast (index.ts): a message from another conversation
+   *  consumes its recipient's wait at once, even when it joins a running turn. */
+  noteAwaitingEvents(events: Parameters<AwaitingResults['noteEvents']>[0]): void {
+    try { this.awaiting().noteEvents(events) } catch (error) { console.warn('Waiting-for-results consume failed', error) }
   }
 
   /** Whom this conversation waits for right now, for workspace clarity; undefined when nobody. */

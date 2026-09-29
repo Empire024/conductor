@@ -85,6 +85,11 @@ const rowIs = async (view, tabId, expected, label) => poll(async () => {
   const row = await rowOf(view, tabId)
   return row && Object.entries(expected).every(([key, value]) => value instanceof RegExp ? value.test(row[key]) : row[key] === value) ? row : null
 }, { timeoutMs: 30_000, label })
+/** The tab strip chip: an hourglass (AwaitingMark) instead of the completed-turn ring while it waits. */
+const chipOf = (view, tabId) => view.evaluate(tabId => {
+  const chip = document.querySelector(`.pane-tab[data-control-tab-id="${tabId}"]`)
+  return chip ? { status: chip.getAttribute('data-clarity-status'), hourglass: Boolean(chip.querySelector('.tab-awaiting')), ring: Boolean(chip.querySelector('.tab-activity')), title: chip.querySelector('.tab-awaiting')?.getAttribute('title') ?? '' } : null
+}, tabId)
 const factsOf = (view, id) => view.evaluate(async id => (await window.conductor.workspaceClarity.facts([id]))[id], id)
 
 try {
@@ -120,7 +125,10 @@ try {
   const plainRow = await rowIs(view, plain.id, { group: 'done' }, 'plain task in Done')
   const oldRow = await rowIs(view, old.id, { group: 'done' }, 'superseded reviewer in Done')
   assert.match(waiting.tooltip, /Waiting for results from Fixer .*fix commits and evidence/)
-  record('W1', 'PASS', {}, `reviewer ${JSON.stringify(waiting)}; plain ${JSON.stringify(plainRow)}; superseded ${JSON.stringify(oldRow)}; ${await shot('w1-waiting-before-restart')}`)
+  const chip = await poll(async () => { const found = await chipOf(view, reviewer.id); return found?.hourglass ? found : null }, { timeoutMs: 20_000, label: 'the strip chip shows the hourglass' })
+  assert.equal(chip.ring, false, 'no completed-turn ring on a waiting tab: ' + JSON.stringify(chip))
+  assert.match(chip.title, /Waiting for results from Fixer/)
+  record('W1', 'PASS', {}, `reviewer ${JSON.stringify(waiting)}; strip chip ${JSON.stringify(chip)}; plain ${JSON.stringify(plainRow)}; superseded ${JSON.stringify(oldRow)}; ${await shot('w1-waiting-before-restart')}`)
 
   // ------------------------------------------------------------------ W2
   step("W2 the owner's app.restart keeps the wait")
@@ -168,6 +176,8 @@ try {
   assert.equal(second.delivery, 'started', JSON.stringify(second))
   await settled(reviewer.resourceId, 'reviewer finishing the review')
   const done = await rowIs(view, reviewer.id, { group: 'done', status: 'done' }, 'reviewer in Done after its review completes')
+  const doneChip = await chipOf(view, reviewer.id)
+  assert.ok(!doneChip || !doneChip.hourglass, 'no hourglass once the review completed: ' + JSON.stringify(doneChip))
   assert.equal((await factsOf(view, reviewer.resourceId)).awaiting, undefined)
   record('W4', 'PASS', { turnsBefore: before, turnsAfter: await turns() }, `first fix started a reviewer turn (delivery started), it waited again, the second fix completed it: ${JSON.stringify(done)}; ${await shot('w4-reviewer-done')}`)
 

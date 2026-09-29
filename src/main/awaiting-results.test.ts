@@ -23,18 +23,24 @@ function harness(settings = new Map<string, string>()) {
     settings: { getSetting: key => settings.get(key) ?? null, setSetting: (key, value) => { settings.set(key, value) }, removeSetting: key => { settings.delete(key) } },
     snapshot: id => states.get(id) ?? null,
     journal: (id, from, to, limit) => (journal.get(id) ?? []).filter(event => event.sequence >= from && event.sequence < to && event.sequence >= (floors.get(id) ?? 0)).slice(0, limit),
-    journalFloor: id => { const kept = (journal.get(id) ?? []).filter(event => event.sequence >= (floors.get(id) ?? 0)); return kept[0]?.sequence ?? null },
     open: id => open[id], successors: () => [], superseded: id => superseded.has(id)
   })
-  /** Appends journal events and a projection that holds only the newest window items. */
-  const emit = (id: string, items: TimelineItem[], window = 2000): SessionProjection => {
-    journal.set(id, [...journal.get(id) ?? [], ...items.map(item => ({ sessionId: id, runtimeId: 'r', sequence: item.sequence, timestamp: item.timestamp, itemId: item.id, data: item.data }) as AgentEvent)])
-    const all = (journal.get(id) ?? []).map(event => ({ id: 'i' + event.sequence, runtimeId: 'r', sequence: event.sequence, timestamp: event.timestamp, data: event.data }) as TimelineItem)
+  const staged = new Map<string, TimelineItem[]>()
+  const toEvent = (id: string, item: TimelineItem): AgentEvent => ({ sessionId: id, runtimeId: 'r', sequence: item.sequence, timestamp: item.timestamp, itemId: item.id, data: item.data }) as AgentEvent
+  const project = (id: string, window: number): SessionProjection => {
+    const all = [...(journal.get(id) ?? []).map(event => ({ id: 'i' + event.sequence, runtimeId: 'r', sequence: event.sequence, timestamp: event.timestamp, data: event.data }) as TimelineItem), ...staged.get(id) ?? []]
     const value = state(id, 'completed', all.slice(-window))
     value.sequence = all.at(-1)?.sequence ?? 0
     return value
   }
-  return { settings, state, ledger, open, superseded, emit, floors }
+  /** Appends journal events and a projection that holds only the newest window items. */
+  const emit = (id: string, items: TimelineItem[], window = 2000): SessionProjection => {
+    journal.set(id, [...journal.get(id) ?? [], ...items.map(item => toEvent(id, item))])
+    return project(id, window)
+  }
+  /** Events applied to the projection but not written to the journal yet (StructuredStore.stage). */
+  const stage = (id: string, items: TimelineItem[]): SessionProjection => { staged.set(id, [...staged.get(id) ?? [], ...items]); return project(id, 2000) }
+  return { settings, state, ledger, open, superseded, emit, stage, floors, toEvent }
 }
 
 describe('AwaitingResults', () => {
@@ -118,6 +124,45 @@ describe('AwaitingResults', () => {
     h.emit('reviewer', [text(3, 'fixer')])
     expect(h.ledger.add('reviewer', 'fixer', 2).agents).toEqual([])
     expect(h.ledger.record('reviewer')).toBeNull()
+  })
+
+  it('consumes a reply that joins a running turn as it is broadcast, with no status change, past the journal retention (review of 66e7037)', () => {
+    const h = harness()
+    h.emit('reviewer', [text(1)])
+    h.ledger.declare('reviewer', ['fixer', 'other'])
+    // The reply is steered into a running turn: an event, but no agent:status change.
+    const reply = text(2, 'fixer')
+    h.emit('reviewer', [reply])
+    h.ledger.noteEvents([h.toEvent('reviewer', reply)])
+    expect(h.ledger.record('reviewer')).toMatchObject({ agents: ['other'] })
+    // The turn streams on past the journal's retention and the projection's window before anything reads the wait.
+    h.emit('reviewer', Array.from({ length: 25_000 }, (_, index) => text(3 + index)))
+    h.floors.set('reviewer', 5_000)
+    expect(h.ledger.fact('reviewer')!.agents.map(agent => agent.agentSessionId)).toEqual(['other'])
+    // Broadcast events from unrelated conversations, or without an origin, read nothing.
+    h.ledger.noteEvents([h.toEvent('someone-else', text(9, 'fixer')), h.toEvent('reviewer', text(10))])
+    expect(h.ledger.record('reviewer')).toMatchObject({ agents: ['other'] })
+  })
+
+  it('reads a staged reply from the projection and never moves the cursor past what it read', () => {
+    const h = harness()
+    h.emit('reviewer', [text(1), text(2)])
+    h.ledger.declare('reviewer', ['fixer', 'other'])
+    // Journal durable through 2; the fixer's reply at 3 is staged, not yet written.
+    h.stage('reviewer', [text(3, 'fixer')])
+    expect(h.ledger.consume('reviewer')).toMatchObject({ agents: ['other'], sinceSequence: 3 })
+  })
+
+  it('reads the journal in bounded pages and continues from the last durable event it read', () => {
+    const h = harness()
+    h.emit('reviewer', [text(1)])
+    h.ledger.declare('reviewer', ['fixer', 'other'])
+    // 25,000 events after the cursor; the reply at 22,000 is beyond one consume's 20 pages and outside the projection.
+    h.emit('reviewer', Array.from({ length: 25_000 }, (_, index) => text(2 + index, 2 + index === 22_000 ? 'fixer' : undefined)))
+    const first = h.ledger.consume('reviewer')!
+    expect(first.agents).toEqual(['fixer', 'other'])
+    expect(first.sinceSequence).toBe(20_001)
+    expect(h.ledger.consume('reviewer')).toMatchObject({ agents: ['other'], sinceSequence: 25_001 })
   })
 
   it('the archive refuses a waiting tab', () => {

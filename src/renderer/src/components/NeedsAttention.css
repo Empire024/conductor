@@ -1,0 +1,15 @@
+/* "Needs attention" under the projects list (NeedsAttention.tsx): as compact as the process summary. */
+.needs-attention { display: flex; flex-direction: column; gap: 3px; padding: 7px 10px 8px 12px; border-top: 1px solid var(--border-soft); }
+.needs-attention-head { display: flex; align-items: center; gap: 6px; color: #e2b872; }
+.needs-attention-head strong { font-size: 10px; font-weight: 500; color: var(--text-2); }
+.needs-attention-head span { margin-left: auto; font-size: 9px; color: #e2b872; font-variant-numeric: tabular-nums; }
+.needs-attention ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 1px; }
+.needs-attention li button { width: 100%; min-width: 0; height: 20px; padding: 0 4px; display: grid; grid-template-columns: auto minmax(0, 1fr) minmax(0, 38%); align-items: center; gap: 5px; border: 0; border-radius: 4px; background: transparent; color: var(--text-2); font-size: 10px; text-align: left; cursor: pointer; }
+.needs-attention li button:hover, .needs-attention li button:focus-visible { background: var(--surface-hover); color: var(--text); }
+.needs-attention li small { color: var(--text-3); font-size: 9px; text-align: right; }
+.needs-attention-reason { padding: 0 4px; border-radius: 4px; background: color-mix(in srgb, #e2b872 14%, transparent); color: #e2b872; font-size: 8px; font-style: normal; text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; }
+.needs-attention-reason.failed, .needs-attention-reason.interrupted { background: color-mix(in srgb, var(--danger) 14%, transparent); color: color-mix(in srgb, var(--danger) 80%, var(--text-2)); }
+.needs-attention-reason.limit { background: var(--surface-hover); color: var(--text-2); }
+.needs-attention-more { align-self: flex-start; padding: 0 4px; border: 0; background: transparent; color: var(--text-3); font-size: 9px; cursor: pointer; }
+.needs-attention-more:hover { color: var(--text); }
+.needs-attention-note { margin: 0; color: var(--text-3); font-size: 9px; }

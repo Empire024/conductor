@@ -3488,8 +3488,10 @@ describe('waiting for results (src/shared/awaiting-results.ts)', () => {
     const fixer = agentIn(f, f.project.id, f.workspace.id, 'fixer'), other = agentIn(f, f.project.id, f.workspace.id, 'other')
     await f.control.call(f.scope, 'agents.await', { agents: [fixer.agentSessionId, other.agentSessionId] })
     await f.control.call(fixer, 'agents.steer', { agentSessionId: f.scope.agentSessionId, prompt: 'FIX 1' })
-    // The status change of the woken reviewer consumes the reply (index.ts calls this on agent:status).
-    f.control.noteAwaitingStatus(f.scope.agentSessionId)
+    // The reply's journal event, as index.ts receives it on the structured:events broadcast, consumes it.
+    const journaled = f.database.structured.events(f.scope.agentSessionId).filter(event => event.data.type === 'text' && event.data.role === 'user')
+    expect(journaled.at(-1)!.data).toMatchObject({ origin: { agentSessionId: fixer.agentSessionId } })
+    f.control.noteAwaitingEvents(journaled)
     const stored = JSON.parse(f.database.getSetting('awaitingResults:' + f.scope.agentSessionId)!)
     expect(stored.agents).toEqual([other.agentSessionId])
     expect(stored.sinceSequence).toBe(f.database.structured.snapshot(f.scope.agentSessionId)!.sequence)

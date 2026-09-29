@@ -135,6 +135,7 @@ import { DeliveryService } from './delivery'
 import { COWORKER_AUTOCLOSE_SETTING, CoworkerAutoClose, coworkerAutoCloseMinutes, normalizeCoworkerAutoCloseMinutes } from './coworker-autoclose'
 import { registerTokenBurnIpc, TokenBurnMeter, TokenBurnService } from './token-burn'
 import { FinishedTabs, agentTabFacts, findLayoutTab } from './workspace-clarity'
+import { createNeedsAttention } from './needs-attention'
 import { FINISHED_TAB_SWEEP_SETTING, finishedTabSweepHours, normalizeFinishedTabSweepHours, type AgentTabFacts } from '../shared/workspace-clarity'
 import { registerDeliveryIpc } from './delivery-ipc'
 import { registerLogicLoopsIpc } from './logic-loops/ipc'
@@ -178,6 +179,7 @@ let disposeDeliveryIpc: (() => void) | undefined
 let coworkerAutoClose: CoworkerAutoClose | undefined
 let tokenBurnMeter: TokenBurnMeter | undefined
 let finishedTabs: FinishedTabs | undefined
+let needsAttentionService: ReturnType<typeof createNeedsAttention> | undefined
 let tabArchiver: TabArchiver | undefined
 /** The owner's Ideas inbox (src/main/ideas/register.ts); undefined until the app is ready. */
 let ideasRegistration: IdeasRegistration | undefined
@@ -1917,6 +1919,7 @@ const registerIpc = (): void => {
     }
     return facts
   })
+  ipcMain.handle('attention:snapshot', event => { trustedStructured(event); return needsAttentionService?.attention.snapshot() ?? { entries: [], total: 0, observedAt: new Date().toISOString() } })
   // The per-workspace tab archive and the "continued from" / "opened by" line (src/shared/tab-archive.ts).
   registerTabArchiveIpc({
     database, trusted: trustedStructured, ui: () => agentControlUi?.request, archiver: () => tabArchiver,
@@ -2928,6 +2931,10 @@ app.whenReady().then(async () => {
   finishedTabs.start()
   // A waiting tab consumes the replies it received on each of its status changes (awaiting-results.ts).
   onBroadcast((channel, payload) => { const id = channel === 'agent:status' ? (payload as { id?: unknown } | null)?.id : undefined; if (typeof id === 'string') control.noteAwaitingStatus(id) })
+  onBroadcast((channel, payload) => { if (channel === 'structured:events' && Array.isArray(payload)) control.noteAwaitingEvents(payload) })
+  // Needs attention under the projects (src/main/needs-attention.ts).
+  const needsAttention = needsAttentionService = createNeedsAttention({ database, permissionRequests: () => permissionGrants?.grants.state().requests ?? [], publish: snapshot => publish('attention:changed', snapshot) })
+  onBroadcast(channel => { if (channel === 'agent:status') needsAttention.attention.changed() })
   // Closes nobody confirms go to the archive only when nothing is lost (tab-archive-eligibility.ts).
   tabArchiver = new TabArchiver({
     layoutTab: (projectId, sessionId, tabId) => { const session = database.listSessions(projectId).find(item => item.id === sessionId); return session ? findLayoutTab(session.layout.root, tabId)?.tab : undefined },

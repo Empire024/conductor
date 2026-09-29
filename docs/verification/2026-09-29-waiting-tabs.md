@@ -53,3 +53,16 @@ refuse it, naming whom it waits for.
    was returning was ignored. The baseline is now the sender's sequence before delivery.
    Regression: agent-control.test.ts, the fixer replies inside the delivery; the test fails on the old
    order and passes on the new one.
+
+## Second review (reviewer agent_mumilb5c_0ba33es on 66e7037)
+
+1. A reply steered into an already running turn emits no `agent:status`, so a long turn could
+   outlive the journal's retention before the next consume. The journal events are now consumed
+   as they are broadcast (`structured:events`, already durable): only user messages with an origin
+   are looked at, and only for a conversation that has a wait. Regression: a reply joining a running
+   turn, then 25,000 events and a journal trim, still owes only the other agent.
+2. The cursor could move to the projection's sequence past events that were staged but not yet
+   written. The projection (which holds the staged tail) is now always read too, and the cursor
+   moves past the journal's end only when the journal was read to its end; with more than 20 pages
+   pending it stops at the last durable event read and continues from there. Regressions: a staged
+   reply; bounded paging that resumes.

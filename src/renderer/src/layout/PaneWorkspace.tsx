@@ -95,6 +95,7 @@ import { openWorkspaceFile } from '../components/workspace-files-state'
 import { fileMachineId, isRemoteFileMachine, statMachineFile } from '../remote-files'
 import { coworkerCloseTargets, coworkerTabGroups } from './coworker-tab-groups'
 import { ControlledByBadge } from '../components/ControlActivity'
+import { AwaitingMark } from '../components/AwaitingMark'
 import { TokenBurnBadge } from '../components/TokenBurn'
 import { guardTabClose, offerCloseUndo } from './close-work-guard'
 import { applyBulkTabAction, dockTabsAt, EMPTY_SELECTION, insertForeignTabs, isBulk, moveTabsToBar, orderedSelection, pruneSelection, selectAll, selectionClick, type BulkTabAction, type TabSelection } from './tab-selection'
@@ -747,6 +748,8 @@ function PaneGroup({
     const correctedPhase = tab.resourceId ? workspace.correctedActivityPhases?.get(tab.resourceId) : undefined
     const tabPhase = correctedPhase ?? rawPhase
     const controller = tab.kind === 'agent' ? controlLinks.find(link => link.controlledTabId === tab.id) : undefined
+    // Waiting for others' results reads as waiting here too, not as a finished turn.
+    const awaiting = clarity?.statusByTab.get(tab.id) === 'awaiting' ? clarity.live.find(row => row.tab.id === tab.id)?.awaiting : undefined
     return (
       <button
         key={tab.id}
@@ -786,7 +789,7 @@ function PaneGroup({
           <span className="tab-limit-continuation" title="Limit continuation is on for this agent"><TimerReset size={12} /></span>
         )}
         {tab.kind === 'agent' && <TokenBurnBadge agentSessionId={tab.resourceId} />}
-        {tab.kind === 'agent' && <TabActivityIndicator phase={tabPhase} title={tab.title} spinEpoch={spinEpoch} />}
+        {tab.kind === 'agent' && (awaiting ? <AwaitingMark fact={awaiting} title={tab.title} /> : <TabActivityIndicator phase={tabPhase} title={tab.title} spinEpoch={spinEpoch} />)}
         <i
           className="tab-close"
           role="button"
