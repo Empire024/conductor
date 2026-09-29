@@ -10,7 +10,7 @@ import { factIsUnknown, REGISTRY } from './registry'
 
 /**
  * The per-project production profile (docs/production-agent.md section 3): defaults, the fact
- * merge (owner beats discovery beats assumption), owner questions for unknown facts, and the pure
+ * merge (owner beats wizard beats discovery beats assumption), owner questions for unknown facts, and the pure
  * profile mutations the store versions. Every function here returns a new profile and never
  * changes its input; the store assigns the version, so every mutation is a version bump.
  */
@@ -50,10 +50,12 @@ export const FACT_QUESTIONS: Readonly<Record<FactKey, { question: string; why: s
   safeHarborReliance: { question: 'Does the project rely on a DMCA-style hosting safe harbor for user content? (yes/no)', why: 'Decides whether a designated agent listing and its renewal are checked.' },
 }
 
-const PRECEDENCE: Record<NonNullable<ProfileFact<unknown>['source']>, number> = { owner: 3, discovery: 2, assumption: 1 }
+const PRECEDENCE: Record<NonNullable<ProfileFact<unknown>['source']>, number> = { owner: 4, wizard: 3, discovery: 2, assumption: 1 }
 
 export const unknownFact = <T>(): ProfileFact<T> => ({ value: null, status: 'unknown', source: null, at: null })
 export const ownerFact = <T>(value: T, at: string, note?: string): ProfileFact<T> => ({ value, status: 'evidenced', source: 'owner', at, ...(note ? { note } : {}) })
+/** A fact a wizard tab set: evidenced (owner authority, repo-proven) but never the owner's own word. */
+export const wizardFact = <T>(value: T, at: string, by: string, note?: string): ProfileFact<T> => ({ value, status: 'evidenced', source: 'wizard', at, by, ...(note ? { note } : {}) })
 export const discoveredFact = <T>(value: T, at: string, note: string): ProfileFact<T> => ({ value, status: 'evidenced', source: 'discovery', at, note })
 export const assumedFact = <T>(value: T, at: string, note: string): ProfileFact<T> => ({ value, status: 'assumed', source: 'assumption', at, note })
 
@@ -85,8 +87,9 @@ export function defaultProfile(projectId: string, now: Date = new Date(), regist
 
 /**
  * Merges incoming facts over the current ones. A fact from a lower-precedence source never
- * replaces one from a higher source (owner > discovery > assumption); the same source replaces its
- * own earlier value. An owner answer is always `evidenced`, an assumption always `assumed`. A null
+ * replaces one from a higher source (owner > wizard > discovery > assumption); the same source
+ * replaces its own earlier value. An owner or wizard fact is always `evidenced`, an assumption
+ * always `assumed`. A null
  * or unknown incoming value is ignored: nothing becomes unknown again by merging.
  */
 export function mergeFacts(current: ProfileFacts, incoming: Partial<Record<FactKey, ProfileFact<unknown>>>): ProfileFacts {
@@ -173,6 +176,11 @@ export function questionsFor(profile: Pick<ProductionProfile, 'facts' | 'scope' 
         ? { ...existing, blocksControls: existing.status === 'open' ? blocks : existing.blocksControls }
         : { id: questionId(fact), factKey: fact, ...FACT_QUESTIONS[fact], blocksControls: blocks, status: 'open', answer: null, answeredAt: null, answeredBy: null, createdAt: at })
     } else if (existing && existing.status !== 'open') out.push(existing)
+    else if (existing && profile.facts[fact]?.source === 'wizard') {
+      // A wizard may close an owner question, but the history says a wizard set it, not the owner.
+      const set = profile.facts[fact]
+      out.push({ ...existing, status: 'answered', answer: formatFactValue(set.value).slice(0, 2_000), answeredAt: set.at ?? at, answeredBy: set.by ?? 'wizard' })
+    }
   }
   return out
 }
@@ -183,13 +191,20 @@ export const openQuestions = (profile: Pick<ProductionProfile, 'questions'>): Ow
 
 const refresh = (profile: ProductionProfile, registry: ControlRegistry, now: Date): ProductionProfile => ({ ...profile, questions: questionsFor(profile, registry, now) })
 
-/** Answers an owner question: the fact is written with source `owner` (evidenced). */
-export function answerQuestion(profile: ProductionProfile, questionIdValue: string, answer: string, by: string, now: Date = new Date(), registry: ControlRegistry = REGISTRY): ProductionProfile {
+/** A fact value as one line of text (report, question history). */
+export const formatFactValue = (value: unknown): string => Array.isArray(value) ? (value.length ? value.join(', ') : 'none') : typeof value === 'boolean' ? (value ? 'yes' : 'no') : String(value ?? '')
+
+/**
+ * Answers an owner question: the fact is written with source `owner` (evidenced), or `wizard` when a
+ * wizard tab answers, so a wizard's answer never reads as the owner's own evidence.
+ */
+export function answerQuestion(profile: ProductionProfile, questionIdValue: string, answer: string, by: string, now: Date = new Date(), registry: ControlRegistry = REGISTRY, source: 'owner' | 'wizard' = 'owner'): ProductionProfile {
   const question = profile.questions.find(candidate => candidate.id === questionIdValue)
   if (!question) throw new Error(`No owner question ${questionIdValue} in this project's production profile; list them with production.profile.get`)
   const value = parseFactAnswer(question.factKey, answer)
   const at = now.toISOString()
-  const facts = mergeFacts(profile.facts, { [question.factKey]: ownerFact(value, at, `Answered by ${by}`) })
+  const fact = source === 'wizard' ? wizardFact(value, at, by, `Answered by ${by}`) : ownerFact(value, at, `Answered by ${by}`)
+  const facts = mergeFacts(profile.facts, { [question.factKey]: fact })
   const questions = profile.questions.map(candidate => candidate.id === question.id ? { ...candidate, status: 'answered' as const, answer: answer.trim().slice(0, 2_000), answeredAt: at, answeredBy: by } : candidate)
   return refresh({ ...profile, facts, questions }, registry, now)
 }
@@ -246,22 +261,30 @@ function validateBudget(budget: AuditBudget): AuditBudget {
 }
 
 /**
- * Applies a profile update. Facts in the update are recorded with `source` (the owner through the
- * panel or a sovereign caller; `assumption` for any other caller), so an agent can never overwrite
- * an owner's answer. Drift and designation are not in this path for non-owners: the control layer
- * gates `production.drift`; this function only validates.
+ * Applies a profile update. Facts in the update are recorded with `source`: `owner` for the owner
+ * (panel or the owner's credential), `wizard` for a wizard tab, `assumption` for any other caller,
+ * so an agent can never overwrite an owner's answer. A wizard that would change a fact the owner
+ * set is refused, naming the facts, rather than silently ignored; the owner may overwrite a wizard
+ * fact. Drift and designation are not in this path for non-owners: the control layer gates
+ * `production.drift`; this function only validates.
  */
-export function applyProfileUpdate(profile: ProductionProfile, update: ProfileUpdate, options: { by: string; source: 'owner' | 'assumption'; now?: Date; registry?: ControlRegistry }): ProductionProfile {
+export function applyProfileUpdate(profile: ProductionProfile, update: ProfileUpdate, options: { by: string; source: 'owner' | 'wizard' | 'assumption'; now?: Date; registry?: ControlRegistry }): ProductionProfile {
   const now = options.now ?? new Date(), at = now.toISOString()
   let next: ProductionProfile = { ...profile }
   if (update.facts) {
     const incoming: Partial<Record<FactKey, ProfileFact<unknown>>> = {}
+    const ownerHeld: string[] = []
     for (const [key, value] of Object.entries(update.facts)) {
       if (!FACT_KEYS.includes(key as FactKey)) throw new Error(`Unknown profile fact: ${key}`)
       if (value === null || value === undefined) continue
       const normalised = normaliseFactValue(key as FactKey, value)
-      incoming[key as FactKey] = options.source === 'owner' ? ownerFact(normalised, at, `Set by ${options.by}`) : assumedFact(normalised, at, `Assumed by ${options.by}; the owner confirms or corrects it`)
+      const existing = profile.facts[key as FactKey] as ProfileFact<unknown>
+      if (options.source === 'wizard' && existing.source === 'owner' && !factIsUnknown(existing) && JSON.stringify(existing.value) !== JSON.stringify(normalised)) ownerHeld.push(`${key} (owner: ${formatFactValue(existing.value)})`)
+      incoming[key as FactKey] = options.source === 'owner' ? ownerFact(normalised, at, `Set by ${options.by}`)
+        : options.source === 'wizard' ? wizardFact(normalised, at, options.by, `Set by ${options.by}`)
+          : assumedFact(normalised, at, `Assumed by ${options.by}; the owner confirms or corrects it`)
     }
+    if (ownerHeld.length) throw new Error(`The owner set ${ownerHeld.join(', ')}; a wizard does not overwrite the owner's own answer. Leave these facts out of the update, or ask the owner to change them in the Production panel`)
     next.facts = mergeFacts(next.facts, incoming)
   }
   if (update.environments) {

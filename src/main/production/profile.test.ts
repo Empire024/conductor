@@ -105,6 +105,26 @@ describe('profile updates', () => {
     expect(agent.facts.subscriptions).toMatchObject({ value: false, status: 'assumed', source: 'assumption' })
   })
 
+  it('records a wizard update as source "wizard", never "owner", and lets the owner overwrite it but not the reverse', () => {
+    const base = defaultProfile('p1', NOW)
+    expect(base.questions.find(question => question.factKey === 'analytics')!.status).toBe('open')
+    const wizard = applyProfileUpdate(base, { facts: { analytics: true, userUploads: false } }, { by: 'wizard:agent_w (Haftheme wizard)', source: 'wizard', now: NOW })
+    expect(wizard.facts.analytics).toMatchObject({ value: true, status: 'evidenced', source: 'wizard', by: 'wizard:agent_w (Haftheme wizard)' })
+    // The wizard closed the owner question; the history says a wizard set it.
+    expect(wizard.questions.find(question => question.factKey === 'analytics')).toMatchObject({ status: 'answered', answer: 'yes', answeredBy: 'wizard:agent_w (Haftheme wizard)' })
+    // An assumption does not replace a wizard fact; the owner does.
+    expect(applyProfileUpdate(wizard, { facts: { analytics: false } }, { by: 'agent_x', source: 'assumption', now: NOW }).facts.analytics).toMatchObject({ value: true, source: 'wizard' })
+    const owned = applyProfileUpdate(wizard, { facts: { analytics: false } }, { by: 'owner', source: 'owner', now: NOW })
+    expect(owned.facts.analytics).toMatchObject({ value: false, source: 'owner' })
+    // A wizard changing the owner's fact is refused visibly; repeating the owner's value is fine.
+    expect(() => applyProfileUpdate(owned, { facts: { analytics: true } }, { by: 'wizard:agent_w', source: 'wizard', now: NOW })).toThrow(/The owner set analytics \(owner: no\)/)
+    expect(applyProfileUpdate(owned, { facts: { analytics: false, userUploads: true } }, { by: 'wizard:agent_w', source: 'wizard', now: NOW }).facts).toMatchObject({ analytics: { source: 'owner' }, userUploads: { value: true, source: 'wizard' } })
+    // A wizard answering an owner question records a wizard fact too.
+    const answered = answerQuestion(base, questionId('emailMarketing'), 'no', 'wizard:agent_w', NOW, undefined, 'wizard')
+    expect(answered.facts.emailMarketing).toMatchObject({ value: false, status: 'evidenced', source: 'wizard', by: 'wizard:agent_w' })
+    expect(answered.questions.find(question => question.factKey === 'emailMarketing')).toMatchObject({ status: 'answered', answeredBy: 'wizard:agent_w' })
+  })
+
   it('validates environments and always allows the base URL origin', () => {
     expect(validateEnvironment(environment({ allowedOrigins: ['https://cdn.shop.example/path'] })).allowedOrigins).toEqual(['https://shop.example', 'https://cdn.shop.example'])
     expect(() => validateEnvironment(environment({ baseUrl: 'file:///C:/site' }))).toThrow(/http and https/)

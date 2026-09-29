@@ -290,10 +290,10 @@ export function createProductionService(deps: ProductionDeps) {
     },
 
     updateProfile: (projectId: string, update: ProfileUpdate, actor: Actor = OWNER_ACTOR): ProductionProfile =>
-      store.mutateProfile(projectId, actorName(actor), current => applyProfileUpdate(current, update, { by: actorName(actor), source: actor.kind === 'owner' || actor.kind === 'wizard' ? 'owner' : 'assumption', now: clock() })),
+      store.mutateProfile(projectId, actorName(actor), current => applyProfileUpdate(current, update, { by: factBy(actor), source: actor.kind === 'owner' ? 'owner' : actor.kind === 'wizard' ? 'wizard' : 'assumption', now: clock() })),
 
     answerQuestion: (projectId: string, questionId: string, answer: string, actor: Actor = OWNER_ACTOR): ProductionProfile =>
-      store.mutateProfile(projectId, actorName(actor), current => answerProfileQuestion(current, questionId, answer, actorName(actor), clock())),
+      store.mutateProfile(projectId, actorName(actor), current => answerProfileQuestion(current, questionId, answer, factBy(actor), clock(), undefined, actor.kind === 'wizard' ? 'wizard' : 'owner')),
 
     dismissQuestion: (projectId: string, questionId: string, reason: string, actor: Actor = OWNER_ACTOR): ProductionProfile =>
       store.mutateProfile(projectId, actorName(actor), current => dismissProfileQuestion(current, questionId, reason, actorName(actor), clock())),
@@ -450,6 +450,8 @@ export function auditVersionReader(store: ProductionStore, lookBack = 50): (prof
 
 const sum = (entries: Array<{ severity: string; count: number }>, severity: string): number => entries.filter(entry => entry.severity === severity).reduce((total, entry) => total + entry.count, 0)
 const actorName = (actor: Actor): string => actor.kind === 'owner' ? 'owner' : `${actor.kind}${actor.agentSessionId ? `:${actor.agentSessionId}` : ''}`
+/** Who set a profile fact: the actor, plus a wizard's tab title so the panel and report can name it. */
+const factBy = (actor: Actor): string => actor.kind === 'wizard' && actor.title ? `${actorName(actor)} (${actor.title})` : actorName(actor)
 
 const NULL_EVIDENCE: BrowserFactoryOptions['evidence'] = {
   async writeText() { throw new Error('no evidence is written by a drift fingerprint') },

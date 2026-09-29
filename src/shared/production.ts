@@ -97,9 +97,14 @@ export type FactStatus = (typeof FACT_STATUSES)[number]
 export interface ProfileFact<T> {
   value: T | null
   status: FactStatus
-  /** Who established it: the owner's answer, discovery (file or page path), or an agent's assumption. */
-  source: 'owner' | 'discovery' | 'assumption' | null
+  /**
+   * Who established it: the owner's own answer, a wizard tab (owner authority, repo-proven, but not
+   * the owner's word), discovery (file or page path), or an agent's assumption.
+   */
+  source: 'owner' | 'wizard' | 'discovery' | 'assumption' | null
   at: string | null
+  /** Who set it (`owner`, or the wizard tab as `wizard:<agentSessionId> (<title>)`); absent on older facts. */
+  by?: string
   note?: string
 }
 
@@ -296,7 +301,11 @@ export interface StackDiscovery {
 export const QUESTION_STATUSES = ['open', 'answered', 'dismissed'] as const
 export type QuestionStatus = (typeof QUESTION_STATUSES)[number]
 
-/** A fact only the owner can give. Answering it writes the fact with source `owner` and bumps the profile version. */
+/**
+ * A fact only the owner can give. Answering it writes the fact with source `owner` (or `wizard` when a
+ * wizard tab answers) and bumps the profile version. A wizard fact that closes an open question keeps
+ * the question as answered, with `answeredBy` naming the wizard, so the panel says who set it.
+ */
 export interface OwnerQuestion {
   id: string
   factKey: FactKey

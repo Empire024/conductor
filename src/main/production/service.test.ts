@@ -70,6 +70,17 @@ describe('audit runs end to end (fake ports)', () => {
     expect(w.service.gate('project-a').state).toBe('STALE')
   })
 
+  it('records profile facts and answers of a wizard tab with source wizard, and only the owner with source owner', () => {
+    const w = world([])
+    const wizard = { kind: 'wizard' as const, agentSessionId: 'agent_w', title: 'Haftheme wizard' }
+    const updated = w.service.updateProfile('project-a', { facts: { analytics: true } }, wizard)
+    expect(updated.facts.analytics).toMatchObject({ status: 'evidenced', source: 'wizard', by: 'wizard:agent_w (Haftheme wizard)' })
+    const answered = w.service.answerQuestion('project-a', 'pq_userUploads', 'no', wizard)
+    expect(answered.facts.userUploads).toMatchObject({ status: 'evidenced', source: 'wizard', by: 'wizard:agent_w (Haftheme wizard)' })
+    expect(w.service.updateProfile('project-a', { facts: { analytics: false } }).facts.analytics).toMatchObject({ value: false, source: 'owner' })
+    expect(() => w.service.updateProfile('project-a', { facts: { analytics: true } }, wizard)).toThrow(/The owner set analytics/)
+  })
+
   it('resumes after a crash mid-control at the checkpoint: done steps are not repeated, the interrupted control reruns once', async () => {
     const hang = deferred()
     const c13 = pass('C13', 'accessibility')

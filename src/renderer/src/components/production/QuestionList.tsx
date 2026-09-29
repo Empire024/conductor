@@ -5,6 +5,10 @@ import { CONTROL_TITLES, type OwnerQuestion } from '../../../../shared/productio
  * Facts only the owner can give. Each open question names the controls it keeps UNVERIFIED and is
  * answered inline; the answer becomes an owner fact and a new profile version.
  */
+/** A wizard's answer never reads as the owner's: it is labelled "Set by wizard <tab>". */
+export const answeredLabel = (answeredBy: string | null): string =>
+  answeredBy?.startsWith('wizard') ? `Set by wizard${answeredBy.replace(/^wizard:?/, '').trim() ? ` ${answeredBy.replace(/^wizard:?/, '').trim()}` : ''}` : 'Answered'
+
 export function QuestionList({ questions, busy, error, onAnswer, onDismiss, confirmId = null, confirm = null }: {
   questions: OwnerQuestion[]
   busy: string
@@ -42,7 +46,7 @@ export function QuestionList({ questions, busy, error, onAnswer, onDismiss, conf
     {settled.length > 0 && <details className="production-settled">
       <summary>Answered or dismissed ({settled.length})</summary>
       <ul>{settled.map(question => <li key={question.id} data-question-id={question.id} data-status={question.status}>
-        <span>{question.question}</span> <em>{question.status === 'answered' ? `Answered: ${question.answer ?? ''}` : 'Dismissed'}</em>
+        <span>{question.question}</span> <em>{question.status === 'answered' ? `${answeredLabel(question.answeredBy)}: ${question.answer ?? ''}` : 'Dismissed'}</em>
       </li>)}</ul>
     </details>}
   </div>

@@ -235,6 +235,13 @@ describe('owner questions', () => {
     await expect(answerQuestion(bridge, 'shop', 'q-analytics', 'no')).rejects.toThrow('already settled')
   })
 
+  it("labels a question a wizard settled as set by the wizard, not as the owner's answer", () => {
+    const settled = { ...fakeQuestion(), status: 'answered' as const, answer: 'yes', answeredAt: '2026-09-29T12:00:00.000Z', answeredBy: 'wizard:agent_w (Haftheme wizard)' }
+    const html = renderToStaticMarkup(createElement(QuestionList, { questions: [settled], busy: '', error: '', onAnswer: noop, onDismiss: noop }))
+    expect(html).toContain('Set by wizard agent_w (Haftheme wizard): yes')
+    expect(html).not.toContain('Answered: yes')
+  })
+
   it('renders an open question with its answer field and the reason the bridge refused an answer', () => {
     const html = renderToStaticMarkup(createElement(QuestionList, { questions: [fakeQuestion()], busy: '', error: 'Answer analytics with yes or no', onAnswer: noop, onDismiss: noop }))
     expect(html).toContain('aria-label="Answer: analytics"')

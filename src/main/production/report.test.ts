@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
 import type { AuditRun, ControlResult, Finding } from '../../shared/production'
+import { emptyFacts, ownerFact, wizardFact } from './profile'
 import { buildReport, renderMarkdown, writeReport, REPORT_SCHEMA } from './report'
 import { emptyLedger } from './store'
 import { ENV_ID, fingerprint } from './testkit'
@@ -63,6 +64,21 @@ describe('audit report', () => {
     expect(markdown.indexOf('## Legal findings')).toBeLessThan(markdown.indexOf('legal defect f1'))
     expect(markdown.indexOf('legal defect f1')).toBeLessThan(markdown.indexOf('## Technical findings'))
     expect(markdown).not.toMatch(/%|certif|secure/i)
+  })
+
+  it('lists the profile facts with who set them, and a wizard fact never reads as the owner', () => {
+    const withFacts = buildReport({
+      run, results: [], findings: [], verifications: [], evidence: [], modelCalls: [], smoke: null, legalSources: [], gate: null, generatedAt: AT,
+      facts: { ...emptyFacts(), analytics: ownerFact(true, AT), userUploads: wizardFact(false, AT, 'wizard:agent_w (Haftheme wizard)') },
+    })
+    expect(withFacts.facts).toEqual([
+      expect.objectContaining({ key: 'userUploads', value: false, source: 'wizard', by: 'wizard:agent_w (Haftheme wizard)', label: 'set by wizard agent_w (Haftheme wizard)' }),
+      expect.objectContaining({ key: 'analytics', value: true, source: 'owner', label: 'owner' }),
+    ])
+    const md = renderMarkdown(withFacts)
+    expect(md).toContain('| userUploads | no | set by wizard agent_w (Haftheme wizard) |')
+    expect(md).toContain('| analytics | yes | owner |')
+    expect(report.facts).toEqual([])
   })
 
   it('writes both files into the run artifacts', () => {

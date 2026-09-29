@@ -530,7 +530,7 @@ export class ProductionRunner {
       run: current, results, findings, verifications, evidence: scope.evidence.list(), modelCalls: store.modelCalls(run.id),
       smoke: scope.state.read<EngineeringSmokeOutcome | null>('smoke') ?? null,
       legalSources: scope.state.read<LegalSourceCheck[]>('legal-sources') ?? [],
-      gate: this.deps.gateAfter?.(current) ?? null, generatedAt: this.clock().toISOString(),
+      gate: this.deps.gateAfter?.(current) ?? null, facts: scope.profile.facts, generatedAt: this.clock().toISOString(),
     })
     scope.alive()
     const paths = writeReport(run.artifactsDir, report)

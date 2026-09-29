@@ -2,9 +2,10 @@ import { mkdirSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   CONTROL_TITLES,
-  type AuditRun, type ControlResult, type EvidenceRef, type Finding, type FindingCategory, type GateState, type ModelCallRecord, type VerificationRecord,
+  type AuditRun, type ControlResult, type EvidenceRef, type FactKey, type Finding, type FindingCategory, type GateState, type ModelCallRecord, type ProfileFact, type ProfileFacts, type VerificationRecord,
 } from '../../shared/production'
 import { gateSummary } from './gate'
+import { formatFactValue } from './profile'
 import { controlDefinition } from './registry'
 
 /**
@@ -38,6 +39,8 @@ export interface ReportInput {
   smoke: EngineeringSmokeOutcome | null
   legalSources: Array<{ title: string; url: string; status: 'reachable' | 'unreachable' | 'skipped'; sha256: string | null; checkedAt: string; detail: string }>
   gate: Pick<GateState, 'state' | 'reasons' | 'fingerprint'> | null
+  /** The profile facts the run decided applicability with; each known one is listed with who set it. */
+  facts?: ProfileFacts
   generatedAt: string
 }
 
@@ -48,6 +51,8 @@ export interface ProductionReport {
   run: Pick<AuditRun, 'id' | 'projectId' | 'kind' | 'environmentId' | 'status' | 'statusReason' | 'trigger' | 'parentRunId' | 'verifies' | 'createdAt' | 'startedAt' | 'finishedAt'>
   registryVersion: number
   profileVersion: number
+  /** Known profile facts with their source; a wizard's are labelled so they never read as the owner's word. */
+  facts: ReportFact[]
   fingerprint: AuditRun['fingerprint']
   gate: { state: GateState['state']; reasons: string[] } | null
   coverage: AuditRun['coverage']
@@ -66,11 +71,29 @@ export interface ProductionReport {
   evidence: Array<{ id: string; kind: string; path: string; sha256: string; description: string }>
 }
 
+export interface ReportFact {
+  key: FactKey; value: unknown; status: ProfileFact<unknown>['status']; source: ProfileFact<unknown>['source']; by: string | null; at: string | null
+  /** "owner", "set by wizard <tab>", "discovered", or "assumed". */
+  label: string
+}
+
 export interface ReportFinding {
   id: string; controlId: string; checkId: string; title: string; severity: string; confidence: string; status: string; route: string | null
   expected: string; observed: string; reproduction: string[]; proposedFix: string; evidence: string[]; taskId: string | null; waiverId: string | null
   legalSources: Array<{ title: string; jurisdiction: string | null; effectiveDate: string | null; reviewBy: string | null }>
 }
+
+export function factLabel(fact: Pick<ProfileFact<unknown>, 'source' | 'by'>): string {
+  if (fact.source === 'owner') return 'owner'
+  if (fact.source === 'wizard') return `set by wizard${fact.by ? ` ${fact.by.replace(/^wizard:?/, '').trim()}` : ''}`
+  if (fact.source === 'discovery') return 'discovered'
+  if (fact.source === 'assumption') return 'assumed'
+  return 'unknown'
+}
+
+const reportFacts = (facts: ProfileFacts | undefined): ReportFact[] => Object.entries(facts ?? {})
+  .filter(([, fact]) => fact && fact.status !== 'unknown' && fact.value !== null && fact.value !== undefined)
+  .map(([key, fact]) => ({ key: key as FactKey, value: fact.value, status: fact.status, source: fact.source, by: fact.by ?? null, at: fact.at, label: factLabel(fact) }))
 
 const SECTION: Readonly<Record<FindingCategory, keyof ProductionReport['sections']>> = { legal: 'legal', technical: 'technical', 'internal-quality': 'internalQuality' }
 
@@ -96,6 +119,7 @@ export function buildReport(input: ReportInput): ProductionReport {
     },
     registryVersion: run.fingerprint.registryVersion,
     profileVersion: run.fingerprint.profileVersion,
+    facts: reportFacts(input.facts),
     fingerprint: run.fingerprint,
     gate: input.gate ? { state: input.gate.state, reasons: input.gate.reasons } : null,
     coverage: run.coverage,
@@ -135,6 +159,12 @@ export function renderMarkdown(report: ProductionReport): string {
   lines.push(`- Profile version: ${report.profileVersion}`)
   lines.push(`- Commit: ${fp.commit ?? 'unknown'}; build: ${fp.build ?? 'unknown'}`)
   lines.push(`- Config hash ${fp.configHash.slice(0, 16)}, policy hash ${fp.policyHash.slice(0, 16)}, dependency hash ${fp.dependencyHash.slice(0, 16)}, routes hash ${fp.routesHash.slice(0, 16)} (computed ${fp.computedAt})`, '')
+
+  if (report.facts.length) {
+    lines.push('## Profile facts', '', '| Fact | Value | Set by |', '| --- | --- | --- |')
+    for (const fact of report.facts) lines.push(`| ${fact.key} | ${cell(formatFactValue(fact.value)).slice(0, 200)} | ${cell(fact.label)} |`)
+    lines.push('')
+  }
 
   lines.push('## Control results', '', '| Control | Class | Status | Rationale |', '| --- | --- | --- | --- |')
   for (const control of report.controls) lines.push(`| ${control.controlId} ${cell(control.title)} | ${control.classification} | ${control.status} | ${cell(control.rationale).slice(0, 400)} |`)

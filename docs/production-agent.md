@@ -82,11 +82,21 @@ ships the capability. Designation is a per-project owner setting and is never in
 
 - **ProductionProfile** (versioned; every mutation writes a new row `(project_id, version)`):
   designation (owner-set, separate from the gate), facts (`ProfileFact<T>` with
-  `evidenced|assumed|unknown` and source), environments (each with `allowedOrigins`, accounts as
+  `evidenced|assumed|unknown`, a source `owner|wizard|discovery|assumption` and `by`), environments (each with `allowedOrigins`, accounts as
   credential *references* plus an optional owner-recorded login state referenced by path,
   captured mail, commerce sandbox, storage config, build-info and smoke commands), sandbox write authorizations, scope (route matrix with `full|sampled|excluded`,
   journeys, devices, locales, region selection, auth and consent states, disabled controls with
   reasons), stack discovery, budget, drift settings, owner questions.
+- **Fact sources.** Only the owner's own action (the Production panel, or the owner's control
+  credential calling `production.profile.update` or `production.answer`) records source `owner`. A
+  wizard tab holds owner authority, so its facts are `evidenced` too, but they are recorded with
+  source `wizard` and `by` naming the tab (`wizard:<agentSessionId> (<title>)`); any other
+  conversation records `assumption`. Precedence is owner > wizard > discovery > assumption: the
+  owner overwrites a wizard fact, and a wizard update that would change a fact the owner set is
+  refused with the fact named (repeating the owner's value is accepted). A wizard fact may close an
+  owner question; the question is kept as answered with `answeredBy` naming the wizard, the panel
+  shows it as "Set by wizard ...", and the report's **Profile facts** table labels every known fact
+  with who set it. Facts stored before `wizard` existed keep their recorded source.
 - **ControlRegistry** (code, `registry.ts`, `version` bumped on any change): sixteen
   `ControlDefinition`s with `sources`, `classification`, `owner`, `applicability`
   (`ApplicabilityPredicate`: required facts, ordered rules, `otherwise`), `provenance` (primary law
@@ -346,7 +356,7 @@ open questions. Do not commit or ship; the wizard integrates. Auto mode.
 versions, runs with `RUN_TRANSITIONS` enforced atomically, steps, operations, results, findings
 upsert by stable id with history, waivers, model calls, events; `FOREIGN KEY project_id`, indexed,
 bounded queries; migration idempotent per `schedule-store.ts`), `defaultProfile(projectId)`,
-`mergeFacts` (owner beats discovery beats assumption; an owner answer is `evidenced`),
+`mergeFacts` (owner beats wizard beats discovery beats assumption; an owner or wizard answer is `evidenced`),
 `questionsFor(profile, registry)` (one question per unknown required fact, listing
 `blocksControls`), `REGISTRY: ControlRegistry` with all sixteen definitions (predicates in data,
 provenance entries with jurisdiction and dates for EU, SK/CZ, US federal and US-CA at minimum,
