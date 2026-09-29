@@ -818,11 +818,22 @@ export class PermissionGrants {
       }
     }
     if (nativeChanged) this.changed()
-    const pending = [...(open?.values() ?? [])].filter(request => request.status === 'pending' && request.source !== 'native')
+    // Only a recent waiting request is still what the conversation is doing; an older one ends in
+    // the predecessor's tab instead of greeting the successor with a card for a call it never made
+    // (owner 2026-09-29: a successor opened with two of its predecessor's night-old denials).
+    const now = this.clock()
+    const movable = (request: PermissionGrantRequest): boolean => !(now - Date.parse(request.requestedAt) > HANDOFF_FRESH_MS)
+    const waiting = [...(open?.values() ?? [])].filter(request => request.status === 'pending' && request.source !== 'native')
+    const pending = waiting.filter(movable)
+    const left = waiting.filter(request => !movable(request))
+    for (const request of left) {
+      request.status = 'expired'
+      this.card(fromId, request)
+    }
+    if (left.length) this.changed()
     if (fromId === toId || (!pending.length && !held.length) || this.ports.provider(toId) !== 'claude') return { requests: 0, grants: 0 }
     // Only a recent approval is the successor's to retry; an older unspent grant (a session grant
     // is never spent) would reach it as "retry it now" for a call it never made.
-    const now = this.clock()
     const granted = held.filter(grant => !(now - Date.parse(grant.grantedAt) > HANDOFF_FRESH_MS))
     const stale = held.filter(grant => !granted.includes(grant))
     const title = this.ports.title?.(toId)

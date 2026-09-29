@@ -919,4 +919,14 @@ describe('an approval reaches a conversation whose turn is still running (H06)',
     expect(told).toEqual([{ id: successor, text: expect.stringMatching(/\(Asked in Wizard · tab \(which handed itself on to this one\) at 2026-09-28 15:20 UTC; approved by a wizard tab at 2026-09-28 15:20 UTC\.\)$/) }])
     expect(told[0]!.text).not.toContain('deploy:staging')
   })
+
+  it('leaves an old unanswered denial with the predecessor: it expires there and never reaches the successor as a card or a retry', async () => {
+    const h = timed()
+    const old = h.deny('toolu_night', 'Edit', { file_path: 'C:\\repo\\src\\service.ts' }, 'Auto-Mode Bypass', true)
+    h.advance(11 * 60 * 60_000)
+    expect(await h.grants.transfer(tab, successor)).toEqual({ requests: 0, grants: 0 })
+    expect(h.grants.list(successor).requests).toEqual([])
+    expect(h.grants.list(tab).requests.find(request => request.id === old)).toMatchObject({ status: 'expired' })
+    expect(h.retried.filter(entry => entry.id === successor)).toEqual([])
+  })
 })
