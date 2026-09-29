@@ -50,7 +50,13 @@ export interface AwaitingRecord {
   /** The waiter's event sequence read through so far (the declaration's baseline at first): only
    *  later messages resolve it, and everything up to here has been consumed. */
   sinceSequence: number
+  /** Each owed conversation's own baseline: only its messages after this count. A broadcast reply is
+   *  judged against it, not against the cursor, which a catch-up read may have moved past a trimmed
+   *  gap. Absent in records written before it existed: sinceSequence stands in. */
+  baselines?: Record<string, number>
 }
+
+export const baselineOf = (record: Pick<AwaitingRecord, 'sinceSequence' | 'baselines'>, agentSessionId: string): number => record.baselines?.[agentSessionId] ?? record.sinceSequence
 
 /** What the renderer and the close rules see: the conversations still owed, with titles. */
 export interface AwaitingFact {
@@ -64,7 +70,8 @@ export function parseAwaitingRecord(raw: string | null | undefined): AwaitingRec
   try {
     const value = JSON.parse(raw) as Partial<AwaitingRecord>
     if (!Array.isArray(value.agents) || !value.agents.every(id => typeof id === 'string' && id) || typeof value.since !== 'string' || typeof value.sinceSequence !== 'number') return null
-    return { agents: value.agents, since: value.since, sinceSequence: value.sinceSequence, ...(typeof value.reason === 'string' && value.reason ? { reason: value.reason } : {}) }
+    const baselines = value.baselines && typeof value.baselines === 'object' && !Array.isArray(value.baselines) ? Object.fromEntries(Object.entries(value.baselines).filter(([, sequence]) => typeof sequence === 'number')) as Record<string, number> : undefined
+    return { agents: value.agents, since: value.since, sinceSequence: value.sinceSequence, ...(typeof value.reason === 'string' && value.reason ? { reason: value.reason } : {}), ...(baselines ? { baselines } : {}) }
   } catch { return null }
 }
 

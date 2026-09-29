@@ -66,3 +66,14 @@ refuse it, naming whom it waits for.
    moves past the journal's end only when the journal was read to its end; with more than 20 pages
    pending it stops at the last durable event read and continues from there. Regressions: a staged
    reply; bounded paging that resumes.
+
+## Third review (reviewer agent_mumilb5c_0ba33es on 14208ca)
+
+A flush checkpoints (and may trim the journal) before its events are broadcast, and the outbox drains
+500 events per tick, so a reply's broadcast can arrive after the reply has left both the journal and the
+projection; noteEvents re-read those stores and lost it. noteEvents now counts the broadcast reply itself.
+Each owed agent carries its own baseline (record.baselines), and a reply counts when it is newer than
+that agent's baseline, even if a catch-up read already moved the cursor past a trimmed gap. consume()
+judges journal and projection arrivals per agent the same way, so an older message from a newly awaited
+recipient never counts. Regressions (src/main/awaiting-results.test.ts): the delayed broadcast after a
+25,000-event trim, then a restart; per-agent baselines with add().

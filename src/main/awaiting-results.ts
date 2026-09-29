@@ -1,5 +1,5 @@
 import type { AgentEvent, SessionProjection } from '../shared/structured-agent'
-import { AWAITING_RESULTS_PREFIX, MAX_AWAITED, MAX_AWAIT_REASON, arrivedFrom, evaluateAwaiting, parseAwaitingRecord, type AwaitedLookup, type AwaitingFact, type AwaitingRecord } from '../shared/awaiting-results'
+import { AWAITING_RESULTS_PREFIX, MAX_AWAITED, MAX_AWAIT_REASON, arrivedFrom, baselineOf, evaluateAwaiting, parseAwaitingRecord, type AwaitedLookup, type Sequenced, type AwaitingFact, type AwaitingRecord } from '../shared/awaiting-results'
 import { handedOffIn } from '../shared/workspace-clarity'
 
 /**
@@ -10,6 +10,15 @@ import { handedOffIn } from '../shared/workspace-clarity'
  * workspace clarity, the finished-tab sweep, the coworker auto-close sweep and the tab archiver
  * read fact() so a waiting tab stays in the active group and is never closed on a timer.
  */
+
+/** The newest sequence of a message from each other conversation among `entries` after `after`. */
+function latestFrom(after: number, entries: Iterable<Sequenced>, into: Map<string, number>): void {
+  for (const entry of entries) {
+    if (entry.sequence <= after) continue
+    const from = arrivedFrom(after, [entry])
+    for (const id of from) into.set(id, Math.max(into.get(id) ?? -Infinity, entry.sequence))
+  }
+}
 
 type Settings = { getSetting(key: string): string | null; setSetting(key: string, value: string): void; removeSetting(key: string): void }
 
@@ -42,11 +51,14 @@ export class AwaitingResults {
   /** Replaces the waiter's wait with these conversations (order kept, duplicates dropped).
    *  `baseline` is the waiter's sequence before the message that asked for the results went out;
    *  by default its sequence now. */
-  declare(waiter: string, agents: readonly string[], reason?: string, baseline?: number): AwaitingRecord {
+  declare(waiter: string, agents: readonly string[], reason?: string, baseline?: number, kept: Record<string, number> = {}): AwaitingRecord {
     const unique = [...new Set(agents.filter(id => id && id !== waiter))].slice(0, MAX_AWAITED)
     if (!unique.length) throw new Error('Name at least one other conversation to wait for')
+    const from = baseline ?? this.deps.snapshot(waiter)?.sequence ?? 0
     const record: AwaitingRecord = {
-      agents: unique, since: new Date(this.deps.now?.() ?? Date.now()).toISOString(), sinceSequence: baseline ?? this.deps.snapshot(waiter)?.sequence ?? 0,
+      agents: unique, since: new Date(this.deps.now?.() ?? Date.now()).toISOString(), sinceSequence: from,
+      // An agent still owed from an earlier wait keeps its own, earlier baseline.
+      baselines: Object.fromEntries(unique.map(id => [id, kept[id] ?? from])),
       ...(reason?.trim() ? { reason: reason.trim().slice(0, MAX_AWAIT_REASON) } : {})
     }
     this.save(waiter, record)
@@ -61,7 +73,8 @@ export class AwaitingResults {
     // Everything owed before was read through at least up to now, so rereading from the earlier
     // baseline only finds what consume() already removed.
     const from = current ? Math.min(current.sinceSequence, baseline) : baseline
-    return this.declare(waiter, [...current?.agents ?? [], agentSessionId], reason ?? current?.reason, from)
+    const kept = current ? Object.fromEntries(current.agents.filter(id => id !== agentSessionId).map(id => [id, baselineOf(current, id)])) : {}
+    return this.declare(waiter, [...current?.agents ?? [], agentSessionId], reason ?? current?.reason, from, kept)
   }
 
   clear(waiter: string): boolean {
@@ -81,11 +94,12 @@ export class AwaitingResults {
     // The projection also holds events staged but not yet written to the journal (the newest ones),
     // so both are read: the journal for everything durable since the cursor, the projection for
     // the staged tail and for anything the journal no longer holds.
-    const arrived = arrivedFrom(record.sinceSequence, state.items)
+    const arrived = new Map<string, number>()
+    latestFrom(record.sinceSequence, state.items, arrived)
     let through = record.sinceSequence, exhausted = !this.deps.journal
     for (let page = 0; this.deps.journal && page < MAX_PAGES && through < state.sequence; page++) {
       const events = this.deps.journal(waiter, through + 1, state.sequence + 1, PAGE)
-      arrivedFrom(through, events, arrived)
+      latestFrom(through, events, arrived)
       if (events.length) through = events[events.length - 1]!.sequence
       if (events.length < PAGE) { exhausted = true; break }
     }
@@ -94,9 +108,10 @@ export class AwaitingResults {
     // every later event is in the projection, which was just read. Otherwise it stops at the last
     // durable event read, and the next consume continues from there.
     if (exhausted) through = Math.max(through, state.sequence)
-    const owed = evaluateAwaiting(record, arrived, this.deps).owed
+    // Each sender's newest message counts only when it is newer than that agent's own baseline.
+    const owed = record.agents.filter(id => ![id, ...this.deps.successors(id)].some(sender => (arrived.get(sender) ?? -Infinity) > baselineOf(record, id)))
     if (!owed.length) { this.clear(waiter); return null }
-    const next: AwaitingRecord = { ...record, agents: owed, sinceSequence: Math.max(record.sinceSequence, through) }
+    const next: AwaitingRecord = { ...record, agents: owed, sinceSequence: Math.max(record.sinceSequence, through), ...(record.baselines ? { baselines: Object.fromEntries(owed.map(id => [id, baselineOf(record, id)])) } : {}) }
     if (next.sinceSequence !== record.sinceSequence || owed.length !== record.agents.length) this.save(waiter, next)
     return next
   }
@@ -104,10 +119,26 @@ export class AwaitingResults {
   /** Journal events as they are broadcast (already durable): a message from another conversation
    *  consumes its recipient's wait at once, even when it joins a running turn and no status change
    *  follows. Only user messages with an origin are looked at. */
-  noteEvents(events: ReadonlyArray<{ sessionId: string; data: { type: string; role?: string; origin?: { agentSessionId?: string } } }>): void {
-    const touched = new Set<string>()
-    for (const event of events) if (event.data.type === 'text' && event.data.role === 'user' && event.data.origin?.agentSessionId) touched.add(event.sessionId)
-    for (const waiter of touched) if (this.deps.settings.getSetting(this.key(waiter)) !== null) this.consume(waiter)
+  noteEvents(events: ReadonlyArray<{ sessionId: string; sequence: number; data: { type: string; role?: string; origin?: { agentSessionId?: string } } }>): void {
+    const replies = new Map<string, Array<{ from: string; sequence: number }>>()
+    for (const event of events) {
+      const from = event.data.type === 'text' && event.data.role === 'user' ? event.data.origin?.agentSessionId : undefined
+      if (from) replies.set(event.sessionId, [...replies.get(event.sessionId) ?? [], { from, sequence: event.sequence }])
+    }
+    for (const [waiter, arrived] of replies) {
+      const record = this.record(waiter)
+      if (!record) continue
+      // The broadcast reply itself is the evidence: it may already have left the journal and the
+      // projection (a flush checkpoints, and may trim, before its batch is broadcast). It counts when
+      // it is newer than that agent's own baseline, wherever the cursor has got to.
+      const owed = record.agents.filter(id => {
+        const senders = new Set([id, ...this.deps.successors(id)])
+        return !arrived.some(reply => senders.has(reply.from) && reply.sequence > baselineOf(record, id))
+      })
+      if (!owed.length) { this.clear(waiter); continue }
+      if (owed.length !== record.agents.length) this.save(waiter, { ...record, agents: owed, ...(record.baselines ? { baselines: Object.fromEntries(owed.map(id => [id, baselineOf(record, id)])) } : {}) })
+      this.consume(waiter)
+    }
   }
 
   /** Whether it is waiting now, and on whom. */

@@ -165,6 +165,41 @@ describe('AwaitingResults', () => {
     expect(h.ledger.consume('reviewer')).toMatchObject({ agents: ['other'], sinceSequence: 25_001 })
   })
 
+  it('counts a reply whose broadcast arrives only after it left the journal and the projection (review of 14208ca)', () => {
+    const h = harness()
+    h.emit('reviewer', [text(1)])
+    h.ledger.declare('reviewer', ['fixer', 'other'])
+    // The durable reply at 2 is still waiting in the broadcast outbox when a 25,000-event burst is
+    // flushed and checkpointed: the journal now holds 5,002..25,001 and the projection the last 2,000.
+    const reply = text(2, 'fixer')
+    h.emit('reviewer', [reply, ...Array.from({ length: 25_000 }, (_, index) => text(3 + index))])
+    h.floors.set('reviewer', 5_002)
+    // A catch-up read in between moves the cursor past the trimmed gap.
+    expect(h.ledger.consume('reviewer')).toMatchObject({ agents: ['fixer', 'other'] })
+    expect(h.ledger.record('reviewer')!.sinceSequence).toBeGreaterThan(2)
+    // The late broadcast carries the reply itself: it counts against the fixer's own baseline.
+    h.ledger.noteEvents([h.toEvent('reviewer', reply)])
+    expect(h.ledger.record('reviewer')).toMatchObject({ agents: ['other'] })
+    // Durable: a restart reads the same.
+    expect(harness(h.settings).ledger.record('reviewer')).toMatchObject({ agents: ['other'] })
+  })
+
+  it('judges each agent against its own baseline: an older message from a newly awaited recipient does not count', () => {
+    const h = harness()
+    h.emit('reviewer', [text(1)])
+    h.ledger.declare('reviewer', ['other'])
+    // The fixer wrote at 2, before the reviewer asked it anything at baseline 3.
+    const old = text(2, 'fixer')
+    h.emit('reviewer', [old, text(3)])
+    expect(h.ledger.add('reviewer', 'fixer', 3).agents).toEqual(['other', 'fixer'])
+    h.ledger.noteEvents([h.toEvent('reviewer', old)])
+    expect(h.ledger.record('reviewer')).toMatchObject({ agents: ['other', 'fixer'], baselines: { other: 1, fixer: 3 } })
+    const answer = text(4, 'fixer')
+    h.emit('reviewer', [answer])
+    h.ledger.noteEvents([h.toEvent('reviewer', answer)])
+    expect(h.ledger.record('reviewer')).toMatchObject({ agents: ['other'] })
+  })
+
   it('the archive refuses a waiting tab', () => {
     expect(archiveRefusal({ wizard: false, controlsLiveCoworkers: false, remote: false, awaiting: 'it is waiting for results from Fixer (fixer)' }, null)).toBe('it is waiting for results from Fixer (fixer)')
     expect(archiveRefusal({ wizard: false, controlsLiveCoworkers: false, remote: false }, null)).toBeNull()
