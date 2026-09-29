@@ -3040,28 +3040,70 @@ describe('H15 error texts and agents.interrupt expedite', () => {
 })
 
 describe('G04: a conversation in another workspace of the same project', () => {
-  it('is refused naming its workspace, its controller and the route that works, never agents.resume', async () => {
+  it('is read and steered only through its controller, and names the route that works, never agents.resume', async () => {
     const f = fixture()
     const room = f.database.createSession(f.project.id, 'Review room')
     const loose = agentIn(f, f.project.id, room.id, 'loose-agent')
     const refused = (id: string, method = 'agents.steer') => f.control.call(f.scope, method, { agentSessionId: id, ...(method === 'agents.steer' ? { prompt: 'x' } : {}) })
-    // Nobody controls it: open a tab there.
-    await expect(refused(loose.agentSessionId)).rejects.toThrow(`"loose-agent" (loose-agent) is open in workspace "Review room" (${room.id}) of this project, not in yours; nobody controls it`)
-    await expect(refused(loose.agentSessionId, 'agents.status')).rejects.toThrow(`tabs.open({workspaceId:"${room.id}",prompt})`)
-    await expect(refused(loose.agentSessionId)).rejects.not.toThrow(/agents\.resume/)
+    // Nobody controls it: it cannot be read from here, and send_message is the route named.
+    await expect(refused(loose.agentSessionId, 'agents.status')).rejects.toThrow(`"loose-agent" (loose-agent) is open in workspace "Review room" (${room.id}) of this project, not in yours; nobody controls it`)
+    await expect(refused(loose.agentSessionId, 'agents.status')).rejects.toThrow(/send_message it \(delivered as a message; it takes no control\)/)
+    await expect(refused(loose.agentSessionId, 'agents.interrupt')).rejects.not.toThrow(/agents\.resume/)
     // Controlled from this workspace: send_message that controller.
     const lead = agentIn(f, f.project.id, f.workspace.id, 'lead')
     const worker = await f.control.call(lead, 'tabs.open', { workspaceId: room.id, title: 'Room worker' }) as AgentControlTab
     await expect(refused(worker.resourceId!, 'agents.status')).rejects.toThrow(`is open in workspace "Review room" (${room.id}) of this project, not in yours; it is controlled by "lead" (lead): send_message that controller instead`)
-    // Controlled from the other workspace: the controller is out of reach too.
+    // Controlled from the other workspace: its controller, which send_message reaches there too.
     const theirs = await f.control.call(loose, 'tabs.open', { title: 'Their worker' }) as AgentControlTab
-    await expect(refused(theirs.resourceId!)).rejects.toThrow(/controlled by "loose-agent" \(loose-agent\), which is not in your workspace either: open your own tab there/)
+    await expect(refused(theirs.resourceId!)).rejects.toThrow(/controlled by "loose-agent" \(loose-agent\): send_message that controller instead \(it reaches another workspace too\)/)
     // No open tab at all: where it belongs, and no promise that agents.resume reopens it.
     f.sessions.ensure({ id: 'tabless', projectId: f.project.id, sessionId: room.id, cwd: f.project.path, provider: 'codex', title: 'Tabless', model: 'codex-synthetic' })
     await expect(refused('tabless')).rejects.toThrow(`"Tabless" (tabless) belongs to workspace "Review room" (${room.id}) of this project and has no open tab`)
-    // The route named works: a tab this caller opens there is its own to steer.
+    // Your own tab there stays yours to steer.
     const own = await f.control.call(f.scope, 'tabs.open', { workspaceId: room.id, title: 'My worker there' }) as AgentControlTab
     await expect(f.control.call(f.scope, 'agents.steer', { agentSessionId: own.resourceId, prompt: 'Go' })).resolves.toMatchObject({ agentSessionId: own.resourceId })
+  })
+
+  // conductor-task:codex-credit-burn (1): no relay tabs between workspaces.
+  it('delivers send_message across workspaces as a message that takes no control, and lets the recipient reply', async () => {
+    const f = fixture()
+    const room = f.database.createSession(f.project.id, 'Review room')
+    const loose = agentIn(f, f.project.id, room.id, 'loose-agent')
+    const sent = await f.control.call(f.scope, 'agents.steer', { agentSessionId: loose.agentSessionId, prompt: 'Status of the P0 chain?' }) as Record<string, unknown>
+    expect(sent).toMatchObject({ agentSessionId: loose.agentSessionId, workspaceId: room.id, controlled: false, acrossWorkspaces: true, delivery: 'started' })
+    const delivered = f.submissions.at(-1)!
+    expect(delivered.prompt).toContain(`[From Controller (controller), workspace "${f.workspace.name}"] Status of the P0 chain?`)
+    expect(delivered.prompt).toContain('Reply with send_message to controller.')
+    // No control was taken: the controller still cannot read or configure it.
+    expect(f.control.listLinks(f.project.id, room.id).some(link => link.targetAgentSessionId === loose.agentSessionId)).toBe(false)
+    await expect(f.control.call(f.scope, 'agents.status', { agentSessionId: loose.agentSessionId })).rejects.toThrow(/not in yours/)
+    // agents.submit is the same message, not a turn the sender owns.
+    await vi.waitFor(() => expect(f.database.structured.snapshot(loose.agentSessionId)!.phase).toBe('completed'))
+    expect(await f.control.call(f.scope, 'agents.submit', { agentSessionId: loose.agentSessionId, prompt: 'Again' })).toMatchObject({ acrossWorkspaces: true, note: expect.stringMatching(/takes no control/) })
+    // A coworker another agent controls is reached only after it wrote first: its reply.
+    const mine = await f.control.call(f.scope, 'tabs.open', { title: 'Mine' }) as AgentControlTab
+    const mineScope = { ...f.scope, agentSessionId: mine.resourceId! }
+    await expect(f.control.call(loose, 'agents.steer', { agentSessionId: mine.resourceId, prompt: 'Unasked' })).rejects.toThrow(/controlled by "Controller" \(controller\): send_message that controller instead/)
+    await vi.waitFor(() => expect(f.database.structured.snapshot(loose.agentSessionId)!.phase).toBe('completed'))
+    expect(await f.control.call(mineScope, 'agents.steer', { agentSessionId: loose.agentSessionId, prompt: 'Question from a worker' })).toMatchObject({ acrossWorkspaces: true })
+    expect(await f.control.call(loose, 'agents.steer', { agentSessionId: mine.resourceId, prompt: 'Answer' })).toMatchObject({ agentSessionId: mine.resourceId, acrossWorkspaces: true, controlled: false })
+    expect(f.submissions.at(-1)!.prompt).toContain(`[From loose-agent (loose-agent), workspace "Review room"] Answer`)
+    // Still the controller's coworker, not the replier's.
+    expect(f.control.listLinks(f.project.id, f.workspace.id).find(link => link.targetAgentSessionId === mine.resourceId)?.controllerAgentSessionId).toBe('controller')
+  })
+
+  it('refuses a cross-workspace message from a read-only conversation, and a report still reaches a controller in another workspace', async () => {
+    const f = fixture()
+    const room = f.database.createSession(f.project.id, 'Review room')
+    const loose = agentIn(f, f.project.id, room.id, 'loose-agent')
+    const state = f.database.structured.snapshot(f.spec.id)!
+    f.database.structured.update(f.spec.id, { settings: { ...state.settings, permission: 'read-only' } })
+    await expect(f.control.call(f.scope, 'agents.steer', { agentSessionId: loose.agentSessionId, prompt: 'x' })).rejects.toThrow(/read-only|planning/i)
+    // A worker opened in the other workspace reports home.
+    const lead = agentIn(f, f.project.id, f.workspace.id, 'lead')
+    const worker = await f.control.call(lead, 'tabs.open', { workspaceId: room.id, title: 'Room worker' }) as AgentControlTab
+    const reported = await f.control.call({ projectId: f.project.id, sessionId: room.id, agentSessionId: worker.resourceId! }, 'agents.report', { text: 'done' })
+    expect(reported).toMatchObject({ agentSessionId: 'lead' })
   })
 })
 

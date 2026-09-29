@@ -219,7 +219,7 @@ const toolSignatures = {
   'agents.configure': '({agentSessionId,model,effort?}) — while the controlled coworker is idle with no queued input, persist an exact models.list model/effort for its next turn and update its visible tab; provider and permissions never change',
   'agents.grant': '({agentSessionId,repository?,research?}) — switch a local-model coworker’s per-conversation grants: repository (the sandbox may commit and branch, and a plain git push runs for it on the host) and research (web_search plus a larger tool-round budget). These are the conversation’s durable settings, the same toggles as its composer, so its own buttons show the change and it applies from its next turn. Only a non-local coworker may grant, only to a provider-local tab it already controls on this machine, never to itself or an ancestor; an omitted field is left alone, false revokes; returns what is now on and off',
   'agents.submit': '({agentSessionId,prompt}) — dispatch to a visible native tab with its existing permission settings; a coworker this caller dispatched whose tab closed as finished (or, for the owner or a wizard, any closed conversation of its own workspace) is reopened in the background first (reopened:true)',
-  'agents.steer': '({agentSessionId,prompt}) — what the user composer does with a message: while a turn is running (or waiting on an approval or a question) it steers the message into that turn where the provider can, else queues it behind the turn; while the conversation is idle, finished, failed, disconnected or interrupted it starts a turn with it exactly as agents.submit does (one turn, same settings, same control link); while a turn is still stopping it is refused, so send it again once it has stopped. A coworker this caller dispatched that finished and closed its tab (or, for the owner or a wizard, any closed conversation of its own workspace) is reopened in the background first (reopened:true). The result says which: delivery "started" for a new turn, "queued" for a message steered into or queued behind the running one',
+  'agents.steer': '({agentSessionId,prompt}) — what the user composer does with a message: while a turn is running (or waiting on an approval or a question) it steers the message into that turn where the provider can, else queues it behind the turn; while the conversation is idle, finished, failed, disconnected or interrupted it starts a turn with it exactly as agents.submit does (one turn, same settings, same control link); while a turn is still stopping it is refused, so send it again once it has stopped. A coworker this caller dispatched that finished and closed its tab (or, for the owner or a wizard, any closed conversation of its own workspace) is reopened in the background first (reopened:true). The result says which: delivery "started" for a new turn, "queued" for a message steered into or queued behind the running one. A conversation of this project open in another workspace that nobody controls, or that messaged you first, receives it as a message headed with your id that takes no control (acrossWorkspaces:true), so no relay tab is needed',
   'agents.interrupt': '({agentSessionId,expedite?}) — stops the running turn, including one waiting on an approval; queued messages stay held above its composer, as after the owner’s Stop. expedite:true is the owner’s Esc instead: what waits in its queue (an approved retry, a steered message) is sent straight after the stop, which is how a wizard releases an approved retry by hand. Interrupting does not take control, here or in a sibling project',
   'agents.resume': '({agentSessionId}) — reopen a live orphan in this workspace without restarting its turn, or reconnect an idle/disconnected native conversation with its existing settings; outside this workspace only a coworker this caller controls. Resuming a failed, interrupted or disconnected one is a recovery: three per conversation in six hours (the owner is not counted), never while it waits on a request, never once it is superseded',
   'agents.supersede': '({agentSessionId,by,reason}) - mark a stopped coworker whose work another conversation (by) took over and delivered, so it reads as superseded rather than unfinished work and is not resumed again; reason up to 300 characters, e.g. what accepted the replacement',
@@ -822,12 +822,11 @@ export class AgentControl {
     const where = home ? `workspace "${home.name}" (${home.id})` : 'another workspace'
     if (!open) return new Error(`${label} belongs to ${where} of this project and has no open tab; agents in one workspace do not reach another's conversations, and agents.resume reopens only a tab of yours. Open your own tab for the work with tabs.open${home ? `({workspaceId:"${home.id}",prompt})` : ''}, or report to your controller`)
     const controller = link ? link.controllerAgentSessionId : null
-    const reachable = controller && (this.tabs(scope).some(tab => tab.resourceId === controller) || this.ancestorsOf(scope.agentSessionId).includes(controller))
+    // send_message crosses workspaces as a message that takes no control (messagesAcrossWorkspaces),
+    // so no relay tab is needed; reading or steering another workspace's tab still is not allowed.
     const route = !controller
-      ? `nobody controls it, and agents in one workspace do not steer another's tabs: open your own tab there with tabs.open({workspaceId:"${open.id}",prompt}), or report to your controller`
-      : reachable
-        ? `it is controlled by ${this.agentLabel(controller)}: send_message that controller instead`
-        : `it is controlled by ${this.agentLabel(controller)}, which is not in your workspace either: open your own tab there with tabs.open({workspaceId:"${open.id}",prompt}), or report to your controller`
+      ? `nobody controls it, and agents in one workspace do not read or steer another's tabs: send_message it (delivered as a message; it takes no control), or report to your controller`
+      : `it is controlled by ${this.agentLabel(controller)}: send_message that controller instead (it reaches another workspace too)`
     return new Error(`${label} is open in ${where} of this project, not in yours; ${route}`)
   }
 
@@ -1162,6 +1161,49 @@ export class AgentControl {
     const title = this.tabs(scope).find(candidate => candidate.resourceId === scope.agentSessionId)?.title || 'Another Conductor tab'
     const delivery = await sessions.steerOrStart(id, prompt, state.settings, [], { agentSessionId: scope.agentSessionId, label: `${title} (${database.getProject(scope.projectId)?.name ?? 'another project'})` })
     return { agentSessionId: id, tabId: tab.id, uri: tab.uri, projectId: spec.projectId, workspaceId: spec.sessionId, phase: database.structured.snapshot(id)?.phase, delivery, reply: true, controlled: false, ...forwarded, ...(method === 'agents.submit' ? { note: 'A reply across projects is steered like agents.steer and takes no control' } : {}) }
+  }
+
+  /** agents.steer/submit to a conversation of this project that is open in another workspace and
+   *  that the caller neither controls nor descends from (codex-credit-burn): delivered as a
+   *  message and taking no control, so controllers in different workspaces talk directly instead
+   *  of each keeping a relay tab in the other's workspace (one such bridge used 12.2M tokens in a
+   *  day). Only an uncontrolled conversation, or one that messaged the caller first (a reply), is
+   *  reached this way; a coworker another agent controls is still reached through that agent. */
+  private messagesAcrossWorkspaces(scope: AgentControlScope, named: string): boolean {
+    const { database } = this.deps
+    const spec = database.structured.spec<AgentSpec>(named)
+    if (!spec || scope.owner || spec.projectId !== scope.projectId || spec.sessionId === scope.sessionId || named === scope.agentSessionId) return false
+    // Ancestors and successors keep their report-style delivery further on.
+    const id = this.successorOf(scope.projectId, named), ancestors = this.ancestorsOf(scope.agentSessionId)
+    if (ancestors.includes(named) || ancestors.includes(id) || this.successorsOf(scope.projectId, scope.agentSessionId).includes(named)) return false
+    const link = this.linkFor(id)
+    if (link?.controllerAgentSessionId === scope.agentSessionId || !link && this.finishedLink(id)?.controllerAgentSessionId === scope.agentSessionId) return false
+    const home = database.structured.spec<AgentSpec>(id)
+    if (!home || home.sessionId === scope.sessionId) return false
+    // A conversation with no open tab keeps target()'s refusal, which says where it belongs.
+    if (!this.tabs({ projectId: scope.projectId, sessionId: home.sessionId, agentSessionId: scope.agentSessionId }).some(tab => tab.kind === 'agent' && tab.resourceId === id)) return false
+    return !link || this.mayReplyTo(scope.agentSessionId, id)
+  }
+
+  private async messageAcrossWorkspaces(scope: AgentControlScope, method: string, args: Args): Promise<unknown> {
+    const { database, sessions } = this.deps
+    const named = text(args, 'agentSessionId', 160), prompt = text(args, 'prompt', MAX_PROMPT_CHARS)
+    const id = this.successorOf(scope.projectId, named)
+    const forwarded = id !== named ? { forwardedFrom: named } : {}
+    const spec = database.structured.spec<AgentSpec>(id)!, state = database.structured.snapshot(id)
+    if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly('send_message (agents.steer) to another workspace'))
+    const sender = this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)
+    if (sender?.state?.remotePeerId) throw new Error('This conversation is driven by a paired machine and stays inside the workspace shared with it')
+    const tab = this.tabs({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: scope.agentSessionId }).find(candidate => candidate.kind === 'agent' && candidate.resourceId === id)
+    if (!tab || !state) throw this.inAnotherWorkspace(scope, id, this.linkFor(id))
+    if (tab.state?.remotePeerId) throw new Error('That conversation is driven by a paired machine; only that machine steers it')
+    if (anonymousConversations.has(scope.agentSessionId) && !anonymousConversations.has(id)) throw new Error('This conversation is anonymous and that one keeps a history, so nothing of it may be sent there; the owner reads it in its tab')
+    const title = sender?.title || database.structured.spec<AgentSpec>(scope.agentSessionId)?.title || 'Another Conductor tab'
+    const workspace = database.getSession(scope.sessionId)?.name ?? 'another workspace'
+    const message = `[From ${title} (${scope.agentSessionId}), workspace "${workspace}"] ${prompt}\n\n(Sent from another workspace of this project; it gives the sender no control over this tab. Reply with ${spec.provider === 'claude' || spec.provider === 'codex' ? 'send_message' : 'agents.steer'} to ${scope.agentSessionId}.)`
+    this.rememberSender(id, scope.agentSessionId)
+    const delivery = await sessions.steerOrStart(id, message, state.settings, [], { agentSessionId: scope.agentSessionId, label: `${title} (${workspace})` })
+    return { agentSessionId: id, tabId: tab.id, uri: tab.uri, projectId: spec.projectId, workspaceId: spec.sessionId, phase: database.structured.snapshot(id)?.phase, delivery, controlled: false, acrossWorkspaces: true, ...forwarded, ...(method === 'agents.submit' ? { note: 'A message to another workspace is steered like agents.steer and takes no control' } : {}) }
   }
 
   /** agents.steer/submit({projectId,prompt}) with no agentSessionId: a message to a project
@@ -1519,6 +1561,7 @@ export class AgentControl {
     if ((method === 'agents.steer' || method === 'agents.submit') && source.provider !== 'local') {
       if (args.agentSessionId === undefined && args.projectId !== undefined) return this.toProject(scope, source, method, args)
       if (typeof args.agentSessionId === 'string' && this.messagesAcross(scope, args.agentSessionId)) return this.messageAcross(scope, method, args)
+      if (typeof args.agentSessionId === 'string' && this.messagesAcrossWorkspaces(scope, args.agentSessionId)) return this.messageAcrossWorkspaces(scope, method, args)
     }
     // Naming another project is only meaningful for the methods that were opened to a sibling;
     // everywhere else it is still an attempt to act outside the authorized scope.

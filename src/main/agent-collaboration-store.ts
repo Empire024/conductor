@@ -369,9 +369,9 @@ export class AgentCollaborationStore {
       lines.push({ text: `- Recorded ${message.kind} at ${message.createdAt} from ${agents.get(message.agentSessionId) ?? message.agentSessionId} (${location(message.sessionId, message.agentSessionId)}): ${message.body}${paths}` })
     }
 
-    // The ids of another workspace identify who holds what; they are not a route. App control
-    // steers only this workspace's tabs and the coworkers a caller opened elsewhere (agents.list).
-    if (elsewhere && options.guidance !== false) lines.push({ text: '- Another workspace\'s agent and tab ids are for coordination: agents.list lists the ones there you control. To reach any other, send_message its controller when that one is in your workspace, or open your own tab there with tabs.open({workspaceId}).' })
+    // App control steers only this workspace's tabs and the coworkers a caller opened elsewhere
+    // (agents.list); anything else there is reached by message, never through a relay tab.
+    if (elsewhere && options.guidance !== false) lines.push({ text: '- Another workspace\'s agent and tab ids are for coordination: agents.list lists the ones there you control. send_message reaches any other directly when nobody controls it (a message; it takes no control), else its controller; do not open relay tabs.' })
     // Only a lease line that fits is recorded as told; one cut off here is offered again next time.
     let result = ''
     for (const line of lines) {
