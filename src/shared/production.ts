@@ -111,7 +111,10 @@ export interface ProfileFact<T> {
 export const BUSINESS_MODELS = ['b2b', 'b2c', 'both'] as const
 export type BusinessModel = (typeof BUSINESS_MODELS)[number]
 
-export const AUDIENCES = ['general', 'child-directed', 'mixed', 'adult-only'] as const
+export const UPLOAD_VISIBILITIES = ['private-only', 'public'] as const
+export type UploadVisibility = (typeof UPLOAD_VISIBILITIES)[number]
+
+export const AUDIENCES =['general', 'child-directed', 'mixed', 'adult-only'] as const
 export type Audience = (typeof AUDIENCES)[number]
 
 /** Facts the registry predicates read. Keys are stable: they are referenced by name in predicates and questions. */
@@ -124,6 +127,13 @@ export interface ProfileFacts {
   accountFeatures: ProfileFact<boolean>
   subscriptions: ProfileFact<boolean>
   userUploads: ProfileFact<boolean>
+  /**
+   * Where uploaded content ends up, when users upload: `private-only` (documents such as an ID or a
+   * prescription kept in non-public storage, seen only by the shop) or `public` (reviews with images,
+   * posts, hosted files). Optional; with `private-only` C15 (notice-and-action) is NOT_APPLICABLE,
+   * since nothing is hosted for the public.
+   */
+  userUploadsVisibility?: ProfileFact<UploadVisibility>
   /** Runtime AI features shown to customers (chat, generation), not AI used to write the code. */
   aiRuntime: ProfileFact<boolean>
   analytics: ProfileFact<boolean>
@@ -284,6 +294,28 @@ export interface ProductionEnvironment {
   smokeCommand: string | null
   /** The owner's rule for test mutations here (see MUTATION_POLICIES); absent or null means the authorization alone decides. */
   mutationPolicy?: MutationPolicy | null
+  /** Extra certificate trust for a staging, sandbox or local site behind a private CA (see EnvironmentTls); refused on production. */
+  tls?: EnvironmentTls | null
+}
+
+/**
+ * Which certificate authorities the audit trusts for one non-production environment, beyond the
+ * public roots bundled with Conductor. The audit's own requests run in Node, which does not read
+ * the operating system's store, so a staging site whose certificate comes from a private CA the
+ * owner installed on this machine fails there while a browser on the same machine opens it. With
+ * this set, every HTTPS origin the audit contacts is still verified (chain and host name) against
+ * the bundled roots plus the system store and/or the listed CA files; a certificate that does not
+ * verify blocks the origin with the TLS error as the reason. Production environments never take
+ * one: their certificates are checked against the public roots only. Only the owner or a wizard
+ * tab sets or changes it (`setBy` is stamped), and every run that uses it says so in a run note.
+ */
+export interface EnvironmentTls {
+  /** Also trust the operating system's certificate store (the Windows store, the macOS keychain), as a browser on this machine does. */
+  allowSystemTrust?: boolean
+  /** Absolute paths of PEM files holding extra CA certificates (a private staging CA). */
+  trustedCaPaths?: string[]
+  /** Stamped by Conductor when the setting is set or changed. */
+  setBy?: { source: 'owner' | 'wizard'; by: string; at: string } | null
 }
 
 export const DEVICE_CLASSES = ['desktop', 'mobile'] as const
@@ -894,7 +926,17 @@ export interface NavigationResult {
   /** `off-allowlist` when a redirect left the allowed origins and navigation was stopped there. */
   outcome: 'ok' | 'error' | 'timeout' | 'off-allowlist' | 'blocked-by-policy'
   durationMs: number
+  /**
+   * Why a navigation that did not end `ok` ended as it did: the network or TLS error (for example
+   * `self-signed certificate in certificate chain`, `net::ERR_NAME_NOT_RESOLVED`), the wait that ran
+   * out, or the policy reason. One line, secrets masked; absent on `ok`.
+   */
+  detail?: string | null
 }
+
+/** A navigation's outcome with its detail, for reasons and evidence: `error: self-signed certificate in certificate chain`, never a bare `error`. */
+export const navigationOutcomeText = (navigation: Pick<NavigationResult, 'outcome' | 'detail'>): string =>
+  navigation.detail ? `${navigation.outcome}: ${navigation.detail}` : navigation.outcome
 
 export interface ObservedRequest {
   url: string
@@ -1019,6 +1061,8 @@ export interface NetworkPolicy {
   requestsPerSecondPerOrigin: number
   /** Private and loopback addresses are refused unless the environment kind is `local`. */
   allowPrivateAddresses: boolean
+  /** The environment's extra certificate trust (never on production); absent or null means the bundled public roots only. */
+  tls?: { allowSystemTrust: boolean; trustedCaPaths: string[] } | null
 }
 
 export interface CapturedMessage {

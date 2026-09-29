@@ -1,3 +1,4 @@
+import { navigationOutcomeText } from '../../../shared/production'
 import type { AuditPage, CheckContext, CheckOutcome, CommerceOrder, ControlCheck } from '../../../shared/production'
 import { decideApplicability } from '../registry'
 import {
@@ -148,7 +149,7 @@ async function checkoutJourney(context: CheckContext, parts: OutcomeParts, produ
     await fillBilling(context, page, email)
     const placed = await mutate(context, 'checkout', `place order on ${checkoutPath}`, () => page.submit(checkoutForm, 'checkout'))
     if (!placed.ok) { parts.unconcluded.push(placed.reason); return false }
-    if (placed.value.outcome !== 'ok') { parts.unconcluded.push(`placing the order ended ${placed.value.outcome}`); return false }
+    if (placed.value.outcome !== 'ok') { parts.unconcluded.push(`placing the order ended ${navigationOutcomeText(placed.value)}`); return false }
     reading.receipt = await page.evaluate<PricePage>(PRICE_SCRIPT)
     return true
   })

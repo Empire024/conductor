@@ -1,3 +1,4 @@
+import { navigationOutcomeText } from '../../shared/production'
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { relative, resolve, sep } from 'node:path'
 import type { AuditPage, ProductionEnvironment, RouteEntry, SourceTree, StackDiscovery } from '../../shared/production'
@@ -36,7 +37,7 @@ export interface DiscoveryResult {
   stack: StackDiscovery
   routes: RouteEntry[]
   /** Pages the crawl actually visited, with depth. */
-  visited: Array<{ path: string; depth: number; outcome: string }>
+  visited: Array<{ path: string; depth: number; outcome: string; detail?: string }>
 }
 
 const PATH_TAGS: Array<[RegExp, string[]]> = [
@@ -318,11 +319,11 @@ export async function discoverStack(source: SourceTree | null, environment: Prod
       const { path, depth } = queue.shift()!
       const url = new URL(path, environment.baseUrl).href
       const navigation = await page.goto(url)
-      visited.push({ path, depth, outcome: navigation.outcome })
+      visited.push({ path, depth, outcome: navigation.outcome, ...(navigation.detail ? { detail: navigation.detail } : {}) })
       if (navigation.outcome !== 'ok') {
         const entry = routes.get(path)
-        if (entry && entry.coverage !== 'excluded') { entry.coverage = 'excluded'; entry.excludedReason = `navigation ${navigation.outcome}` }
-        if (first) stack.unread.push(`${url}: ${navigation.outcome}`)
+        if (entry && entry.coverage !== 'excluded') { entry.coverage = 'excluded'; entry.excludedReason = `navigation ${navigationOutcomeText(navigation)}` }
+        if (first) stack.unread.push(`${url}: ${navigationOutcomeText(navigation)}`)
         first = false
         continue
       }

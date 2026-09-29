@@ -1,3 +1,4 @@
+import { navigationOutcomeText } from '../../../shared/production'
 import {
   type AuditPage, type CheckContext, type CheckOutcome, type CommerceSandboxAdapter, type ControlResultStatus, type DataRecordsAdapter, type DeviceClass,
   type FindingDraft, type HumanReviewItem, type MutationKind, type NavigationResult, type RouteCoverage, type RouteEntry, type TestAccountRef,
@@ -73,7 +74,7 @@ export interface Visit {
 /** Navigates and classifies the outcome: an HTTP error, a policy stop or a timeout is a page that could not be read. */
 export async function visit(page: AuditPage, url: string): Promise<Visit> {
   const navigation = await page.goto(url)
-  if (navigation.outcome !== 'ok') return { navigation, ok: false, problem: `${pathOf(url)}: ${navigation.outcome}` }
+  if (navigation.outcome !== 'ok') return { navigation, ok: false, problem: `${pathOf(url)}: ${navigationOutcomeText(navigation)}` }
   if (navigation.status !== null && navigation.status >= 400) return { navigation, ok: false, problem: `${pathOf(url)}: HTTP ${navigation.status}` }
   return { navigation, ok: true, problem: null }
 }

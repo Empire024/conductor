@@ -1,3 +1,4 @@
+import { navigationOutcomeText } from '../../../shared/production'
 import type { CapturedMessage, CheckContext, CheckOutcome, ControlCheck } from '../../../shared/production'
 import { decideApplicability, factIsUnknown } from '../registry'
 import {
@@ -19,7 +20,7 @@ import {
 const CHECK_ID = 'email'
 
 const PROMO = /\b(?:sale|discount|% ?off|\d+ ?% |offer|deal|promo|coupon|voucher|newsletter|new (?:collection|arrivals?)|black friday|limited time|shop now|z[ľl]ava|akci[ae]|v[ýy]predaj|sleva|novinky)\b/i
-const TRANSACTIONAL = /\border\s*#?\s*\d|\breceipt\b|\binvoice\b|password reset|reset your password|verify your (?:email|account)|confirm your (?:email|account)|has (?:been )?shipped|tracking number|your (?:order|booking|payment) (?:has been|is|was)|objedn[aá]vk[ay] [čc]\.|fakt[úu]r/i
+const TRANSACTIONAL = /\border\s*#?\s*(?:\d|%s|%\d\$s|\{)|ready for (?:pickup|collection)|\bpick(?:ed)?[- ]?up\b|out for delivery|has been (?:delivered|dispatched|cancell?ed|refunded)|\breceipt\b|\binvoice\b|password reset|reset your password|verify your (?:email|account)|confirm your (?:email|account)|has (?:been )?shipped|tracking number|your (?:order|booking|payment) (?:has been|is|was)|objedn[aá]vk[ay] [čc]\.|fakt[úu]r/i
 const OPT_OUT_TEXT = /unsubscribe|opt[- ]?out|manage (?:your )?(?:email )?preferences|odhl[aá]si[tť]|odhl[aá]sen/i
 const REPLY_FRAMED = /^\s*(?:re|fw|fwd|aw|sv|odp)\s*:/i
 const TRANSACTION_FRAMED = /\byour (?:order|invoice|receipt|payment|account)\b|action required|account (?:suspended|locked|on hold)|final notice|urgent/i
@@ -30,6 +31,12 @@ const TEMPLATE_OPT_OUT = /unsubscribe|opt[- ]?out|\*\|UNSUB\|\*|%unsubscribe%|\{
 const TEMPLATE_ADDRESS = /\{\{\s*(?:company_|business_|shop_|store_)?address|\*\|LIST:ADDRESS(?:LINE)?\|\*|%address%|\{\{\s*(?:site|store)\.address/i
 const TEMPLATE_GLOBS = ['**/emails/**/*.{html,htm,php,mjml,hbs,twig,tsx,jsx,txt}', '**/email/**/*.{html,htm,php,mjml,hbs,twig,tsx,jsx,txt}', '**/mail-templates/**/*.{html,htm,php,mjml,hbs,twig}']
 const MAX_TEMPLATES = 40
+/**
+ * Template file names of mail one customer needs about their own order, account or request
+ * (WooCommerce's customer-processing-order, customer-reset-password, a theme's customer-ready-pickup).
+ * A marketing name (newsletter, promo) still wins.
+ */
+const TRANSACTIONAL_TEMPLATE = /(?:^|[-_.])(?:order|orders|pickup|pick-up|shipping|shipped|shipment|delivery|delivered|dispatch(?:ed)?|tracking|receipt|invoice|refund(?:ed)?|payment|processing|completed|on-hold|cancell?ed|failed|password|reset|account|verify|verification|confirm(?:ation)?|login|otp|note|booking|reservation|appointment)(?=$|[-_.])/i
 
 export interface EmailCheckOptions {
   /** How long to wait for the next campaign after the opt-out (default 60 s). */
@@ -64,6 +71,14 @@ export function classifyByRules(subject: string, text: string, headers: Record<s
   if (promo && !transactional) return { kind: 'marketing', rule: 'promotional wording' }
   if (transactional && !promo) return { kind: 'transactional', rule: 'transaction wording' }
   return { kind: 'unknown', rule: promo && transactional ? 'both promotional and transaction wording' : 'no rule matched' }
+}
+
+/** A template's kind from its path: marketing names first, then transactional file names; null leaves it to the words and the classify role. */
+export function templateKindByName(path: string): { kind: MailKind; rule: string } | null {
+  if (/newsletter|marketing|campaign|promo|digest|announcement/i.test(path)) return { kind: 'marketing', rule: 'template name' }
+  const file = (path.split('/').pop() ?? path).replace(/\.(?:blade\.php|php|html?|mjml|hbs|twig|tsx|jsx|txt)$/i, '')
+  if (TRANSACTIONAL_TEMPLATE.test(file)) return { kind: 'transactional', rule: 'transactional template name' }
+  return null
 }
 
 /** The opt-out URL of a message: List-Unsubscribe (http), else a link whose text or address says unsubscribe. */
@@ -158,7 +173,7 @@ async function templates(context: CheckContext, parts: OutcomeParts): Promise<vo
     const source = await context.source.read(path, 128 * 1024)
     if (source === null) { unobservable(parts.coverage, `email template ${path} could not be read`); continue }
     const text = stripHtml(source)
-    const named = /newsletter|marketing|campaign|promo|digest|announcement/i.test(path) ? { kind: 'marketing' as MailKind, rule: 'template name' } : null
+    const named = templateKindByName(path)
     const { kind, rule } = named ?? await classify(context, parts, path.split('/').pop() ?? path, text, {}, path)
     kinds.push(`${path}: ${kind} (${rule})`)
     if (kind !== 'marketing') continue
@@ -264,7 +279,7 @@ async function optOutJourney(context: CheckContext, parts: OutcomeParts, marketi
   if (!confirmed) {
     parts.findings.push(draft(context, CHECK_ID, {
       key: `opt-out-broken:${slug(item.message.subject)}`, scope: 'email', component: item.message.subject, title: 'The opt-out link does not work',
-      expected: 'Following the opt-out link confirms the unsubscription', observed: `${navigation.outcome}, HTTP ${navigation.status ?? 'none'}: "${text.slice(0, 200)}"`,
+      expected: 'Following the opt-out link confirms the unsubscription', observed: `${navigationOutcomeText(navigation)}, HTTP ${navigation.status ?? 'none'}: "${text.slice(0, 200)}"`,
       severity: 'high', confidence: 'confirmed', reproduction: [`Follow the opt-out link of "${item.message.subject}"`],
       proposedFix: 'Make the unsubscribe link work in one step and confirm it.',
     }))

@@ -1,3 +1,4 @@
+import { navigationOutcomeText } from '../../../shared/production'
 import {
   type AuditPage, type CheckContext, type CheckOutcome, type ConsentState, type CookieRecord, type DeviceClass,
   type FindingDraft, type HumanReviewItem, type NavigationResult, type ObservedRequest, type RouteCoverage, type RouteEntry, type StorageRecord,
@@ -93,7 +94,7 @@ export interface Visit {
 /** Navigates and classifies the outcome; an HTTP error is a readable failure, a policy stop or timeout is not. */
 export async function visit(page: AuditPage, url: string, waitMs = 0): Promise<Visit> {
   const navigation = await page.goto(url, { waitMs })
-  if (navigation.outcome !== 'ok') return { navigation, ok: false, problem: `${pathOf(url)}: ${navigation.outcome}` }
+  if (navigation.outcome !== 'ok') return { navigation, ok: false, problem: `${pathOf(url)}: ${navigationOutcomeText(navigation)}` }
   if (navigation.status !== null && navigation.status >= 400) return { navigation, ok: false, problem: `${pathOf(url)}: HTTP ${navigation.status}` }
   return { navigation, ok: true, problem: null }
 }

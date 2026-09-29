@@ -111,7 +111,16 @@ export function policyForEnvironment(environment: ProductionEnvironment, options
     maxRequests: options.budget.maxRequests,
     requestsPerSecondPerOrigin: options.budget.requestsPerSecondPerOrigin,
     allowPrivateAddresses: environment.kind === 'local',
+    tls: tlsPolicyOf(environment),
   }
+}
+
+/** The environment's extra certificate trust as the audit browser takes it; production never has any. */
+export function tlsPolicyOf(environment: Pick<ProductionEnvironment, 'kind' | 'tls'>): NetworkPolicy['tls'] {
+  const tls = environment.tls
+  if (!tls || environment.kind === 'production') return null
+  const trustedCaPaths = [...(tls.trustedCaPaths ?? [])]
+  return tls.allowSystemTrust || trustedCaPaths.length ? { allowSystemTrust: tls.allowSystemTrust === true, trustedCaPaths } : null
 }
 
 /** Throws MutationRefused unless the policy's live authorization names this mutation kind. Runs before any network. */

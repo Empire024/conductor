@@ -9,6 +9,7 @@ import type {
 import type { ProductionEvidenceSink } from './evidence'
 import { maskSecrets } from '../structured-store'
 import { MAX_REDIRECT_HOPS, MutationRefused, NetworkGate, assertMutationAllowed, originOf, walkRedirects, type GateDecision, type NetworkGateOptions } from './netpolicy'
+import { createTlsTrust, type TlsTrust, type TlsTrustOptions } from './tls-trust'
 
 /**
  * The audit browser (docs/production-agent.md sections 1 and 4): Playwright over the bundled
@@ -102,6 +103,8 @@ export interface AuditBrowserOptions {
   gate?: NetworkGateOptions
   /** For tests: resolve against a fake filesystem. */
   resolve?: ResolveEngineOptions
+  /** For tests: how the environment's extra certificate trust (policy.tls) handshakes and reads CA files. */
+  tlsTrust?: TlsTrustOptions
 }
 
 export interface ProductionAuditBrowser extends AuditBrowser {
@@ -173,6 +176,7 @@ export const MASK_COLOR = '#000000'
 const EXCERPT_CHARS = 4096
 const DEFAULT_NAVIGATION_TIMEOUT = 20_000
 const QUIET_MS = 500
+const SETTLE_REASON_MS = 1_000
 /** Streams cannot be buffered here; they go to the network as the browser makes them (see fetchThroughHops). */
 const STREAMING_TYPES = new Set(['media', 'eventsource'])
 const READ_ONLY_METHODS = new Set(['GET', 'HEAD'])
@@ -181,6 +185,7 @@ const HOP_DROPPED_HEADERS = /^(host|content-length|cookie|connection|transfer-en
 export function createAuditBrowser(policy: NetworkPolicy, options: AuditBrowserOptions): ProductionAuditBrowser {
   const frozen = deepFreeze(structuredClone(policy))
   const gate = new NetworkGate(frozen, options.gate)
+  const tlsTrust = createTlsTrust(frozen, options.tlsTrust)
   let launched: Promise<Browser> | null = null
   let resolution: Promise<EngineResolution> | null = null
   const pages = new Set<AuditPageImpl>()
@@ -253,10 +258,13 @@ export function createAuditBrowser(policy: NetworkPolicy, options: AuditBrowserO
         // already decides private addresses; a `local` environment grants them.
         permissions: frozen.allowPrivateAddresses ? ['local-network-access'] : [],
         storageState: loginState,
+        // With extra trust, the page's own checks (Chromium's and route.fetch's, which cannot take a CA)
+        // step aside: every HTTPS origin is verified by tlsTrust before its first request goes out.
+        ignoreHTTPSErrors: !!tlsTrust,
       }
       // A system browser that does not know the permission refuses it; it has no such check to satisfy either.
       const context = await browser.newContext(contextOptions).catch(() => browser.newContext({ ...contextOptions, permissions: [] }))
-      const page = new AuditPageImpl(context, gate, frozen, openOptions, options, secrets)
+      const page = new AuditPageImpl(context, gate, frozen, openOptions, options, secrets, tlsTrust)
       await page.attach()
       pages.add(page)
       page.onClose(() => pages.delete(page))
@@ -277,7 +285,20 @@ interface NavigationState {
   error: string | null
 }
 
-const normaliseUrl = (url: string): string => { try { const parsed = new URL(url); parsed.hash = ''; return parsed.href } catch { return url } }
+/**
+ * One line of a navigation failure for evidence and reasons. Playwright appends a call log that lists
+ * the request headers, cookies included, so only the first line is kept, its API prefix dropped and
+ * the login state's values masked.
+ */
+export function failureDetail(failure: unknown, secrets: readonly string[] = []): string | null {
+  if (failure === null || failure === undefined || failure === '') return null
+  let line = (failure instanceof Error ? failure.message : String(failure)).split('\n')[0]!.trim()
+  line = line.replace(/^(?:route\.fetch|page\.(?:goto|reload|waitForURL)|apiRequestContext\.fetch|Error):\s*/i, '')
+  for (const secret of secrets) if (secret) line = line.split(secret).join('[REDACTED]')
+  return maskSecrets(line).slice(0, 300) || null
+}
+
+const normaliseUrl = (url: string): string =>{ try { const parsed = new URL(url); parsed.hash = ''; return parsed.href } catch { return url } }
 const sleep = (ms: number): Promise<void> => new Promise(done => setTimeout(done, ms))
 
 export class AuditPageImpl implements AuditPage {
@@ -302,6 +323,7 @@ export class AuditPageImpl implements AuditPage {
     readonly options: OpenPageOptions,
     private readonly browserOptions: AuditBrowserOptions,
     private readonly secrets: readonly string[] = [],
+    private readonly tlsTrust: TlsTrust | null = null,
   ) {
     this.timeout = browserOptions.navigationTimeoutMs ?? DEFAULT_NAVIGATION_TIMEOUT
     this.consentPending = ['rejected', 'accepted', 'selected', 'withdrawn'].includes(options.consent) ? options.consent : null
@@ -312,11 +334,12 @@ export class AuditPageImpl implements AuditPage {
     // Bundlers that keep function names wrap page functions in `__name(...)`; give pages a no-op one.
     await this.context.addInitScript('globalThis.__name ??= (target) => target')
     await this.context.route('**/*', route => this.handle(route))
-    await this.context.routeWebSocket(() => true, ws => {
+    await this.context.routeWebSocket(() => true, async ws => {
       const url = ws.url()
       const httpUrl = url.replace(/^ws/, 'http')
       const decision = this.gate.decide({ url: httpUrl, method: 'GET', resourceType: 'websocket', mainFrameNavigation: false, initiator: 'page' })
-      const refused = decision.action === 'block' ? decision.reason : decision.party === 'first-party' && this.policy.readOnly ? 'read-only: first-party websocket refused' : null
+      const untrusted = decision.action === 'allow' && this.tlsTrust ? await this.tlsTrust.verify(url) : null
+      const refused = decision.action === 'block' ? decision.reason : untrusted ?? (decision.party === 'first-party' && this.policy.readOnly ? 'read-only: first-party websocket refused' : null)
       this.record({ url, method: 'GET', resourceType: 'websocket', party: decision.party, initiator: 'page', blocked: refused, status: null, excerpt: excerptOf(url, null, this.secrets), at: new Date().toISOString() })
       if (refused) void ws.close({ code: 1008, reason: 'blocked by audit policy' }).catch(() => undefined)
       else ws.connectToServer()
@@ -447,6 +470,8 @@ export class AuditPageImpl implements AuditPage {
       if (host && await this.gate.refusesHost(host)) {
         return { action: 'block', party: decision.party, outcome: 'blocked-by-policy', reason: `${host} resolves to a private address, refused for a ${this.policy.environmentKind} environment` }
       }
+      const untrusted = this.tlsTrust ? await this.tlsTrust.verify(url) : null
+      if (untrusted) return { action: 'block', party: decision.party, outcome: 'blocked-by-policy', reason: untrusted }
     }
     return decision
   }
@@ -514,15 +539,15 @@ export class AuditPageImpl implements AuditPage {
 
   private async navigate(requestedUrl: string, act: () => Promise<unknown>, waitMs = 0): Promise<NavigationResult> {
     const started = Date.now()
-    const result = (finalUrl: string, status: number | null, outcome: NavigationResult['outcome']): NavigationResult =>
-      ({ requestedUrl, finalUrl, status, outcome, durationMs: Date.now() - started })
+    const result = (finalUrl: string, status: number | null, outcome: NavigationResult['outcome'], detail: unknown = null): NavigationResult =>
+      ({ requestedUrl, finalUrl, status, outcome, durationMs: Date.now() - started, ...(outcome === 'ok' ? {} : { detail: failureDetail(detail, this.secrets) }) })
     let target: string
-    try { target = new URL(requestedUrl).href } catch { return result(requestedUrl, null, 'error') }
+    try { target = new URL(requestedUrl).href } catch { return result(requestedUrl, null, 'error', `not a URL: ${requestedUrl}`) }
     // Schemes and origins the route handler would never see (file:, javascript:, data:) or would refuse anyway.
     const pre = await this.decide(target, 'GET', 'document', true, 'agent', false)
     if (pre.action === 'block') {
       this.record({ url: target, method: 'GET', resourceType: 'document', party: pre.party, initiator: 'agent', blocked: pre.reason, status: null, excerpt: excerptOf(target, null, this.secrets), at: new Date().toISOString() })
-      return result(target, null, pre.outcome)
+      return result(target, null, pre.outcome, pre.reason)
     }
     const state = this.beginNavigation(target)
     let failure: unknown = null
@@ -537,15 +562,20 @@ export class AuditPageImpl implements AuditPage {
     const served = state.settled.then(() => state.blocked || state.error || state.hops > 0 ? undefined : committed)
     const timedOut = await Promise.race([acting.then(() => false), served.then(() => false), sleep(this.timeout).then(() => true)])
     this.expected.delete(normaliseUrl(target))
-    if (state.blocked) return result(state.blocked.url, state.status, state.blocked.outcome)
+    if (state.blocked) return result(state.blocked.url, state.status, state.blocked.outcome, state.blocked.reason)
     if (state.hops > 0 && state.finalUrl) {
       const finalUrl = state.finalUrl
       await this.page.waitForURL(url => normaliseUrl(url.href) === finalUrl, { waitUntil: 'domcontentloaded', timeout: this.timeout }).catch(error => { failure ??= error })
     }
     if (!timedOut && !failure) await this.loaded()
     if (waitMs > 0) await this.page.waitForTimeout(waitMs)
-    if (timedOut || (failure && /timeout/i.test(String(failure)))) return result(this.page.url(), state.status, 'timeout')
-    if (state.error || (failure && state.status === null)) return result(this.page.url(), state.status, 'error')
+    // Leaving an error page, Chromium aborts the navigation before the handler's own fetch has failed; wait for its reason.
+    if (failure && !timedOut && state.status === null && !state.error && !state.blocked) await Promise.race([state.settled, sleep(SETTLE_REASON_MS)])
+    const late = state.blocked as NavigationState['blocked']
+    if (late) return result(late.url, state.status, late.outcome, late.reason)
+    if (timedOut || (failure && /timeout/i.test(String(failure)))) return result(this.page.url(), state.status, 'timeout', timedOut ? `no response within ${this.timeout} ms` : failure)
+    // The handler's own fetch error (TLS, DNS, refused connection) says more than the page's net::ERR_FAILED.
+    if (state.error || (failure && state.status === null)) return result(this.page.url(), state.status, 'error', state.error ?? failure)
     await this.reachConsent()
     return result(this.page.url(), state.status, 'ok')
   }

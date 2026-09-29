@@ -1,9 +1,9 @@
 import {
   AUDIENCES, AUTH_STATES, BUSINESS_MODELS, CONSENT_STATES, CONTROL_IDS, DEFAULT_AUDIT_BUDGET, DEFAULT_DRIFT_MINUTES, DEVICE_CLASSES,
-  ENVIRONMENT_KINDS, MUTATION_KINDS, MUTATION_POLICIES, REGION_SELECTIONS,
+  ENVIRONMENT_KINDS, MUTATION_KINDS, MUTATION_POLICIES, REGION_SELECTIONS, UPLOAD_VISIBILITIES,
   type AuditBudget, type AuditScope, type ControlId, type ControlRegistry, type DriftSettings, type FactKey, type OwnerQuestion,
   type ProductionDesignation, type ProductionEnvironment, type ProductionProfile, type ProfileFact, type ProfileFacts, type ProfileUpdate,
-  type LoginStateRefresh, type SandboxWriteAuthorization, type StoredLoginStateRef, type WriteAuthorizationRequest
+  type EnvironmentTls, type LoginStateRefresh, type SandboxWriteAuthorization, type StoredLoginStateRef, type WriteAuthorizationRequest
 } from '../../shared/production'
 import { isAbsolute } from 'node:path'
 import { makeId } from '../../shared/models'
@@ -17,17 +17,17 @@ import { factIsUnknown, REGISTRY } from './registry'
  */
 
 export const FACT_KEYS: readonly FactKey[] = [
-  'legalEntity', 'targetCountries', 'businessModel', 'products', 'accountFeatures', 'subscriptions', 'userUploads',
+  'legalEntity', 'targetCountries', 'businessModel', 'products', 'accountFeatures', 'subscriptions', 'userUploads', 'userUploadsVisibility',
   'aiRuntime', 'analytics', 'sessionReplay', 'emailMarketing', 'marketingSender', 'transactionalSender', 'dataCategories', 'audience', 'ageRestrictedProducts',
   'paymentProviders', 'processors', 'safeHarborReliance',
 ]
 
 type FactType = 'text' | 'email' | 'list' | 'boolean' | { oneOf: readonly string[] }
 /** Facts a profile stored before they existed may lack; no control's applicability requires them. */
-export const OPTIONAL_FACT_KEYS: readonly FactKey[] = ['marketingSender', 'transactionalSender']
+export const OPTIONAL_FACT_KEYS: readonly FactKey[] = ['marketingSender', 'transactionalSender', 'userUploadsVisibility']
 export const FACT_TYPES: Readonly<Record<FactKey, FactType>> = {
   legalEntity: 'text', targetCountries: 'list', businessModel: { oneOf: BUSINESS_MODELS }, products: 'list',
-  accountFeatures: 'boolean', subscriptions: 'boolean', userUploads: 'boolean', aiRuntime: 'boolean', analytics: 'boolean',
+  accountFeatures: 'boolean', subscriptions: 'boolean', userUploads: 'boolean', userUploadsVisibility: { oneOf: UPLOAD_VISIBILITIES }, aiRuntime: 'boolean', analytics: 'boolean',
   sessionReplay: 'boolean', emailMarketing: 'boolean', marketingSender: 'email', transactionalSender: 'email', dataCategories: 'list', audience: { oneOf: AUDIENCES },
   ageRestrictedProducts: 'boolean', paymentProviders: 'list', processors: 'list', safeHarborReliance: 'boolean',
 }
@@ -41,6 +41,7 @@ export const FACT_QUESTIONS: Readonly<Record<FactKey, { question: string; why: s
   accountFeatures: { question: 'Can customers create accounts? (yes/no)', why: 'Decides whether authenticated journeys and account deletion are tested.' },
   subscriptions: { question: 'Does the project sell subscriptions or anything that renews automatically? (yes/no)', why: 'Renewal disclosure and cancellation checks apply only to recurring billing.' },
   userUploads: { question: 'Can users upload or publish content (reviews with images, files, posts)? (yes/no)', why: 'Copyright notice-and-takedown checks apply only to hosted user content.' },
+  userUploadsVisibility: { question: 'Where do uploads end up? (private-only: documents such as an ID kept in non-public storage and seen only by the shop; public: reviews with images, posts or hosted files)', why: 'Notice-and-takedown duties apply to content hosted for the public, not to private documents a customer hands the shop.' },
   aiRuntime: { question: 'Does the site offer AI features to customers at runtime (chat, generated content)? (yes/no)', why: 'AI interaction and content disclosures apply to runtime AI, not to AI used to write the code.' },
   analytics: { question: 'Are analytics, advertising pixels or other tracking intended on the site? (yes/no)', why: 'Decides whether consent is required before tracking or the site must be essential-only.' },
   sessionReplay: { question: 'Is session replay or input recording (for example Hotjar, Clarity, FullStory) intended? (yes/no)', why: 'Replay masking is tested with synthetic markers; undeclared replay is a finding.' },
@@ -257,10 +258,39 @@ export function validateEnvironment(environment: ProductionEnvironment): Product
     return { ...account, usernameRef: account.usernameRef ?? null, passwordRef: account.passwordRef ?? null, ...(account.storageState ? { storageState: validateLoginState(account.storageState, account.id) } : {}) }
   })
   if (environment.mutationPolicy !== undefined && environment.mutationPolicy !== null && !MUTATION_POLICIES.includes(environment.mutationPolicy)) throw new Error(`Environment ${environment.id}: mutationPolicy must be one of ${MUTATION_POLICIES.join(', ')} (or null)`)
-  return { ...environment, label: environment.label.trim(), baseUrl: environment.baseUrl, allowedOrigins: origins, accounts, capturedMail: environment.capturedMail ?? null, commerce: environment.commerce ?? null, storage: environment.storage ?? null, buildInfoCommand: environment.buildInfoCommand ?? null, smokeCommand: environment.smokeCommand ?? null, mutationPolicy: environment.mutationPolicy ?? null }
+  const tls = validateTls(environment)
+  return { ...environment, tls, label: environment.label.trim(), baseUrl: environment.baseUrl, allowedOrigins: origins, accounts, capturedMail: environment.capturedMail ?? null, commerce: environment.commerce ?? null, storage: environment.storage ?? null, buildInfoCommand: environment.buildInfoCommand ?? null, smokeCommand: environment.smokeCommand ?? null, mutationPolicy: environment.mutationPolicy ?? null }
 }
 
 export const MAX_REFRESH_TIMEOUT_MS = 600_000
+export const MAX_TRUSTED_CA_PATHS = 10
+
+/** Extra certificate trust (EnvironmentTls): never on production, and it must name what it trusts. */
+function validateTls(environment: ProductionEnvironment): EnvironmentTls | null {
+  const tls = environment.tls
+  if (tls === undefined || tls === null) return null
+  if (typeof tls !== 'object') throw new Error(`Environment ${environment.id}: tls must be an object ({allowSystemTrust?, trustedCaPaths?}) or null`)
+  if (environment.kind === 'production') throw new Error(`Environment ${environment.id} is production: its certificates are always checked against the public roots, so tls is refused there. Set tls on a staging, sandbox or local environment`)
+  if (tls.allowSystemTrust !== undefined && typeof tls.allowSystemTrust !== 'boolean') throw new Error(`Environment ${environment.id}: tls.allowSystemTrust must be true or false`)
+  const paths = tls.trustedCaPaths ?? []
+  if (!Array.isArray(paths) || paths.length > MAX_TRUSTED_CA_PATHS || paths.some(path => typeof path !== 'string' || !isAbsolute(path))) throw new Error(`Environment ${environment.id}: tls.trustedCaPaths must be a list of up to ${MAX_TRUSTED_CA_PATHS} absolute paths to PEM files`)
+  if (!tls.allowSystemTrust && !paths.length) throw new Error(`Environment ${environment.id}: tls needs allowSystemTrust: true or at least one trustedCaPaths entry (use tls: null for the public roots only)`)
+  return { allowSystemTrust: tls.allowSystemTrust === true, trustedCaPaths: [...new Set(paths)], setBy: tls.setBy ?? null }
+}
+
+const tlsKey = (tls: EnvironmentTls | null | undefined): string => tls ? JSON.stringify({ allowSystemTrust: !!tls.allowSystemTrust, trustedCaPaths: tls.trustedCaPaths ?? [] }) : ''
+
+/** Extra certificate trust widens what the audit accepts, so only the owner or a wizard tab sets or changes it; Conductor stamps who did. */
+function stampTls(before: readonly ProductionEnvironment[], after: ProductionEnvironment[], options: { by: string; source: 'owner' | 'wizard' | 'assumption'; at: string }): ProductionEnvironment[] {
+  const prior = new Map(before.map(environment => [environment.id, environment.tls ?? null]))
+  return after.map(environment => {
+    if (!environment.tls) return environment
+    const old = prior.get(environment.id)
+    if (old && tlsKey(old) === tlsKey(environment.tls)) return { ...environment, tls: { ...environment.tls, setBy: old.setBy ?? null } }
+    if (options.source === 'assumption') throw new Error(`Environment ${environment.id}: extra certificate trust (tls) widens what the audit accepts, so only the owner or a wizard tab may set or change it`)
+    return { ...environment, tls: { ...environment.tls, setBy: { source: options.source, by: options.by, at: options.at } } }
+  })
+}
 
 function validateLoginState(state: StoredLoginStateRef, accountId: string): StoredLoginStateRef {
   if (typeof state.path !== 'string' || !isAbsolute(state.path)) throw new Error(`Account ${accountId}: storageState.path must be an absolute path to a Playwright storage-state file`)
@@ -344,7 +374,8 @@ export function applyProfileUpdate(profile: ProductionProfile, update: ProfileUp
     next.facts = mergeFacts(next.facts, incoming)
   }
   if (update.environments) {
-    const environments = stampRefreshes(profile.environments, update.environments.map(validateEnvironment), { by: options.by, source: options.source, at })
+    const stamp = { by: options.by, source: options.source, at }
+    const environments = stampTls(profile.environments, stampRefreshes(profile.environments, update.environments.map(validateEnvironment), stamp), stamp)
     const ids = environments.map(environment => environment.id)
     if (new Set(ids).size !== ids.length) throw new Error('Environment ids must be unique')
     next.environments = environments

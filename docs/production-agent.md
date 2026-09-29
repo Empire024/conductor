@@ -156,6 +156,21 @@ the same project; `production.evidence` reads are bounded to 1 MiB and pass thro
    the handler's requests carry the context's cookie jar without the browser's SameSite and
    third-party filtering, so a cross-site subresource can receive a cookie the browser would have
    withheld. Neither can make a first-party mutation: a stream is a GET, and a cookie grants no method.
+   Third, the handler's fetch runs in Node, which trusts only its bundled public roots, not the
+   operating system's store: a staging site whose certificate comes from a private CA the owner
+   installed on this machine fails there (`error: self-signed certificate in certificate chain`)
+   while Chromium opens it. A non-production environment may therefore carry
+   `tls = {allowSystemTrust?, trustedCaPaths?}` (`EnvironmentTls`). With it the context skips its
+   own certificate check (`ignoreHTTPSErrors`, the only switch Playwright's fetch has), and
+   `tls-trust.ts` verifies every HTTPS and WSS origin once, chain and host name, against the public
+   roots plus the system store and/or the listed PEM files, before the first request to it; an
+   origin that does not verify is `blocked-by-policy` with the TLS error as the reason. The profile
+   refuses `tls` on a `production` environment and `createTlsTrust` ignores one that reaches a
+   production policy, so production keeps strict checking. Only the owner or a wizard sets it
+   (`setBy` stamped), and every run using it says so in a run note. A navigation that fails carries
+   `NavigationResult.detail` (the TLS, DNS or network error, the timeout, or the policy reason;
+   one line, secrets masked), and every reason built from it reads `error: <detail>`, never a
+   bare `error`.
 2. **Read-only production.** `NetworkPolicy.readOnly` is true for `production` environments and for
    any environment without a live `SandboxWriteAuthorization`. Under it the route handler aborts
    every non-GET/HEAD request to a first-party origin (recorded as `blocked-by-policy`), and
@@ -574,6 +589,15 @@ report paths instead of opening them. Wizard decisions applied on 2026-09-29:
   (validated, lower-cased; profiles stored before them stay valid and no control requires them, so
   they never become owner questions). When known, C08 flags a captured marketing or transactional
   message from another address (`wrong-sender:<kind>:<address>`, medium).
+- **Upload visibility.** `userUploadsVisibility` (`private-only` | `public`) is optional like the
+  sender facts. With `userUploads: true` and `private-only` (an ID or prescription kept in
+  non-public storage, seen only by the shop) C15 is NOT_APPLICABLE: nothing is hosted for the
+  public, so notice-and-action and takedown duties do not apply.
+- **Transactional templates.** C08 reads a template's file name before its words: newsletter,
+  promo and campaign names are marketing; order, pickup, shipping, delivery, receipt, invoice,
+  refund, payment, password, reset, account, verify and confirm names (WooCommerce's
+  `customer-*-order`, a theme's `customer-ready-pickup`) are transactional. Placeholders such as
+  `order #%s` count as transaction wording.
 - The store's 10,000-finding bound measures the query thread's CPU time, so a loaded machine delays
   it without failing it; the index-plan assertions are unchanged.
 

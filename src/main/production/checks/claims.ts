@@ -1,3 +1,4 @@
+import { navigationOutcomeText } from '../../../shared/production'
 import type { AuditPage, CheckContext, CheckOutcome, ControlCheck, FindingDraft, HumanReviewItem } from '../../../shared/production'
 import {
   browserProblem, draft, fold, markTested, normalise, outcome, planRoutes, review, throwIfAborted, visit, withPage,
@@ -122,7 +123,7 @@ async function runClaims(context: CheckContext): Promise<CheckOutcome> {
         second = await inventoryOf(page)
         const reloaded = await page.reload()
         if (reloaded.outcome === 'ok') { await page.waitFor(SETTLE_MS); afterReload = await inventoryOf(page) }
-        else unconcluded.push(`route ${route.path} could not be reloaded (${reloaded.outcome}) to compare countdowns and counts`)
+        else unconcluded.push(`route ${route.path} could not be reloaded (${navigationOutcomeText(reloaded)}) to compare countdowns and counts`)
       }
       const ref = await context.evidence.writeJson('dom', `Claims inventory of ${route.path}`, { first, second, afterReload })
       evidence.push(ref.id)

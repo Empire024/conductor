@@ -7,7 +7,7 @@ import { createCapturedMailAdapter, parseRfc822 } from '../adapters/mailpit'
 import { resolveEngine } from '../browser'
 import { createMailpitFake, type FakeMail, type MailpitFake, type MailpitFakeOptions } from '../fixtures/mailpit-fake'
 import { answeringInterpreter, createCommerceContext, type CommerceContextOptions, type JournalEntry } from './commerce-testkit'
-import { classifyByRules, createEmailCheck, optOutLink } from './email'
+import { classifyByRules, createEmailCheck, optOutLink, templateKindByName } from './email'
 
 const engine = await resolveEngine()
 const check = createEmailCheck({ suppressionWaitMs: 2_000, pollMs: 100 })
@@ -68,6 +68,17 @@ describe('C08 rules and adapters', () => {
     expect(classifyByRules('Your order #12 has shipped', 'Tracking number 1Z', {}).kind).toBe('transactional')
     expect(classifyByRules('Autumn sale', '20 % off', {}).kind).toBe('marketing')
     expect(classifyByRules('A note from us', 'We wanted to share some thoughts.', {})).toEqual({ kind: 'unknown', rule: 'no rule matched' })
+  })
+
+  it('treats order, pickup, shipping, receipt, password and account templates as transactional', () => {
+    expect(classifyByRules('customer-ready-pickup.php', 'Hi %s, Great news! Your order #%s is ready for pickup. Pickup Location', {})).toEqual({ kind: 'transactional', rule: 'transaction wording' })
+    for (const path of ['woocommerce/emails/customer-ready-pickup.php', 'woocommerce/emails/plain/customer-ready-pickup.php', 'woocommerce/emails/customer-processing-order.php', 'woocommerce/emails/customer-completed-order.php',
+      'woocommerce/emails/customer-reset-password.php', 'woocommerce/emails/customer-new-account.php', 'woocommerce/emails/customer-invoice.php', 'emails/order-receipt.html', 'emails/shipping-confirmation.mjml']) {
+      expect(templateKindByName(path), path).toEqual({ kind: 'transactional', rule: 'transactional template name' })
+    }
+    expect(templateKindByName('emails/newsletter-order-now.html')).toEqual({ kind: 'marketing', rule: 'template name' })
+    expect(templateKindByName('emails/spring-sale.html')).toBeNull()
+    expect(templateKindByName('woocommerce/emails/email-header.php')).toBeNull()
   })
 
   it('finds the opt-out link in List-Unsubscribe, the HTML or the text', () => {
@@ -132,7 +143,7 @@ describe.skipIf(!engine.available)('C08 marketing email check', { timeout: 60_00
     expect(operations.map(entry => `${entry.mutation}:${entry.status}`)).toEqual(['email-optout:done'])
     expect(fake.optOuts()).toEqual(['ben@sandbox.test'])
     const observed = result.observations.join('\n')
-    expect(observed).toMatch(/Templates: emails\/newsletter\.html: marketing \(template name\); emails\/order-receipt\.html: transactional \(transaction wording\)/)
+    expect(observed).toMatch(/Templates: emails\/newsletter\.html: marketing \(template name\); emails\/order-receipt\.html: transactional \(transactional template name\)/)
     expect(observed).toMatch(/Captured deliveries: 3 \(2 marketing, 1 transactional, 0 unclassified\)/)
     expect(observed).toMatch(/Opt-out of ben@sandbox\.test confirmed/)
     expect(observed).toMatch(/Suppression shown: "Winter news: new glazes" went to 1 recipient\(s\) after the opt-out, not to ben@sandbox\.test/)

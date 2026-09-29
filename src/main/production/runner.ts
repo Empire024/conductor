@@ -236,6 +236,7 @@ export class ProductionRunner {
       const note = (line: string): void => { try { store.event(runId, guard, 'note', line.slice(0, 1_000)) } catch { /* superseded */ } }
       const prepareLogin = createLoginStatePreparer({ runCommand: this.deps.runCommand ?? null, evidence, allowedOrigins: policy.allowedOrigins, signal, now: this.clock, note })
       browser = this.deps.browserFactory(policy, { userDataDir: join(initial.artifactsDir, `attempt-${lease.epoch}`, 'browser'), evidence, signal, guest: guestStateAccount(environment), prepareLogin })
+      if (policy.tls) note(`TLS trust of ${environment.id} (${environment.kind}): certificates are verified against the public roots plus ${[...(policy.tls.allowSystemTrust ? ['the system certificate store'] : []), ...policy.tls.trustedCaPaths].join(', ')}${environment.tls?.setBy ? `; set by ${environment.tls.setBy.by} at ${environment.tls.setBy.at}` : ''}`)
       if (environment.mutationPolicy) note(`Mutation policy of ${environment.id}: ${environment.mutationPolicy === 'none' ? 'no mutation is allowed' : 'only production-intended changes may stay; every test-only mutation needs a rollback step, and one without is refused'}`)
       const availability = await browser.availability()
       alive()

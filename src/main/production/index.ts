@@ -19,6 +19,7 @@ import type { CommandRunner } from './checks/engineering-smokes'
 import type { PublicReader } from './checks/legal-sources'
 import { recordsAdapter } from './checks/commerce-support'
 import { createFsSourceTree } from './discovery'
+import { tlsPolicyOf } from './netpolicy'
 import { runDrift, type DriftOutcome, type DriftPorts } from './drift'
 import { classifyChange, computeFingerprint, hashFiles, normalisePolicyText, type FingerprintFile } from './fingerprint'
 import { applyReviewAnswers, computeGate } from './gate'
@@ -243,6 +244,7 @@ export function createProductionService(deps: ProductionDeps) {
     environmentId: environment.id, environmentKind: environment.kind,
     allowedOrigins: [...new Set([environment.baseUrl, ...environment.allowedOrigins].map(url => { try { return new URL(url).origin } catch { return null } }).filter((origin): origin is string => !!origin))],
     readOnly: true, writeAuthorization: null, maxRequests: profile.budget.maxRequests, requestsPerSecondPerOrigin: profile.budget.requestsPerSecondPerOrigin, allowPrivateAddresses: environment.kind === 'local',
+    tls: tlsPolicyOf(environment),
   })
 
   const service = {

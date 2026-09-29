@@ -362,6 +362,7 @@ export const REGISTRY: ControlRegistry = {
       applicability: {
         requiredFacts: ['userUploads'],
         rules: [
+          { when: [{ fact: 'userUploads', is: 'true' }, { fact: 'userUploadsVisibility', equals: 'private-only' }], then: 'not-applicable', rationale: 'Uploads are private documents only (kept in non-public storage, seen only by the shop): no content is hosted for the public, so notice-and-action and takedown duties do not apply.' },
           { when: [{ fact: 'userUploads', is: 'true' }], then: 'applicable', rationale: 'Users upload or publish content: rights notices, reporting routes and takedown handling apply.' },
           { when: [{ fact: 'userUploads', is: 'false' }], then: 'not-applicable', rationale: 'No user-generated content is hosted.' }
         ],
@@ -505,7 +506,7 @@ export function registryProblems(registry: ControlRegistry = REGISTRY): string[]
   const ids = registry.controls.map(definition => definition.id)
   for (const id of CONTROL_IDS) if (!ids.includes(id)) problems.push(`${id} has no definition`)
   if (new Set(ids).size !== ids.length) problems.push('A control id is defined twice')
-  const factKeys = new Set<string>(['legalEntity', 'targetCountries', 'businessModel', 'products', 'accountFeatures', 'subscriptions', 'userUploads', 'aiRuntime', 'analytics', 'sessionReplay', 'emailMarketing', 'dataCategories', 'audience', 'ageRestrictedProducts', 'paymentProviders', 'processors', 'safeHarborReliance'] satisfies FactKey[])
+  const factKeys = new Set<string>(['legalEntity', 'targetCountries', 'businessModel', 'products', 'accountFeatures', 'subscriptions', 'userUploads', 'userUploadsVisibility', 'aiRuntime', 'analytics', 'sessionReplay', 'emailMarketing', 'dataCategories', 'audience', 'ageRestrictedProducts', 'paymentProviders', 'processors', 'safeHarborReliance'] satisfies FactKey[])
   const checkIds = new Map<string, ControlId>()
   for (const item of SOURCE_ITEM_IDS) {
     const owner = SOURCE_COVERAGE[item]

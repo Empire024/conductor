@@ -1,3 +1,4 @@
+import { navigationOutcomeText } from '../../../shared/production'
 import type { AuditPage, CheckContext, CheckOutcome, ControlCheck, DomForm, DomSnapshot } from '../../../shared/production'
 import { decideApplicability } from '../registry'
 import {
@@ -201,7 +202,7 @@ async function deletionJourney(context: CheckContext, parts: OutcomeParts, route
     }
     const done = await mutate(context, 'deletion-request', `synthetic deletion request on ${route.path}`, () => page.submit('form[data-conductor-target="rights-form"]', 'deletion-request'))
     if (!done.ok) { parts.unconcluded.push(done.reason); return false }
-    if (done.value.outcome !== 'ok' || (done.value.status ?? 200) >= 400) { parts.unconcluded.push(`the deletion request on ${route.path} ended ${done.value.outcome} (HTTP ${done.value.status ?? 'none'})`); return false }
+    if (done.value.outcome !== 'ok' || (done.value.status ?? 200) >= 400) { parts.unconcluded.push(`the deletion request on ${route.path} ended ${navigationOutcomeText(done.value)} (HTTP ${done.value.status ?? 'none'})`); return false }
     return true
   })
   if (!submitted) return
