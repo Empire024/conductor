@@ -15,15 +15,21 @@ import type { SessionProjection } from './structured-agent'
  * - a controller's live coworkers (control links) already keep it live in workspace clarity.
  *
  * The record lives in the settings table under AWAITING_RESULTS_PREFIX + the waiter's id, so it
- * survives a restart. What resolves it is read from the waiter's own persisted timeline: a user
- * message whose origin is an awaited conversation (or one that took its work over), newer than the
- * declaration. Every route another tab reaches it by (send_message, agents.report, a successor's
- * message, a message across workspaces or projects) records that origin, so nothing is hooked and
- * nothing polls: the message itself starts the waiter's turn, as it always did.
+ * survives a restart. What resolves it is the waiter's own durable event journal: a user message
+ * whose origin is an awaited conversation (or one that took its work over), after the record's
+ * cursor. Every route another tab reaches it by (send_message, agents.report, a successor's
+ * message, a message across workspaces or projects) records that origin, and the message itself
+ * starts the waiter's turn as it always did, so nothing polls.
  *
- * - Each awaited conversation drops out of the list once its message has arrived; a turn that
- *   ends after the last one arrived, without declaring again, is finished work (the record is
- *   deleted and the tab goes to Done). A turn that declares again starts a fresh wait.
+ * - Arrivals are consumed durably: the record keeps only the conversations still owed and the
+ *   journal sequence it has read through (sinceSequence), so a reply that later falls out of the
+ *   bounded timeline projection, or a restart, never brings a satisfied dependency back. Main
+ *   consumes on every status change of a waiting conversation (a delivered message starts or
+ *   joins a turn), well inside the journal's retention window.
+ * - A turn that ends after the last owed message arrived, without declaring again, is finished
+ *   work (the record is deleted and the tab goes to Done). A turn that declares again starts a
+ *   fresh wait. send_message's awaitReply takes its baseline before the message is delivered, so a
+ *   reply that arrives while the send is still returning counts.
  * - An awaited conversation with no open tab any more (closed, finished, never existed) is no
  *   longer waited for. If every one is gone the tab is not waiting; the record is kept, so an
  *   awaited coworker reopened by a message counts again.
@@ -36,12 +42,13 @@ export const MAX_AWAITED = 20
 export const MAX_AWAIT_REASON = 300
 
 export interface AwaitingRecord {
-  /** Conversations whose results are awaited, in the order named. */
+  /** Conversations whose results are still owed, in the order named; arrivals are removed. */
   agents: string[]
   reason?: string
   /** When it was declared (ISO). */
   since: string
-  /** The waiter's projection sequence at the declaration: only newer messages resolve it. */
+  /** The waiter's event sequence read through so far (the declaration's baseline at first): only
+   *  later messages resolve it, and everything up to here has been consumed. */
   sinceSequence: number
 }
 
@@ -61,15 +68,17 @@ export function parseAwaitingRecord(raw: string | null | undefined): AwaitingRec
   } catch { return null }
 }
 
-/** The ids whose messages arrived in the waiter's timeline after the declaration. */
-export function arrivedFrom(record: Pick<AwaitingRecord, 'sinceSequence'>, items: SessionProjection['items']): Set<string> {
-  const from = new Set<string>()
-  for (const item of items) {
-    if (item.sequence <= record.sinceSequence) continue
-    const data = item.data
-    if (data.type === 'text' && data.role === 'user' && data.origin?.agentSessionId) from.add(data.origin.agentSessionId)
+/** Anything sequenced that carries timeline data: journal events and projection items alike. */
+export interface Sequenced { sequence: number; data: SessionProjection['items'][number]['data'] }
+
+/** The conversations whose messages arrived among `entries` after sequence `after`. */
+export function arrivedFrom(after: number, entries: Iterable<Sequenced>, into: Set<string> = new Set()): Set<string> {
+  for (const entry of entries) {
+    if (entry.sequence <= after) continue
+    const data = entry.data
+    if (data.type === 'text' && data.role === 'user' && data.origin?.agentSessionId) into.add(data.origin.agentSessionId)
   }
-  return from
+  return into
 }
 
 export interface AwaitedLookup {
@@ -86,8 +95,7 @@ export interface AwaitingEvaluation {
   open: Array<{ agentSessionId: string; title: string }>
 }
 
-export function evaluateAwaiting(record: AwaitingRecord, state: Pick<SessionProjection, 'items'>, lookup: AwaitedLookup): AwaitingEvaluation {
-  const arrived = arrivedFrom(record, state.items)
+export function evaluateAwaiting(record: AwaitingRecord, arrived: ReadonlySet<string>, lookup: AwaitedLookup): AwaitingEvaluation {
   const owed = record.agents.filter(id => ![id, ...lookup.successors(id)].some(candidate => arrived.has(candidate)))
   const open = owed.flatMap(id => {
     // A handed-off conversation's successor carries its work, and its report.

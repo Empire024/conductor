@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { PaneTab } from './models'
 import type { TimelineItem } from './structured-agent'
-import { awaitingLabel, awaitingSentence, evaluateAwaiting, parseAwaitingRecord, type AwaitingFact, type AwaitingRecord } from './awaiting-results'
+import { arrivedFrom, awaitingLabel, awaitingSentence, evaluateAwaiting, parseAwaitingRecord, type AwaitingFact, type AwaitingRecord } from './awaiting-results'
 import { buildWorkspaceClarity, clarityStatus, finishedCloseRefusal, statusLabel, type AgentTabFacts } from './workspace-clarity'
 
 const item = (sequence: number, from?: string, role: 'user' | 'assistant' = 'user'): TimelineItem => ({
@@ -14,19 +14,19 @@ const lookup = (open: Record<string, string>, successors: Record<string, string[
 describe('evaluateAwaiting', () => {
   it('owes each awaited conversation until its own message arrives after the declaration', () => {
     const open = lookup({ a: 'Fixer A', b: 'Fixer B' })
-    expect(evaluateAwaiting(record(['a', 'b']), { items: [] }, open)).toEqual({ owed: ['a', 'b'], open: [{ agentSessionId: 'a', title: 'Fixer A' }, { agentSessionId: 'b', title: 'Fixer B' }] })
+    expect(evaluateAwaiting(record(['a', 'b']), arrivedFrom(10, []), open)).toEqual({ owed: ['a', 'b'], open: [{ agentSessionId: 'a', title: 'Fixer A' }, { agentSessionId: 'b', title: 'Fixer B' }] })
     // Older than the declaration, from the owner (no origin), or an assistant line: not an arrival.
     const noise = [item(5, 'a'), item(11), item(12, 'a', 'assistant')]
-    expect(evaluateAwaiting(record(['a', 'b']), { items: noise }, open).owed).toEqual(['a', 'b'])
-    expect(evaluateAwaiting(record(['a', 'b']), { items: [...noise, item(13, 'a')] }, open).owed).toEqual(['b'])
-    expect(evaluateAwaiting(record(['a', 'b']), { items: [item(13, 'a'), item(14, 'b')] }, open).owed).toEqual([])
+    expect(evaluateAwaiting(record(['a', 'b']), arrivedFrom(10, noise), open).owed).toEqual(['a', 'b'])
+    expect(evaluateAwaiting(record(['a', 'b']), arrivedFrom(10, [...noise, item(13, 'a')]), open).owed).toEqual(['b'])
+    expect(evaluateAwaiting(record(['a', 'b']), arrivedFrom(10, [item(13, 'a'), item(14, 'b')]), open).owed).toEqual([])
   })
 
   it('counts a successor’s message and waits on the open successor; a closed awaited tab is not waited for', () => {
     const chain = lookup({ a2: 'Fixer A (continued)' }, { a: ['a2'] })
-    expect(evaluateAwaiting(record(['a']), { items: [] }, chain)).toEqual({ owed: ['a'], open: [{ agentSessionId: 'a2', title: 'Fixer A (continued)' }] })
-    expect(evaluateAwaiting(record(['a']), { items: [item(11, 'a2')] }, chain).owed).toEqual([])
-    expect(evaluateAwaiting(record(['gone']), { items: [] }, lookup({}))).toEqual({ owed: ['gone'], open: [] })
+    expect(evaluateAwaiting(record(['a']), arrivedFrom(10, []), chain)).toEqual({ owed: ['a'], open: [{ agentSessionId: 'a2', title: 'Fixer A (continued)' }] })
+    expect(evaluateAwaiting(record(['a']), arrivedFrom(10, [item(11, 'a2')]), chain).owed).toEqual([])
+    expect(evaluateAwaiting(record(['gone']), arrivedFrom(10, []), lookup({}))).toEqual({ owed: ['gone'], open: [] })
   })
 
   it('parses only well-formed records', () => {

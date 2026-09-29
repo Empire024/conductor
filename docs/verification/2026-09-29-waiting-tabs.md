@@ -36,3 +36,20 @@ refuse it, naming whom it waits for.
   finished refuses it; W4 the fixer's message starts one reviewer turn (delivery started, no polling), the
   reviewer waits again and stays live, the second message completes it and it moves to Done. All PASS
   (the harness cleanup inventory twice tripped over an unrelated process command line; no process was left).
+
+## Review fixes (reviewer agent_mumgbwry_9p0h99y on 93c049f)
+
+1. Partial arrivals were not consumed durably: the owed list was recomputed from the projection,
+   which keeps only the newest 2000 items, so a reply that fell out of it brought a satisfied
+   dependency back. Now each read consumes arrivals from the durable event journal
+   (StructuredStore.journalRange, a primary-key range from the record's cursor, at most 20 pages of
+   1000 rows) and saves the remaining owed list with the sequence it read through; the projection is
+   only a fallback when the journal was trimmed past the cursor. Main consumes on every
+   `agent:status` change of a waiting conversation (index.ts), so a reply is recorded as soon as it
+   starts or joins a turn. Regressions: src/main/awaiting-results.test.ts (eviction + journal trim +
+   restart; a reply already out of the projection) and agent-control.test.ts (real journal, projection
+   emptied, fresh AgentControl).
+2. send_message awaitReply took its baseline after delivery, so a reply that landed while the send
+   was returning was ignored. The baseline is now the sender's sequence before delivery.
+   Regression: agent-control.test.ts, the fixer replies inside the delivery; the test fails on the old
+   order and passes on the new one.

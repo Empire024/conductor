@@ -3463,4 +3463,41 @@ describe('waiting for results (src/shared/awaiting-results.ts)', () => {
     expect(f.database.getSetting('awaitingResults:' + reviewer.agentSessionId)).toBeNull()
     await expect(f.control.call({ ...f.scope, agentSessionId: 'owner', owner: true }, 'agents.await', { agents: ['fixer'] })).rejects.toThrow(/owner credential has none/)
   })
+
+  it('awaitReply counts a reply that lands while the send is still returning (baseline before delivery)', async () => {
+    const f = fixture()
+    const child = await f.control.call(f.scope, 'tabs.open', { title: 'Fixer' }) as AgentControlTab
+    const fixer = { ...f.scope, agentSessionId: child.resourceId! }
+    // The fixer answers inside the delivery of the controller's message, before agents.steer resolves.
+    const deliver = f.sessions.steerOrStart.bind(f.sessions)
+    let replied = false
+    vi.spyOn(f.sessions, 'steerOrStart').mockImplementation(async (id, ...rest) => {
+      const delivery = await deliver(id, ...rest)
+      if (id === fixer.agentSessionId && !replied) { replied = true; await f.control.call(fixer, 'agents.steer', { agentSessionId: f.scope.agentSessionId, prompt: 'REPLY during the send' }) }
+      return delivery
+    })
+    const sent = await f.control.call(f.scope, 'agents.steer', { agentSessionId: fixer.agentSessionId, prompt: 'Send me the fix', awaitReply: true }) as { awaiting: unknown }
+    expect(replied).toBe(true)
+    expect(sent.awaiting).toBeNull()
+    expect(f.control.awaitingFact(f.scope.agentSessionId)).toBeUndefined()
+    expect(f.database.getSetting('awaitingResults:' + f.scope.agentSessionId)).toBeNull()
+  })
+
+  it('a partial reply is consumed from the journal and stays consumed after the projection drops it and a restart', async () => {
+    const f = fixture()
+    const fixer = agentIn(f, f.project.id, f.workspace.id, 'fixer'), other = agentIn(f, f.project.id, f.workspace.id, 'other')
+    await f.control.call(f.scope, 'agents.await', { agents: [fixer.agentSessionId, other.agentSessionId] })
+    await f.control.call(fixer, 'agents.steer', { agentSessionId: f.scope.agentSessionId, prompt: 'FIX 1' })
+    // The status change of the woken reviewer consumes the reply (index.ts calls this on agent:status).
+    f.control.noteAwaitingStatus(f.scope.agentSessionId)
+    const stored = JSON.parse(f.database.getSetting('awaitingResults:' + f.scope.agentSessionId)!)
+    expect(stored.agents).toEqual([other.agentSessionId])
+    expect(stored.sinceSequence).toBe(f.database.structured.snapshot(f.scope.agentSessionId)!.sequence)
+    // The bounded projection no longer holds the reply: still only the other fixer is owed ...
+    const snapshot = f.database.structured.snapshot.bind(f.database.structured)
+    vi.spyOn(f.database.structured, 'snapshot').mockImplementation(id => { const state = snapshot(id); return state && id === f.scope.agentSessionId ? { ...state, items: [] } : state })
+    expect(f.control.awaitingFact(f.scope.agentSessionId)!.agents.map(agent => agent.agentSessionId)).toEqual([other.agentSessionId])
+    // ... and after a restart (a fresh AgentControl over the same database).
+    expect(new AgentControl(f.deps).awaitingFact(f.scope.agentSessionId)!.agents.map(agent => agent.agentSessionId)).toEqual([other.agentSessionId])
+  })
 })

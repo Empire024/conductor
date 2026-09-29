@@ -1334,10 +1334,17 @@ export class AgentControl {
     const projectOf = (id: string): string => database.structured.spec<AgentSpec>(id)?.projectId ?? ''
     return this.awaitingLedger ??= new AwaitingResults({
       settings: database, snapshot: id => database.structured.snapshot(id),
+      journal: (id, from, to, limit) => database.structured.journalRange(id, from, to, limit), journalFloor: id => database.structured.journalFloor(id),
       open: id => this.describeTarget({ agentSessionId: id })?.title,
       successors: id => this.successorsOf(projectOf(id), id),
       superseded: id => Boolean(this.recovery().status(projectOf(id), id).superseded)
     })
+  }
+
+  /** A status change of this conversation (index.ts): consume the messages it received, so an
+   *  answered dependency is recorded durably before the bounded projection can drop the reply. */
+  noteAwaitingStatus(agentSessionId: string): void {
+    try { if (this.awaiting().record(agentSessionId)) this.awaiting().consume(agentSessionId) } catch (error) { console.warn('Waiting-for-results consume failed', error) }
   }
 
   /** Whom this conversation waits for right now, for workspace clarity; undefined when nobody. */
@@ -1372,11 +1379,14 @@ export class AgentControl {
   private async steerAwaitingReply(scope: AgentControlScope, rawArgs: unknown): Promise<unknown> {
     const { awaitReply, ...rest } = object(rawArgs)
     if (typeof awaitReply !== 'boolean') throw new ArgumentError('awaitReply must be true or false')
+    // The baseline is taken before delivery: a reply that lands while the send is still returning
+    // is newer than it and counts.
+    const baseline = this.deps.database.structured.snapshot(scope.agentSessionId)?.sequence ?? 0
     const result = await this.invoke(scope, 'agents.steer', rest)
     if (!awaitReply || scope.owner) return result
     const delivered = object(result), recipient = typeof delivered.agentSessionId === 'string' ? delivered.agentSessionId : typeof object(delivered.deliveredTo).agentSessionId === 'string' ? String(object(delivered.deliveredTo).agentSessionId) : undefined
     if (!recipient) return result
-    this.awaiting().add(scope.agentSessionId, recipient)
+    this.awaiting().add(scope.agentSessionId, recipient, baseline)
     return { ...delivered, awaiting: this.awaiting().fact(scope.agentSessionId) ?? null }
   }
   /** The approval reviews raised for a worker's requests; none when the journal cannot be read. */

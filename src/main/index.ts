@@ -2926,6 +2926,8 @@ app.whenReady().then(async () => {
     ...(sweepOverride ? { ageOverrideMs: sweepOverride } : {})
   })
   finishedTabs.start()
+  // A waiting tab consumes the replies it received on each of its status changes (awaiting-results.ts).
+  onBroadcast((channel, payload) => { const id = channel === 'agent:status' ? (payload as { id?: unknown } | null)?.id : undefined; if (typeof id === 'string') control.noteAwaitingStatus(id) })
   // Closes nobody confirms go to the archive only when nothing is lost (tab-archive-eligibility.ts).
   tabArchiver = new TabArchiver({
     layoutTab: (projectId, sessionId, tabId) => { const session = database.listSessions(projectId).find(item => item.id === sessionId); return session ? findLayoutTab(session.layout.root, tabId)?.tab : undefined },
