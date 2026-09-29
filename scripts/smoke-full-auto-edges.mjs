@@ -38,7 +38,7 @@ const nativePending = id => poll(async () => {
 }, { timeoutMs: 90_000, label: `${id} native pending grant` })
 const ownerButton = async (id, label) => {
   const detail = pane(id).locator('.sa-full-auto-details')
-  if (!await detail.evaluate(element => element.open)) await detail.locator('summary').click()
+  if (!await detail.evaluate(element => element.open)) await detail.locator(':scope > summary').click()
   await detail.getByRole('button', { name: label, exact: true }).click()
 }
 

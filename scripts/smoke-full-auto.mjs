@@ -53,7 +53,7 @@ const ownerButton = async label => {
   await call('tabs.focus', { tabId: worker.id })
   await workerPane().waitFor({ state: 'visible' })
   const detail = workerPane().locator('.sa-full-auto-details')
-  if (!await detail.evaluate(element => element.open)) await detail.locator('summary').click()
+  if (!await detail.evaluate(element => element.open)) await detail.locator(':scope > summary').click()
   await detail.getByRole('button', { name: label, exact: true }).click()
 }
 const modeLabel = () => workerPane().locator('.sa-mode-trigger').textContent()

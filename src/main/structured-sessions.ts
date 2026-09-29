@@ -200,6 +200,18 @@ export class StructuredSessions {
     }
     return results
   }
+  /** Live Claude conversations whose runtime confirmed bypassPermissions; read-only, for the owner's card. */
+  claudeFullAutoTabs(): Array<{ agentSessionId: string; title: string; projectId: string }> {
+    const tabs: Array<{ agentSessionId: string; title: string; projectId: string }> = []
+    for (const live of this.live.values()) {
+      if (live.closed || !live.adapter || live.spec.provider !== 'claude') continue
+      const state = this.database.structured.snapshot(live.spec.id)
+      const effective = state?.capabilities?.effectiveSettings
+      const values = effective && typeof effective === 'object' && !Array.isArray(effective) ? effective : {}
+      if (values.permissionMode === 'bypassPermissions' && values.permissionModeStatus === 'confirmed') tabs.push({ agentSessionId: live.spec.id, title: state?.title || live.spec.title, projectId: live.spec.projectId })
+    }
+    return tabs
+  }
   private refreshClaudeFullAutoFor(live: LiveSession): Promise<ClaudeFullAutoRefreshResult> {
     if (live.claudePolicyRefresh) return live.claudePolicyRefresh
     const refresh = this.refreshClaudeFullAutoNow(live).finally(() => { live.claudePolicyRefresh = undefined })

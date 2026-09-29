@@ -58,4 +58,17 @@ describe('installation-wide owner Full Auto policy', () => {
     await enable(trusted, true)
     expect(h.policy.authorized()).toBe(true)
   })
+  it('lists confirmed Full Auto tabs read-only, to trusted origins only', () => {
+    const h = harness()
+    const handlers = new Map<string, (...args: any[]) => unknown>()
+    const ipc = { handle: (name: string, handler: (...args: any[]) => unknown) => { handlers.set(name, handler) }, removeHandler: vi.fn() }
+    const trusted = { sender: 'owner-top-level' }
+    const tabs = [{ agentSessionId: 'a1', title: 'Worker', projectId: 'p1', runtime: 'chat' as const }]
+    registerClaudeFullAutoIpc(ipc, h.policy, event => { if (event !== trusted as unknown) throw new Error('Untrusted origin') }, () => tabs)
+    const list = handlers.get('claude-full-auto:tabs')!
+    expect(() => list({ sender: 'agent' })).toThrow('Untrusted origin')
+    expect(list(trusted)).toEqual(tabs)
+    expect(h.policy.authorized()).toBe(false)
+    expect(h.reconcile).not.toHaveBeenCalled()
+  })
 })

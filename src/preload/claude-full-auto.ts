@@ -3,6 +3,7 @@ import type { ClaudeFullAutoBridge, ClaudeFullAutoState } from '../shared/claude
 
 export const claudeFullAutoBridge: ClaudeFullAutoBridge = {
   state: () => ipcRenderer.invoke('claude-full-auto:state'),
+  tabs: () => ipcRenderer.invoke('claude-full-auto:tabs'),
   setEnabled: enabled => ipcRenderer.invoke('claude-full-auto:set-enabled', enabled),
   onChanged: callback => {
     const listener = (_event: Electron.IpcRendererEvent, state: ClaudeFullAutoState): void => callback(state)

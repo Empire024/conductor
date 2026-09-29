@@ -7,8 +7,17 @@ export interface ClaudeFullAutoState {
   error?: string
 }
 
+/** A live Claude runtime whose provider confirmed bypassPermissions. Read-only presentation data. */
+export interface ClaudeFullAutoTab {
+  agentSessionId: string
+  title: string
+  projectId: string
+  runtime: 'chat' | 'cli'
+}
+
 export interface ClaudeFullAutoBridge {
   state(): Promise<ClaudeFullAutoState>
+  tabs(): Promise<ClaudeFullAutoTab[]>
   setEnabled(enabled: boolean): Promise<ClaudeFullAutoState>
   onChanged(callback: (state: ClaudeFullAutoState) => void): () => void
 }

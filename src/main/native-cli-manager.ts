@@ -53,6 +53,11 @@ export class NativeCliManager {
   private switching = new Map<string, Promise<RuntimeEnsureResult & { sequence: number }>>()
   private claudeFullAutoPolicy: () => boolean = () => false
   setClaudeFullAutoPolicy(policy: () => boolean): void { this.claudeFullAutoPolicy = policy }
+  /** Interactive Claude CLIs that were launched with bypassPermissions and are still running. */
+  claudeFullAutoTabs(): Array<{ agentSessionId: string; title: string; projectId: string }> {
+    return [...this.live].filter(([, live]) => !live.exited && live.spec.provider === 'claude' && live.launchedFullAuto)
+      .map(([id, live]) => ({ agentSessionId: id, title: this.database.structured.snapshot(id)?.title || live.spec.title, projectId: live.spec.projectId }))
+  }
   /** The interactive TUI has no acknowledged permission setter. Idle handoffs return to the
    * structured runtime safely; an in-flight command stays alive and is reported as blocked. */
   async refreshClaudeFullAutoPolicy(): Promise<Array<{ agentSessionId: string; status: 'confirmed' | 'blocked'; error?: string }>> {

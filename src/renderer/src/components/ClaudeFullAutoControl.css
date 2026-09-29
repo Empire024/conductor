@@ -1,7 +1,30 @@
-.sa-full-auto-control { padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; }
-.sa-full-auto-control p { margin: 0 0 10px; font-size: 12px; line-height: 1.5; }
-.sa-full-auto-control p:last-child { margin-bottom: 0; margin-top: 8px; }
-.sa-full-auto-control button { white-space: normal; text-align: left; }
+.sa-full-auto-control { padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; display: grid; gap: 8px; }
+.sa-full-auto-control[data-state="on"] { border-color: var(--accent-muted); background: var(--accent-bg); }
+.sa-full-auto-control p { margin: 0; font-size: 12px; line-height: 1.5; }
 .sa-full-auto-control [role="alert"] { color: var(--error, #ef8d8d); }
+.sa-full-auto-head { display: flex; align-items: center; gap: 10px; }
+.sa-full-auto-dot { flex: none; width: 9px; height: 9px; border-radius: 50%; background: var(--text-3, #6b7280); }
+.sa-full-auto-control[data-state="on"] .sa-full-auto-dot { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg); }
+.sa-full-auto-control[data-state="applying"] .sa-full-auto-dot { background: var(--blue); }
+.sa-full-auto-title { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.sa-full-auto-title strong { font-size: 13px; display: flex; align-items: center; gap: 6px; }
+.sa-full-auto-title small { font-size: 11px; color: var(--text-2, #9aa1ab); }
+.sa-full-auto-badge { font-size: 10px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-2, #9aa1ab); }
+.sa-full-auto-control[data-state="on"] .sa-full-auto-badge { border-color: var(--accent-muted); color: var(--accent); }
+.sa-full-auto-head button { flex: none; white-space: nowrap; padding: 5px 12px; border: 1px solid var(--border); border-radius: 5px; font-size: 12px; background: transparent; color: var(--text); cursor: pointer; }
+.sa-full-auto-head button.primary { border-color: var(--accent); background: var(--accent); color: #10140c; font-weight: 650; }
+.sa-full-auto-head button.sa-full-auto-disable { border-color: var(--danger); color: var(--danger); }
+.sa-full-auto-head button.sa-full-auto-disable:not(:disabled):hover { background: var(--danger); color: var(--bg); }
+.sa-full-auto-head button:disabled { opacity: .5; cursor: default; }
+.sa-full-auto-tabs { display: grid; gap: 4px; font-size: 12px; }
+.sa-full-auto-tabs > span { font-size: 11px; color: var(--text-2, #9aa1ab); }
+.sa-full-auto-tabs > small { font-size: 11px; color: var(--text-3, #6b7280); }
+.sa-full-auto-tabs ul { margin: 0; padding: 0; list-style: none; display: flex; flex-wrap: wrap; gap: 4px; }
+.sa-full-auto-tabs li { padding: 2px 8px; border: 1px solid var(--border); border-radius: 999px; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sa-full-auto-tabs li small { margin-left: 6px; font-size: 10px; color: var(--text-3, #6b7280); }
+.sa-full-auto-explain { font-size: 12px; }
+.sa-full-auto-explain summary { cursor: pointer; color: var(--text-2, #9aa1ab); font-size: 11px; }
+.sa-full-auto-explain p { margin-top: 6px; color: var(--text-2, #9aa1ab); }
 .sa-full-auto-details { margin: 6px 0; font-size: 12px; }
-.sa-full-auto-details summary { cursor: pointer; padding: 4px 0; }
+.sa-full-auto-details > summary { cursor: pointer; padding: 4px 0; }
+.settings-page > .sa-full-auto-control { padding: 10px 12px; margin-bottom: 21px; border: 1px solid var(--border); }

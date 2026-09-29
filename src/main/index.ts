@@ -2629,7 +2629,11 @@ const registerIpc = (): void => {
   if (ideasRegistration) disposeIdeasIpc = ideasRegistration.registerIpc(event => trustedStructured(event))
   if (ideaRunsRegistration) disposeIdeaRunsIpc = ideaRunsRegistration.registerIpc(event => trustedStructured(event))
   registerPermissionGrantsIpc(() => permissionGrants?.grants, event => trustedStructured(event))
-  registerClaudeFullAutoIpc(ipcMain, claudeFullAuto, event => trustedStructured(event))
+  registerClaudeFullAutoIpc(ipcMain, claudeFullAuto, event => trustedStructured(event), () => {
+    const cli = agents.nativeCli.claudeFullAutoTabs().map(tab => ({ ...tab, runtime: 'cli' as const }))
+    const cliIds = new Set(cli.map(tab => tab.agentSessionId))
+    return [...agents.structured.claudeFullAutoTabs().filter(tab => !cliIds.has(tab.agentSessionId)).map(tab => ({ ...tab, runtime: 'chat' as const })), ...cli]
+  })
   cloud?.registerIpc({
     authorize: (event, projectId) => { trustedStructured(event); requireLocalProject(database, structuredId(projectId), 'Cloud sessions') },
     projectPath: projectId => { const project = database.getProject(projectId); return project && !project.remote ? project.path : null }
