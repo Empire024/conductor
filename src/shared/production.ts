@@ -140,7 +140,7 @@ export type EnvironmentKind = (typeof ENVIRONMENT_KINDS)[number]
 /** Kinds of mutation a check may perform, each needing an explicit sandbox write authorization. */
 export const MUTATION_KINDS = [
   'form-submit', 'account-create', 'checkout', 'subscription-cancel', 'deletion-request',
-  'upload', 'email-optout', 'storage-probe-write',
+  'upload', 'email-optout', 'storage-probe-write', 'refund-request',
 ] as const
 export type MutationKind = (typeof MUTATION_KINDS)[number]
 
@@ -969,10 +969,16 @@ export interface StorageAdapter {
   probeAnonymous(key: string): Promise<{ status: number; listing: boolean }>
 }
 
+/** Where a data subject's records still live after a deletion request (C07 tracing): one row per store and record. */
+export interface DataRecordsAdapter {
+  records(subject: string): Promise<Array<{ store: string; kind: string; id: string; retainedBecause: string | null }>>
+}
+
 export interface Adapters {
   mail: CapturedMailAdapter | null
   commerce: CommerceSandboxAdapter | null
   storage: StorageAdapter | null
+  records?: DataRecordsAdapter | null
 }
 
 /** Bounded, redacted model call. Output is JSON validated against `schema`; anything else is dropped as a refusal. */

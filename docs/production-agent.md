@@ -450,7 +450,8 @@ subs-good,subs-billing-continues,subs-na,refunds-good,refunds-blanket-no}` and f
 mutations go through `operation()`; without a write authorization every journey stops before the
 first mutation and reports UNVERIFIED with "sandbox write authorization required for
 <mutation>". Data rights: request route reachable, proportionate identity check, synthetic
-deletion request traced through the adapter (`custom-command` prints JSON of remaining records),
+deletion request traced through the adapter (`custom-command` prints JSON of remaining records;
+the optional `Adapters.records` answers the same per data subject),
 documented exceptions reconciled. Email: templates from the source tree plus captured deliveries;
 marketing vs transactional by `classify` with deterministic header/footer rules first; sender,
 subject truthfulness, postal address, working opt-out; opt-out followed by a second campaign send
@@ -458,7 +459,8 @@ must show suppression (fixture). Pricing: advertised vs cart vs checkout vs orde
 via adapter in sandbox, fee disclosure before commitment. Subscriptions: renewal terms near the
 consent action, cancel through UI and adapter, `nextPaymentAt` cleared; cancellation, deletion and
 refund are separate journeys. Refunds: policy before purchase, consistency, blanket "no refunds"
-as human review, sandbox refund request only with authorization.
+as human review, sandbox refund request only with an authorization naming `refund-request` (production refuses it like every
+mutation).
 
 ### Wave 3 (one worker; needs waves 1-2)
 
