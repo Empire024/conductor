@@ -23,7 +23,8 @@ import type { ProductionStore, WriteGuard } from './store'
 /** What M8 adapts: ModelIntelligence routing, AgentControl.evaluationTurn, LocalModelRunner.ask, usage limits. */
 export interface InterpreterPorts {
   route(features: TaskFeatures, constraints: Partial<RouteConstraints>): Promise<{ decisionId: string | null; key: ModelKey }>
-  cloudTurn(key: ModelKey, prompt: string, signal: AbortSignal, maxTokens: number): Promise<{ text: string; inputTokens: number; outputTokens: number; costUsd: number | null }>
+  /** One cloud turn; `context.projectId` is the audited project, where the turn's background tab opens. */
+  cloudTurn(key: ModelKey, prompt: string, signal: AbortSignal, maxTokens: number, context: { projectId: string }): Promise<{ text: string; inputTokens: number; outputTokens: number; costUsd: number | null }>
   /** The local model; null when none is available right now (or starting one would disturb an interactive local turn). */
   localAsk(request: { system: string; user: string; maxTokens: number; signal: AbortSignal }): Promise<{ text: string; model: string; inputTokens: number; outputTokens: number } | null>
   /** The owner's weekly stop for a provider, in percent of its weekly window; null when none applies. */
@@ -98,7 +99,7 @@ export function createRunInterpreter(options: RunInterpreterOptions): Interprete
           answer = local && { text: local.text, inputTokens: local.inputTokens, outputTokens: local.outputTokens, costUsd: 0 }
           if (local) model = local.model
         } else {
-          answer = await ports.cloudTurn(key, prompt, signal, maxTokens)
+          answer = await ports.cloudTurn(key, prompt, signal, maxTokens, { projectId: run.projectId })
         }
       } catch (error) {
         store.charge(run.id, guard, { tokens: -maxTokens, modelCalls: -1, role: request.role })

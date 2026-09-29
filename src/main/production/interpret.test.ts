@@ -28,6 +28,8 @@ describe('run interpreter', () => {
     const answer = await interpreter(ports).ask(request('interpret'), signal)
     expect(answer).toMatchObject({ ok: true, json: { rationale: 'ok' }, refused: null })
     expect(ports.calls.map(call => call.kind)).toEqual(['route', 'cloud'])
+    // The cloud turn is told which project is audited, so its tab opens there.
+    expect(ports.calls.find(call => call.kind === 'cloud')?.projectId).toBe('project-a')
     const ledger = temp.store.run(runId).ledger
     expect(ledger).toMatchObject({ tokens: 120, modelCalls: 1 })
     expect(ledger.byRole.interpret).toEqual({ calls: 1, tokens: 120 })

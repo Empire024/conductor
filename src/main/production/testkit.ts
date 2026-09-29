@@ -87,7 +87,7 @@ export function fakeBrowserFactory(options: { available?: boolean } = {}): { fac
 }
 
 export interface RecordingPorts extends InterpreterPorts {
-  calls: Array<{ kind: 'route' | 'cloud' | 'local'; detail: string }>
+  calls: Array<{ kind: 'route' | 'cloud' | 'local'; detail: string; projectId?: string }>
 }
 
 export function recordingPorts(options: {
@@ -106,8 +106,8 @@ export function recordingPorts(options: {
       if (options.routeError) throw new Error(options.routeError)
       return { decisionId: 'decision-1', key: options.key ?? { provider: 'anthropic', model: 'claude-test' } }
     },
-    async cloudTurn(key, prompt) {
-      calls.push({ kind: 'cloud', detail: `${key.provider}/${key.model}` })
+    async cloudTurn(key, prompt, _signal, _maxTokens, context) {
+      calls.push({ kind: 'cloud', detail: `${key.provider}/${key.model}`, projectId: context.projectId })
       return { text: options.cloudText?.(prompt) ?? '{"rationale":"ok"}', inputTokens: 100, outputTokens: 20, costUsd: 0.001 }
     },
     async localAsk(request) {

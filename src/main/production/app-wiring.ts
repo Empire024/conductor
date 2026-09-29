@@ -26,8 +26,8 @@ export interface ProductionAppDeps {
   projectName(projectId: string): string
   /** Routing with the live facts of the audited project (AgentControl.routeForHost). */
   route(projectId: string, features: TaskFeatures, constraints: Partial<RouteConstraints>): Promise<{ decisionId: string | null; key: ModelKey }>
-  /** One cloud evaluation turn (AgentControl.evaluationTurn, lean profile). */
-  evaluationTurn(key: ModelKey, prompt: { system: string; user: string }, signal: AbortSignal, maxTokens: number): Promise<{ answer: string; tokens: number | null; costUsd: number | null; inputTokens: number | null }>
+  /** One cloud evaluation turn (AgentControl.evaluationTurn, lean profile), in the audited project's workspace. */
+  evaluationTurn: EvaluationTurn
   /** The process's local model runner (local assist); null when it is not running. */
   localRunner(): LocalModelRunner | null
   /** An interactive local conversation is mid-turn: the audit never starts a model server then. */
@@ -40,6 +40,21 @@ export interface ProductionAppDeps {
    *  parked smoke never spends a cloud allowance or takes the owner's GPU. */
   offline?: boolean
   log?(line: string): void
+}
+
+export type EvaluationTurn = (key: ModelKey, prompt: { system: string; user: string }, signal: AbortSignal, options: { maxTokens: number; scope: { projectId: string } }) => Promise<{ answer: string; tokens: number | null; costUsd: number | null; inputTokens: number | null }>
+
+/**
+ * The interpreter's cloud port over an evaluation turn. The turn's background read-only tab opens in
+ * the audited project (its first workspace), not in whichever project happens to be first, so the
+ * owner sees an audit's model call beside the audit.
+ */
+export function evaluationCloudTurn(evaluationTurn: EvaluationTurn): InterpreterPorts['cloudTurn'] {
+  return async (key, prompt, signal, maxTokens, context) => {
+    const turn = await evaluationTurn(key, { system: '', user: prompt }, signal, { maxTokens, scope: { projectId: context.projectId } })
+    const inputTokens = turn.inputTokens ?? 0
+    return { text: turn.answer, inputTokens, outputTokens: Math.max(0, (turn.tokens ?? inputTokens) - inputTokens), costUsd: turn.costUsd }
+  }
 }
 
 export interface ProductionApp {
@@ -57,11 +72,7 @@ export function createProductionApp(deps: ProductionAppDeps): ProductionApp {
       if (deps.offline) throw new Error('offline test profile: no model is asked')
       return deps.route(features.projectId ?? '', features, constraints)
     },
-    cloudTurn: async (key, prompt, signal, maxTokens) => {
-      const turn = await deps.evaluationTurn(key, { system: '', user: prompt }, signal, maxTokens)
-      const inputTokens = turn.inputTokens ?? 0
-      return { text: turn.answer, inputTokens, outputTokens: Math.max(0, (turn.tokens ?? inputTokens) - inputTokens), costUsd: turn.costUsd }
-    },
+    cloudTurn: evaluationCloudTurn(deps.evaluationTurn),
     localAsk: async request => {
       const runner = deps.offline ? null : deps.localRunner()
       if (!runner) return null
