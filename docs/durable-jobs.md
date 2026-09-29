@@ -171,3 +171,17 @@ renderer while it runs, pauses, resumes, cancels, and checks that an approval-ga
 - `--fixture=crossref` — six large modules summarised and cross-referenced over four stages, so
   the job advances through several fresh contexts; `--extras=none` stops after its report.
   `DURABLE_SMOKE_STAGE_TIMEOUT_MS` raises the settle wait for a slow real model.
+- `--loop-case`, `--stall-case` (stub) — a job repeating one call and one whose model never
+  answers; both must end `blocked`. `--approval-gate` and `--blocked-restart` (stub) run only
+  their own restart scenarios.
+- `--soak` (with `--real-model --fixture=crossref`) — the job back to back for
+  `DURABLE_SOAK_WORKLOAD_MS` (default 6 h); each iteration is bounded by stage count × stage
+  timeout. It forces `contextRolloverFraction` to `DURABLE_SOAK_ROLLOVER_FRACTION` (default 0.55).
+  That value must leave room to read one module and write its notes before the rollover: at 0.4
+  no rollover ever carried file progress, so none was credited and no iteration completed.
+- With `--kill-server`, recovery must be a server-loss event followed by a new stage attempt,
+  not just a `running` status.
+- Real-model runs need the GPU free: a job does not displace another Conductor's idle server
+  for 10 quiet minutes, so stop the owner's server first (`local.stop`) and restore it afterwards.
+
+`docs/verification/2026-09-29-durable-jobs.md` holds the latest acceptance matrix.

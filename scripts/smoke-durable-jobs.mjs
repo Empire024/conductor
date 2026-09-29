@@ -49,8 +49,9 @@ import { assertBuildHash, identityOf, listProcesses, newInstance, registerPlaywr
 //   --soak          (with --real-model --fixture=crossref or --fixture=index) only this: the
 //                   fixture's job runs back to back, unattended, until the measured workload time
 //                   reaches DURABLE_SOAK_WORKLOAD_MS (default 6h; iterations start only before
-//                   that, the last one is bounded by the stage timeout, and the overall watchdog is
-//                   workload + stage timeout + 10 minutes of cleanup - give smoke-lock at least that).
+//                   that; each iteration is a whole job, bounded by its stage count x the stage timeout,
+//                   and the overall watchdog is workload + one iteration's bound + 10 minutes of
+//                   cleanup - give smoke-lock at least that).
 //                   Outputs are cleared before each iteration and a completed one is checked
 //                   against the fixture's own truth. Both fixtures force a lower
 //                   contextRolloverFraction so every iteration rolls over reliably. Asserts the
@@ -145,8 +146,10 @@ const outputProblems = async jobId => {
     const lines = table.split(/\r?\n/).map(line => line.toLowerCase())
     for (const [index, name] of MODULES.entries()) {
       const next = MODULES[(index + 1) % MODULES.length], other = MODULES[(index + 3) % MODULES.length]
+      // One row per import or one row per imported function are both a correct table (a real run on
+      // 2026-09-29 wrote the second): each function needs a row naming both modules and it.
       for (const [from, fns] of [[next, [`${next}Transform0`, `${next}Check0`]], [other, [`${other}Transform1`]]])
-        if (!lines.some(line => line.includes(name) && line.includes(from) && fns.every(fn => line.includes(fn.toLowerCase())))) problems.push(`CROSSREF.md has no row: ${name} imports ${fns.join(', ')} from ${from}`)
+        if (!fns.every(fn => lines.some(line => line.includes(name) && line.includes(from) && line.includes(fn.toLowerCase())))) problems.push(`CROSSREF.md has no row: ${name} imports ${fns.join(', ')} from ${from}`)
     }
   } else if (fixture === 'index') {
     const lines = ((await read('INDEX.md')) ?? '').split(/\r?\n/).map(line => line.trim()).filter(Boolean)
@@ -315,9 +318,19 @@ const jobTabIn = async () => page.evaluate(async id => {
 
 const STAGE_TIMEOUT = Number(process.env.DURABLE_SMOKE_STAGE_TIMEOUT_MS ?? (realModel ? 20 * 60_000 : 90_000))
 const SOAK_WORKLOAD_MS = Number(process.env.DURABLE_SOAK_WORKLOAD_MS ?? 6 * 3_600_000)
+// A soak iteration is the fixture's whole job (crossref: four stages), not one stage: at the soak's
+// forced rollover fraction and below-normal priority a healthy crossref job takes 15-25 minutes, so
+// one stage's timeout cut the first iteration off mid-stage-3 on 2026-09-29.
+const SOAK_ITERATION_TIMEOUT = STAGE_TIMEOUT * (fixture === 'crossref' ? 4 : 1)
+// The soak's forced contextRolloverFraction. It must sit between one unit of work (a crossref
+// module read and its notes written) and the stage's peak, or no rollover ever carries file
+// progress to credit: at 0.4 (13,107 of 32,768 tokens) the stage rolled over before it had read
+// one module, and 36 of 36 iterations on 2026-09-29 spent all three attempts on uncredited rollovers;
+// at 0.55 one iteration completed with two credited rollovers that went on.
+const SOAK_ROLLOVER_FRACTION = Number(process.env.DURABLE_SOAK_ROLLOVER_FRACTION ?? 0.55)
 // A soak's watchdog covers the whole workload, its bounded last iteration and ten minutes of
 // cleanup; a smaller DURABLE_SMOKE_TIMEOUT_MS cannot cut the workload short.
-const WATCHDOG_MS = flag('soak') ? Math.max(Number(process.env.DURABLE_SMOKE_TIMEOUT_MS ?? 0), SOAK_WORKLOAD_MS + STAGE_TIMEOUT + 10 * 60_000) : Number(process.env.DURABLE_SMOKE_TIMEOUT_MS ?? (realModel ? 90 : 10) * 60_000)
+const WATCHDOG_MS = flag('soak') ? Math.max(Number(process.env.DURABLE_SMOKE_TIMEOUT_MS ?? 0), SOAK_WORKLOAD_MS + SOAK_ITERATION_TIMEOUT + 10 * 60_000) : Number(process.env.DURABLE_SMOKE_TIMEOUT_MS ?? (realModel ? 90 : 10) * 60_000)
 const watchdog = setTimeout(() => { observe('watchdog: giving up'); process.stdout.write(JSON.stringify({ root, observations }, null, 2) + '\n', () => process.exit(1)) }, WATCHDOG_MS)
 let failed = null
 try {
@@ -446,7 +459,7 @@ try {
     // A long soak wants several context rollovers, not just a job that happens to finish; the
     // fixture's own peaks (~15k-22k of 32,768) rarely cross the default 0.7 threshold on their
     // own, so a soak run forces a lower one to make every stage roll over reliably.
-    ...(flag('soak') ? { budgets: { contextRolloverFraction: 0.4 } } : {}),
+    ...(flag('soak') ? { budgets: { contextRolloverFraction: SOAK_ROLLOVER_FRACTION } } : {}),
     stages: [pair('alpha', 'beta'), pair('gamma', 'delta'), pair('epsilon', 'zeta'),
       { title: 'Write the cross-reference', objective: 'Using notes/*.md (not the sources), write CROSSREF.md with one row per import: importing module, imported module, function names.', completionCriteria: ['CROSSREF.md has a row for every import listed in notes/'] }]
   })
@@ -459,7 +472,7 @@ try {
     title, model,
     objective: `Read every one of the ${INDEX_FILE_COUNT} files under inputs/ in filename order (file001.txt..file${INDEX_FILE_COUNT}.txt) and append one line per file to INDEX.md, in that same order: "<filename>: <unique token from the file>". Never skip, reorder or repeat a file; check INDEX.md's current lines first so you resume after the last one already written.`,
     constraints: ['Only write INDEX.md', 'Read each input file before writing its line'],
-    ...(flag('soak') ? { budgets: { contextRolloverFraction: 0.4 } } : {}),
+    ...(flag('soak') ? { budgets: { contextRolloverFraction: SOAK_ROLLOVER_FRACTION } } : {}),
     stages: [{ title: 'Build the index', objective: `For each of the ${INDEX_FILE_COUNT} files under inputs/, in filename order, append one line to INDEX.md: "<filename>: <unique token>". Read INDEX.md first and continue after its last line; do not rewrite lines already written.`, completionCriteria: [`INDEX.md has exactly ${INDEX_FILE_COUNT} lines, one per input file, in filename order, each with that file's unique token`] }]
   })
 
@@ -469,19 +482,19 @@ try {
     const buildSoakJob = fixture === 'index' ? indexJob : crossrefJob
     // The workload is measured on a monotonic clock from the first job to the last settlement,
     // excluding setup and cleanup. Iterations start only while it is short of SOAK_WORKLOAD_MS; the
-    // last one is bounded by STAGE_TIMEOUT like every other. Nothing is subtracted and still
+    // last one is bounded by SOAK_ITERATION_TIMEOUT like every other. Nothing is subtracted and still
     // called six hours: a short workload fails the assertion below.
     const ledgerFile = join(output, 'soak-ledger.ndjson')
     const workloadStarted = performance.now()
     const workloadElapsed = () => Math.round(performance.now() - workloadStarted)
-    observe('soak workload started', { workloadMs: SOAK_WORKLOAD_MS, stageTimeoutMs: STAGE_TIMEOUT, ledgerFile })
+    observe('soak workload started', { workloadMs: SOAK_WORKLOAD_MS, stageTimeoutMs: STAGE_TIMEOUT, iterationTimeoutMs: SOAK_ITERATION_TIMEOUT, ledgerFile })
     let iteration = 0, totalRollovers = 0, totalStages = 0, totalRetries = 0, totalRecoveries = 0, totalCompleted = 0, verifiedCompletions = 0
     const audited = []
     while (workloadElapsed() < SOAK_WORKLOAD_MS) {
       iteration++
       await clearOutputs()
       const soakJob = await call('jobs.create', buildSoakJob(`Smoke: soak iteration ${iteration}`))
-      const settled = await waitFor(soakJob.id, s => ['completed', 'blocked', 'failed'].includes(s.status), `soak iteration ${iteration} settled`, STAGE_TIMEOUT)
+      const settled = await waitFor(soakJob.id, s => ['completed', 'blocked', 'failed'].includes(s.status), `soak iteration ${iteration} settled`, SOAK_ITERATION_TIMEOUT)
       totalRollovers += settled.counters.contextRollovers
       totalStages += settled.counters.stagesCompleted
       totalRetries += settled.counters.retries
@@ -563,10 +576,21 @@ try {
     const appRoot = instance.roots.find(entry => entry.pid === owner.pid)
     assert.ok(appRoot, `parked main pid ${owner.pid} is not a registered root`)
     const snapshot = async () => (await listProcesses()).list
+    // Status alone proves nothing here: a job stays `running` through a server loss. Recovery is a
+    // server-loss event and then a new stage attempt, both after the kill, or the job completing.
+    const beforeKill = (await allEvents(job.id)).events.length
     const stopped = await stopDurableSmokeServer({ call, model, app: appRoot, snapshot })
     observe('llama-server stopped and its exit observed', { pid: stopped.pid, model: stopped.model, creationTime: stopped.identity.creationTime })
-    await waitFor(job.id, s => s.counters.recoveries > afterReload.counters.recoveries || s.lastEvent?.kind === 'server', 'server loss noticed', 5 * 60_000)
-    await waitFor(job.id, s => s.status === 'running' || s.status === 'completed', 'job running again after server restart', STAGE_TIMEOUT)
+    const sinceKill = async () => (await allEvents(job.id)).events.slice(beforeKill)
+    const lossAt = events => events.findIndex(event => (event.kind === 'server' && /dead/.test(event.message)) || event.kind === 'retry' || event.kind === 'recovery')
+    await expect.poll(async () => lossAt(await sinceKill()) >= 0, { timeout: 5 * 60_000, intervals: [1000] }).toBe(true)
+    observe('server loss noticed', { event: (await sinceKill())[lossAt(await sinceKill())]?.message })
+    await expect.poll(async () => {
+      const events = await sinceKill()
+      const loss = lossAt(events)
+      return events.slice(loss + 1).some(event => event.kind === 'stage' && /attempt \d+ started/.test(event.message)) || (await status(job.id)).status === 'completed'
+    }, { timeout: STAGE_TIMEOUT, intervals: [2000] }).toBe(true)
+    observe('job running again after server restart', { events: (await sinceKill()).map(event => `${event.at} ${event.kind} ${event.message.slice(0, 120)}`) })
     // Exactly one replacement: one app-registered server for the model, a different OS process than
     // the one stopped, started by this parked app.
     const replacements = (await call('local.servers')).filter(entry => entry.model === model)

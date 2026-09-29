@@ -18,8 +18,9 @@ export interface LocalServerSources {
   models(): LocalModelConfig[]
   record(model: LocalModelConfig): RunRecord | null
   alive(pid: number | null): boolean
-  /** The machine-wide llama-server process list; may throw where it cannot be read. */
-  inventory(): ServerProcess[]
+  /** The machine-wide llama-server process list; may throw where it cannot be read. Omitted by a
+   *  caller that cannot afford the query, which then trusts run records with a live pid. */
+  inventory?(): ServerProcess[]
 }
 
 /** Local model ids are 'local/<id>' everywhere (stack config, run records, conversations); a
@@ -31,14 +32,18 @@ export const localModelId = (id: string): string => id.startsWith('local/') ? id
  *  stopped from here. */
 export function listLocalServers(sources: LocalServerSources): LocalServerEntry[] {
   const entries: LocalServerEntry[] = []
+  // A readable inventory is the authority on which recorded pids are still llama-servers: a record
+  // left behind by a server killed outside Conductor (a parked smoke's teardown on 2026-09-29) has
+  // a pid the OS may since have handed to an unrelated process, which is alive but not a server.
+  let inventory: ServerProcess[] | null = null
+  try { inventory = sources.inventory ? sources.inventory() : null } catch { /* Reported servers stay the Conductor-started ones. */ }
   for (const model of sources.models()) {
     const record = sources.record(model)
     if (!record || record.pid === null || !sources.alive(record.pid)) continue
+    if (inventory && !inventory.some(process => process.pid === record.pid)) continue
     entries.push({ model: model.id, label: localModelLabel(model.id), pid: record.pid, port: record.port, startedAt: record.startedAt, startedByConductor: true })
   }
-  let inventory: ServerProcess[] = []
-  try { inventory = sources.inventory() } catch { /* Reported servers stay the Conductor-started ones. */ }
-  for (const process of inventory) {
+  for (const process of inventory ?? []) {
     if (entries.some(entry => entry.pid === process.pid)) continue
     entries.push({ model: process.model, label: localModelLabel(process.model), pid: process.pid, port: process.port ?? null, startedAt: null, startedByConductor: false })
   }

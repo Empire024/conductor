@@ -23,6 +23,17 @@ describe('local model servers', () => {
     expect(listLocalServers(sources({ alive: () => false, inventory: () => { throw new Error('no inventory') } }))).toEqual([])
   })
 
+  it('drops a run record whose live pid is no longer a llama-server, unless the inventory is unknown', () => {
+    // 2026-09-29: a parked smoke's teardown killed its server outside Conductor, and the pid was
+    // reused by a conhost.exe that local.servers then reported as the Qwen server.
+    const reused = sources({ alive: () => true, inventory: () => [{ pid: 700, model: 'foreign-model', port: 8080 }] })
+    expect(listLocalServers(reused)).toEqual([{ model: 'foreign-model', label: expect.any(String), pid: 700, port: 8080, startedAt: null, startedByConductor: false }])
+    // No inventory (a caller that skips the query) or an unreadable one: the record is trusted.
+    const { inventory: _omitted, ...withoutInventory } = sources()
+    expect(listLocalServers(withoutInventory).map(entry => entry.pid)).toEqual([62380])
+    expect(listLocalServers(sources({ inventory: () => { throw new Error('no inventory') } })).map(entry => entry.pid)).toEqual([62380])
+  })
+
   it('stops an idle Conductor-started server by model or pid', async () => {
     const servers = listLocalServers(sources())
     const ports = { busy: vi.fn(async () => 'idle' as const), stop: vi.fn(async () => 'stopped (pid 62380)') }

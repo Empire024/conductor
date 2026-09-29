@@ -242,20 +242,20 @@ const safeKey = (ports: LocalModelRunnerPorts): string => { try { return ports.a
 /** Ports over the app's real local-models runtime; imported lazily so the MCP server and tests
  *  that only need the runner do not load the whole local stack. */
 export async function realRunnerPorts(): Promise<LocalModelRunnerPorts> {
-  const [llama, config, local, servers, guard, client] = await Promise.all([
+  const [llama, config, local, servers, client] = await Promise.all([
     import('../local-models/llama.ts'), import('../local-models/config.ts'), import('../providers/local.ts'),
-    import('../local-models/servers.ts'), import('../local-models/resource-guard.ts'), import('../local-models/client.ts')
+    import('../local-models/servers.ts'), import('../local-models/client.ts')
   ])
   const models = (): LocalModelConfig[] => { try { return Object.values(config.loadConfig().models) } catch { return [] } }
   const apiKey = (): string => { try { return config.readApiKey() } catch { return '' } }
   // Only servers this Conductor started (run records): the machine-wide process list is a
-  // synchronous PowerShell query that would stall the main process. A foreign server is still
-  // found by startServer's admission check, which refuses and becomes the fallback note.
-  const noInventory = (): ReturnType<typeof guard.runningLlamaProcesses> => []
+  // synchronous PowerShell query that would stall the main process, so no inventory is passed. A
+  // foreign server is still found by startServer's admission check, which refuses and becomes the
+  // fallback note.
   return {
     now: () => Date.now(),
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
-    servers: () => servers.listLocalServers({ models, record: llama.readRunRecord, alive: llama.processAlive, inventory: noInventory }),
+    servers: () => servers.listLocalServers({ models, record: llama.readRunRecord, alive: llama.processAlive }),
     models,
     apiKey,
     endpointOverride: local.localEndpointOverride,
