@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hash and Flowers</title>
+<style>body { font: 16px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 760px; padding: 16px; } </style>
+</head>
+<body>
+<header><a href="/">Home</a></header>
+<main>
+
+<h1>Fresh flowers in Bratislava</h1>
+<p>The best bouquets in Bratislava, hand-tied every morning.</p>
+<p>Autumn sale ends in <span data-countdown data-deadline="2099-12-31T23:00:00Z">--:--:--</span></p>
+<section class="testimonials">
+<blockquote class="testimonial"><p>The peonies lasted a whole week.</p><cite>Jana K.</cite></blockquote>
+<blockquote class="testimonial"><p>Delivered on time for our anniversary, thank you.</p><cite>Peter M.</cite></blockquote>
+</section>
+<p><a href="/product/">Autumn bouquet</a> · <a href="/checkout/">Checkout</a></p>
+
+<script>
+(() => {
+  const node = document.querySelector('[data-countdown]')
+  const deadline = Date.parse(node.getAttribute('data-deadline'))
+  const pad = value => String(value).padStart(2, '0')
+  const tick = () => {
+    const left = Math.max(0, Math.floor((deadline - Date.now()) / 1000))
+    node.textContent = pad(Math.floor(left / 3600)) + ':' + pad(Math.floor(left / 60) % 60) + ':' + pad(left % 60)
+  }
+  tick(); setInterval(tick, 250)
+})()
+</script>
+</main>
+<footer>
+<nav aria-label="Legal"><a href="/privacy/">Privacy policy</a> · <a href="/terms/">Terms and conditions</a> · <a href="/contact/">Contact</a></nav>
+</footer>
+</body>
+</html>

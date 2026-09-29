@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flower Deals</title>
+<style>body { font: 16px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 760px; padding: 16px; } </style>
+</head>
+<body>
+<header><a href="/">Home</a></header>
+<main>
+
+<h1>Flower Deals</h1>
+<p>Flash sale ends in <span data-countdown>--:--:--</span></p>
+<p class="stock">Hurry, only <span data-stock></span> left in stock!</p>
+<script>
+(() => {
+  const seen = Number(sessionStorage.getItem('stock-visits') || '0')
+  sessionStorage.setItem('stock-visits', String(seen + 1))
+  document.querySelector('[data-stock]').textContent = seen === 0 ? '5' : '3'
+})()
+</script>
+<section class="testimonials">
+<blockquote class="testimonial"><p>Absolutely the best flowers I have ever ordered, five stars!</p><cite>Maria L.</cite></blockquote>
+<blockquote class="testimonial"><p>Fast delivery and friendly service.</p><cite>Tom B.</cite></blockquote>
+</section>
+<p><a href="/product/">Rose box</a> · <a href="/checkout/">Checkout</a></p>
+
+<script>
+(() => {
+  const node = document.querySelector('[data-countdown]')
+  const deadline = Date.now() + 15 * 60 * 1000 // restarts at 15:00 on every load
+  const pad = value => String(value).padStart(2, '0')
+  const tick = () => {
+    const left = Math.max(0, Math.floor((deadline - Date.now()) / 1000))
+    node.textContent = pad(Math.floor(left / 3600)) + ':' + pad(Math.floor(left / 60) % 60) + ':' + pad(left % 60)
+  }
+  tick(); setInterval(tick, 250)
+})()
+</script>
+</main>
+<footer>
+<nav aria-label="Legal"><a href="/privacy/">Privacy policy</a> · <a href="/terms/">Terms and conditions</a> · <a href="/contact/">Contact</a></nav>
+</footer>
+</body>
+</html>
