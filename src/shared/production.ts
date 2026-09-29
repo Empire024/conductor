@@ -215,6 +215,8 @@ export interface StorageConfig {
   credentialRef: CredentialRef | null
   /** Path prefixes the owner declares intentionally public (product images); everything else is private. */
   publicPrefixes: string[]
+  /** URL under which the storage is served (local-dir, wordpress-uploads); anonymous probes go there. */
+  publicBaseUrl?: string | null
 }
 
 export interface ProductionEnvironment {
@@ -967,6 +969,11 @@ export interface StorageAdapter {
   inventory(prefix: string | null, limit: number): Promise<StorageObject[]>
   /** Anonymous GET/HEAD from outside the tenant; returns the status only, never the content. */
   probeAnonymous(key: string): Promise<{ status: number; listing: boolean }>
+  /**
+   * Mints a signed link with this TTL and probes it anonymously before and after expiry; null when the store has no
+   * signed links. Absent or null means the expiry part of C16 is reported unobservable, never passed.
+   */
+  signedLinkExpiry?(key: string, ttlSeconds: number): Promise<{ beforeStatus: number | null; afterStatus: number | null } | null>
 }
 
 /** Where a data subject's records still live after a deletion request (C07 tracing): one row per store and record. */

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Forms good – contact</title>
+</head>
+<body>
+  <nav><a href="/">Home</a> <a href="/contact/">Contact</a></nav>
+  <main>
+    <h1>Contact us</h1>
+    <form id="contact" method="post" action="/contact/send">
+      <label for="name">Name</label>
+      <input id="name" name="name" autocomplete="name" required>
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" autocomplete="email" required>
+      <label for="message">Message</label>
+      <textarea id="message" name="message" required></textarea>
+      <label><input type="checkbox" name="newsletter"> Send me the monthly newsletter</label>
+      <button type="submit">Send</button>
+    </form>
+  </main>
+</body>
+</html>

@@ -1,0 +1,12 @@
+/* Defective fixture: a fixed-width layout, faint text and no focus indicator anywhere. */
+body { margin: 0; font-family: system-ui, sans-serif; color: #222222; background: #ffffff; }
+.page { width: 1400px; margin: 0 auto; }
+nav a { display: inline-block; padding: 0.5rem 0.75rem; color: #0b4f9c; }
+.faint { color: #c8c8c8; }
+button { font: inherit; padding: 0.5rem 1rem; color: #ffffff; background: #0b4f9c; border: 0; }
+*:focus, *:focus-visible { outline: none; box-shadow: none; }
+.banner { position: fixed; left: 0; right: 0; bottom: 0; padding: 1rem; background: #ffffff; border-top: 2px solid #222222; }
+.banner[hidden] { display: none; }
+.fake-button { display: inline-block; padding: 0.5rem 1rem; color: #ffffff; background: #555555; cursor: pointer; }
+.offer { position: fixed; top: 20%; left: 30%; width: 400px; padding: 1rem; background: #ffffff; border: 2px solid #222222; }
+.offer[hidden] { display: none; }

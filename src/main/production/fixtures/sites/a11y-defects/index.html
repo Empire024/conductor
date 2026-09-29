@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Home – Defective Shop</title>
+  <link rel="stylesheet" href="/css/site.css">
+  <script src="/js/consent.js" defer></script>
+  <script src="/js/offer.js" defer></script>
+</head>
+<body>
+  <!-- Known defects: missing alt, unlabelled input, low-contrast text, outline removed on focus,
+       a fixed 1400px layout, a Reject choice that is a div without tabindex, and a modal dialog
+       that does not keep focus inside. -->
+  <div class="page">
+    <header>
+      <nav aria-label="Main">
+        <a href="/">Home</a>
+        <a href="/shop/">Shop</a>
+        <a href="/contact/">Contact</a>
+      </nav>
+    </header>
+    <main>
+      <h1>Defective Shop</h1>
+      <img src="/img/hero.svg" width="600" height="300">
+      <p class="faint">Free shipping on orders over 50 euros. Offer ends soon.</p>
+      <h2>Newsletter</h2>
+      <form action="/search/" method="get">
+        <input type="text" name="email">
+        <button type="submit">Subscribe</button>
+      </form>
+      <button type="button" id="open-offer" aria-haspopup="dialog">Show offer</button>
+    </main>
+    <footer>
+      <a href="/privacy-policy/">Privacy policy</a>
+      <a href="/terms/">Terms and conditions</a>
+    </footer>
+  </div>
+  <section id="cookie-banner" class="banner" aria-label="Cookie consent" hidden>
+    <p>We use cookies for analytics with your consent.</p>
+    <button type="button" data-consent-action="accept">Accept all</button>
+    <div role="button" class="fake-button" data-consent-action="reject">Reject all</div>
+  </section>
+  <div id="offer" role="dialog" aria-modal="true" aria-labelledby="offer-title" class="offer" hidden>
+    <h2 id="offer-title">Special offer</h2>
+    <p>Ten percent off your first order.</p>
+    <button type="button" id="take-offer">Take the offer</button>
+    <button type="button" id="close-offer">Close</button>
+  </div>
+</body>
+</html>

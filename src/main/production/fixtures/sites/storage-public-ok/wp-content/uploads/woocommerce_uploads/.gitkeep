@@ -1,0 +1,1 @@
+Keeps the private directory in the fixture tree; the server answers 403 for it (site.json).

@@ -1,0 +1,2 @@
+@font-face { font-family: "Remote"; src: url("{{alias}}/fonts/remote.woff2") format("woff2"); }
+body { font-family: "Remote", system-ui, sans-serif; }

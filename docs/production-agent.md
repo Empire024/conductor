@@ -421,6 +421,21 @@ with `humanReview` listing the manual checks. Storage: inventory via adapter, an
 of private keys (status only), listing check, signed-link expiry; public prefixes are the negative
 control.
 
+*As built (M4).* Each check is a factory with bounds (`createConsentCheck({maxRoutes, settleMs})`
+and so on) plus a default instance (`consentCheck`) for `checks/index.ts`; shared helpers live in
+`checks/technical-support.ts` (vendor/tracker signatures, consent-requiring activity, marker search,
+consent UI and keyboard reach) and `checks/technical-testkit.ts`.
+- **C03.** Pages open clean, and the check makes each choice itself through `AuditPage.consent`. The
+  request log is then cut at the click: "before consent" and "after the choice" are exact.
+- **C04, C06.** Leaks are proven with synthetic markers searched in request excerpts, URLs and web
+  storage. Evidence scrubs the markers.
+- **C16.** Uses `adapters/storage.ts` (local-dir, wordpress-uploads, s3 with SigV4, custom-command
+  through an injected runner). It adds two optional contract fields: `StorageConfig.publicBaseUrl`,
+  and `StorageAdapter.signedLinkExpiry`. Without the latter, signed-link expiry is reported
+  unobservable, never passed.
+- **Fixtures.** Real-looking tracker endpoints come from the fixture server's `collectPaths` site
+  directive.
+
 **M5 Document and claims checks: C01, C02, C12, C14, C15.** Owns `checks/policies.ts`,
 `checks/identity.ts`, `checks/claims.ts`, `checks/children.ts`, `checks/uploads.ts`, tests and
 fixture sites `fixtures/sites/{policies-good,policies-placeholder,policies-contradiction,

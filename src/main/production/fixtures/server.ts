@@ -17,7 +17,8 @@ import { extname, join, resolve, sep } from 'node:path'
  *   "delayMs": { "/js/tracker.js": 1500 },              // response delay per exact path (delayed scripts)
  *   "headers": { "/": { "cache-control": "no-store" } },
  *   "status": { "/gone": 410 },
- *   "mutationPaths": ["/delete"]                         // any method, GET included, is a recorded mutation
+ *   "mutationPaths": ["/delete"],                        // any method, GET included, is a recorded mutation
+ *   "collectPaths": ["/collect", "/g/collect"]          // behave like /__collect (tracker endpoints with real-world paths)
  * }
  * ```
  *
@@ -40,6 +41,7 @@ export interface SiteDirectives {
   headers?: Record<string, Record<string, string>>
   status?: Record<string, number>
   mutationPaths?: string[]
+  collectPaths?: string[]
 }
 
 export interface FixtureRequestRecord {
@@ -67,7 +69,7 @@ export interface FixtureServer {
   mutations(site?: string): FixtureRequestRecord[]
   /** Every request received, optionally for one site. */
   requests(site?: string): FixtureRequestRecord[]
-  /** Requests to `/__collect`, optionally for one site. */
+  /** Requests to `/__collect` or a `collectPaths` entry, optionally for one site. */
   collected(site?: string): FixtureRequestRecord[]
   reset(): void
   close(): Promise<void>
@@ -145,7 +147,7 @@ export async function createFixtureServer(options: FixtureServerOptions): Promis
       const status = Number(url.searchParams.get('status') ?? 302)
       return send(response, [301, 302, 303, 307, 308].includes(status) ? status : 302, { ...headers, location: fill(to, name) }, '')
     }
-    if (url.pathname === '/__collect') {
+    if (isCollect(url.pathname, site)) {
       return send(response, 204, { ...headers, 'access-control-allow-origin': '*' }, '')
     }
     if (MUTATING.has(method) || site.mutationPaths?.includes(url.pathname)) {
@@ -186,7 +188,7 @@ export async function createFixtureServer(options: FixtureServerOptions): Promis
     },
     mutations: site => log.filter(bySite(site)).filter(item => isMutation(item, directives[item.site]!)),
     requests: site => log.filter(bySite(site)),
-    collected: site => log.filter(bySite(site)).filter(item => item.path.split('?')[0] === '/__collect'),
+    collected: site => log.filter(bySite(site)).filter(item => isCollect(item.path.split('?')[0]!, directives[item.site]!)),
     reset: () => { log.length = 0 },
     close: async () => {
       await Promise.all(servers.map(server => new Promise<void>(done => { server.closeAllConnections(); server.close(() => done()) })))
@@ -194,9 +196,11 @@ export async function createFixtureServer(options: FixtureServerOptions): Promis
   }
 }
 
+const isCollect = (path: string, site: SiteDirectives): boolean => path === '/__collect' || (site.collectPaths?.includes(path) ?? false)
+
 function isMutation(item: FixtureRequestRecord, site: SiteDirectives): boolean {
   const path = item.path.split('?')[0]!
-  if (path === '/__collect' || path === '/__mutations' || path === '/__redirect') return false
+  if (isCollect(path, site) || path === '/__mutations' || path === '/__redirect') return false
   return MUTATING.has(item.method) || (site.mutationPaths?.includes(path) ?? false)
 }
 

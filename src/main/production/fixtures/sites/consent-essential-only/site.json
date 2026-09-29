@@ -1,0 +1,7 @@
+{
+  "setCookie": {
+    "/": [
+      "cart_session=abc123; Path=/; HttpOnly; SameSite=Lax"
+    ]
+  }
+}

@@ -798,13 +798,16 @@ export class ProductionStore {
   findings(projectId: string, filter: FindingFilter = {}): Finding[] {
     const { sql, params } = this.findingWhere(projectId, filter)
     params.push(bound(filter.limit, 500), Math.max(0, Math.floor(filter.offset ?? 0)))
-    return (this.db.prepare(`SELECT data FROM ${T.findings} WHERE ${sql} ORDER BY updated_at DESC LIMIT ? OFFSET ?`).all(...params) as Row[]).map(row => json<Finding>(row.data))
+    // With a selective filter, `+updated_at` stops SQLite from walking the whole project through
+    // recent_idx just to avoid a sort: it seeks env_idx or control_idx and sorts only the matches.
+    const order = filter.environmentId || filter.status?.length || filter.severity?.length || filter.controlId ? '+updated_at' : 'updated_at'
+    return (this.db.prepare(`SELECT data FROM ${T.findings} WHERE ${sql} ORDER BY ${order} DESC LIMIT ? OFFSET ?`).all(...params) as Row[]).map(row => json<Finding>(row.data))
   }
 
   findingsByIds(projectId: string, ids: string[]): Finding[] {
     if (!ids.length) return []
     const unique = [...new Set(ids)].slice(0, MAX_LIST)
-    return (this.db.prepare(`SELECT data FROM ${T.findings} WHERE id IN (${unique.map(() => '?').join(', ')}) AND project_id = ?`).all(...unique, projectId) as Row[]).map(row => json<Finding>(row.data))
+    return (this.db.prepare(`SELECT data FROM ${T.findings} WHERE id IN (${unique.map(() => '?').join(', ')}) AND +project_id = ?`).all(...unique, projectId) as Row[]).map(row => json<Finding>(row.data))
   }
 
   /** Counts by status and severity for the gate and the queue, without reading any finding body. */

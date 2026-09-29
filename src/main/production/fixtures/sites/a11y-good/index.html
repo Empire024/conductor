@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Home – Accessible Shop</title>
+  <link rel="stylesheet" href="/css/site.css">
+  <script src="/js/consent.js" defer></script>
+  <script src="/js/dialog.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="bar">
+    <div class="wrap">
+      <a class="brand" href="/"><img src="/img/logo.svg" alt="Accessible Shop home" width="40" height="40"></a>
+      <nav aria-label="Main">
+        <ul class="nav">
+          <li><a href="/">Home</a></li>
+          <li><a href="/shop/">Shop</a></li>
+          <li><a href="/contact/">Contact</a></li>
+        </ul>
+      </nav>
+    </div>
+  </header>
+  <main id="main" class="wrap">
+    <h1>Accessible Shop</h1>
+    <p>Hand-made ceramics, shipped across Europe. Every product page lists materials, dimensions and care instructions.</p>
+    <img class="hero" src="/img/bowl.svg" alt="A glazed blue ceramic bowl on a wooden table" width="600" height="300">
+    <h2>Find a product</h2>
+    <form class="search" role="search" action="/search/" method="get">
+      <label for="query">Search products</label>
+      <input id="query" name="q" type="search" autocomplete="off">
+      <button type="submit">Search</button>
+    </form>
+    <h2>Delivery</h2>
+    <p>Orders ship within two working days.</p>
+    <button type="button" id="open-delivery" aria-haspopup="dialog" aria-controls="delivery-dialog">Delivery details</button>
+  </main>
+  <footer class="wrap footer">
+    <ul class="nav">
+      <li><a href="/privacy-policy/">Privacy policy</a></li>
+      <li><a href="/terms/">Terms and conditions</a></li>
+    </ul>
+  </footer>
+  <dialog id="delivery-dialog" aria-labelledby="delivery-title">
+    <h2 id="delivery-title">Delivery details</h2>
+    <p>Standard delivery takes three to five working days. Express delivery is available at checkout.</p>
+    <p><a href="/contact/">Ask about delivery</a></p>
+    <button type="button" id="close-delivery">Close</button>
+  </dialog>
+  <section id="cookie-banner" class="banner" aria-label="Cookie consent" hidden>
+    <p>We use cookies for analytics with your consent.</p>
+    <div class="choices">
+      <button type="button" data-consent-action="accept">Accept all</button>
+      <button type="button" data-consent-action="reject">Reject all</button>
+    </div>
+  </section>
+</body>
+</html>

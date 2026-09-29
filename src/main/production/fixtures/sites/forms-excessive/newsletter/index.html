@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Forms excessive – newsletter</title>
+  <script src="/js/capture.js" defer></script>
+</head>
+<body>
+  <nav><a href="/">Home</a> <a href="/contact/">Contact</a></nav>
+  <main>
+    <h1>Newsletter</h1>
+    <form id="signup" method="post" action="/newsletter/subscribe">
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" required>
+      <label for="dob">Date of birth</label>
+      <input id="dob" name="date_of_birth" type="text" required>
+      <label for="gender">Gender</label>
+      <input id="gender" name="gender" type="text">
+      <label for="rc">Rodné číslo</label>
+      <input id="rc" name="rodne_cislo" type="text">
+      <label><input type="checkbox" name="marketing_partners" checked> Share my details with partners for offers</label>
+      <button type="submit">Subscribe</button>
+    </form>
+  </main>
+</body>
+</html>

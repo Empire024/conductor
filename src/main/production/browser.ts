@@ -619,10 +619,10 @@ export class AuditPageImpl implements AuditPage {
 
   async consent(action: ConsentAction): Promise<{ applied: boolean; mechanism: string | null }> {
     if (action.action === 'withdraw') {
-      const opened = await this.clickFirst(CMP.reopen, TEXT.reopen)
+      const opened = await this.clickFirst(CMP.reopen, CONSENT_TEXT.reopen)
       if (opened) {
         await this.settle()
-        const rejected = await this.clickFirst(CMP.reject, TEXT.reject)
+        const rejected = await this.clickFirst(CMP.reject, CONSENT_TEXT.reject)
         if (rejected) { await this.settle(); return { applied: true, mechanism: `${opened} → ${rejected}` } }
       }
       const api = await this.page.evaluate(CMP_API_SCRIPT, 'withdraw').catch(() => null) as string | null
@@ -630,17 +630,17 @@ export class AuditPageImpl implements AuditPage {
       return { applied: false, mechanism: null }
     }
     if (action.action === 'select') {
-      const opened = await this.clickFirst(CMP.settings, TEXT.settings)
+      const opened = await this.clickFirst(CMP.settings, CONSENT_TEXT.settings)
       if (!opened) return { applied: false, mechanism: null }
       await this.settle()
       const wanted = (action.categories ?? []).map(category => category.toLowerCase())
       await this.page.evaluate(SELECT_CATEGORIES_SCRIPT, wanted).catch(() => 0)
-      const saved = await this.clickFirst(CMP.save, TEXT.save)
+      const saved = await this.clickFirst(CMP.save, CONSENT_TEXT.save)
       if (!saved) return { applied: false, mechanism: opened }
       await this.settle()
       return { applied: true, mechanism: `${opened} → ${saved}` }
     }
-    const clicked = await this.clickFirst(action.action === 'accept' ? CMP.accept : CMP.reject, action.action === 'accept' ? TEXT.accept : TEXT.reject)
+    const clicked = await this.clickFirst(action.action === 'accept' ? CMP.accept : CMP.reject, action.action === 'accept' ? CONSENT_TEXT.accept : CONSENT_TEXT.reject)
     if (clicked) { await this.settle(); return { applied: true, mechanism: clicked } }
     const api = await this.page.evaluate(CMP_API_SCRIPT, action.action).catch(() => null) as string | null
     if (api) { await this.settle(); return { applied: true, mechanism: api } }
@@ -786,7 +786,7 @@ export const CMP = {
   ],
 } as const
 
-const TEXT = {
+export const CONSENT_TEXT = {
   accept: /^(accept|allow|agree|i agree|ok|got it|accept all|allow all|accept cookies|allow cookies|accept all cookies|súhlasím|prijať|prijať všetko|povoliť všetko|přijmout|přijmout vše|souhlasím|akzeptieren|alle akzeptieren|zustimmen)$/i,
   reject: /^(reject|decline|deny|refuse|reject all|decline all|deny all|only necessary|necessary only|use necessary cookies only|reject cookies|odmietnuť|odmietnuť všetko|odmítnout|odmítnout vše|ablehnen|alle ablehnen|nur notwendige)$/i,
   settings: /^(settings|preferences|customi[sz]e|manage|manage cookies|cookie settings|more options|nastavenia|nastavení|einstellungen)$/i,

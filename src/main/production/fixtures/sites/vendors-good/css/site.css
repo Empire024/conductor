@@ -1,0 +1,2 @@
+@font-face { font-family: "Site"; src: url("/fonts/site.woff2") format("woff2"); }
+body { font-family: "Site", system-ui, sans-serif; }

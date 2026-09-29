@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Consent good – privacy</title>
+  <link rel="stylesheet" href="/css/site.css">
+  <script src="/js/consent.js" defer></script>
+</head>
+<body>
+  <nav><a href="/">Home</a> <a href="/about/">About</a> <a href="/privacy/">Privacy</a></nav>
+  <main>
+    <h1>Privacy policy</h1>
+    <p>With your consent we use an analytics service.</p>
+  </main>
+  <footer><button type="button" data-consent-action="open">Cookie settings</button></footer>
+  <div id="cookie-banner" role="dialog" aria-label="Cookie consent" hidden>
+    <p>We would like to use analytics cookies.</p>
+    <button type="button" data-consent-action="accept">Accept all</button>
+    <button type="button" data-consent-action="reject">Reject all</button>
+    <button type="button" data-consent-action="settings">Settings</button>
+    <div id="cookie-preferences" hidden>
+      <label><input type="checkbox" data-consent-category="necessary" checked disabled> Necessary</label>
+      <label><input type="checkbox" data-consent-category="functional"> Functional</label>
+      <label><input type="checkbox" data-consent-category="analytics"> Analytics</label>
+      <button type="button" data-consent-action="save">Save choices</button>
+    </div>
+  </div>
+</body>
+</html>

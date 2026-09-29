@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>replay-masked – checkout</title>
+  <script src="{{alias}}/sdk/logrocket.min.js"></script>
+</head>
+<body>
+  <nav><a href="/">Home</a> <a href="/checkout/">Checkout</a></nav>
+  <main>
+    <h1>Checkout</h1>
+    <form id="checkout" method="post" action="/checkout/pay">
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" autocomplete="email">
+      <label for="password">Create a password</label>
+      <input id="password" name="password" type="password" autocomplete="new-password">
+      <label for="card">Card number</label>
+      <input id="card" name="card_number" autocomplete="cc-number" inputmode="numeric">
+      <label for="note">Order note</label>
+      <textarea id="note" name="note"></textarea>
+      <button type="submit">Pay</button>
+    </form>
+  </main>
+</body>
+</html>

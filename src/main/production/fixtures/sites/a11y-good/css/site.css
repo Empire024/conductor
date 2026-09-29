@@ -1,0 +1,25 @@
+/* Accessible fixture: flexible widths, dark text on white, a visible focus ring on every control. */
+*, *::before, *::after { box-sizing: border-box; }
+html { font-size: 100%; }
+body { margin: 0; font-family: system-ui, sans-serif; line-height: 1.5; color: #1a1a1a; background: #ffffff; }
+.wrap { max-width: 60rem; margin: 0 auto; padding: 0 1rem; }
+.bar { border-bottom: 1px solid #cccccc; }
+.bar .wrap { display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; }
+.brand { display: inline-block; padding: 0.25rem; }
+.nav { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0; padding: 0; list-style: none; }
+.nav a { display: inline-block; padding: 0.5rem 0.75rem; }
+a { color: #0b4f9c; }
+img { max-width: 100%; height: auto; }
+.hero { display: block; margin: 1rem 0; }
+.search { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+input { font: inherit; padding: 0.5rem; border: 2px solid #555555; border-radius: 4px; min-width: 0; max-width: 100%; }
+button { font: inherit; padding: 0.5rem 1rem; color: #ffffff; background: #0b4f9c; border: 2px solid #0b4f9c; border-radius: 4px; cursor: pointer; }
+:focus-visible { outline: 3px solid #b3261e; outline-offset: 2px; }
+.skip { position: absolute; left: -999px; top: 0; padding: 0.5rem; background: #ffffff; }
+.skip:focus-visible { left: 0.5rem; }
+.footer { margin-top: 2rem; padding-bottom: 8rem; border-top: 1px solid #cccccc; }
+dialog { max-width: min(30rem, calc(100% - 2rem)); border: 2px solid #1a1a1a; border-radius: 6px; }
+dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
+.banner { position: fixed; left: 0; right: 0; bottom: 0; padding: 1rem; background: #ffffff; border-top: 2px solid #1a1a1a; }
+.banner[hidden] { display: none; }
+.choices { display: flex; flex-wrap: wrap; gap: 0.5rem; }
