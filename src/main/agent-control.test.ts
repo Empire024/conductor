@@ -3411,3 +3411,56 @@ describe('coordination roles open on medium effort', () => {
     expect(rows[0]?.effort).toBe('medium')
   })
 })
+
+describe('waiting for results (src/shared/awaiting-results.ts)', () => {
+  it('agents.await keeps a tab waiting until the awaited conversation messages it, and persists in settings', async () => {
+    const f = fixture()
+    const fixer = agentIn(f, f.project.id, f.workspace.id, 'fixer')
+    await expect(f.control.call(f.scope, 'agents.await', { agents: [f.scope.agentSessionId] })).rejects.toThrow(/does not wait for itself/)
+    await expect(f.control.call(f.scope, 'agents.await', { agents: ['nobody'] })).rejects.toThrow(/No conversation nobody/)
+    await expect(f.control.call(f.scope, 'agents.await', { agents: [] })).rejects.toThrow(/at least one/)
+    const declared = await f.control.call(f.scope, 'agents.await', { agents: [fixer.agentSessionId], reason: 'fix commits and evidence' }) as { awaiting: { agents: Array<{ agentSessionId: string; title: string }>; reason: string }; note: string }
+    expect(declared.awaiting).toMatchObject({ agents: [{ agentSessionId: 'fixer', title: 'fixer' }], reason: 'fix commits and evidence' })
+    expect(declared.note).toMatch(/do not poll/)
+    // Durable: a fresh AgentControl over the same database (an app restart) still reads it.
+    expect(new AgentControl(f.deps).awaitingFact(f.scope.agentSessionId)).toMatchObject({ agents: [{ agentSessionId: 'fixer' }] })
+    const waiting = f.control.finishTargets().find(target => target.agentSessionId === f.scope.agentSessionId)!
+    expect(waiting.awaiting).toMatch(/^it is waiting for results from fixer \(fixer\): fix commits and evidence$/)
+    // The fixer's message starts the reviewer's turn; with nothing else owed, the wait is over.
+    await f.control.call(fixer, 'agents.steer', { agentSessionId: f.scope.agentSessionId, prompt: 'FIXED at abc123' })
+    expect(f.submissions.at(-1)).toMatchObject({ prompt: expect.stringContaining('FIXED at abc123') })
+    expect(f.control.awaitingFact(f.scope.agentSessionId)).toBeUndefined()
+    expect(f.database.getSetting('awaitingResults:' + f.scope.agentSessionId)).toBeNull()
+    expect(f.control.finishTargets().find(target => target.agentSessionId === f.scope.agentSessionId)!.awaiting).toBeUndefined()
+  })
+
+  it('send_message awaitReply awaits the recipient; clear, a closed awaited tab and finishing end the wait', async () => {
+    const f = fixture()
+    const child = await f.control.call(f.scope, 'tabs.open', { title: 'Reviewer' }) as AgentControlTab
+    const reviewer = { ...f.scope, agentSessionId: child.resourceId! }
+    const other = agentIn(f, f.project.id, f.workspace.id, 'other-fixer')
+    // A coworker's send_message to its controller is a report; awaitReply awaits that controller.
+    const sent = await f.control.call(reviewer, 'agents.steer', { agentSessionId: f.scope.agentSessionId, prompt: 'Please send the fix commits', awaitReply: true }) as { reportedTo: string; awaiting: { agents: Array<{ agentSessionId: string }> } }
+    expect(sent.reportedTo).toBe('controller')
+    expect(sent.awaiting.agents.map(agent => agent.agentSessionId)).toEqual([f.scope.agentSessionId])
+    await expect(f.control.call(reviewer, 'agents.steer', { agentSessionId: f.scope.agentSessionId, prompt: 'x', awaitReply: 'yes' })).rejects.toThrow(/awaitReply must be true or false/)
+    // Replacing the list, then clear:true.
+    await f.control.call(reviewer, 'agents.await', { agents: [f.scope.agentSessionId, other.agentSessionId] })
+    expect(f.control.awaitingFact(reviewer.agentSessionId)!.agents.map(agent => agent.agentSessionId)).toEqual([f.scope.agentSessionId, other.agentSessionId])
+    expect(await f.control.call(reviewer, 'agents.await', { clear: true })).toEqual({ cleared: true, awaiting: null })
+    expect(f.control.awaitingFact(reviewer.agentSessionId)).toBeUndefined()
+    // An awaited tab that closed is no longer waited for.
+    await f.control.call(reviewer, 'agents.await', { agents: [other.agentSessionId] })
+    expect(f.control.awaitingFact(reviewer.agentSessionId)).toBeDefined()
+    const current = f.database.getSession(f.workspace.id)!
+    if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+    current.layout.root.tabs = current.layout.root.tabs.filter(tab => tab.resourceId !== other.agentSessionId)
+    f.database.saveSession(f.workspace.id, current.layout, null, [])
+    expect(f.control.awaitingFact(reviewer.agentSessionId)).toBeUndefined()
+    // Finishing (every finish route closes through closeFinished) ends the wait for good.
+    await f.control.call(reviewer, 'agents.await', { agents: [f.scope.agentSessionId] })
+    await f.control.closeFinished(f.control.finishTargets().find(target => target.agentSessionId === reviewer.agentSessionId)!)
+    expect(f.database.getSetting('awaitingResults:' + reviewer.agentSessionId)).toBeNull()
+    await expect(f.control.call({ ...f.scope, agentSessionId: 'owner', owner: true }, 'agents.await', { agents: ['fixer'] })).rejects.toThrow(/owner credential has none/)
+  })
+})

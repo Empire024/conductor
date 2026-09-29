@@ -16,7 +16,8 @@ import { unsettledReason, type FinishTarget } from './coworker-autoclose'
  * - it is a finished coworker whose report its controller has not collected yet: the report still
  *   sits, undelivered, in the controller's durable queue or pending steering (a report delivered
  *   as a turn leaves both, and only then is it collected; see uncollectedReportReason);
- * - it is the live wizard, still controls open coworkers, or runs on another machine.
+ * - it is the live wizard, still controls open coworkers, waits for other conversations' results
+ *   (src/shared/awaiting-results.ts), or runs on another machine.
  *
  * A tab with no conversation (a terminal, a file, an agent tab that never started) is never busy.
  * The race with a turn starting is closed by a latch (StructuredSessions.beginArchive), taken
@@ -27,7 +28,7 @@ import { unsettledReason, type FinishTarget } from './coworker-autoclose'
  * the owner may close a working tab on purpose; this rule is for closes nobody confirms.
  */
 export function archiveRefusal(
-  target: Pick<FinishTarget, 'wizard' | 'controlsLiveCoworkers' | 'remote'> | undefined,
+  target: Pick<FinishTarget, 'wizard' | 'controlsLiveCoworkers' | 'remote' | 'awaiting'> | undefined,
   state: SessionProjection | null | undefined,
   pendingWork: string | null = null,
   uncollectedReport: string | null = null
@@ -37,6 +38,7 @@ export function archiveRefusal(
   if (uncollectedReport) return uncollectedReport
   if (target?.wizard) return 'it is the live wizard'
   if (target?.controlsLiveCoworkers) return 'it still controls open coworkers; finish or release them first'
+  if (target?.awaiting) return target.awaiting
   if (target?.remote) return 'it runs on another machine'
   return null
 }

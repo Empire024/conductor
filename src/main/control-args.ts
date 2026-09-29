@@ -72,7 +72,7 @@ const METHOD_ALIASES: Record<string, string> = {
   'agents.send': 'agents.steer', 'agents.message': 'agents.steer', 'agents.reply': 'agents.steer', 'agents.prompt': 'agents.steer',
   'git.commit': 'git.ship', 'git.push': 'git.ship', 'git.deliver': 'git.ship',
   'tabs.create': 'tabs.open', 'agents.open': 'tabs.open', 'agents.start': 'tabs.open', 'agents.create': 'tabs.open', 'agents.dispatch': 'router.dispatch',
-  'agents.close': 'agents.finish', 'agents.done': 'agents.finish', 'agents.stop': 'agents.interrupt', 'agents.cancel': 'agents.interrupt',
+  'agents.close': 'agents.finish', 'agents.wait': 'agents.await', 'agents.done': 'agents.finish', 'agents.stop': 'agents.interrupt', 'agents.cancel': 'agents.interrupt',
   'agents.get': 'agents.status', 'agents.state': 'agents.status', 'tabs.state': 'app.state', 'files.search': 'files.list'
 }
 

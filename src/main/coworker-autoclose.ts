@@ -65,6 +65,8 @@ export interface FinishTarget {
   controlsLiveCoworkers: boolean
   /** It runs on, or is driven by, another machine. */
   remote: boolean
+  /** It waits for other conversations' results (src/shared/awaiting-results.ts): in words, else absent. */
+  awaiting?: string | null
 }
 
 /** Why this conversation is not settled, in words for a refusal; null when it is. A forced
@@ -243,7 +245,7 @@ export class CoworkerAutoClose {
       const id = target.agentSessionId
       const idle = idleFor(id, this.deps.snapshot(id))
       if (idle === null || idle < timeout || this.selfFinish.has(id)) continue
-      if (!target.opened || protectedReason(target) || !this.delivered(id)) continue
+      if (!target.opened || protectedReason(target) || target.awaiting || !this.delivered(id)) continue
       try { await this.closeAndRelease(target) } catch { /* An unsent draft keeps it; the next pass asks again. */ }
     }
     // Idle CLI release: any settled Claude or Codex runtime, open tab or not. The conversation

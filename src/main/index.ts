@@ -1910,7 +1910,7 @@ const registerIpc = (): void => {
     const facts: Record<string, AgentTabFacts> = {}
     for (const id of agentSessionIds as string[]) {
       const state = database.structured.snapshot(id), provider = database.structured.spec<AgentSpec>(id)?.provider
-      if (state) facts[id] = agentTabFacts(state, Boolean(provider && provider !== 'local' && wizardActive(state.settings, provider)))
+      if (state) facts[id] = agentTabFacts(state, Boolean(provider && provider !== 'local' && wizardActive(state.settings, provider)), finishedTabs?.awaiting(id))
     }
     return facts
   })
@@ -2906,7 +2906,7 @@ app.whenReady().then(async () => {
     settings: database, snapshot: id => database.structured.snapshot(id),
     targets: () => control.finishTargets(),
     layoutTab: target => { const session = database.listSessions(target.projectId).find(item => item.id === target.sessionId); return session ? findLayoutTab(session.layout.root, target.tabId) : undefined },
-    close: target => autoClose.closeSettled(target),
+    close: target => autoClose.closeSettled(target), awaiting: id => control.awaitingFact(id),
     ...(sweepOverride ? { ageOverrideMs: sweepOverride } : {})
   })
   finishedTabs.start()

@@ -3,6 +3,7 @@ import { Archive, ChevronDown, ChevronRight, FileText, MoreHorizontal, Pin, Term
 import type { AgentActivityPhase, PaneTab, SessionRecord } from '../../../shared/models'
 import type { AgentControlLink } from '../../../shared/agent-control'
 import { distinctTabLabels, statusLabel, tabPinned, type ClarityRow } from '../../../shared/workspace-clarity'
+import { awaitingSentence } from '../../../shared/awaiting-results'
 import { listGroups } from '../layout/layout-operations'
 import { tabGroupsOf, type TabGroupAction } from '../layout/tab-groups'
 import type { WorkspaceTabAction } from '../layout/workspace-tab-actions'
@@ -86,11 +87,12 @@ export function WorkspaceTabList({ session, active, expanded, activityPhases, on
   const renderTabRow = (row: ClarityRow, done = false): React.JSX.Element => {
     const { tab } = row
     const group = groups.find(item => item.id === row.groupId) ?? groups[0]!
-    const tabPhase = (tab.resourceId ? activityPhases.get(tab.resourceId) : undefined) ?? (row.status === 'running' ? 'working' : row.status === 'waiting' ? 'waiting_input' : row.status === 'done' ? 'complete' : 'idle')
+    // A tab waiting for others' results reads by its label, not as a completed turn.
+    const tabPhase = row.status === 'awaiting' ? 'idle' : (tab.resourceId ? activityPhases.get(tab.resourceId) : undefined) ?? (row.status === 'running' ? 'working' : row.status === 'waiting' ? 'waiting_input' : row.status === 'done' ? 'complete' : 'idle')
     const { controlledBy, controlling } = tab.kind === 'agent' ? tabControlRole(tab.id, links) : { controlledBy: undefined, controlling: [] }
     const tabGroup = tab.tabGroupId ? tabGroupsOf(group).find(item => item.id === tab.tabGroupId) : undefined
     const liveCoworkers = controlling.filter(link => clarity.live.some(candidate => candidate.tab.id === link.controlledTabId)).length
-    const label = done ? statusLabel(row) : ''
+    const label = done || row.status === 'awaiting' ? statusLabel(row) : ''
     // One MAIN per workspace; any other live controller leads its own coworkers.
     const role = !done && row.role === 'main' ? 'Main' : !done && row.role === 'lead' ? 'Lead' : undefined
     const picked = bulk && selection.ids.has(tab.id)
@@ -104,7 +106,7 @@ export function WorkspaceTabList({ session, active, expanded, activityPhases, on
         {tab.kind === 'agent' ? <ProviderIcon provider={String(tab.state?.provider ?? 'codex')} model={tab.state?.model as string | undefined} size={12} /> : tab.kind === 'terminal' ? <TerminalSquare size={12} /> : <FileText size={12} />}
         <span className="ellipsis">{labelOf.get(tab.id) ?? tab.title}</span>
         {tabPinned(tab) && <Pin className="workspace-tab-pin" size={10} aria-label="pinned" />}
-        {label && <em className={`workspace-tab-status ${row.status}`}>{label}</em>}
+        {label && <em className={`workspace-tab-status ${row.status}`} title={row.awaiting ? awaitingSentence(row.awaiting) : undefined}>{label}</em>}
         {tab.kind === 'agent' && !done && <TabActivityIndicator phase={tabPhase} title={tab.title} spinEpoch={spinEpoch} />}
       </button>
       {role && <button type="button" className={`workspace-tab-role ${row.role}`} title={`${tab.title} ${role === 'Main' ? 'is in charge of this workspace' : 'leads its own coworkers'}${liveCoworkers ? `: ${liveCoworkers} live coworker${liveCoworkers === 1 ? '' : 's'}` : ''}; show one`} aria-label={`${tab.title} is the ${role.toLowerCase()} tab${liveCoworkers ? ` with ${liveCoworkers} live coworkers` : ''}`} onClick={() => { const first = controlling[0]; if (first) focusLinkedTab(first.controlledTabId) }}><span>{role}</span>{liveCoworkers > 0 && <b>{liveCoworkers}</b>}</button>}

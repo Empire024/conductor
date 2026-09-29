@@ -40,6 +40,8 @@ import { createApprovalRouting } from './approval-review-routing'
 import { ApprovalReviews } from './approval-review'
 import { sinceCursor, supervise } from './agent-supervision'
 import { CoworkerRecovery } from './coworker-recovery'
+import { AwaitingResults } from './awaiting-results'
+import { awaitingSentence, MAX_AWAITED, MAX_AWAIT_REASON, type AwaitingFact } from '../shared/awaiting-results'
 import { displaySessionPhase } from '../shared/project-activity'
 import { claudeHookHealth } from './providers/claude'
 import { localStopOf } from '../shared/local-stop.ts'
@@ -230,13 +232,14 @@ const toolSignatures = {
   'agents.configure': '({agentSessionId,model,effort?}) — while the controlled coworker is idle with no queued input, persist an exact models.list model/effort for its next turn and update its visible tab; provider and permissions never change',
   'agents.grant': '({agentSessionId,repository?,research?}) — switch a local-model coworker’s per-conversation grants: repository (the sandbox may commit and branch, and a plain git push runs for it on the host) and research (web_search plus a larger tool-round budget). These are the conversation’s durable settings, the same toggles as its composer, so its own buttons show the change and it applies from its next turn. Only a non-local coworker may grant, only to a provider-local tab it already controls on this machine, never to itself or an ancestor; an omitted field is left alone, false revokes; returns what is now on and off',
   'agents.submit': '({agentSessionId,prompt}) — dispatch to a visible native tab with its existing permission settings; a coworker this caller dispatched whose tab closed as finished (or, for the owner or a wizard, any closed conversation of its own workspace) is reopened in the background first (reopened:true)',
-  'agents.steer': '({agentSessionId,prompt}) — what the user composer does with a message: while a turn is running (or waiting on an approval or a question) it steers the message into that turn where the provider can, else queues it behind the turn; while the conversation is idle, finished, failed, disconnected or interrupted it starts a turn with it exactly as agents.submit does (one turn, same settings, same control link); while a turn is still stopping it is refused, so send it again once it has stopped. A coworker this caller dispatched that finished and closed its tab (or, for the owner or a wizard, any closed conversation of its own workspace) is reopened in the background first (reopened:true). The result says which: delivery "started" for a new turn, "queued" for a message steered into or queued behind the running one. A conversation of this project open in another workspace that nobody controls, or that messaged you first, receives it as a message headed with your id that takes no control (acrossWorkspaces:true), so no relay tab is needed',
+  'agents.steer': '({agentSessionId,prompt}) — what the user composer does with a message: while a turn is running (or waiting on an approval or a question) it steers the message into that turn where the provider can, else queues it behind the turn; while the conversation is idle, finished, failed, disconnected or interrupted it starts a turn with it exactly as agents.submit does (one turn, same settings, same control link); awaitReply:true (send_message’s awaitReply) also records that you wait for the recipient’s reply, as agents.await does; while a turn is still stopping it is refused, so send it again once it has stopped. A coworker this caller dispatched that finished and closed its tab (or, for the owner or a wizard, any closed conversation of its own workspace) is reopened in the background first (reopened:true). The result says which: delivery "started" for a new turn, "queued" for a message steered into or queued behind the running one. A conversation of this project open in another workspace that nobody controls, or that messaged you first, receives it as a message headed with your id that takes no control (acrossWorkspaces:true), so no relay tab is needed',
   'agents.interrupt': '({agentSessionId,expedite?}) — stops the running turn, including one waiting on an approval; queued messages stay held above its composer, as after the owner’s Stop. expedite:true is the owner’s Esc instead: what waits in its queue (an approved retry, a steered message) is sent straight after the stop, which is how a wizard releases an approved retry by hand. Interrupting does not take control, here or in a sibling project',
   'agents.resume': '({agentSessionId}) — reopen a live orphan in this workspace without restarting its turn, or reconnect an idle/disconnected native conversation with its existing settings; outside this workspace only a coworker this caller controls. Resuming a failed, interrupted or disconnected one is a recovery: three per conversation in six hours (the owner is not counted), never while it waits on a request, never once it is superseded',
   'agents.supersede': '({agentSessionId,by,reason}) - mark a stopped coworker whose work another conversation (by) took over and delivered, so it reads as superseded rather than unfinished work and is not resumed again; reason up to 300 characters, e.g. what accepted the replacement',
   'agents.fork': '({agentSessionId,title?}) — fork supported idle native history into a visible linked tab, opened in the workspace that holds the original; outside this workspace only a coworker this caller controls',
   'agents.release': '({agentSessionId}) — release this controller relationship, wherever the coworker lives',
   'agents.report': '({text}) — deliver a report to the conversation that opened this tab (its controller, whoever that is; a controller that handed itself on is reached through its successor), as agents.steer does: steered into a running turn where the provider can, else queued or starting one. Never refused for length: the first 2000 characters (cut at a line break) are delivered with a pointer, and the whole text is kept as an artifact the controller reads with agents.artifact; the result says {delivered,total,artifactId}. Takes no agentSessionId: it always reports to the caller\'s own controller, never any other target. For a local model this is the way to reach its controller directly instead of the controller polling agents.status',
+  'agents.await': '({agents,reason?}|{clear:true}) — declare that this conversation ends its turn waiting for results from the named conversations (agent ids, at most ' + MAX_AWAITED + '; reason up to ' + MAX_AWAIT_REASON + ' characters): its tab stays in the active group labelled "waiting for …" instead of Done, and no sweep closes it; it survives a restart. Their message (send_message, agents.report) wakes you as it always does, so end your turn and never poll. Each one drops out when its message arrives; once all have and your turn ends without declaring again, the tab is finished work. A conversation whose tab closed is no longer waited for. Calling it again replaces the list; clear:true cancels; agents.finish ends it. Your own live coworkers need no declaration',
   'agents.finish': '({agentSessionId?,waitSeconds?,force?}) — close a finished coworker: its tab closes with history kept (reopenable from the closed tabs) and its CLI process is released. With agentSessionId, a controller finishes a coworker it controls whose turn has settled with no background tasks, at once and without an owner dialog; waitSeconds (max ' + FINISH_WAIT_SECONDS + MCP_WAIT_NOTE + '; a longer wait is capped and the result says so in waitCapped) first waits that long for it to settle, so there is no agents.status loop; refused, naming the reason, while it is (still) running, has background tasks, waits on an approval, has an unsent draft, is a wizard tab or still controls open coworkers. With {} a coworker finishes itself as its last act: Conductor closes it once this turn settles, so call it after your work is delivered and reported, then end the turn; background tasks of your own are waited for with waitSeconds, or stopped with your CLI with force:true',
   'agents.handoff': `({handoff,title?,successor?,provider?,model?,effort?}) — hand your own remaining work to a fresh tab when this conversation's context has grown expensive. Takes no agentSessionId: it always hands off the caller. handoff is ${HANDOFF_MINIMUM}-${HANDOFF_MAXIMUM} characters holding the six sections of docs/token-thrift-policy.md on their own lines, in order (${handoffSections.join(', ')}); reference long output by repository path rather than pasting it. The new tab opens in this workspace with your provider, model, effort and mode, and receives the handoff as its first prompt; provider, model and effort from models.list continue you elsewhere (another provider must name its model; your mode is kept, never widened). Your tab stays open and steerable: finish the step you are in, report it, and stop. successor:true is for a main brain (a wizard tab, or a controller with live coworkers): the new tab is you continued, not your coworker. It opens as a root (under your own controller, if you have one), inherits wizard mode and limit continuation, takes over every coworker you control (their agents.report, approvals and steering go to it) and any pending restart that would bring you back (a wizard's successor must be a model that can hold the wand, else nothing opens); you lose wizard mode, are marked superseded, and your tab shows “Continued in <tab>”`,
   'files.list': '({query?,projectId?}) — indexed project search, at most 100 matches with stable URIs',
@@ -1317,6 +1320,59 @@ export class AgentControl {
 
   private recoveryLedger?: CoworkerRecovery
   private recovery(): CoworkerRecovery { return this.recoveryLedger ??= new CoworkerRecovery(this.deps.database) }
+
+  private awaitingLedger?: AwaitingResults
+  /** Conversations whose turn ended waiting for others' results (src/shared/awaiting-results.ts). */
+  awaiting(): AwaitingResults {
+    const { database } = this.deps
+    const projectOf = (id: string): string => database.structured.spec<AgentSpec>(id)?.projectId ?? ''
+    return this.awaitingLedger ??= new AwaitingResults({
+      settings: database, snapshot: id => database.structured.snapshot(id),
+      open: id => this.describeTarget({ agentSessionId: id })?.title,
+      successors: id => this.successorsOf(projectOf(id), id),
+      superseded: id => Boolean(this.recovery().status(projectOf(id), id).superseded)
+    })
+  }
+
+  /** Whom this conversation waits for right now, for workspace clarity; undefined when nobody. */
+  awaitingFact(agentSessionId: string): AwaitingFact | undefined {
+    try { return this.awaiting().fact(agentSessionId) } catch { return undefined }
+  }
+
+  /** agents.await: the caller declares (or cancels) the wait its turn ends on. */
+  private declareAwait(scope: AgentControlScope, args: Args): unknown {
+    if (scope.owner) throw new Error('agents.await is declared by the conversation that waits; the owner credential has none')
+    const input = validateArgs('agents.await', args, ['agents', 'reason', 'clear'], { aliases: { agentSessionIds: 'agents', agentIds: 'agents', agentSessionId: 'agents', agentId: 'agents', for: 'reason' } })
+    const ledger = this.awaiting()
+    if (input.clear !== undefined) {
+      if (input.clear !== true || input.agents !== undefined) throw new ArgumentError('clear:true cancels the wait and takes nothing else')
+      return { cleared: ledger.clear(scope.agentSessionId), awaiting: null }
+    }
+    const named = typeof input.agents === 'string' ? [input.agents] : input.agents
+    const agents = strings(named, 'agents', MAX_AWAITED, 160)
+    if (!agents.length) throw new ArgumentError('agents names at least one conversation id (agents.list gives them); clear:true cancels a wait')
+    if (agents.includes(scope.agentSessionId)) throw new ArgumentError('A conversation does not wait for itself')
+    for (const id of agents) if (!this.deps.database.structured.spec<AgentSpec>(id)) throw new ArgumentError(`No conversation ${id} exists in this Conductor; agents.list gives the ids`)
+    const reason = input.reason === undefined ? undefined : text(input, 'reason', MAX_AWAIT_REASON)
+    ledger.declare(scope.agentSessionId, agents, reason)
+    const fact = ledger.fact(scope.agentSessionId)
+    return {
+      awaiting: fact ?? null,
+      note: fact ? `${awaitingSentence(fact)} End your turn now; do not poll.` : 'None of those conversations has an open tab, so nothing is waited for; message them first, or finish your work.'
+    }
+  }
+
+  /** send_message({awaitReply:true}): the message goes as agents.steer, then its recipient is awaited. */
+  private async steerAwaitingReply(scope: AgentControlScope, rawArgs: unknown): Promise<unknown> {
+    const { awaitReply, ...rest } = object(rawArgs)
+    if (typeof awaitReply !== 'boolean') throw new ArgumentError('awaitReply must be true or false')
+    const result = await this.invoke(scope, 'agents.steer', rest)
+    if (!awaitReply || scope.owner) return result
+    const delivered = object(result), recipient = typeof delivered.agentSessionId === 'string' ? delivered.agentSessionId : typeof object(delivered.deliveredTo).agentSessionId === 'string' ? String(object(delivered.deliveredTo).agentSessionId) : undefined
+    if (!recipient) return result
+    this.awaiting().add(scope.agentSessionId, recipient)
+    return { ...delivered, awaiting: this.awaiting().fact(scope.agentSessionId) ?? null }
+  }
   /** The approval reviews raised for a worker's requests; none when the journal cannot be read. */
   private reviewsFor(projectId: string, workerId: string) {
     try { return new ApprovalReviews(this.deps.database).forWorker(projectId, workerId) } catch { return undefined }
@@ -1555,7 +1611,7 @@ export class AgentControl {
    *  (`agents.report: text is required`), so the caller knows which call to fix. */
   async call(scope: AgentControlScope, method: string, rawArgs: unknown = {}): Promise<unknown> {
     try {
-      return await this.callContext.run({ method }, () => this.invoke(scope, method, rawArgs))
+      return await this.callContext.run({ method }, () => method === 'agents.steer' && object(rawArgs).awaitReply !== undefined ? this.steerAwaitingReply(scope, rawArgs) : this.invoke(scope, method, rawArgs))
     } catch (error) {
       if (error instanceof ArgumentError && !error.prefixed) {
         error.prefixed = true
@@ -1712,6 +1768,7 @@ export class AgentControl {
       return active([...own, ...orphaned, ...finished, ...this.reachableElsewhere(scope).map(({ tab, scope: target, yours }) => ({ ...this.observation(target, tab, database.structured.snapshot(tab.resourceId!), observedAt), crossProject: true, controlled: yours }))])
     }
     if (method === 'agents.finish') return this.finish(scope, args)
+    if (method === 'agents.await') return this.declareAwait(scope, args)
     if (method === 'agents.report') {
       // Takes no addressee, but one naming the caller's own controller is harmless and accepted.
       const reportArgs = validateArgs(method, args, ['text'], { aliases: { message: 'text', report: 'text', summary: 'text', content: 'text' }, ignore: ['agentSessionId'], hint: 'agents.report always goes to your own controller; put everything in text.' })
@@ -2974,12 +3031,14 @@ export class AgentControl {
     const controllers = new Set(tabs.flatMap(entry => entry.controller ? [entry.controller] : []))
     return tabs.map(({ tab, projectId, sessionId, controller }) => {
       const id = tab.resourceId!, state = this.deps.database.structured.snapshot(id)
+      const awaiting = this.awaitingFact(id)
       const provider = typeof tab.state?.provider === 'string' ? tab.state.provider : undefined
       return {
         agentSessionId: id, projectId, sessionId, tabId: tab.id, title: tab.title, provider, controller,
         opened: this.deps.database.getSetting(COWORKER_OPENED_PREFIX + id) !== null,
         wizard: wizardActive(state?.settings, provider), controlsLiveCoworkers: controllers.has(id),
-        remote: Boolean(tab.state?.remotePeerId) || tabMachineId(tab) !== LOCAL_MACHINE_ID
+        remote: Boolean(tab.state?.remotePeerId) || tabMachineId(tab) !== LOCAL_MACHINE_ID,
+        ...(awaiting ? { awaiting: `it is ${awaitingSentence(awaiting).replace(/^Waiting/, 'waiting').replace(/\. It wakes when they message it\.$/, '')}` } : {})
       }
     })
   }
@@ -2989,6 +3048,7 @@ export class AgentControl {
   async closeFinished(target: FinishTarget): Promise<void> {
     const scope = { projectId: target.projectId, sessionId: target.sessionId, agentSessionId: '' }
     await this.ui(scope, 'tabs.close', { tabId: target.tabId, unlessDraft: true })
+    this.awaiting().clear(target.agentSessionId)
     const key = 'agentControlParent:' + target.agentSessionId, stored = this.deps.database.getSetting(key)
     this.deps.database.removeSetting(key)
     this.deps.linksChanged?.(scope)

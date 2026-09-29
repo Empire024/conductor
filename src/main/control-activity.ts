@@ -249,6 +249,10 @@ export class ControlActivityRecorder {
       const target = named(str(object(result).agentSessionId))
       return { actions: [{ method, kind: 'steer', label: `Reported to ${titled(target, 'its controller')}`, at, target, ...failure }], driven: [] }
     }
+    if (method === 'agents.await') {
+      const waiting = object(object(result).awaiting), names = Array.isArray(waiting.agents) ? waiting.agents.map(agent => str(object(agent).title) ?? str(object(agent).agentSessionId)).filter(Boolean) : []
+      return { actions: [{ method, kind: 'other', label: args.clear === true ? 'Stopped waiting' : names.length ? `Waiting for ${names.join(', ')}` : 'Declared a wait', at, ...failure }], driven: [] }
+    }
     if (method === 'agents.finish' && !str(args.agentSessionId)) return { actions: [{ method, kind: 'close', label: 'Finished itself', at, ...failure }], driven: [] }
     const agentVerb = AGENT_VERBS[method]
     if (agentVerb) {

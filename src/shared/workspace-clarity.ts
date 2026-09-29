@@ -1,4 +1,5 @@
 import type { AgentControlLink } from './agent-control'
+import { awaitingLabel, type AwaitingFact } from './awaiting-results'
 import type { AgentActivityPhase, PaneTab } from './models'
 import type { SessionProjection } from './structured-agent'
 
@@ -16,7 +17,9 @@ import type { SessionProjection } from './structured-agent'
  *   open, reachable from the sidebar's Done group and Ctrl+K), and after the owner's sweep age an
  *   unfocused finished tab closes itself with its history kept;
  * - never hidden or closed: a running tab, one waiting on an approval or question, the live
- *   wizard, a pinned tab, the tab on screen in its pane.
+ *   wizard, a pinned tab, the tab on screen in its pane;
+ * - a tab whose turn ended waiting for other conversations' results (src/shared/awaiting-results.ts)
+ *   is live work labelled with whom it waits for, never Done, hidden or swept.
  */
 
 /** tab.state keys: when the owner last had this tab in front of them, and a pin. */
@@ -32,9 +35,12 @@ export interface AgentTabFacts {
   settledAt?: string
   /** Main's own reading while it is not settled, for a window without the renderer's phase map. */
   live?: 'running' | 'waiting'
+  /** Its turn ended waiting for other conversations' results (src/shared/awaiting-results.ts). */
+  awaiting?: AwaitingFact
 }
 
-export type ClarityStatus = 'running' | 'waiting' | 'open' | 'done' | 'failed' | 'stopped' | 'handed-off'
+/** 'awaiting': its turn is over but it declared it waits for named conversations, which wake it. */
+export type ClarityStatus = 'running' | 'waiting' | 'awaiting' | 'open' | 'done' | 'failed' | 'stopped' | 'handed-off'
 export type ClarityRole = 'main' | 'lead' | 'coworker'
 
 const FINISHED: ReadonlySet<ClarityStatus> = new Set(['done', 'failed', 'stopped', 'handed-off'])
@@ -55,6 +61,8 @@ export function clarityStatus(tab: Pick<PaneTab, 'kind'>, phase: AgentActivityPh
   if (phase === 'working' || phase === 'waiting_background' || phase === 'limited') return 'running'
   if (phase === 'waiting_input') return 'waiting'
   if (facts?.handedOff) return 'handed-off'
+  // Ending a provider turn to wait for others' results is not finishing; the owner's stop is.
+  if (facts?.awaiting && phase !== 'stopped') return 'awaiting'
   if (phase === 'complete') return 'done'
   if (phase === 'failed' || phase === 'disconnected') return 'failed'
   if (phase === 'stopped') return 'stopped'
@@ -75,6 +83,8 @@ export interface ClarityRow {
   settledAt?: number
   /** It was a wizard or controlled coworkers: a finished one reads as ended, not as failed. */
   led?: boolean
+  /** Whom it waits for, when its status is 'awaiting'. */
+  awaiting?: AwaitingFact
 }
 export interface WorkspaceClarity {
   mainTabId: string | null
@@ -95,7 +105,7 @@ export interface ClarityInput {
   facts: Readonly<Record<string, AgentTabFacts>>
 }
 
-const liveRank = (status: ClarityStatus): number => status === 'waiting' ? 0 : status === 'running' ? 1 : 2
+const liveRank = (status: ClarityStatus): number => status === 'waiting' ? 0 : status === 'running' ? 1 : status === 'awaiting' ? 2 : 3
 
 /** The one MAIN: a live (not handed-off) wizard, preferring one at work, then the most recently
  *  settled; with no wizard, the live controller with the most live coworkers. */
@@ -139,7 +149,8 @@ export function buildWorkspaceClarity(input: ClarityInput): WorkspaceClarity {
       ...(roleOf(id) ? { role: roleOf(id) } : {}),
       ...(controller && controller !== nestedUnder ? { controllerTitle: byTab.get(controller)!.tab.title } : {}),
       ...(time(entry.facts?.settledAt) !== undefined ? { settledAt: time(entry.facts?.settledAt) } : {}),
-      ...(entry.facts?.wizard || leaders.has(id) ? { led: true } : {})
+      ...(entry.facts?.wizard || leaders.has(id) ? { led: true } : {}),
+      ...(entry.status === 'awaiting' && entry.facts?.awaiting ? { awaiting: entry.facts.awaiting } : {})
     }
   }
   const byPosition = (a: string, b: string): number => byTab.get(a)!.position - byTab.get(b)!.position
@@ -150,7 +161,7 @@ export function buildWorkspaceClarity(input: ClarityInput): WorkspaceClarity {
   const childrenOf = (id: string): string[] => liveIds.filter(child => nestedParent(child) === id).sort(byLiveness)
   const tops = liveIds.filter(id => !nestedParent(id) || nestedParent(nestedParent(id)!) === id)
   const agentFirst = (a: string, b: string): number => {
-    const rank = (id: string): number => id === mainTabId ? -1 : byTab.get(id)!.tab.kind !== 'agent' ? 3 : liveRank(byTab.get(id)!.status)
+    const rank = (id: string): number => id === mainTabId ? -1 : byTab.get(id)!.tab.kind !== 'agent' ? 4 : liveRank(byTab.get(id)!.status)
     return rank(a) - rank(b) || byPosition(a, b)
   }
   const live: ClarityRow[] = []
@@ -189,7 +200,8 @@ export function stripRank(tabIds: readonly string[], clarity: Pick<WorkspaceClar
   return tabIds.map((id, index) => ({ id, index })).sort((a, b) => rank(a.id) - rank(b.id) || a.index - b.index).map(entry => entry.id)
 }
 
-export const statusLabel = (row: Pick<ClarityRow, 'status' | 'led'>): string => {
+export const statusLabel = (row: Pick<ClarityRow, 'status' | 'led' | 'awaiting'>): string => {
+  if (row.status === 'awaiting') return row.awaiting ? awaitingLabel(row.awaiting) : 'waiting for results'
   if (row.status === 'handed-off') return 'handed off'
   if ((row.status === 'failed' || row.status === 'stopped') && row.led) return 'ended'
   // Done is what the group already says; only a different ending is worth a label.
@@ -249,12 +261,15 @@ export function normalizeFinishedTabSweepHours(value: unknown): number {
  *  sweep's extra rule (settled and unseen for its age, not on screen); the owner's button skips it. */
 export function finishedCloseRefusal(tab: {
   finished: boolean; pinned: boolean; wizard: boolean; controlsLiveCoworkers: boolean; remote: boolean; busy: string | null
+  /** It waits for other conversations' results (awaitingSentence), so its work is not over. */
+  awaiting?: string | null
 }, aged?: { active: boolean; settledAt?: number; seenAt?: number; now: number; ageMs: number }): string | null {
   if (tab.busy) return tab.busy
   if (!tab.finished) return 'it is not finished'
   if (tab.pinned) return 'it is pinned'
   if (tab.wizard) return 'it is the live wizard'
   if (tab.controlsLiveCoworkers) return 'it still controls open coworkers'
+  if (tab.awaiting) return tab.awaiting
   if (tab.remote) return 'it runs on another machine'
   if (!aged) return null
   if (aged.active) return 'it is the tab on screen in its pane'

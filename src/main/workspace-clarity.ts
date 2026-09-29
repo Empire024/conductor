@@ -1,5 +1,6 @@
 import type { LayoutNode, PaneTab } from '../shared/models'
 import type { SessionProjection } from '../shared/structured-agent'
+import type { AwaitingFact } from '../shared/awaiting-results'
 import { finishedCloseRefusal, finishedTabSweepHours, handedOffIn, tabPinned, tabSeenAt, type AgentTabFacts } from '../shared/workspace-clarity'
 import { unsettledReason, type FinishTarget } from './coworker-autoclose'
 
@@ -22,10 +23,10 @@ export function settledAt(state: SessionProjection | null | undefined): string |
   return Number.isFinite(Date.parse(last.timestamp)) ? last.timestamp : undefined
 }
 
-export function agentTabFacts(state: SessionProjection | null | undefined, wizard: boolean): AgentTabFacts {
+export function agentTabFacts(state: SessionProjection | null | undefined, wizard: boolean, awaiting?: AwaitingFact): AgentTabFacts {
   const settled = settledAt(state), busy = state ? unsettledReason(state) : null
   const live = busy ? (state!.phase === 'waiting_approval' || state!.phase === 'waiting_input' ? 'waiting' as const : 'running' as const) : undefined
-  return { wizard, handedOff: state ? handedOffIn(state.items) : false, ...(settled ? { settledAt: settled } : {}), ...(live ? { live } : {}) }
+  return { wizard, handedOff: state ? handedOffIn(state.items) : false, ...(settled ? { settledAt: settled } : {}), ...(live ? { live } : {}), ...(awaiting ? { awaiting } : {}) }
 }
 
 /** Finished as main sees it, without the renderer's phase map: it ran, and nothing of it is still going. */
@@ -50,6 +51,8 @@ export interface FinishedTabsDependencies {
   layoutTab(target: FinishTarget): LayoutTab | undefined
   /** AgentControl.closeFinished, then the CLI release (CoworkerAutoClose does both for coworkers). */
   close(target: FinishTarget): Promise<void>
+  /** Whom a conversation waits for (AgentControl.awaitingFact), for the renderer's tab facts. */
+  awaiting?(agentSessionId: string): AwaitingFact | undefined
   /** Test runs only: replaces the owner's hours. */
   ageOverrideMs?: number
   now?(): number
@@ -81,13 +84,15 @@ export class FinishedTabs {
 
   dispose(): void { if (this.timer) clearInterval(this.timer); this.timer = undefined }
 
+  awaiting(agentSessionId: string): AwaitingFact | undefined { return this.deps.awaiting?.(agentSessionId) }
+
   private refusal(target: FinishTarget, aged: boolean): string | null {
     const state = this.deps.snapshot(target.agentSessionId), placed = this.deps.layoutTab(target)
     const busy = unsettledReason(state)
     // A wizard whose last turn failed or was stopped, or that handed itself on, is ended work
     // (the sidebar says so), even while its wand is still set; only a live one is kept.
     const ended = state ? ['failed', 'interrupted', 'disconnected'].includes(state.phase) || handedOffIn(state.items) : false
-    const base = { finished: finishedState(state), pinned: placed ? tabPinned(placed.tab) : false, wizard: target.wizard && !ended, controlsLiveCoworkers: target.controlsLiveCoworkers, remote: target.remote, busy }
+    const base = { finished: finishedState(state), pinned: placed ? tabPinned(placed.tab) : false, wizard: target.wizard && !ended, controlsLiveCoworkers: target.controlsLiveCoworkers, remote: target.remote, busy, awaiting: target.awaiting ?? null }
     if (!aged) return finishedCloseRefusal(base)
     // A tab in a detached window is on screen as far as the sweep can tell.
     const settled = settledAt(state)
