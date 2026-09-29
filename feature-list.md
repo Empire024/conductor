@@ -1861,4 +1861,6 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 
 - [ ] add a Needs attention summary under all projects that shows active cards currently needing supervision <!-- conductor-task:eb5faab5-920e-4d92-8bf0-2438d6227cca -->
 
+- [ ] Full Auto authorization UI is just a wall of text (owner, 2026-09-29 after the genuine activation): redesign the Claude Full Auto control as a clear toggle/state card (authorized or not, since when, which tabs run Full Auto, disable) with the explanation collapsed <!-- conductor-task:full-auto-ui-redesign -->
+
 - [~] production-agent: Production agent + Production Verifier (owner 2026-09-28) <!-- conductor-task:production-agent agent=agent_mulqw2hi_o99lde2 -->
