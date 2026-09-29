@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>My subscriptions</title>
+</head>
+<body class="woocommerce">
+  <header>
+    <nav aria-label="Main">
+      <a href="/">Home</a>
+      <a href="/product/alpha/">Shop</a>
+      <a href="/cart/">Cart</a>
+    </nav>
+  </header>
+  <main>
+    <h1>My subscriptions</h1>
+    <table class="shop_table subscriptions">
+      <tr><th>Subscription</th><th>Status</th><th>Next payment</th><th></th></tr>
+      <tr>
+        <td>#sub-1001 Monthly flower box</td><td>Active</td><td>1 November 2026</td>
+        <td>
+          <form class="cancel-subscription" method="post" action="{{woo}}/store/subscriptions/sub-1001/cancel">
+            <button type="submit" class="button cancel">Cancel subscription</button>
+          </form>
+        </td>
+      </tr>
+    </table>
+    <p>Cancelling stops future payments. It does not delete your account or refund past payments; those are separate requests.</p>
+  </main>
+  <footer>
+    <a href="/terms/">Terms and conditions</a>
+    <a href="/privacy-policy/">Privacy policy</a>
+    <a href="/my-account/subscriptions/">My subscriptions</a>
+    <p>Example Shop s.r.o., Hlavná 1, 811 01 Bratislava, Slovakia</p>
+  </footer>
+</body>
+</html>

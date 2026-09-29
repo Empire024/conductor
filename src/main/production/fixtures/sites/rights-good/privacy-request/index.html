@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Data request – Example Shop</title>
+</head>
+<body class="woocommerce">
+  <header>
+    <nav aria-label="Main">
+      <a href="/">Home</a>
+      <a href="/product/alpha/">Shop</a>
+      <a href="/cart/">Cart</a>
+    </nav>
+  </header>
+  <main>
+    <h1>Data request</h1>
+    <p>We verify your identity by sending a confirmation link to the email address you enter. We never ask for identity documents.</p>
+    <form class="data-request" method="post" action="/privacy-request/submit">
+      <label>Email address <input type="email" name="email" autocomplete="email" required></label>
+      <label>Request
+        <select name="type"><option value="access">Access my data</option><option value="erasure" selected>Delete my data</option></select>
+      </label>
+      <label>Details (optional) <textarea name="message"></textarea></label>
+      <button type="submit">Send request</button>
+    </form>
+  </main>
+  <footer>
+    <a href="/terms/">Terms and conditions</a>
+    <a href="/privacy-policy/">Privacy policy</a>
+    <p>Example Shop s.r.o., Hlavná 1, 811 01 Bratislava, Slovakia</p>
+  </footer>
+</body>
+</html>
