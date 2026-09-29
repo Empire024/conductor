@@ -1,10 +1,11 @@
 import {
   AUDIENCES, AUTH_STATES, BUSINESS_MODELS, CONSENT_STATES, CONTROL_IDS, DEFAULT_AUDIT_BUDGET, DEFAULT_DRIFT_MINUTES, DEVICE_CLASSES,
-  ENVIRONMENT_KINDS, MUTATION_KINDS, REGION_SELECTIONS,
+  ENVIRONMENT_KINDS, MUTATION_KINDS, MUTATION_POLICIES, REGION_SELECTIONS,
   type AuditBudget, type AuditScope, type ControlId, type ControlRegistry, type DriftSettings, type FactKey, type OwnerQuestion,
   type ProductionDesignation, type ProductionEnvironment, type ProductionProfile, type ProfileFact, type ProfileFacts, type ProfileUpdate,
-  type SandboxWriteAuthorization, type WriteAuthorizationRequest
+  type LoginStateRefresh, type SandboxWriteAuthorization, type StoredLoginStateRef, type WriteAuthorizationRequest
 } from '../../shared/production'
+import { isAbsolute } from 'node:path'
 import { makeId } from '../../shared/models'
 import { factIsUnknown, REGISTRY } from './registry'
 
@@ -17,15 +18,17 @@ import { factIsUnknown, REGISTRY } from './registry'
 
 export const FACT_KEYS: readonly FactKey[] = [
   'legalEntity', 'targetCountries', 'businessModel', 'products', 'accountFeatures', 'subscriptions', 'userUploads',
-  'aiRuntime', 'analytics', 'sessionReplay', 'emailMarketing', 'dataCategories', 'audience', 'ageRestrictedProducts',
+  'aiRuntime', 'analytics', 'sessionReplay', 'emailMarketing', 'marketingSender', 'transactionalSender', 'dataCategories', 'audience', 'ageRestrictedProducts',
   'paymentProviders', 'processors', 'safeHarborReliance',
 ]
 
-type FactType = 'text' | 'list' | 'boolean' | { oneOf: readonly string[] }
+type FactType = 'text' | 'email' | 'list' | 'boolean' | { oneOf: readonly string[] }
+/** Facts a profile stored before they existed may lack; no control's applicability requires them. */
+export const OPTIONAL_FACT_KEYS: readonly FactKey[] = ['marketingSender', 'transactionalSender']
 export const FACT_TYPES: Readonly<Record<FactKey, FactType>> = {
   legalEntity: 'text', targetCountries: 'list', businessModel: { oneOf: BUSINESS_MODELS }, products: 'list',
   accountFeatures: 'boolean', subscriptions: 'boolean', userUploads: 'boolean', aiRuntime: 'boolean', analytics: 'boolean',
-  sessionReplay: 'boolean', emailMarketing: 'boolean', dataCategories: 'list', audience: { oneOf: AUDIENCES },
+  sessionReplay: 'boolean', emailMarketing: 'boolean', marketingSender: 'email', transactionalSender: 'email', dataCategories: 'list', audience: { oneOf: AUDIENCES },
   ageRestrictedProducts: 'boolean', paymentProviders: 'list', processors: 'list', safeHarborReliance: 'boolean',
 }
 
@@ -42,6 +45,8 @@ export const FACT_QUESTIONS: Readonly<Record<FactKey, { question: string; why: s
   analytics: { question: 'Are analytics, advertising pixels or other tracking intended on the site? (yes/no)', why: 'Decides whether consent is required before tracking or the site must be essential-only.' },
   sessionReplay: { question: 'Is session replay or input recording (for example Hotjar, Clarity, FullStory) intended? (yes/no)', why: 'Replay masking is tested with synthetic markers; undeclared replay is a finding.' },
   emailMarketing: { question: 'Does the project send marketing email (newsletters, promotions)? (yes/no)', why: 'Marketing email rules (identity, opt-out, suppression) apply only to commercial messages.' },
+  marketingSender: { question: 'Which address must marketing email come from?', why: 'A captured campaign from another address is flagged.' },
+  transactionalSender: { question: 'Which address must transactional email (orders, accounts) come from?', why: 'A captured order or account email from another address is flagged.' },
   dataCategories: { question: 'Which categories of personal data does the project collect? (for example contact, address, payment, health, none)', why: 'Forms and data-rights checks compare what is collected with what is needed and declared.' },
   audience: { question: 'Who is the intended audience? (general, child-directed, mixed, adult-only)', why: 'Child-data and age-restriction rules depend on it.' },
   ageRestrictedProducts: { question: 'Does the project sell age-restricted products (alcohol, tobacco, CBD, adult content)? (yes/no)', why: 'Age-restricted sales need a jurisdiction-specific eligibility review.' },
@@ -90,7 +95,9 @@ export function defaultProfile(projectId: string, now: Date = new Date(), regist
  * replaces one from a higher source (owner > wizard > discovery > assumption); the same source
  * replaces its own earlier value. An owner or wizard fact is always `evidenced`, an assumption
  * always `assumed`. A null
- * or unknown incoming value is ignored: nothing becomes unknown again by merging.
+ * or unknown incoming value is ignored: nothing becomes unknown again by merging. An owner or wizard
+ * re-recording the same value rewrites the source, `by`, time and note (a wizard re-recording an
+ * owner-sourced value marks it as the wizard's); an assumption or discovery never demotes a higher fact.
  */
 export function mergeFacts(current: ProfileFacts, incoming: Partial<Record<FactKey, ProfileFact<unknown>>>): ProfileFacts {
   const next = { ...current } as Record<FactKey, ProfileFact<unknown>>
@@ -98,9 +105,11 @@ export function mergeFacts(current: ProfileFacts, incoming: Partial<Record<FactK
     if (!FACT_KEYS.includes(key)) throw new Error(`Unknown profile fact: ${key}`)
     if (!fact || fact.source === null || fact.value === null || fact.value === undefined || fact.status === 'unknown') continue
     const existing = next[key]
-    if (!factIsUnknown(existing) && existing.source && PRECEDENCE[existing.source] > PRECEDENCE[fact.source]) continue
+    const value = normaliseFactValue(key, fact.value)
+    const restated = (fact.source === 'owner' || fact.source === 'wizard') && !factIsUnknown(existing) && JSON.stringify(existing.value) === JSON.stringify(value)
+    if (!restated && !factIsUnknown(existing) && existing.source && PRECEDENCE[existing.source] > PRECEDENCE[fact.source]) continue
     const status = fact.source === 'assumption' ? 'assumed' : 'evidenced'
-    next[key] = { ...fact, value: normaliseFactValue(key, fact.value), status }
+    next[key] = { ...fact, value, status }
   }
   return next as unknown as ProfileFacts
 }
@@ -111,6 +120,11 @@ export function normaliseFactValue(key: FactKey, value: unknown): unknown {
   if (type === 'text') {
     if (typeof value !== 'string' || !value.trim() || value.length > 2_000) throw new Error(`${key} must be non-empty text of up to 2,000 characters`)
     return value.trim()
+  }
+  if (type === 'email') {
+    const address = typeof value === 'string' ? value.trim().toLowerCase() : ''
+    if (address.length > 254 || !/^[^\s@<>",;]+@[^\s@<>",;]+\.[a-z0-9-]{2,}$/.test(address)) throw new Error(`${key} must be one email address, for example shop@example.com`)
+    return address
   }
   if (type === 'boolean') {
     if (typeof value !== 'boolean') throw new Error(`${key} must be true or false`)
@@ -139,7 +153,7 @@ export function parseFactAnswer(key: FactKey, answer: string): unknown {
     if (/^(none|no|nothing|-)$/i.test(text)) return []
     return normaliseFactValue(key, text.split(/[,;\n]/).map(item => item.trim()).filter(Boolean))
   }
-  if (type === 'text') return normaliseFactValue(key, text)
+  if (type === 'text' || type === 'email') return normaliseFactValue(key, text)
   return normaliseFactValue(key, text.toLowerCase())
 }
 
@@ -233,11 +247,53 @@ export function validateEnvironment(environment: ProductionEnvironment): Product
   if (typeof environment.label !== 'string' || !environment.label.trim()) throw new Error(`Environment ${environment.id} needs a label`)
   const base = originOf(environment.baseUrl)
   const origins = [...new Set([base, ...(environment.allowedOrigins ?? []).map(originOf)])]
-  for (const account of environment.accounts ?? []) {
+  const accounts = (environment.accounts ?? []).map(account => {
     if (environment.kind === 'production' && account.role !== 'guest') throw new Error(`Environment ${environment.id} is production: test accounts belong to staging, sandbox or local environments`)
-    for (const ref of [account.usernameRef, account.passwordRef]) if (!ref || !['env', 'secret-file'].includes(ref.source) || !ref.key) throw new Error(`Account ${account.id}: credentials are references (env or secret-file with a key), never values`)
-  }
-  return { ...environment, label: environment.label.trim(), baseUrl: environment.baseUrl, allowedOrigins: origins, accounts: environment.accounts ?? [], capturedMail: environment.capturedMail ?? null, commerce: environment.commerce ?? null, storage: environment.storage ?? null, buildInfoCommand: environment.buildInfoCommand ?? null, smokeCommand: environment.smokeCommand ?? null }
+    const gateOnly = account.role === 'guest' && !!account.storageState
+    for (const ref of [account.usernameRef ?? null, account.passwordRef ?? null]) {
+      if (ref === null && gateOnly) continue
+      if (!ref || !['env', 'secret-file'].includes(ref.source) || !ref.key) throw new Error(`Account ${account.id}: credentials are references (env or secret-file with a key), never values; only a guest account with a storageState may leave them null`)
+    }
+    return { ...account, usernameRef: account.usernameRef ?? null, passwordRef: account.passwordRef ?? null, ...(account.storageState ? { storageState: validateLoginState(account.storageState, account.id) } : {}) }
+  })
+  if (environment.mutationPolicy !== undefined && environment.mutationPolicy !== null && !MUTATION_POLICIES.includes(environment.mutationPolicy)) throw new Error(`Environment ${environment.id}: mutationPolicy must be one of ${MUTATION_POLICIES.join(', ')} (or null)`)
+  return { ...environment, label: environment.label.trim(), baseUrl: environment.baseUrl, allowedOrigins: origins, accounts, capturedMail: environment.capturedMail ?? null, commerce: environment.commerce ?? null, storage: environment.storage ?? null, buildInfoCommand: environment.buildInfoCommand ?? null, smokeCommand: environment.smokeCommand ?? null, mutationPolicy: environment.mutationPolicy ?? null }
+}
+
+export const MAX_REFRESH_TIMEOUT_MS = 600_000
+
+function validateLoginState(state: StoredLoginStateRef, accountId: string): StoredLoginStateRef {
+  if (typeof state.path !== 'string' || !isAbsolute(state.path)) throw new Error(`Account ${accountId}: storageState.path must be an absolute path to a Playwright storage-state file`)
+  const refresh = state.refresh
+  if (refresh === undefined || refresh === null) return state
+  if (typeof refresh.command !== 'string' || !refresh.command.trim() || refresh.command.length > 2_000) throw new Error(`Account ${accountId}: storageState.refresh.command must be a command line of up to 2,000 characters`)
+  if (typeof refresh.cwd !== 'string' || !isAbsolute(refresh.cwd)) throw new Error(`Account ${accountId}: storageState.refresh.cwd must be an absolute directory (the owner's repository)`)
+  if (typeof refresh.maxAgeHours !== 'number' || !(refresh.maxAgeHours > 0) || refresh.maxAgeHours > 24 * 90) throw new Error(`Account ${accountId}: storageState.refresh.maxAgeHours must be a number of hours from above 0 to 2,160`)
+  if (refresh.timeoutMs !== undefined && (!Number.isInteger(refresh.timeoutMs) || refresh.timeoutMs < 1_000 || refresh.timeoutMs > MAX_REFRESH_TIMEOUT_MS)) throw new Error(`Account ${accountId}: storageState.refresh.timeoutMs must be 1,000 to ${MAX_REFRESH_TIMEOUT_MS} ms`)
+  if (refresh.maskEnv !== undefined && (!Array.isArray(refresh.maskEnv) || refresh.maskEnv.length > 20 || refresh.maskEnv.some(name => typeof name !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(name)))) throw new Error(`Account ${accountId}: storageState.refresh.maskEnv must be a list of environment variable names`)
+  return { ...state, refresh: { ...refresh, command: refresh.command.trim() } }
+}
+
+const refreshKey = (refresh: LoginStateRefresh | null | undefined): string => refresh ? JSON.stringify({ command: refresh.command, cwd: refresh.cwd, maxAgeHours: refresh.maxAgeHours, timeoutMs: refresh.timeoutMs ?? null, maskEnv: refresh.maskEnv ?? [] }) : ''
+
+/**
+ * A login-state refresh runs a command on the host, so only the owner or a wizard tab sets or changes one;
+ * Conductor stamps who did. An unchanged refresh keeps its stamp.
+ */
+function stampRefreshes(before: readonly ProductionEnvironment[], after: ProductionEnvironment[], options: { by: string; source: 'owner' | 'wizard' | 'assumption'; at: string }): ProductionEnvironment[] {
+  const prior = new Map<string, LoginStateRefresh>()
+  for (const environment of before) for (const account of environment.accounts) if (account.storageState?.refresh) prior.set(`${environment.id}\u0000${account.id}`, account.storageState.refresh)
+  return after.map(environment => ({
+    ...environment,
+    accounts: environment.accounts.map(account => {
+      const refresh = account.storageState?.refresh
+      if (!refresh) return account
+      const old = prior.get(`${environment.id}\u0000${account.id}`)
+      if (old && refreshKey(old) === refreshKey(refresh)) return { ...account, storageState: { ...account.storageState!, refresh: { ...refresh, setBy: old.setBy ?? null } } }
+      if (options.source === 'assumption') throw new Error(`Account ${account.id}: a login-state refresh runs a command on this machine, so only the owner or a wizard tab may set or change it`)
+      return { ...account, storageState: { ...account.storageState!, refresh: { ...refresh, setBy: { source: options.source, by: options.by, at: options.at } } } }
+    }),
+  }))
 }
 
 function validateScope(scope: AuditScope): AuditScope {
@@ -278,7 +334,7 @@ export function applyProfileUpdate(profile: ProductionProfile, update: ProfileUp
       if (!FACT_KEYS.includes(key as FactKey)) throw new Error(`Unknown profile fact: ${key}`)
       if (value === null || value === undefined) continue
       const normalised = normaliseFactValue(key as FactKey, value)
-      const existing = profile.facts[key as FactKey] as ProfileFact<unknown>
+      const existing = (profile.facts[key as FactKey] ?? unknownFact()) as ProfileFact<unknown>
       if (options.source === 'wizard' && existing.source === 'owner' && !factIsUnknown(existing) && JSON.stringify(existing.value) !== JSON.stringify(normalised)) ownerHeld.push(`${key} (owner: ${formatFactValue(existing.value)})`)
       incoming[key as FactKey] = options.source === 'owner' ? ownerFact(normalised, at, `Set by ${options.by}`)
         : options.source === 'wizard' ? wizardFact(normalised, at, options.by, `Set by ${options.by}`)
@@ -288,7 +344,7 @@ export function applyProfileUpdate(profile: ProductionProfile, update: ProfileUp
     next.facts = mergeFacts(next.facts, incoming)
   }
   if (update.environments) {
-    const environments = update.environments.map(validateEnvironment)
+    const environments = stampRefreshes(profile.environments, update.environments.map(validateEnvironment), { by: options.by, source: options.source, at })
     const ids = environments.map(environment => environment.id)
     if (new Set(ids).size !== ids.length) throw new Error('Environment ids must be unique')
     next.environments = environments
@@ -361,6 +417,6 @@ export function profileProblems(profile: ProductionProfile): string[] {
     else if (environment.kind === 'production') problems.push(`Write authorization ${authorization.id} names ${environment.id}, a production environment; revoke it (writes are never authorized on production)`)
   }
   if (profile.designation.productionReady && !ids.includes(profile.designation.environmentId ?? '')) problems.push('The production-ready designation must name an environment in the profile')
-  for (const key of FACT_KEYS) if (!profile.facts[key]) problems.push(`Fact ${key} is missing`)
+  for (const key of FACT_KEYS) if (!profile.facts[key] && !OPTIONAL_FACT_KEYS.includes(key)) problems.push(`Fact ${key} is missing`)
   return problems
 }

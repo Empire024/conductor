@@ -88,6 +88,13 @@ export interface AuditBrowserOptions {
    * used on production, where only `TestAccountRef.storageState` reaches the authenticated state.
    */
   login?: (page: AuditPage, account: TestAccountRef) => Promise<void>
+  /**
+   * The environment's guest account whose recorded state (for example only a site-gate cookie) every
+   * unauthenticated page loads; without it an unauthenticated page opens with nothing stored.
+   */
+  guest?: TestAccountRef | null
+  /** Makes an account's recorded state usable before it is read (the unattended refresh); a rejection refuses the open. */
+  prepareLogin?: (account: TestAccountRef) => Promise<void>
   /** Receives the cookie and storage values of a loaded login state, for redaction. Default: the evidence sink's `addSecrets`. */
   registerSecrets?: (values: string[]) => void
   navigationTimeoutMs?: number
@@ -117,7 +124,7 @@ export const MAX_LOGIN_STATE_BYTES = 1024 * 1024
  * origin and storage of allowed origins are kept; their values come back as secrets to redact. The
  * file is read in place and never copied.
  */
-export function loadLoginState(ref: StoredLoginStateRef, allowedOrigins: readonly string[], label: string): { state: LoginState; secrets: string[]; dropped: number } {
+export function loadLoginState(ref: StoredLoginStateRef, allowedOrigins: readonly string[], label: string, now: number = Date.now()): { state: LoginState; secrets: string[]; dropped: number } {
   if (!ref.path || !isAbsolute(ref.path)) throw new AuthUnavailable(`The login state for ${label} must be an absolute path to a recorded storage-state file`)
   let text: string
   try {
@@ -135,14 +142,15 @@ export function loadLoginState(ref: StoredLoginStateRef, allowedOrigins: readonl
   const origins = (Array.isArray(parsed.origins) ? parsed.origins : []) as LoginState['origins']
   const keptCookies = cookies.filter(cookie => {
     const domain = String(cookie?.domain ?? '').replace(/^\./, '').toLowerCase()
-    return !!domain && typeof cookie.value === 'string' && hosts.some(host => host === domain || host.endsWith(`.${domain}`))
+    const live = typeof cookie?.expires !== 'number' || cookie.expires <= 0 || cookie.expires * 1000 > now
+    return !!domain && live && typeof cookie.value === 'string' && hosts.some(host => host === domain || host.endsWith(`.${domain}`))
   })
   const keptOrigins = origins.filter(entry => allowedOrigins.includes(originOf(String(entry?.origin ?? '')) ?? '')).map(entry => ({
     origin: entry.origin,
     localStorage: (Array.isArray(entry.localStorage) ? entry.localStorage : []).filter(item => typeof item?.name === 'string' && typeof item.value === 'string'),
   }))
   if (!keptCookies.length && !keptOrigins.some(entry => entry.localStorage.length)) {
-    throw new AuthUnavailable(`The login state for ${label} holds no cookies or storage for ${allowedOrigins.join(', ')}`)
+    throw new AuthUnavailable(`The login state for ${label} holds no cookies or storage for ${allowedOrigins.join(', ')} (expired cookies do not count)`)
   }
   const secrets = [...keptCookies.map(cookie => cookie.value), ...keptOrigins.flatMap(entry => entry.localStorage.map(item => item.value))]
     .filter(value => value.length >= 8)
@@ -209,10 +217,15 @@ export function createAuditBrowser(policy: NetworkPolicy, options: AuditBrowserO
     async open(openOptions: OpenPageOptions) {
       if (closed || options.signal?.aborted) throw new Error('The audit browser is closed')
       const account = openOptions.auth
+      // An unauthenticated page still carries the guest account's state (a site gate), never a login.
+      const stateAccount = account?.storageState ? account : !account && options.guest?.storageState ? options.guest : null
       let loginState: LoginState | undefined
       let secrets: string[] = []
-      if (account?.storageState) {
-        const loaded = loadLoginState(account.storageState, frozen.allowedOrigins, account.label)
+      if (stateAccount) {
+        if (options.prepareLogin) {
+          try { await options.prepareLogin(stateAccount) } catch (error) { throw new AuthUnavailable(error instanceof Error ? error.message : String(error)) }
+        }
+        const loaded = loadLoginState(stateAccount.storageState!, frozen.allowedOrigins, stateAccount.label)
         loginState = loaded.state
         secrets = loaded.secrets
         const sink = options.evidence as Partial<ProductionEvidenceSink> | undefined

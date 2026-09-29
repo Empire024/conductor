@@ -93,7 +93,9 @@ ships the capability. Designation is a per-project owner setting and is never in
   source `wizard` and `by` naming the tab (`wizard:<agentSessionId> (<title>)`); any other
   conversation records `assumption`. Precedence is owner > wizard > discovery > assumption: the
   owner overwrites a wizard fact, and a wizard update that would change a fact the owner set is
-  refused with the fact named (repeating the owner's value is accepted). A wizard fact may close an
+  refused with the fact named. Repeating the owner's value is accepted and rewrites the fact's source,
+  `by` and time to the wizard's (an owner or wizard restating any fact does the same; an assumption or
+  discovery restating a higher fact changes nothing). A wizard fact may close an
   owner question; the question is kept as answered with `answeredBy` naming the wizard, the panel
   shows it as "Set by wizard ...", and the report's **Profile facts** table labels every known fact
   with who set it. Facts stored before `wizard` existed keep their recorded source.
@@ -166,7 +168,13 @@ the same project; `production.evidence` reads are bounded to 1 MiB and pass thro
    one, naming environment, `MutationKind`s and expiry. `CheckContext.operation(mutation, target,
    act)` is the only way a check mutates: it checks the authorization, journals the operation as
    `intended`, runs `act`, settles `done|failed`. A restart with an `intended` operation blocks the
-   run for the owner (no replay). Test accounts and sandbox endpoints do not imply permission for
+   run for the owner (no replay). An environment may add the owner's `mutationPolicy`: `none`
+   refuses every mutation whatever is authorized; `production-intended-or-rollback` refuses a
+   test-only mutation (`operation(..., {intent:'test'})`, the default) unless it passes
+   `rollback: {describe, act}`. Rollbacks run after their check, newest first, bounded to 60 s each,
+   and a run note lists what was rolled back; a failed rollback becomes a human-review item ("Undo by
+   hand"). A mutation with `intent: 'production'` stays. No built-in check has a rollback yet, so under
+   that policy their mutating journeys stop UNVERIFIED with the policy named. Test accounts and sandbox endpoints do not imply permission for
    any other mutation; each kind is named. There is no `login` mutation kind: on a sandbox or
    local environment a login step may submit the login form only under an authorization of the
    existing kinds (for example `form-submit`), and on production the audit never logs in by
@@ -203,7 +211,20 @@ the same project; `production.evidence` reads are bounded to 1 MiB and pass thro
    it registers the kept cookie and storage values with the evidence sink (`addSecrets`), which masks
    them, raw or URL-encoded, from evidence, descriptions and request excerpts. An authenticated open
    refuses (`AuthUnavailable`) with a reason that names the fix: on production without a recorded
-   state, and elsewhere without either a recorded state or a login step.
+   state, and elsewhere without either a recorded state or a login step. Expired cookies in the file
+   are dropped. A `guest` account with a recorded state (for example only a site-gate cookie, and no
+   credential references) is loaded into every unauthenticated page of the environment.
+   **Unattended refresh** (`storageState.refresh = {command, cwd, maxAgeHours, timeoutMs?, maskEnv?}`,
+   `login-refresh.ts`): before the browser reads a state whose file is missing, older than
+   `maxAgeHours` or holds an expired cookie for an allowed origin, the runner runs the owner's command
+   on the host (default 120 s, at most 600 s; once per account per run), keeps its output as `command`
+   evidence with the values of the `maskEnv` variables masked, notes it in the run journal, and reads
+   the file again. A failure makes the open refuse, so the affected checks are UNVERIFIED with
+   "not audited: <reason>", discovery is skipped and unreadable policy pages are hashed as such; the run
+   still completes. The command is the owner's (a Playwright setup in their repository posting a site
+   gate); the audit browser still never submits a login form on production. Setting or changing a
+   refresh is an environment change, so only the owner or a wizard tab may, and Conductor stamps
+   `refresh.setBy`.
 7. **Self-dealing.** Waivers, designation, write authorizations and drift settings are
    `PRODUCTION_SOVEREIGN_METHODS`. A run has no agent identity and cannot call control methods; a
    finding's status moves to `fixed` only through a `verify` run. `production.tasks.create` never
@@ -549,6 +570,10 @@ report paths instead of opening them. Wizard decisions applied on 2026-09-29:
   FAIL. The panel answers them in its Human review section.
 - A re-test or verification asked for while a run is active is refused with the next step (it
   would otherwise coalesce into a plain audit and lose its finding ids).
+- **Sender facts.** `marketingSender` and `transactionalSender` are optional email-address facts
+  (validated, lower-cased; profiles stored before them stay valid and no control requires them, so
+  they never become owner questions). When known, C08 flags a captured marketing or transactional
+  message from another address (`wrong-sender:<kind>:<address>`, medium).
 - The store's 10,000-finding bound measures the query thread's CPU time, so a loaded machine delays
   it without failing it; the index-plan assertions are unchanged.
 

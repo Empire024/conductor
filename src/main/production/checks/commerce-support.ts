@@ -104,7 +104,7 @@ export async function mutate<T>(context: CheckContext, mutation: MutationKind, t
     return { ok: true, value: await context.operation(mutation, target, act) }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    if (isMutationRefused(error)) return { ok: false, refused: true, reason: `sandbox write authorization required for ${mutation}: ${message}` }
+    if (isMutationRefused(error)) return { ok: false, refused: true, reason: /mutation policy/.test(message) ? message : `sandbox write authorization required for ${mutation}: ${message}` }
     return { ok: false, refused: false, reason: `${mutation} on ${target} failed: ${message}` }
   }
 }

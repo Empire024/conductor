@@ -4,7 +4,7 @@ import {
   CONFIDENCES, SEVERITIES,
   type Adapters, type AuditBrowser, type AuditRun, type CheckContext, type CheckOutcome, type ControlCheck, type ControlId, type ControlResult,
   type EvidenceKind, type EvidenceRef, type EvidenceSink, type Finding, type GateState, type NetworkPolicy, type ProductionEnvironment,
-  type ProductionProfile, type RouteCoverage, type RouteEntry, type RunStep, type SourceTree, type TargetFingerprint, type VerificationRecord,
+  type HumanReviewItem, type MutationKind, type ProductionProfile, type RouteCoverage, type TestAccountRef, type RouteEntry, type RunStep, type SourceTree, type TargetFingerprint, type VerificationRecord,
 } from '../../shared/production'
 import { discoverStack } from './discovery'
 import { createEvidenceSink } from './evidence'
@@ -19,6 +19,8 @@ import { autoTaskFindings, claimedFixed, closeFixedTask, ensureFixTasks, type Fi
 import { recheckSpec, reviewDisagreement, verdict } from './verifier'
 import { checkLegalSources, sourcesFor, type LegalSourceCheck, type PublicReader } from './checks/legal-sources'
 import { runEngineeringSmoke, type CommandRunner } from './checks/engineering-smokes'
+import { AuthUnavailable } from './browser'
+import { createLoginStatePreparer } from './login-refresh'
 
 /**
  * The audit run engine (docs/production-agent.md sections 2, 4 and 6). One run at a time on this
@@ -48,7 +50,15 @@ export interface BrowserFactoryOptions {
   userDataDir: string
   evidence: EvidenceSink & { addSecrets?(values: Iterable<string>): void }
   signal: AbortSignal
+  /** The environment's guest account with a recorded state (a site gate), loaded into every unauthenticated page. */
+  guest?: TestAccountRef | null
+  /** Refreshes an account's recorded state before the browser reads it (the owner's refresh command). */
+  prepareLogin?: (account: TestAccountRef) => Promise<void>
 }
+
+/** The first guest account with a recorded state: its cookies (for example a site gate) go into every unauthenticated page. */
+export const guestStateAccount = (environment: ProductionEnvironment): TestAccountRef | null =>
+  environment.accounts.find(account => account.role === 'guest' && !!account.storageState) ?? null
 
 export interface FingerprintRequest {
   run: AuditRun
@@ -223,7 +233,10 @@ export class ProductionRunner {
       const policy0 = policyForEnvironment(environment, { authorizations: profile.writeAuthorizations, budget: initial.budget, now: this.clock() })
       // A resumed run's browser may only spend what the ledger has left.
       const policy: NetworkPolicy = { ...policy0, maxRequests: Math.max(0, initial.budget.maxRequests - initial.ledger.requests) }
-      browser = this.deps.browserFactory(policy, { userDataDir: join(initial.artifactsDir, `attempt-${lease.epoch}`, 'browser'), evidence, signal })
+      const note = (line: string): void => { try { store.event(runId, guard, 'note', line.slice(0, 1_000)) } catch { /* superseded */ } }
+      const prepareLogin = createLoginStatePreparer({ runCommand: this.deps.runCommand ?? null, evidence, allowedOrigins: policy.allowedOrigins, signal, now: this.clock, note })
+      browser = this.deps.browserFactory(policy, { userDataDir: join(initial.artifactsDir, `attempt-${lease.epoch}`, 'browser'), evidence, signal, guest: guestStateAccount(environment), prepareLogin })
+      if (environment.mutationPolicy) note(`Mutation policy of ${environment.id}: ${environment.mutationPolicy === 'none' ? 'no mutation is allowed' : 'only production-intended changes may stay; every test-only mutation needs a rollback step, and one without is refused'}`)
       const availability = await browser.availability()
       alive()
       if (!availability.available && initial.steps.some(step => step.kind === 'control' && step.status !== 'done' && step.status !== 'skipped')) {
@@ -321,7 +334,12 @@ export class ProductionRunner {
       scope.state.write('discovery', { skipped: this.deps.discovery === false ? 'discovery disabled' : 'the owner lists every route' })
       return
     }
-    const page = await scope.browser.open({ device: 'desktop', locale: scope.profile.scope.locales[0] ?? null, auth: null, consent: 'clean', regionSelection: scope.profile.scope.regionSelection })
+    let page
+    try { page = await scope.browser.open({ device: 'desktop', locale: scope.profile.scope.locales[0] ?? null, auth: null, consent: 'clean', regionSelection: scope.profile.scope.regionSelection }) } catch (error) {
+      if (!(error instanceof AuthUnavailable)) throw error
+      scope.state.write('discovery', { skipped: `not audited: ${error.message}` })
+      return
+    }
     let found: Awaited<ReturnType<typeof discoverStack>>
     try { found = await discoverStack(scope.source, scope.environment, page) } finally { await page.close().catch(() => undefined) }
     scope.alive()
@@ -427,13 +445,20 @@ export class ProductionRunner {
     let timer: NodeJS.Timeout | undefined
     const routes: RouteEntry[] = scope.profile.scope.routes
     const run = scope.run()
+    const rollbacks: PendingRollback[] = []
+    const environment = scope.environment
     const context: CheckContext = {
       run: { id: run.id, projectId: run.projectId, kind: run.kind, environmentId: run.environmentId, fingerprint: run.fingerprint, budget: run.budget },
       profile: scope.profile, environment: scope.environment, control: definition, policy: scope.policy, browser: scope.browser,
       source: scope.source ?? EMPTY_SOURCE, adapters: scope.adapters, evidence: scope.evidence, interpreter: scope.interpreter,
       synthetic: kind => scope.synthetic.next(kind),
-      async operation(mutation, target, act) {
+      async operation(mutation, target, act, options) {
         assertMutationAllowed(scope.policy, mutation)
+        const intent = options?.intent ?? 'test'
+        if (environment.mutationPolicy === 'none') throw new MutationRefused(mutation, `${mutation} refused: the mutation policy of ${environment.id} allows no mutation`)
+        if (environment.mutationPolicy === 'production-intended-or-rollback' && intent === 'test' && !options?.rollback) {
+          throw new MutationRefused(mutation, `${mutation} refused by the mutation policy of ${environment.id} (production-intended-or-rollback): a test-only mutation needs a rollback step, and this check has none`)
+        }
         let operation
         try { operation = store.intend(scope.runId, scope.guard, { stepId: step.id, mutation, target }) } catch (error) {
           if (error instanceof WriteNotAuthorizedError) throw new MutationRefused(mutation, `${mutation} refused: sandbox write authorization required for ${mutation}`)
@@ -442,6 +467,7 @@ export class ProductionRunner {
         try {
           const value = await act()
           store.settle(scope.runId, scope.guard, operation.id, 'done')
+          if (options?.rollback && intent === 'test') rollbacks.push({ mutation, target, ...options.rollback })
           return value
         } catch (error) {
           store.settle(scope.runId, scope.guard, operation.id, 'failed', error instanceof Error ? error.message : String(error))
@@ -454,21 +480,53 @@ export class ProductionRunner {
       signal: controller.signal,
       now: () => this.clock().toISOString(),
     }
+    let outcome: CheckOutcome
     try {
-      const outcome = await Promise.race([
+      outcome = await Promise.race([
         check.run(context),
         new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort('timeout'); reject(new Error(`timed out after ${Math.round(timeoutMs / 1000)} s`)) }, timeoutMs) }),
         // A check that ignores its signal must not hold a paused, cancelled or closing run.
         new Promise<never>((_, reject) => { if (scope.signal.aborted) reject(new RunStopped('stopped')); else scope.signal.addEventListener('abort', () => reject(new RunStopped('stopped during a check')), { once: true }) }),
       ])
-      return { ...outcome, checkId: check.checkId, durationMs: Date.now() - started } as CheckOutcome
+      outcome = { ...outcome, checkId: check.checkId, durationMs: Date.now() - started } as CheckOutcome
     } catch (error) {
-      if (error instanceof StaleEpochError || scope.signal.aborted) throw error instanceof StaleEpochError ? error : new RunStopped('stopped during a check')
-      return { ...unverified(check.checkId, `check failed: ${error instanceof Error ? error.message : String(error)}`), durationMs: Date.now() - started } as CheckOutcome
+      if (error instanceof StaleEpochError || scope.signal.aborted) {
+        await this.rollBack(rollbacks, scope, check.checkId)
+        throw error instanceof StaleEpochError ? error : new RunStopped('stopped during a check')
+      }
+      const reason = error instanceof AuthUnavailable ? `not audited: ${error.message}` : `check failed: ${error instanceof Error ? error.message : String(error)}`
+      outcome = { ...unverified(check.checkId, reason), durationMs: Date.now() - started } as CheckOutcome
     } finally {
       clearTimeout(timer)
       scope.signal.removeEventListener('abort', onAbort)
     }
+    const failed = await this.rollBack(rollbacks, scope, check.checkId)
+    if (!failed.length) return outcome
+    const review: HumanReviewItem[] = failed.map((line, index) => ({ id: `${check.controlId}:rollback-failed-${check.checkId}-${index + 1}`, controlId: check.controlId, question: `Undo by hand: ${line}`, why: `The rollback of a test-only mutation in ${environment.id} failed, so the test change is still there.`, route: null, evidence: [] }))
+    return { ...outcome, humanReview: [...outcome.humanReview, ...review], observations: [...outcome.observations, ...failed.map(line => `rollback failed: ${line}`)] }
+  }
+
+  /**
+   * Undoes the check's test-only mutations, newest first, each bounded in time, and lists what was
+   * rolled back in a run note. Returns the ones that failed (they become human-review items).
+   */
+  private async rollBack(pending: PendingRollback[], scope: StepScope, checkId: string): Promise<string[]> {
+    const done: string[] = [], failed: string[] = []
+    for (const entry of pending.splice(0).reverse()) {
+      const line = `${entry.mutation} ${entry.target}: ${entry.describe}`
+      let timer: NodeJS.Timeout | undefined
+      try {
+        await Promise.race([entry.act(), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`timed out after ${ROLLBACK_TIMEOUT_MS / 1000} s`)), ROLLBACK_TIMEOUT_MS) })])
+        done.push(line)
+      } catch (error) {
+        failed.push(`${line} (${error instanceof Error ? error.message : String(error)})`)
+      } finally { clearTimeout(timer) }
+    }
+    if (done.length || failed.length) {
+      const message = `${checkId}: rolled back ${done.length} test mutation(s)${done.length ? `: ${done.join('; ')}` : ''}${failed.length ? `; rollback FAILED for ${failed.join('; ')}` : ''}`
+      try { this.deps.store.event(scope.runId, scope.guard, 'note', message.slice(0, 2_000), { rolledBack: done.length, rollbackFailed: failed.length }) } catch { /* superseded */ }
+    }
+    return failed
   }
 
   // ---- interpretation -----------------------------------------------------------------------------
@@ -560,6 +618,9 @@ interface StepScope {
   alive(): void
   run(): AuditRun
 }
+
+interface PendingRollback { mutation: MutationKind; target: string; describe: string; act: () => Promise<void> }
+const ROLLBACK_TIMEOUT_MS = 60_000
 
 const EMPTY_SOURCE: SourceTree = { root: '', read: async () => null, list: async () => [], exists: async () => false }
 

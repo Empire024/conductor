@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { CheckContext, ControlCheck, TargetFingerprint } from '../../shared/production'
+import { AuthUnavailable } from './browser'
 import { createProductionService, type ProductionService } from './index'
 import { controlsInvalidatedBy, REGISTRY } from './registry'
 import {
@@ -416,3 +417,102 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<voi
     await new Promise(resolve => setTimeout(resolve, 5))
   }
 }
+
+describe('environment mutation policy and unattended login state', () => {
+  const later = new Date(Date.now() + 3_600_000).toISOString()
+  const staging = (policy: 'none' | 'production-intended-or-rollback') => temp.store.mutateProfile('project-a', 'owner', profile => ({ ...profile, environments: profile.environments.map(entry => ({ ...entry, kind: 'staging' as const, mutationPolicy: policy })) }))
+
+  it('refuses a test-only mutation without a rollback under production-intended-or-rollback, runs and lists the rollback of one that has it', async () => {
+    staging('production-intended-or-rollback')
+    const order: string[] = []
+    const check = scriptedCheck('C16', 'storage', async context => {
+      const refused = await context.operation('storage-probe-write', 'uploads/probe.txt', async () => { order.push('unrolled write') }).then(() => null, (error: Error) => error)
+      await context.operation('storage-probe-write', 'uploads/probe-2.txt', async () => { order.push('write') }, { rollback: { describe: 'delete uploads/probe-2.txt', act: async () => { order.push('rollback') } } })
+      await context.operation('storage-probe-write', 'uploads/keep.txt', async () => { order.push('kept') }, { intent: 'production' })
+      order.push('check done')
+      return outcome('storage', 'PASS', [], { observations: [refused ? `${refused.name}: ${refused.message}` : 'not refused'] })
+    })
+    const w = world([check])
+    w.service.authorizeWrites('project-a', { environmentId: 'env-a', mutations: ['storage-probe-write'], expiresAt: later, note: 'test' }, { kind: 'owner', agentSessionId: null })
+    const run = await auditAndWait(w, ['C16'])
+    expect(run.status).toBe('completed')
+    expect(order).toEqual(['write', 'kept', 'check done', 'rollback'])
+    const notes = w.service.events('project-a', run.id, 50).map(event => event.message).join('\n')
+    expect(notes).toMatch(/Mutation policy of env-a: only production-intended changes may stay/)
+    expect(notes).toMatch(/storage: rolled back 1 test mutation\(s\): storage-probe-write uploads\/probe-2.txt: delete uploads\/probe-2.txt/)
+    expect(temp.store.operations(run.id).map(operation => `${operation.target}:${operation.status}`)).toEqual(['uploads/probe-2.txt:done', 'uploads/keep.txt:done'])
+    const observations = JSON.parse(readFileSync(join(run.artifactsDir, 'state', 'observations-C16.json'), 'utf8')) as string[]
+    expect(observations[0]).toMatch(/^MutationRefused: storage-probe-write refused by the mutation policy of env-a \(production-intended-or-rollback\): a test-only mutation needs a rollback step/)
+  })
+
+  it('turns a failed rollback into a human-review item', async () => {
+    staging('production-intended-or-rollback')
+    const check = scriptedCheck('C16', 'storage', async context => {
+      await context.operation('storage-probe-write', 'uploads/probe.txt', async () => undefined, { rollback: { describe: 'delete uploads/probe.txt', act: async () => { throw new Error('403 from storage') } } })
+      return outcome('storage', 'PASS')
+    })
+    const w = world([check])
+    w.service.authorizeWrites('project-a', { environmentId: 'env-a', mutations: ['storage-probe-write'], expiresAt: later, note: 'test' }, { kind: 'owner', agentSessionId: null })
+    const run = await auditAndWait(w, ['C16'])
+    const [result] = temp.store.results(run.id)
+    expect(result!.humanReview).toEqual([expect.objectContaining({ id: 'C16:rollback-failed-storage-1', question: expect.stringMatching(/^Undo by hand: storage-probe-write uploads\/probe.txt: delete uploads\/probe.txt \(403 from storage\)/) })])
+    expect(w.service.events('project-a', run.id, 50).map(event => event.message).join('\n')).toMatch(/rollback FAILED for storage-probe-write uploads\/probe.txt/)
+  })
+
+  it('refuses every mutation under policy none, rollback or not', async () => {
+    staging('none')
+    const check = scriptedCheck('C16', 'storage', async context => {
+      const error = await context.operation('storage-probe-write', 'x', async () => undefined, { rollback: { describe: 'undo', act: async () => undefined } }).then(() => null, (failure: Error) => failure.message)
+      return outcome('storage', 'UNVERIFIED', [], { reason: error })
+    })
+    const w = world([check])
+    w.service.authorizeWrites('project-a', { environmentId: 'env-a', mutations: ['storage-probe-write'], expiresAt: later, note: 'test' }, { kind: 'owner', agentSessionId: null })
+    const run = await auditAndWait(w, ['C16'])
+    expect(temp.store.results(run.id)[0]!.checks[0]!.reason).toBe('storage-probe-write refused: the mutation policy of env-a allows no mutation')
+    expect(temp.store.operations(run.id)).toEqual([])
+  })
+
+  it('hands the guest account and a refresh preparer to the browser; a failed refresh leaves the check not audited and the run completes', async () => {
+    const guest = {
+      id: 'gate', label: 'Site gate', role: 'guest' as const, usernameRef: null, passwordRef: null,
+      storageState: { path: join(temp.dir, 'gate-state.json'), capturedAt: null, capturedBy: null, refresh: { command: 'npx playwright test --project=gate-setup', cwd: temp.dir, maxAgeHours: 24 } },
+    }
+    temp.store.mutateProfile('project-a', 'owner', profile => ({ ...profile, environments: profile.environments.map(entry => ({ ...entry, accounts: [guest] })) }))
+    const commands: string[] = []
+    const guests: unknown[] = []
+    const { factory } = fakeBrowserFactory()
+    const opener = scriptedCheck('C13', 'accessibility', async context => {
+      await context.browser.open({ device: 'desktop', locale: null, auth: null, consent: 'clean', regionSelection: 'none' })
+      return outcome('accessibility', 'PASS')
+    })
+    const service = createProductionService({
+      store: temp.store, userData: temp.dir, interpreter: recordingPorts(), board: fakeBoard(), projectRoot: () => null, checks: [opener], ownerId: 'owner-C',
+      browserFactory: (policy, options) => {
+        guests.push(options.guest)
+        const browser = factory(policy)
+        // What the audit browser does before it reads a recorded state.
+        browser.open = async () => {
+          try { await options.prepareLogin!(options.guest!) } catch (error) { throw new AuthUnavailable(error instanceof Error ? error.message : String(error)) }
+          throw new Error('no pages in this test')
+        }
+        return browser
+      },
+      browserAvailability: async () => ({ available: true, engine: 'playwright-chromium', reason: null }),
+      fingerprint: async () => fingerprint({ registryVersion: REGISTRY.version }),
+      adapters: () => ({ mail: null, commerce: null, storage: null }),
+      discovery: false, readPublic: null, leaseTtlMs: 5_000,
+      runCommand: async command => { commands.push(command); return { exitCode: 2, output: 'gate password not set' } },
+    })
+    services.push(service)
+    const started = await service.audit('project-a', { controls: ['C13'] })
+    if (started.outcome === 'dropped') throw new Error(started.reason)
+    await service.runner.idle()
+    const run = temp.store.run(started.run.id)
+    expect(guests[0]).toMatchObject({ id: 'gate', role: 'guest' })
+    expect(run.status).toBe('completed')
+    expect(commands).toEqual(['npx playwright test --project=gate-setup'])
+    expect(temp.store.results(run.id)[0]).toMatchObject({ controlId: 'C13', status: 'UNVERIFIED' })
+    expect(temp.store.results(run.id)[0]!.checks[0]!.reason).toMatch(/^not audited: the login state of Site gate could not be refreshed: the refresh command exited 2/)
+    expect(service.events('project-a', run.id, 50).map(event => event.message).join('\n')).toMatch(/Refreshing the login state of Site gate: the storage-state file does not exist/)
+  })
+})

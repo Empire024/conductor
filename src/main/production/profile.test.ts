@@ -118,7 +118,7 @@ describe('profile updates', () => {
     expect(owned.facts.analytics).toMatchObject({ value: false, source: 'owner' })
     // A wizard changing the owner's fact is refused visibly; repeating the owner's value is fine.
     expect(() => applyProfileUpdate(owned, { facts: { analytics: true } }, { by: 'wizard:agent_w', source: 'wizard', now: NOW })).toThrow(/The owner set analytics \(owner: no\)/)
-    expect(applyProfileUpdate(owned, { facts: { analytics: false, userUploads: true } }, { by: 'wizard:agent_w', source: 'wizard', now: NOW }).facts).toMatchObject({ analytics: { source: 'owner' }, userUploads: { value: true, source: 'wizard' } })
+    expect(applyProfileUpdate(owned, { facts: { analytics: false, userUploads: true } }, { by: 'wizard:agent_w', source: 'wizard', now: NOW }).facts).toMatchObject({ analytics: { value: false, source: 'wizard' }, userUploads: { value: true, source: 'wizard' } })
     // A wizard answering an owner question records a wizard fact too.
     const answered = answerQuestion(base, questionId('emailMarketing'), 'no', 'wizard:agent_w', NOW, undefined, 'wizard')
     expect(answered.facts.emailMarketing).toMatchObject({ value: false, status: 'evidenced', source: 'wizard', by: 'wizard:agent_w' })
@@ -132,6 +132,60 @@ describe('profile updates', () => {
     const account = { id: 'a', label: 'Customer', role: 'customer' as const, usernameRef: { id: 'u', source: 'env' as const, key: 'U', purpose: 'login' }, passwordRef: { id: 'p', source: 'env' as const, key: 'P', purpose: 'login' } }
     expect(() => validateEnvironment(environment({ accounts: [account] }))).toThrow(/production/)
     expect(() => applyProfileUpdate(defaultProfile('p1', NOW), { environments: [environment(), environment()] }, { by: 'owner', source: 'owner', now: NOW })).toThrow(/unique/)
+  })
+
+  it('rewrites the source, author and time of a fact re-recorded with the same value by the owner or a wizard, never by an assumption', () => {
+    const later = new Date(NOW.getTime() + 60_000)
+    const owned = applyProfileUpdate(defaultProfile('p1', NOW), { facts: { legalEntity: 'Hash and Flowers s.r.o.', targetCountries: ['SK'] } }, { by: 'owner', source: 'owner', now: NOW })
+    expect(owned.facts.legalEntity).toMatchObject({ source: 'owner', at: AT })
+    const restated = applyProfileUpdate(owned, { facts: { legalEntity: ' Hash and Flowers s.r.o. ', targetCountries: ['sk'] } }, { by: 'wizard:agent_w (Haftheme wizard)', source: 'wizard', now: later })
+    for (const key of ['legalEntity', 'targetCountries'] as const) {
+      expect(restated.facts[key]).toMatchObject({ status: 'evidenced', source: 'wizard', by: 'wizard:agent_w (Haftheme wizard)', at: later.toISOString(), note: 'Set by wizard:agent_w (Haftheme wizard)' })
+    }
+    expect(restated.facts.legalEntity!.value).toBe('Hash and Flowers s.r.o.')
+    // The owner takes it back the same way; an agent restating it demotes nothing.
+    expect(applyProfileUpdate(restated, { facts: { legalEntity: 'Hash and Flowers s.r.o.' } }, { by: 'owner', source: 'owner', now: later }).facts.legalEntity).toMatchObject({ source: 'owner' })
+    const assumed = applyProfileUpdate(restated, { facts: { legalEntity: 'Hash and Flowers s.r.o.' } }, { by: 'agent_x', source: 'assumption', now: later })
+    expect(assumed.facts.legalEntity).toMatchObject({ source: 'wizard', status: 'evidenced' })
+    expect(mergeFacts(owned.facts, { legalEntity: discoveredFact('Hash and Flowers s.r.o.', AT, 'footer') }).legalEntity).toMatchObject({ source: 'owner' })
+  })
+
+  it('records marketing and transactional senders as validated addresses; older profiles without them stay valid', () => {
+    const profile = applyProfileUpdate(defaultProfile('p1', NOW), { facts: { marketingSender: ' News@Shop.Example ', transactionalSender: 'orders@shop.example' } }, { by: 'wizard:agent_w', source: 'wizard', now: NOW })
+    expect(profile.facts.marketingSender).toMatchObject({ value: 'news@shop.example', source: 'wizard' })
+    expect(profile.facts.transactionalSender).toMatchObject({ value: 'orders@shop.example' })
+    expect(() => applyProfileUpdate(profile, { facts: { marketingSender: 'Hash and Flowers' } }, { by: 'owner', source: 'owner', now: NOW })).toThrow(/marketingSender must be one email address/)
+    expect(parseFactAnswer('transactionalSender', 'Orders@Shop.example')).toBe('orders@shop.example')
+    // No control requires them, so they never become owner questions.
+    expect(profile.questions.some(question => question.factKey === 'marketingSender' || question.factKey === 'transactionalSender')).toBe(false)
+    const { marketingSender: _m, transactionalSender: _t, ...older } = profile.facts
+    expect(profileProblems({ ...profile, facts: older as typeof profile.facts })).toEqual([])
+    expect(applyProfileUpdate({ ...profile, facts: older as typeof profile.facts }, { facts: { marketingSender: 'news@shop.example' } }, { by: 'owner', source: 'owner', now: NOW }).facts.marketingSender).toMatchObject({ source: 'owner' })
+  })
+
+  it('accepts a gate-only guest account on production and lets only the owner or a wizard set its refresh command', () => {
+    const guest = {
+      id: 'gate', label: 'Site gate', role: 'guest' as const, usernameRef: null, passwordRef: null,
+      storageState: { path: 'C:\\haftheme\\tests-e2e\\.smoke-auth\\state.json', capturedAt: null, capturedBy: 'refresh', refresh: { command: 'npx playwright test --project=gate-setup', cwd: 'C:\\haftheme', maxAgeHours: 24 * 7, maskEnv: ['HAF_SMOKE_SITE_PASSWORD'] } },
+    }
+    const prod = environment({ accounts: [guest] })
+    expect(validateEnvironment(prod).accounts[0]).toMatchObject({ role: 'guest', usernameRef: null, passwordRef: null })
+    expect(() => validateEnvironment(environment({ accounts: [{ ...guest, storageState: null }] }))).toThrow(/only a guest account with a storageState/)
+    expect(() => validateEnvironment(environment({ accounts: [{ ...guest, storageState: { ...guest.storageState, refresh: { ...guest.storageState.refresh, cwd: 'relative/dir' } } }] }))).toThrow(/refresh.cwd must be an absolute/)
+    expect(() => validateEnvironment(environment({ accounts: [{ ...guest, storageState: { ...guest.storageState, refresh: { ...guest.storageState.refresh, maxAgeHours: 0 } } }] }))).toThrow(/maxAgeHours/)
+
+    expect(() => applyProfileUpdate(defaultProfile('p1', NOW), { environments: [prod] }, { by: 'agent_x', source: 'assumption', now: NOW })).toThrow(/only the owner or a wizard tab may set or change it/)
+    const set = applyProfileUpdate(defaultProfile('p1', NOW), { environments: [prod] }, { by: 'wizard:agent_w (Haftheme wizard)', source: 'wizard', now: NOW })
+    expect(set.environments[0]!.accounts[0]!.storageState!.refresh!.setBy).toEqual({ source: 'wizard', by: 'wizard:agent_w (Haftheme wizard)', at: AT })
+    // Resending the same refresh keeps its stamp; a forged stamp is ignored.
+    const again = applyProfileUpdate(set, { environments: [environment({ accounts: [{ ...guest, storageState: { ...guest.storageState, refresh: { ...guest.storageState.refresh, setBy: { source: 'owner', by: 'owner', at: AT } } } }] })] }, { by: 'owner', source: 'owner', now: new Date(NOW.getTime() + 1_000) })
+    expect(again.environments[0]!.accounts[0]!.storageState!.refresh!.setBy).toEqual({ source: 'wizard', by: 'wizard:agent_w (Haftheme wizard)', at: AT })
+  })
+
+  it('validates the environment mutation policy', () => {
+    expect(validateEnvironment(environment({ kind: 'staging', mutationPolicy: 'production-intended-or-rollback' })).mutationPolicy).toBe('production-intended-or-rollback')
+    expect(validateEnvironment(environment()).mutationPolicy).toBeNull()
+    expect(() => validateEnvironment(environment({ mutationPolicy: 'anything' as never }))).toThrow(/mutationPolicy must be one of none, production-intended-or-rollback/)
   })
 
   it('validates scope, budget and drift', () => {

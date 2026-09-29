@@ -129,6 +129,13 @@ export interface ProfileFacts {
   analytics: ProfileFact<boolean>
   sessionReplay: ProfileFact<boolean>
   emailMarketing: ProfileFact<boolean>
+  /**
+   * The address marketing email must come from, and the one transactional email must come from (plain
+   * addresses, lower-cased). Optional: profiles stored before they existed lack them, and no control's
+   * applicability needs them. When known, C08 flags a captured message of that kind from another address.
+   */
+  marketingSender?: ProfileFact<string>
+  transactionalSender?: ProfileFact<string>
   dataCategories: ProfileFact<string[]>
   audience: ProfileFact<Audience>
   ageRestrictedProducts: ProfileFact<boolean>
@@ -174,32 +181,68 @@ export interface CredentialRef {
 }
 
 /**
+ * How Conductor re-records a login state unattended: a command from the owner's own repository (for example
+ * its Playwright setup project that posts a site-gate password read from the owner's environment and saves
+ * `storageState`). Before an audit opens a page with the state, the service runs the command on the host when
+ * the file is missing, older than `maxAgeHours`, or holds an expired cookie for an allowed origin; then it
+ * re-reads the file. Output goes to the run's evidence (redacted, `maskEnv` values masked); a failure leaves the
+ * pages that need the state UNVERIFIED ("not audited") and the run goes on. The audit browser itself still
+ * never submits a login form on production. Only the owner or a wizard tab sets it (`setBy` is stamped).
+ */
+export interface LoginStateRefresh {
+  /** Command line run through the shell, for example `npx playwright test --project=gate-setup`. */
+  command: string
+  /** Absolute working directory (the owner's repository). */
+  cwd: string
+  maxAgeHours: number
+  /** Default 120 000 ms, at most 600 000. */
+  timeoutMs?: number
+  /** Names of environment variables whose values are masked from the command's output (never logged). */
+  maskEnv?: string[]
+  /** Stamped by Conductor when the refresh is set or changed. */
+  setBy?: { source: 'owner' | 'wizard'; by: string; at: string } | null
+}
+
+/**
  * A login state the owner captured by hand (a Playwright `storageState` JSON file recorded in a visible or
- * sandbox session), referenced by absolute path. The file is a secret: the audit browser reads it when it opens
- * an authenticated page, drops cookies and storage for origins off the environment's allowlist, never copies it
- * into run artifacts, and redacts its cookie and storage values from evidence and request excerpts. It is how an
- * audit reaches the authenticated state on production, where a login POST is never made.
+ * sandbox session), or one its `refresh` command records, referenced by absolute path. The file is a secret: the
+ * audit browser reads it when it opens an authenticated page, drops cookies and storage for origins off the
+ * environment's allowlist, never copies it into run artifacts, and redacts its cookie and storage values from
+ * evidence and request excerpts. It is how an audit reaches the authenticated state on production, where a login
+ * POST is never made. A `guest` account's state (for example only a site-gate cookie) is loaded into every
+ * unauthenticated page of the environment.
  */
 export interface StoredLoginStateRef {
   path: string
   capturedAt: string | null
   capturedBy: string | null
   note?: string
+  refresh?: LoginStateRefresh | null
 }
 
 /**
  * A synthetic test account. On production the only way in is `storageState`; on sandbox or local environments a
  * login step may instead submit the login form, and that submit needs a write authorization of an existing
- * mutation kind (there is no `login` kind).
+ * mutation kind (there is no `login` kind). A `guest` account with a `storageState` (a site gate) may leave
+ * both credential references null.
  */
 export interface TestAccountRef {
   id: string
   label: string
   role: 'guest' | 'customer' | 'subscriber' | 'admin'
-  usernameRef: CredentialRef
-  passwordRef: CredentialRef
+  usernameRef: CredentialRef | null
+  passwordRef: CredentialRef | null
   storageState?: StoredLoginStateRef | null
 }
+
+/**
+ * The owner's rule for test mutations in one environment. Absent: the write authorization alone decides.
+ * `none`: no mutation at all, whatever is authorized. `production-intended-or-rollback`: only a change meant
+ * for production may stay; every test-only mutation needs a rollback step, which runs after its check and is
+ * listed in the run notes, and a test-only mutation without one is refused.
+ */
+export const MUTATION_POLICIES = ['none', 'production-intended-or-rollback'] as const
+export type MutationPolicy = (typeof MUTATION_POLICIES)[number]
 
 export interface CapturedMailConfig {
   kind: 'mailpit' | 'maildir'
@@ -239,6 +282,8 @@ export interface ProductionEnvironment {
   buildInfoCommand: string | null
   /** The project's own release smoke command, run as an additional engineering check when set. */
   smokeCommand: string | null
+  /** The owner's rule for test mutations here (see MUTATION_POLICIES); absent or null means the authorization alone decides. */
+  mutationPolicy?: MutationPolicy | null
 }
 
 export const DEVICE_CLASSES = ['desktop', 'mobile'] as const
@@ -1076,13 +1121,24 @@ export interface CheckContext {
   evidence: EvidenceSink
   interpreter: Interpreter
   synthetic(kind: SyntheticValue['kind']): SyntheticValue
-  /** Journals an intended mutation before it happens and settles it afterwards; refused without authorization. */
-  operation<T>(mutation: MutationKind, target: string, act: () => Promise<T>): Promise<T>
+  /**
+   * Journals an intended mutation before it happens and settles it afterwards; refused without authorization,
+   * and refused by the environment's `mutationPolicy` (a test-only mutation without `rollback` under
+   * `production-intended-or-rollback`, any mutation under `none`).
+   */
+  operation<T>(mutation: MutationKind, target: string, act: () => Promise<T>, options?: OperationOptions): Promise<T>
   routes(filter?: { tags?: string[] }): RouteEntry[]
   url(path: string): string
   log(line: string): void
   signal: AbortSignal
   now(): string
+}
+
+export interface OperationOptions {
+  /** `production`: a change the owner means to keep. Default `test`: done only to observe behaviour. */
+  intent?: 'production' | 'test'
+  /** Undoes the mutation once its check finished (after a successful act only); runs even if the check failed. */
+  rollback?: { describe: string; act: () => Promise<void> }
 }
 
 export interface ControlCheck {
@@ -1137,7 +1193,7 @@ export interface ProductionQueueEntry {
 }
 
 export interface ProfileUpdate {
-  facts?: Partial<{ [K in FactKey]: ProfileFacts[K]['value'] }>
+  facts?: Partial<{ [K in FactKey]: NonNullable<ProfileFacts[K]>['value'] }>
   environments?: ProductionEnvironment[]
   scope?: Partial<AuditScope>
   budget?: Partial<AuditBudget>

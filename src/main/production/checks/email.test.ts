@@ -102,6 +102,17 @@ describe('C08 applicability', () => {
     expect(fake.optOutRequests()).toEqual([])
   })
 
+  it('flags a message of each kind sent from another address than the recorded sender fact', async () => {
+    const fake = await sandbox()
+    const { result } = await run(fake, { facts: { emailMarketing: true, marketingSender: 'news@shop.test', transactionalSender: 'shop@shop.test' } })
+    const wrong = result.findings.filter(finding => finding.key.startsWith('wrong-sender:'))
+    expect(wrong.map(finding => finding.key)).toEqual(['wrong-sender:transactional:orders@shop.test'])
+    expect(wrong[0]).toMatchObject({ severity: 'medium', confidence: 'confirmed', expected: expect.stringMatching(/sent from shop@shop\.test \(profile fact transactionalSender\)/) })
+    expect(result.observations).toEqual(expect.arrayContaining(['Marketing sender (profile): news@shop.test', 'Transactional sender (profile): shop@shop.test']))
+    const { result: unset } = await run(await sandbox(), { facts: { emailMarketing: true } })
+    expect(unset.findings.some(finding => finding.key.startsWith('wrong-sender:'))).toBe(false)
+  })
+
   it('is UNVERIFIED while marketing email use is unknown', async () => {
     const fake = await sandbox()
     const { result } = await run(fake, { facts: {} })

@@ -12,7 +12,8 @@ import { createCapturedMailAdapter } from './adapters/mailpit'
 import { createCustomCommandAdapter, killTree } from './adapters/custom-command'
 import { createStorageAdapter } from './adapters/storage'
 import { createWooCommerceAdapter } from './adapters/woocommerce'
-import { createAuditBrowser, resolveEngine } from './browser'
+import { AuthUnavailable, createAuditBrowser, resolveEngine } from './browser'
+import { createLoginStatePreparer } from './login-refresh'
 import { CHECKS } from './checks/index'
 import type { CommandRunner } from './checks/engineering-smokes'
 import type { PublicReader } from './checks/legal-sources'
@@ -27,7 +28,7 @@ import {
   dismissQuestion as dismissProfileQuestion, revokeWrites as removeWriteAuthorization,
 } from './profile'
 import { REGISTRY } from './registry'
-import { ProductionRunner, type BrowserFactoryOptions, type FingerprintRequest, type RunnerDeps } from './runner'
+import { ProductionRunner, guestStateAccount, type BrowserFactoryOptions, type FingerprintRequest, type RunnerDeps } from './runner'
 import { ACTIVE_RUN_STATUSES, OWNER, type ProductionStore, type ReconcileRunOutcome } from './store'
 import { ensureFixTasks, type FixTaskBoard, type FixTaskOutcome } from './tasks'
 import { CONDUCTOR_ACTOR, requestRun, trigger, type RunRequestOutcome } from './triggers'
@@ -100,7 +101,7 @@ export function createProductionService(deps: ProductionDeps) {
 
   const runner = new ProductionRunner({
     store, ownerId, clock, checks, board: deps.board, interpreter: deps.interpreter, sourceTree, projectRoot: deps.projectRoot, fingerprint,
-    browserFactory: deps.browserFactory ?? ((policy: NetworkPolicy, options: BrowserFactoryOptions) => createAuditBrowser(policy, { userDataDir: options.userDataDir, evidence: options.evidence, signal: options.signal })),
+    browserFactory: deps.browserFactory ?? ((policy: NetworkPolicy, options: BrowserFactoryOptions) => createAuditBrowser(policy, { userDataDir: options.userDataDir, evidence: options.evidence, signal: options.signal, guest: options.guest, prepareLogin: options.prepareLogin })),
     adapters: deps.adapters ?? ((environment, policy, projectId) => defaultAdapters(environment, policy, { resolveCredential, projectRoot: deps.projectRoot(projectId) })),
     runCommand, readPublic: deps.readPublic ?? null, discovery: deps.discovery, leaseTtlMs: deps.leaseTtlMs, checkTimeoutMs: deps.checkTimeoutMs, log: deps.log,
     gateAfter: run => gateFor(run.projectId, run.environmentId, run),
@@ -222,7 +223,10 @@ export function createProductionService(deps: ProductionDeps) {
       const profile = store.profile(projectId)!
       const last = store.lastCompletedRun(projectId, environment.id)
       const policy = { ...policyFor(profile, environment), readOnly: true, writeAuthorization: null }
-      const browser = (deps.browserFactory ?? ((p: NetworkPolicy, o: BrowserFactoryOptions) => createAuditBrowser(p, { userDataDir: o.userDataDir, evidence: o.evidence, signal: o.signal })))(policy, { userDataDir: join(deps.userData, 'production-audits', 'drift-browser'), evidence: NULL_EVIDENCE, signal })
+      const browser = (deps.browserFactory ?? ((p: NetworkPolicy, o: BrowserFactoryOptions) => createAuditBrowser(p, { userDataDir: o.userDataDir, evidence: o.evidence, signal: o.signal, guest: o.guest, prepareLogin: o.prepareLogin })))(policy, {
+        userDataDir: join(deps.userData, 'production-audits', 'drift-browser'), evidence: NULL_EVIDENCE, signal, guest: guestStateAccount(environment),
+        prepareLogin: createLoginStatePreparer({ runCommand, evidence: NULL_EVIDENCE, allowedOrigins: policy.allowedOrigins, signal, now: clock }),
+      })
       try {
         return await fingerprint({ run: last ?? ({ id: 'drift', projectId, environmentId: environment.id } as AuditRun), profile, environment, browser, source: sourceTree(projectId), signal })
       } finally { await browser.close().catch(() => undefined) }
@@ -605,7 +609,13 @@ export async function computeTargetFingerprint(request: FingerprintRequest, port
     const policyRoutes = profile.scope.routes.filter(route => route.tags.includes('policy') && route.coverage !== 'excluded').slice(0, 8)
     for (const route of policyRoutes) {
       if (signal.aborted) break
-      const page = await browser.open({ device: 'desktop', locale: profile.scope.locales[0] ?? null, auth: null, consent: 'clean', regionSelection: profile.scope.regionSelection })
+      let page
+      try { page = await browser.open({ device: 'desktop', locale: profile.scope.locales[0] ?? null, auth: null, consent: 'clean', regionSelection: profile.scope.regionSelection }) } catch (error) {
+        // An unusable site-gate state leaves the policy pages unread, not the run failed.
+        if (!(error instanceof AuthUnavailable)) throw error
+        policyPages.push({ path: route.path, content: 'unreadable:login-state-unavailable' })
+        continue
+      }
       try {
         const navigation = await page.goto(new URL(route.path, environment.baseUrl).href)
         policyPages.push({ path: route.path, content: navigation.outcome === 'ok' ? normalisePolicyText((await page.snapshot()).text) : `unreadable:${navigation.outcome}:${navigation.status ?? ''}` })

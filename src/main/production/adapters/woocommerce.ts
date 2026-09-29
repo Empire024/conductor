@@ -65,8 +65,8 @@ export function createWooCommerceAdapter(options: WooCommerceOptions): WooCommer
   }
   const guard = (mutation: MutationKind): void => { assertMutationAllowed(options.policy, mutation) }
   const customerId = async (account: TestAccountRef): Promise<string> => {
-    const email = resolve(account.usernameRef)
-    if (!email) throw new WooRequestFailed(null, `the username of test account ${account.label} could not be resolved (${account.usernameRef.source}:${account.usernameRef.key})`)
+    const email = account.usernameRef ? resolve(account.usernameRef) : null
+    if (!email) throw new WooRequestFailed(null, `the username of test account ${account.label} could not be resolved (${account.usernameRef ? `${account.usernameRef.source}:${account.usernameRef.key}` : 'no username reference'})`)
     const customers = array(await request('GET', `customers?email=${encodeURIComponent(email)}&per_page=5`))
     const id = customers[0]?.id
     if (id === undefined || id === null) throw new WooRequestFailed(404, `no WooCommerce customer for test account ${account.label}`)

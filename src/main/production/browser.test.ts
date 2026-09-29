@@ -465,6 +465,32 @@ describe.skipIf(!engine.available)('audit browser', { timeout: BROWSER_TIMEOUT }
     await page.close()
   })
 
+  it('loads a guest account\'s gate-only state into every unauthenticated page after preparing it, and refuses the open when preparing fails', async () => {
+    const site = server.site('baseline')
+    server.reset()
+    const gate = 'pwd-gate-4b9e1c7d2a'
+    const statePath = join(scratch, 'owner-secrets', 'gate-state.json')
+    mkdirSync(join(scratch, 'owner-secrets'), { recursive: true })
+    writeFileSync(statePath, JSON.stringify({ cookies: [
+      { name: 'pp_gate', value: gate, domain: '127.0.0.1', path: '/', expires: Math.floor(Date.now() / 1000) + 20 * 86_400, httpOnly: true, secure: false, sameSite: 'Lax' },
+      { name: 'old_gate', value: 'expired-gate-value-1', domain: '127.0.0.1', path: '/', expires: 1_000, httpOnly: true, secure: false, sameSite: 'Lax' },
+    ], origins: [] }))
+    const guest: TestAccountRef = { id: 'gate', label: 'Site gate', role: 'guest', usernameRef: null, passwordRef: null, storageState: { path: statePath, capturedAt: null, capturedBy: null } }
+    const prepared: string[] = []
+    const browser = createAuditBrowser(productionPolicy(site.origin), { userDataDir: join(scratch, 'gate-state'), guest, prepareLogin: async account => { prepared.push(account.id) } })
+    browsers.push(browser)
+    const page = await browser.open(desktop())
+    expect(prepared).toEqual(['gate'])
+    expect((await page.goto(site.url('/'))).outcome).toBe('ok')
+    expect(server.requests('baseline').find(item => item.path === '/')?.headers.cookie).toBe(`pp_gate=${gate}`)
+    await page.close()
+
+    const failing = createAuditBrowser(productionPolicy(site.origin), { userDataDir: join(scratch, 'gate-state-failed'), guest, prepareLogin: async () => { throw new Error('the login state of Site gate could not be refreshed: the refresh command exited 1') } })
+    browsers.push(failing)
+    await expect(failing.open(desktop())).rejects.toThrow(AuthUnavailable)
+    await expect(failing.open(desktop())).rejects.toThrow(/could not be refreshed: the refresh command exited 1/)
+  })
+
   it('refuses an authenticated open without a usable recorded login state, and never runs a login step on production', async () => {
     const site = server.site('baseline')
     const login = vi.fn()

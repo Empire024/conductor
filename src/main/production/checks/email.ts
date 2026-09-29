@@ -1,5 +1,5 @@
 import type { CapturedMessage, CheckContext, CheckOutcome, ControlCheck } from '../../../shared/production'
-import { decideApplicability } from '../registry'
+import { decideApplicability, factIsUnknown } from '../registry'
 import {
   draft, isAllowed, mutate, mutationBlocked, newParts, normalise, notRun, outcome, review, sleep, throwIfAborted, unobservable, withPage,
   type OutcomeParts,
@@ -114,6 +114,7 @@ async function runEmail(context: CheckContext, options: Required<EmailCheckOptio
   })))).id)
   const marketing = classified.filter(item => item.kind === 'marketing')
   parts.observations.push(`Captured deliveries: ${classified.length} (${marketing.length} marketing, ${classified.filter(item => item.kind === 'transactional').length} transactional, ${classified.filter(item => item.kind === 'unknown').length} unclassified)`)
+  senderAddresses(context, parts, classified)
   if (!marketing.length) {
     parts.unconcluded.push('no marketing delivery was captured: sender, subject, address and opt-out of real campaigns not observed')
     return outcome(CHECK_ID, parts)
@@ -179,6 +180,33 @@ async function templates(context: CheckContext, parts: OutcomeParts): Promise<vo
     }
   }
   parts.observations.push(`Templates: ${kinds.join('; ')}`)
+}
+
+/** The owner's sender facts: a marketing message must come from `marketingSender`, a transactional one from `transactionalSender`. */
+function senderAddresses(context: CheckContext, parts: OutcomeParts, classified: readonly Classified[]): void {
+  const facts = context.profile.facts
+  const expected: Record<'marketing' | 'transactional', string | null> = {
+    marketing: factIsUnknown(facts.marketingSender) ? null : String(facts.marketingSender!.value).toLowerCase(),
+    transactional: factIsUnknown(facts.transactionalSender) ? null : String(facts.transactionalSender!.value).toLowerCase(),
+  }
+  if (expected.marketing) parts.observations.push(`Marketing sender (profile): ${expected.marketing}`)
+  if (expected.transactional) parts.observations.push(`Transactional sender (profile): ${expected.transactional}`)
+  const seen = new Set<string>()
+  for (const item of classified) {
+    if (item.kind === 'unknown') continue
+    const want = expected[item.kind]
+    const address = addressOf(item.message.from)
+    if (!want || address === want || seen.has(`${item.kind}:${address}`)) continue
+    seen.add(`${item.kind}:${address}`)
+    parts.findings.push(draft(context, CHECK_ID, {
+      key: `wrong-sender:${item.kind}:${address}`, scope: 'email', component: item.message.subject,
+      title: `${item.kind === 'marketing' ? 'Marketing' : 'Transactional'} email comes from ${address}, not the recorded ${item.kind} sender`,
+      expected: `${item.kind === 'marketing' ? 'Marketing' : 'Transactional'} email is sent from ${want} (profile fact ${item.kind}Sender)`,
+      observed: `"${item.message.subject}" (${item.message.receivedAt}) came from ${item.message.from}`,
+      severity: 'medium', confidence: 'confirmed', reproduction: [`Open the captured message "${item.message.subject}" from ${item.message.from} (${item.message.receivedAt})`],
+      proposedFix: `Send ${item.kind} email from ${want}, or correct the ${item.kind}Sender fact if the address changed.`, evidence: [],
+    }))
+  }
 }
 
 function inspectMessage(context: CheckContext, parts: OutcomeParts, item: Classified, key: string): void {
