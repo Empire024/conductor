@@ -289,6 +289,7 @@ const bridge: ConductorBridge = {
     importImage: (projectId, name, bytes) => ipcRenderer.invoke('files:import-image', projectId, name, bytes),
     attachContext: (projectId, relativePath) => ipcRenderer.invoke('files:attach-context', projectId, relativePath),
     importContextPath: (projectId, sourcePath, name, mimeType) => ipcRenderer.invoke('files:import-context-path', projectId, sourcePath, name, mimeType),
+    openPastedText: (projectId, request) => ipcRenderer.invoke('files:open-pasted-text', projectId, request),
     pathForFile: file => webUtils.getPathForFile(file),
     moveExternalDrop: (projectId, sourcePath, destinationDirectory) => ipcRenderer.invoke('files:move-external-drop', projectId, sourcePath, destinationDirectory),
     onOpenShortcut: (callback) => subscribe('files:open-shortcut', callback),

@@ -134,6 +134,7 @@ import { localEndpointOverride, localModelAvailability, localTurnsInFlight, onLo
 import { DeliveryService } from './delivery'
 import { COWORKER_AUTOCLOSE_SETTING, CoworkerAutoClose, coworkerAutoCloseMinutes, normalizeCoworkerAutoCloseMinutes } from './coworker-autoclose'
 import { registerTokenBurnIpc, TokenBurnMeter, TokenBurnService } from './token-burn'
+import { materializePastedText } from './pasted-text-files'
 import { FinishedTabs, agentTabFacts, findLayoutTab } from './workspace-clarity'
 import { createNeedsAttention } from './needs-attention'
 import { FINISHED_TAB_SWEEP_SETTING, finishedTabSweepHours, normalizeFinishedTabSweepHours, type AgentTabFacts } from '../shared/workspace-clarity'
@@ -1597,6 +1598,25 @@ const registerIpc = (): void => {
     const attachment = await importPromptImage(project.path, name, bytes)
     invalidateProjectFiles(project.path)
     return attachment
+  })
+  // A pasted-text chip opens as a gitignored project file (src/main/pasted-text-files.ts): a draft
+  // sends its text, a sent message names the conversation artifact that kept it.
+  ipcMain.handle('files:open-pasted-text', async (event, projectId: string, request: unknown) => {
+    trustedStructured(event)
+    const project = localProject(database, projectId, 'Opening pasted text')
+    const asked = (request && typeof request === 'object' ? request : {}) as { attachmentId?: unknown; content?: unknown; sessionId?: unknown; artifactId?: unknown }
+    let content = asked.content
+    if (content === undefined) {
+      const sessionId = structuredId(asked.sessionId)
+      if (database.structured.spec<{ projectId?: string }>(sessionId)?.projectId !== project.id) throw new Error('That conversation is not in this project')
+      if (typeof asked.artifactId !== 'string') throw new Error('This pasted text was sent before Conductor kept pasted text')
+      content = database.structured.output(sessionId, asked.artifactId)
+    }
+    const path = await materializePastedText(project.path, String(asked.attachmentId), content)
+    invalidateProjectFiles(project.path)
+    // A preview already showing this path reads it again (it may have been missing before).
+    projectFileChanges?.changed({ projectId: project.id, path })
+    return { path }
   })
   ipcMain.handle('files:attach-context', async (event, projectId: string, requested: string) => {
     trustedStructured(event)

@@ -18,6 +18,7 @@ import type { RuntimeDetachment } from './providers/adapter'
 import { settled } from './providers/adapter-state'
 import { validateLiveTurn } from './live-test-policy'
 import { activeUsageCap, isUsageLimitMessage, parseUsageLimitReset, usageCapKey } from './usage-limit'
+import { isPastedText } from '../shared/pasted-text'
 import { carriesAccountLimits, describeAccountLimits, describeUsageCap, evaluateUsageCap, recordAccountLimits, summarizeContext, summarizeUsageRun, type AccountLimitRecord, type AccountLimitsReport, type UsageCapStatus } from '../shared/usage-accounting'
 import { LiveRuntimeBudget } from './live-runtime-budget'
 import { sanitizeDiagnostic } from './structured-store'
@@ -936,11 +937,20 @@ export class StructuredSessions {
     if (status === 'delivered') {
       this.setSteering(live, prompts.filter(prompt => prompt.id !== inputId), source.native)
       live.expediteInput?.delete(inputId)
-      this.emit(live, { turnId: input.turnId, itemId: inputId, data: { type: 'text', role: 'user', text: input.text, mode: 'snapshot', ...(input.attachments.length ? { attachments: input.attachments.map(({ content: _content, ...metadata }) => metadata) } : {}), ...(input.origin ? { origin: input.origin } : {}) }, native: source.native })
+      this.emit(live, { turnId: input.turnId, itemId: inputId, data: { type: 'text', role: 'user', text: input.text, mode: 'snapshot', ...(input.attachments.length ? { attachments: this.sentAttachments(live, input.attachments) } : {}), ...(input.origin ? { origin: input.origin } : {}) }, native: source.native })
     } else {
       this.setSteering(live, prompts.map(prompt => prompt.id === inputId ? { ...prompt, status } : prompt), source.native)
     }
     queueMicrotask(() => { void this.drainQueue(live) })
+  }
+  /** What the timeline keeps of a sent message's attachments: their metadata, never their content,
+   *  except that a pasted text is kept as a private output artifact of the conversation so its chip
+   *  still opens as a file after the message left (pasted-text-files.ts). */
+  private sentAttachments(live: LiveSession, attachments: ContextAttachment[]): ContextAttachment[] {
+    return attachments.map(({ content, ...metadata }) => {
+      if (!isPastedText(metadata) || typeof content !== 'string' || metadata.artifactId) return metadata
+      try { return { ...metadata, artifactId: this.database.structured.putOutput(live.spec.id, content) } } catch { return metadata }
+    })
   }
   private setQueue(live: LiveSession, prompts: import('../shared/structured-agent').QueuedPrompt[]): void {
     this.emit(live, { data: { type: 'queue', prompt: prompts[0] ?? null, prompts } })
@@ -1111,7 +1121,7 @@ export class StructuredSessions {
       // An anonymous conversation is never named after what was said in it (local-models/anonymous.ts).
       store.update(id, { settings, title: state.title || (anonymousConversations.has(id) ? '' : deriveConversationTitle(text)) })
       // Keep expanded file bytes and recalled context in the provider request, outside the user's message.
-      if (!refusalRetry) this.emit(live, { itemId: userItemId, data: { type: 'text', role: 'user', text: text.trim(), mode: 'snapshot', ...(attachments.length ? { attachments: attachments.map(({ content: _content, ...metadata }) => metadata) } : {}), ...(origin ? { origin } : {}) } })
+      if (!refusalRetry) this.emit(live, { itemId: userItemId, data: { type: 'text', role: 'user', text: text.trim(), mode: 'snapshot', ...(attachments.length ? { attachments: this.sentAttachments(live, attachments) } : {}), ...(origin ? { origin } : {}) } })
       this.emit(live, { data: { type: 'session', phase: 'running' } })
       if (process.env.CONDUCTOR_LIVE_TESTS === '1') live.budget = new LiveRuntimeBudget(boundary => this.stopLive(live, boundary === 'active-runtime' ? 'Live prompt reached its 90 second active runtime allowance' : 'Live prompt reached its 30 second cumulative human-input wait allowance'))
       const dispatch = live.adapter.submit(submitted, settings, attachments.filter(item => item.kind === 'image'))

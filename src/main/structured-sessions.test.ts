@@ -648,6 +648,23 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     expect(JSON.stringify(user?.data)).not.toContain('[Attached')
   })
 
+  // conductor-task:21b9a1d6: a sent pasted text still opens as a file after the message left.
+  it('keeps a sent pasted text as a conversation artifact its chip reopens, and nothing else', async () => {
+    const f = fixture()
+    const pasted = 'line\n'.repeat(40)
+    await f.manager.submit(f.spec.id, '[Pasted text #1: 41 lines] explain', settings, [
+      { id: 'pasted-text:abc-123', kind: 'selection', name: 'Pasted text #1: 41 lines', content: pasted },
+      { id: 'selection', kind: 'selection', name: 'selected lines', content: 'selected' }
+    ])
+    expect(f.current.submissions[0]!.text).toContain(pasted.trim())
+    const user = f.database.structured.snapshot(f.spec.id)?.items.find(item => item.data.type === 'text' && item.data.role === 'user')
+    const attachments = user?.data.type === 'text' ? user.data.attachments ?? [] : []
+    expect(attachments.map(item => Object.keys(item).includes('content'))).toEqual([false, false])
+    expect(attachments[1]?.artifactId).toBeUndefined()
+    expect(f.database.structured.output(f.spec.id, attachments[0]!.artifactId!)).toBe(pasted)
+    expect(JSON.stringify(user?.data)).not.toContain('line\nline')
+  })
+
   it('describes opaque media by verified workspace metadata without decoding it as text', async () => {
     const f = fixture()
     const bytes = Buffer.from([0, 1, 2, 3, 0xff])

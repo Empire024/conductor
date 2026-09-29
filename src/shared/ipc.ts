@@ -184,6 +184,8 @@ export interface ConductorBridge {
     importImage(projectId: string, name: string, bytes: Uint8Array): Promise<import('./structured-agent').ContextAttachment>
     attachContext(projectId: string, relativePath: string): Promise<import('./structured-agent').ContextAttachment>
     importContextPath(projectId: string, sourcePath: string, name: string, mimeType: string): Promise<import('./structured-agent').ContextAttachment>
+    /** Writes a pasted-text chip's text to its gitignored project file and returns the path to open. */
+    openPastedText(projectId: string, request: { attachmentId: string; content?: string; sessionId?: string; artifactId?: string }): Promise<{ path: string }>
     pathForFile(file: File): string
     moveExternalDrop(projectId: string, sourcePath: string, destinationDirectory: string): Promise<FileEntry>
     onOpenShortcut(callback: () => void): () => void

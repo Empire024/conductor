@@ -109,6 +109,9 @@ export interface ContextAttachment {
   size?: number
   startLine?: number
   endLine?: number
+  /** A sent pasted text's content, kept as a private output artifact of its conversation so its
+   *  chip still opens after the message left (pasted-text-files.ts). */
+  artifactId?: string
 }
 export interface InputQuestion {
   id: string

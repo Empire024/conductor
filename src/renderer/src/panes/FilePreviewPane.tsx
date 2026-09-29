@@ -98,6 +98,11 @@ export function FilePreviewPane({
     return () => { active = false }
   }, [kind, path, project.id, version])
 
+  // A file rewritten in place is read again: a pasted-text chip reopened after its file was deleted.
+  useEffect(() => window.conductor.files.onChanged(change => {
+    if (!change.machineId && change.projectId === project.id && change.path.replaceAll('\\', '/') === path) setVersion(value => value + 1)
+  }), [project.id, path])
+
   const openExternally = (): void => {
     void window.conductor.files.openExternal(project.id, path).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason)))
   }
