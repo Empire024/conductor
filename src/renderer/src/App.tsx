@@ -4,7 +4,7 @@ import { useAgentControl } from './use-agent-control'
 import { ListTodo } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
-import { Bot, Brain, Clock3, Gauge, GitBranch, Globe2, HardDrive, LayoutPanelTop, PanelLeft, PanelRight, Plus, Radio, Workflow, X, Zap } from 'lucide-react'
+import { Bot, Brain, Clock3, Gauge, GitBranch, Globe2, HardDrive, LayoutPanelTop, PanelLeft, PanelRight, Plus, Radio, ShieldCheck, Workflow, X, Zap } from 'lucide-react'
 import type {
   AgentActivityPhase,
   AgentProviderId,
@@ -70,6 +70,7 @@ import { ProcessDashboardPane } from './panes/ProcessDashboardPane'
 import { SourceControlPane } from './components/SourceControlPane'
 import { OrchestrationHub } from './components/OrchestrationHub'
 import { SchedulesPane } from './components/SchedulesPane'
+import { OPEN_PRODUCTION_EVENT, OPEN_PRODUCTION_QUEUE_EVENT, OPEN_PROJECT_TASKS_EVENT, ProductionPane } from './components/ProductionPane'
 import { WorkspaceFiles } from './components/WorkspaceFiles'
 import { openWorkspaceFile, changeWorkspacePath, loadWorkspaceFiles, workspaceFileIds, workspaceFileMachine } from './components/workspace-files-state'
 import { ProjectBacklogPane } from './components/ProjectBacklogPane'
@@ -147,7 +148,7 @@ export function App(): React.JSX.Element {
   const [utilityPanel, setUtilityPanel] = useState<SidebarUtilityPanel | null>(() => {
     const saved = localStorage.getItem('conductor.utilityPanel')
     if (saved === 'jobs') { localStorage.removeItem('conductor.utilityPanel'); return null }
-    return ['agents', 'tasks', 'routines', 'memory', 'processes', 'backlog', 'schedules', 'source-control'].includes(saved ?? '')
+    return ['agents', 'tasks', 'routines', 'memory', 'processes', 'backlog', 'schedules', 'source-control', 'production'].includes(saved ?? '')
       ? saved as SidebarUtilityPanel
       : null
   })
@@ -304,6 +305,8 @@ export function App(): React.JSX.Element {
       ? { label: 'Processes', aria: 'Process dashboard', icon: Gauge }
       : utilityPanel === 'schedules'
         ? { label: 'Scheduled tasks', aria: 'Scheduled tasks, their scripts and run history', icon: Clock3 }
+      : utilityPanel === 'production'
+        ? { label: 'Production', aria: 'Production audit, findings and readiness', icon: ShieldCheck }
       : utilityPanel === 'source-control'
         ? { label: 'Source control', aria: 'Repository status and delivery', icon: GitBranch }
       : utilityPanel === 'routines'
@@ -1115,6 +1118,44 @@ export function App(): React.JSX.Element {
     setFocusedGroupId(group.id)
   }, [activeSession, focusedGroupId, setLayout])
 
+  /** The production queue is one tab per workspace: an open one is focused, otherwise one is added. */
+  const openProductionQueue = useCallback((): void => {
+    if (!activeSession) return
+    const groups = listGroups(activeSession.layout.root)
+    const holder = groups.find(group => group.tabs.some(tab => tab.kind === 'production-queue'))
+    if (holder) {
+      setLayout(activateTab(activeSession.layout, holder.id, holder.tabs.find(tab => tab.kind === 'production-queue')!.id))
+      setFocusedGroupId(holder.id)
+      return
+    }
+    const group = findGroup(activeSession.layout.root, focusedGroupId) ?? groups[0]
+    if (!group) return
+    setLayout(addTab(activeSession.layout, group.id, createPaneTab('production-queue')))
+    setFocusedGroupId(group.id)
+  }, [activeSession, focusedGroupId, setLayout])
+
+  // The Production drawer and queue pane ask for these: the queue tab, a project's drawer (switching
+  // project first), and the task board that holds fix tasks.
+  useEffect(() => {
+    const openQueue = (): void => openProductionQueue()
+    const openProduction = (event: Event): void => {
+      const projectId = (event as CustomEvent<{ projectId?: string }>).detail?.projectId
+      void (async () => {
+        if (projectId && projectId !== activeProjectIdRef.current) await loadProject(projectId)
+        setUtilityPanel('production')
+      })()
+    }
+    const openTasks = (): void => setUtilityPanel('tasks')
+    window.addEventListener(OPEN_PRODUCTION_QUEUE_EVENT, openQueue)
+    window.addEventListener(OPEN_PRODUCTION_EVENT, openProduction)
+    window.addEventListener(OPEN_PROJECT_TASKS_EVENT, openTasks)
+    return () => {
+      window.removeEventListener(OPEN_PRODUCTION_QUEUE_EVENT, openQueue)
+      window.removeEventListener(OPEN_PRODUCTION_EVENT, openProduction)
+      window.removeEventListener(OPEN_PROJECT_TASKS_EVENT, openTasks)
+    }
+  }, [loadProject, openProductionQueue])
+
   const openExplorerFile = useCallback((relativePath: string, mode: 'editor' | 'preview', projectId?: string): void => {
     const owner = projectId ?? activeProjectIdRef.current
     if (owner) openWorkspaceFile(owner, relativePath, mode)
@@ -1332,6 +1373,8 @@ export function App(): React.JSX.Element {
     { id: 'open-memory', label: 'Open project memory', detail: 'Open the workspace memory drawer', category: 'Workspace', icon: 'file', run: () => setUtilityPanel('memory') },
     { id: 'ideas', label: 'Ideas: new note', detail: 'Jot an idea down; no project needed', category: 'Workspace', icon: 'file', shortcut: 'Ctrl+Alt+I', run: () => { setIdeasOpen(true); setIdeasCapture(n => n + 1) } },
     { id: 'open-processes', label: 'Open process dashboard', detail: 'Open the workspace process drawer', category: 'Workspace', icon: 'layout', run: () => setUtilityPanel('processes') },
+    { id: 'open-production', label: 'Open Production panel', detail: 'Audit state, findings and readiness of the active project', category: 'Workspace', icon: 'layout', run: () => setUtilityPanel('production') },
+    { id: 'open-production-queue', label: 'Open production queue', detail: 'Every production-ready project, the ones that need attention first', category: 'Workspace', icon: 'layout', run: () => openProductionQueue() },
     { id: 'split-right', label: 'Split tab right', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Alt →', run: () => splitFocused('right') },
     { id: 'split-below', label: 'Split tab below', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Alt ↓', run: () => splitFocused('below') },
     { id: 'split-claude', label: 'Split Claude Code right', detail: 'Create and launch in one action', category: 'Agents', icon: 'agent', run: () => splitFocused('right', makeTab('agent', 'claude')) },
@@ -1347,7 +1390,7 @@ export function App(): React.JSX.Element {
     { id: 'snap-tab', label: 'Snap tab area to the next stop', detail: 'Preset widths instead of a 5% nudge', category: 'Layout', icon: 'layout', run: () => nudgeFocusedGroup('right', true) },
     { id: 'move-tab-right', label: 'Move tab right', detail: 'Relocate the tab itself, not the divider', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift Alt →', run: () => moveFocusedTabTo('right') },
     { id: 'move-tab-left', label: 'Move tab left', detail: 'Relocate the tab itself, not the divider', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift Alt ←', run: () => moveFocusedTabTo('left') }
-  ], [cycleFocusedTab, moveFocusedTabTo, nudgeFocusedGroup, openInFocused, reopenClosed, splitFocused])
+  ], [cycleFocusedTab, moveFocusedTabTo, nudgeFocusedGroup, openInFocused, openProductionQueue, reopenClosed, splitFocused])
 
   // The subagent roster links a background task back to the runtime it is driving.
   useEffect(() => {
@@ -1718,6 +1761,8 @@ export function App(): React.JSX.Element {
                           ? <ProcessDashboardPane project={activeProject} />
                           : utilityPanel === 'schedules'
                             ? <SchedulesPane projectId={activeProject.id} />
+                          : utilityPanel === 'production'
+                            ? <ProductionPane projectId={activeProject.id} />
                           : utilityPanel === 'source-control'
                             ? <SourceControlPane key={activeProject.id} project={activeProject} />
                           : <OrchestrationHub

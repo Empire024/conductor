@@ -70,6 +70,7 @@ export interface ConductorBridge {
   delivery: import('./delivery').DeliveryBridge
   permissionGrants: import('./permission-grants').PermissionGrantsBridge
   durableJobs: import('./durable-jobs-bridge').DurableJobsBridge
+  production: import('./production').ProductionBridge
   cloud: import('./cloud').CloudBridge
   ideas: import('./ideas').IdeasBridge
   ideaRuns: import('./idea-runs').IdeaRunsBridge

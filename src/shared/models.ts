@@ -17,6 +17,8 @@ export type PaneKind =
   | 'job'
   /** A Claude Code cloud session run as a coworker; resourceId is the run id (src/shared/cloud.ts). */
   | 'cloud'
+  /** Every production-ready project's audit state (src/shared/production.ts); no resourceId. */
+  | 'production-queue'
 
 export type AgentProviderId = 'codex' | 'claude' | 'grok' | 'gemini' | 'qwen' | 'kimi' | 'local'
 export type AgentEffort = 'auto' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'

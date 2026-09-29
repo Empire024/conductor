@@ -27,6 +27,7 @@ import {
   Hourglass,
   MoreHorizontal,
   Plus,
+  ShieldCheck,
   TerminalSquare,
   TimerReset,
   EyeOff,
@@ -84,6 +85,7 @@ import { FilePreviewPane } from '../panes/FilePreviewPane'
 import { TerminalPane } from '../panes/TerminalPane'
 import { LauncherPane } from '../panes/LauncherPane'
 import { CloudPane } from '../panes/CloudPane'
+import { ProductionQueuePane } from '../panes/ProductionQueuePane'
 import { FileTreePane } from '../panes/FileTreePane'
 import { CodePane } from '../panes/CodePane'
 import { BrowserPane } from '../panes/BrowserPane'
@@ -161,6 +163,7 @@ const iconFor = (tab: PaneTab): typeof Bot => {
   if (tab.kind === 'browser') return Globe2
   if (tab.kind === 'job') return Hourglass
   if (tab.kind === 'cloud') return Cloud
+  if (tab.kind === 'production-queue') return ShieldCheck
   return FileText
 }
 
@@ -273,6 +276,8 @@ const PaneBody = ({
   if (tab.kind === 'job') return tab.resourceId ? <DurableJobPanel projectId={project.id} jobId={tab.resourceId} /> : <DurableJobsPane projectId={project.id} workspaceId={session.id} />
   // The run id is the tab's identity, like a job tab's: the session runs whether or not a tab shows it.
   if (tab.kind === 'cloud' && tab.resourceId) return <CloudPane projectId={project.id} runId={tab.resourceId} />
+  // Cross-project: every designated project's gate; a row switches project and opens its drawer.
+  if (tab.kind === 'production-queue') return <ProductionQueuePane currentProjectId={project.id} />
   // Every read and write for a remote project's file goes through the host, which is what carries
   // the revision check that turns a concurrent edit into a conflict message instead of an overwrite.
   if (tab.kind === 'code') return <CodePane project={project} tabId={tab.id} path={(tab.state?.path as string) ?? tab.resourceId ?? ''} line={tab.state?.line as number | undefined} machineId={host ?? fileMachineId(tab.state?.machineId as string | undefined)} />

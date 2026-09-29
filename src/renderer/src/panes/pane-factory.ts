@@ -82,6 +82,8 @@ export const createPaneTab = (
       return { id: makeId('pane'), kind, title: options?.title ?? 'Memory' }
     case 'logs':
       return { id: makeId('pane'), kind, title: options?.title ?? 'Processes' }
+    case 'production-queue':
+      return { id: makeId('pane'), kind, title: options?.title ?? 'Production queue' }
     default:
       return { id: makeId('pane'), kind, title: options?.title ?? kind }
   }

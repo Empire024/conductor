@@ -16,6 +16,7 @@ import { deliveryBridge } from './delivery'
 import { permissionGrantsBridge } from './permission-grants'
 import { claudeFullAutoBridge } from './claude-full-auto'
 import { durableJobsBridge } from './durable-jobs'
+import { productionBridge } from './production'
 import { cloudBridge } from './cloud'
 import { logicLoopsBridge } from './logic-loops'
 import { ideasBridge } from './ideas'
@@ -200,6 +201,7 @@ const bridge: ConductorBridge = {
   permissionGrants: permissionGrantsBridge,
   claudeFullAuto: claudeFullAutoBridge,
   durableJobs: durableJobsBridge,
+  production: productionBridge,
   cloud: cloudBridge,
   ideas: ideasBridge,
   ideaRuns: ideaRunsBridge,
