@@ -24,7 +24,7 @@ export interface NeedsAttentionSources {
   agents(): AttentionAgentRow[]
   snapshot(id: string): SessionProjection | null
   /** Pending request_permission cards (PermissionGrants.state().requests). */
-  permissionRequests?(): Array<{ agentSessionId: string; status: string; reason?: string; command?: string; path?: string; url?: string; createdAt?: string }>
+  permissionRequests?(): Array<{ agentSessionId: string; status: string; reason?: string; resource?: string; requestedAt?: string; command?: string; path?: string; url?: string; createdAt?: string }>
   /** Taken over by another conversation (agents.supersede): its failure is not the owner's to chase. */
   superseded?(projectId: string, id: string): boolean
 }
@@ -61,7 +61,8 @@ export function computeNeedsAttention(sources: NeedsAttentionSources, now = new 
   for (const request of sources.permissionRequests?.() ?? []) {
     if (request.status !== 'pending' || listed.has(request.agentSessionId) || !shown.has(request.agentSessionId)) continue
     listed.add(request.agentSessionId)
-    add(request.agentSessionId, 'permission', [request.command ?? request.path ?? request.url, request.reason].filter(Boolean).join(' — '), request.createdAt)
+    // A PermissionGrantRequest names its call as resource and its time as requestedAt.
+    add(request.agentSessionId, 'permission', [request.resource ?? request.command ?? request.path ?? request.url, request.reason].filter(Boolean).join(' — '), request.requestedAt ?? request.createdAt)
   }
   for (const row of sources.agents()) {
     if (!FLAGGED.has(row.activityPhase) || listed.has(row.id)) continue

@@ -449,6 +449,26 @@ describe('a pending owner approval survives a handoff (grant-survives-handoff)',
   const successor = 'agent_other'
   const script = 'app/prod/fix-pool.sh'
 
+  // Haftheme 2026-09-29 (grant-cards-lost-at-handoff): a wizard filed four cards, handed itself on
+  // and the app restarted. The requests must stay the successor's pending ones in state (what the
+  // pane's dock and Needs attention read), and the successor wizard may not answer them itself.
+  it('keeps a moved request pending for the successor across a restart, answerable by the owner and never by the successor wizard', async () => {
+    const saved: { value?: SavedPermissionGrants } = {}
+    const h = harness({ persist: value => { saved.value = value } })
+    const asked = h.grants.request(tab, { command: `bash ${script}`, reason: 'launch step 1, the owner said go' })
+    await h.grants.transfer(tab, successor)
+    expect(h.grants.holder(tab, asked.id)).toBe(successor)
+    // The successor's runtime was not live when the card was written (notice false): state still holds it.
+    const restarted = harness({ notice: () => false })
+    restarted.grants.restore(JSON.parse(JSON.stringify(saved.value)), () => true)
+    expect(restarted.grants.state().requests).toEqual([expect.objectContaining({ id: asked.id, agentSessionId: successor, status: 'pending', resource: `bash ${script}` })])
+    const wizard = { agentSessionId: successor, wizard: true, answers: () => true }
+    // Neither by its own id nor through the predecessor's, whose handoff chain ends at the caller.
+    for (const agentSessionId of [successor, tab]) await expect(callPermissions(restarted.grants, wizard, 'permissions.decide', { agentSessionId, requestId: asked.id, decision: 'approve-once' })).rejects.toThrow(/cannot answer its own.*do not run the call another way/)
+    expect(restarted.grants.state().requests[0]!.status).toBe('pending')
+    await expect(callPermissions(restarted.grants, { agentSessionId: '', owner: true, answers: () => true }, 'permissions.decide', { agentSessionId: successor, requestId: asked.id, decision: 'approve-once' })).resolves.toMatchObject({ status: 'approved-once', grant: { decidedBy: 'owner', agentSessionId: successor } })
+  })
+
   it('moves a pending request to the successor: its list and card show it with the holder, the approval tells the successor, and it consumes it exactly once', async () => {
     const h = harness({ title: id => id === successor ? 'Wizard (continued)' : 'Wizard' })
     const asked = h.grants.request(tab, { command: `bash ${script}`, reason: 'B5 lsphp pool fix' })

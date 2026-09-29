@@ -7,3 +7,9 @@
 .sa-grant-fields dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .sa-grant-fields code { white-space: pre-wrap; word-break: break-all; }
 .sa-grant-status { display: flex; align-items: center; gap: 10px; margin: 4px 0 0; }
+/* Waiting requests pinned above the composer (PendingGrantDock.tsx). */
+.sa-grant-dock { flex: 0 0 auto; max-height: 45%; overflow-y: auto; margin: 0 12px 6px; padding: 6px 8px; border: 1px solid var(--warning, #c98a1b); border-radius: 8px; background: color-mix(in srgb, var(--warning, #c98a1b) 7%, transparent); }
+.sa-grant-dock-head { display: flex; width: 100%; justify-content: space-between; align-items: baseline; gap: 10px; padding: 2px 0; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.sa-grant-dock-cards { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.sa-grant-dock-pulse { animation: sa-grant-dock-pulse 0.8s ease-in-out 2; }
+@keyframes sa-grant-dock-pulse { 50% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--warning, #c98a1b) 55%, transparent); } }

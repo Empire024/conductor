@@ -12,7 +12,7 @@ const error = (sequence: number, message: string, code?: string): TimelineItem =
 const notice = (sequence: number): TimelineItem => ({ id: 'n' + sequence, runtimeId: 'r', sequence, timestamp: AT, data: { type: 'notice', level: 'info', message: 'Handed on', payload: { succession: { to: 'next' } } } } as unknown as TimelineItem)
 const projection = (id: string, phase: SessionPhase, items: TimelineItem[] = [text(1)], extra: Partial<SessionProjection> = {}): SessionProjection => ({ sessionId: id, runtimeId: 'r', phase, sequence: items.length, items, settings: { permission: 'default', plan: false }, title: id, archived: false, truncated: false, ...extra } as SessionProjection)
 
-function sources(options: { tabs: PaneTab[]; rows: Array<[string, AgentActivityPhase]>; states: Record<string, SessionProjection>; detached?: DetachedWindowRecord[]; permissions?: Array<{ agentSessionId: string; status: string; command?: string; reason?: string }>; superseded?: string[]; continueOnLimit?: boolean; other?: PaneTab[] }): NeedsAttentionSources {
+function sources(options: { tabs: PaneTab[]; rows: Array<[string, AgentActivityPhase]>; states: Record<string, SessionProjection>; detached?: DetachedWindowRecord[]; permissions?: Array<{ agentSessionId: string; status: string; command?: string; reason?: string; resource?: string; requestedAt?: string }>; superseded?: string[]; continueOnLimit?: boolean; other?: PaneTab[] }): NeedsAttentionSources {
   const main = workspace('w1', 'p1', options.tabs, options.continueOnLimit)
   const other = workspace('w2', 'p2', options.other ?? [])
   const rows: AttentionAgentRow[] = options.rows.map(([id, activityPhase]) => ({ id, projectId: (options.other ?? []).some(entry => entry.resourceId === id) ? 'p2' : 'p1', sessionId: (options.other ?? []).some(entry => entry.resourceId === id) ? 'w2' : 'w1', activityPhase }))
@@ -48,6 +48,15 @@ describe('computeNeedsAttention', () => {
     expect(snapshot.entries.find(entry => entry.agentSessionId === 'perm')!.detail).toBe('npm publish — release')
     expect(snapshot.entries.find(entry => entry.agentSessionId === 'fail')!.detail).toBe('Tests failed')
     expect(snapshot.total).toBe(7)
+  })
+
+  // A request_permission card as PermissionGrants.state() holds it: resource and requestedAt.
+  it('names a permission card by its resource and time, as the grants state carries them', () => {
+    const snapshot = computeNeedsAttention(sources({
+      tabs: [tab('successor')], rows: [['successor', 'working']], states: { successor: projection('successor', 'running') },
+      permissions: [{ agentSessionId: 'successor', status: 'pending', resource: 'bash .conductor-scratch/controller/prod-step1-db-snapshot.sh', reason: 'launch step 1', requestedAt: '2026-09-29T22:56:20.125Z' }]
+    }))
+    expect(snapshot.entries).toEqual([expect.objectContaining({ agentSessionId: 'successor', reason: 'permission', detail: 'bash .conductor-scratch/controller/prod-step1-db-snapshot.sh — launch step 1', since: '2026-09-29T22:56:20.125Z' })])
   })
 
   it('leaves out a failure the owner has looked at, one taken over or handed on, a closed tab, and a limit that continues by itself', () => {

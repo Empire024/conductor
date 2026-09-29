@@ -1,6 +1,7 @@
 import { BellRing } from 'lucide-react'
 import { memo, useEffect, useState } from 'react'
 import { ATTENTION_LABEL, type AttentionSnapshot } from '../../../shared/needs-attention'
+import { revealConversation } from './permission-grants/PendingGrantDock'
 import './NeedsAttention.css'
 
 const SHOWN = 5
@@ -24,9 +25,9 @@ export const NeedsAttention = memo(function NeedsAttention(): React.JSX.Element 
   if (!snapshot?.entries.length) return null
   const rows = expanded ? snapshot.entries : snapshot.entries.slice(0, SHOWN)
   const hidden = snapshot.total - rows.length
-  const show = (projectId: string, workspaceId: string, tabId: string): void => {
+  const show = (projectId: string, workspaceId: string, tabId: string, agentSessionId: string): void => {
     setNote('')
-    window.conductor.agentControl.focusTab(projectId, workspaceId, tabId).catch(error => setNote(error instanceof Error ? error.message : String(error)))
+    window.conductor.agentControl.focusTab(projectId, workspaceId, tabId).then(() => revealConversation(agentSessionId), error => setNote(error instanceof Error ? error.message : String(error)))
   }
   return (
     <section className="needs-attention" aria-label={`${snapshot.total} tab${snapshot.total === 1 ? '' : 's'} need attention`} data-attention-count={snapshot.total}>
@@ -41,7 +42,7 @@ export const NeedsAttention = memo(function NeedsAttention(): React.JSX.Element 
             <button
               type="button" data-attention-tab={entry.tabId} data-attention-reason={entry.reason}
               title={`${entry.title} — ${entry.projectName} / ${entry.workspaceName}${entry.detail ? `\n${entry.detail}` : ''}`}
-              onClick={() => show(entry.projectId, entry.workspaceId, entry.tabId)}
+              onClick={() => show(entry.projectId, entry.workspaceId, entry.tabId, entry.agentSessionId)}
             >
               <em className={`needs-attention-reason ${entry.reason}`}>{ATTENTION_LABEL[entry.reason]}</em>
               <span className="ellipsis">{entry.title}</span>

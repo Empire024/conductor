@@ -13,6 +13,8 @@ export const PERMISSION_METHOD_SIGNATURES: Record<string, string> = {
 export const PERMISSION_OWNER_SIGNATURES: Record<string, string> = {
   'permissions.decide': '({agentSessionId, requestId, decision: "approve-once"|"approve-session"|"deny"}) — owner credential or wizard tab only: answer a permission request for the owner, the same authority as agents.approve: the owner answers any conversation of this project, a wizard the coworkers it controls (and theirs); any class, local, shared, destructive or external (production included), so review the exact call, reason and rollback first; never your own request. An approval of a conversation whose turn is still running interrupts that turn at once, so the retry runs as a message of its own'
 }
+/** Why a wizard may not answer what it holds itself, and what to do instead. */
+export const OWN_REQUEST = "A conversation cannot answer its own permission request, not even one the owner agreed to in chat: the owner's click on the card is the record. The card waits for the owner above this tab's composer and in Needs attention; tell the owner it is there, carry on with other work, and do not run the call another way."
 export const PERMISSION_METHODS = [...Object.keys(PERMISSION_METHOD_SIGNATURES), ...Object.keys(PERMISSION_OWNER_SIGNATURES)]
 
 export interface PermissionCallScope {
@@ -48,10 +50,13 @@ export async function callPermissions(grants: PermissionGrants, scope: Permissio
   if (method === 'permissions.decide') {
     if (!sovereign) throw new Error('permissions.decide answers only the owner\'s own control credential or a wizard tab')
     const agentSessionId = text(args.agentSessionId, 'agentSessionId', true)!
-    if (agentSessionId === scope.agentSessionId && !scope.owner) throw new Error('A conversation cannot answer its own permission request')
+    const requestId = text(args.requestId, 'requestId', true)!
+    // Its own, or one a handoff moved to it: the wand holds the owner's authority over coworkers, not
+    // over itself, even for a call the owner agreed to in words; the owner's click is the record.
+    if (!scope.owner && (agentSessionId === scope.agentSessionId || grants.holder(agentSessionId, requestId) === scope.agentSessionId)) throw new Error(OWN_REQUEST)
     if (!scope.answers?.(agentSessionId)) throw new Error(scope.owner ? 'No such agent conversation in this project' : 'That conversation is not one of your coworkers; a wizard answers only for the coworkers it controls')
     // Every class, as in the card: the wand holds the owner's authority (owner decision 2026-09-28, H13).
-    return grants.decide(agentSessionId, text(args.requestId, 'requestId', true)!, text(args.decision, 'decision', true) as GrantDecision, scope.owner ? 'owner' : 'wizard')
+    return grants.decide(agentSessionId, requestId, text(args.decision, 'decision', true) as GrantDecision, scope.owner ? 'owner' : 'wizard')
   }
   throw new Error(`Unknown permissions method: ${method}`)
 }

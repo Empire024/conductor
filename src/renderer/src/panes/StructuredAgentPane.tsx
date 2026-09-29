@@ -45,6 +45,7 @@ import { SuccessionBanner, successionOf } from './SuccessionBanner'
 import { cleanIpcError } from '../ipc-errors'
 import { copyText } from '../clipboard'
 import { onAgentControlGrants, onAgentControlSettings } from '../agent-control-settings'
+import { PendingGrantDock, REVEAL_CONVERSATION_EVENT } from '../components/permission-grants/PendingGrantDock'
 import { TabLineageLine } from './TabLineageLine'
 import './StructuredAgentPane.css'
 
@@ -692,6 +693,9 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     return readingWindow.map((item) => latest.get(item.id) ?? item)
   }, [projection.items, conversationItems, visibleCount, readingWindow])
   useLayoutEffect(() => { lastVisibleItems.current = visibleItems }, [visibleItems])
+  // A permission card among the last few items at the live end is in view already; the dock above
+  // the composer pins every other waiting one (paged out, scrolled past, or never written here).
+  const renderedGrantCards = useMemo(() => new Set(readingWindow ? [] : visibleItems.slice(-5).flatMap(item => item.data.type === 'notice' && item.nativeItemId ? [item.nativeItemId] : [])), [visibleItems, readingWindow])
   // Back at the live end (the reading window let go), the history paged in to read it goes again,
   // so typing never pays for how far back the owner once scrolled. Only on that transition: a
   // restored view that was left scrolled up keeps the cards it was showing.
@@ -922,6 +926,14 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     setNewOutput(false)
     requestAnimationFrame(() => { if (timeline.current) timeline.current.scrollTop = timeline.current.scrollHeight })
   }
+  // A conversation link or Needs attention row that names this tab brings its live end into view,
+  // so a link to the tab already on screen still shows what it pointed at (PendingGrantDock pulses).
+  const jumpToLatestRef = useRef(jumpToLatest); jumpToLatestRef.current = jumpToLatest
+  useEffect(() => {
+    const reveal = (event: Event): void => { if ((event as CustomEvent<{ agentSessionId?: string }>).detail?.agentSessionId === activeId) jumpToLatestRef.current() }
+    window.addEventListener(REVEAL_CONVERSATION_EVENT, reveal)
+    return () => window.removeEventListener(REVEAL_CONVERSATION_EVENT, reveal)
+  }, [activeId])
   // Same identity notion the subagent roster counts by: same color and disambiguated name
   // everywhere a given subagent shows up, not a second, independent labeling scheme.
   const subagentRoster = useMemo(() => summarizeSubagents(projection.items, projection.runtimeId, projection.phase, false), [projection.items, projection.runtimeId, projection.phase])
@@ -1034,6 +1046,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     {find.open && <ConversationFindBar query={find.query} count={findMatches.length} index={find.index} results={findResults} searching={findSearching} focusToken={findFocus} onQuery={query => dispatchFind({ type: 'query', query })} onStep={direction => dispatchFind({ type: 'step', direction, count: findMatches.length })} onOpenHit={openFindHit} onClose={() => { dispatchFind({ type: 'close' }); if (composer.current && !composer.current.disabled) composer.current.focus(); else timeline.current?.focus() }} />}
     {timelineView}
     <StructuredAgentTelemetry key={activeId} items={projection.items} runtimeId={projection.runtimeId} phase={projection.phase} truncated={projection.truncated} sessionId={activeId} cwd={fileCwd} projectId={props.project.id} interactive={!historical} onInspectAttachment={setInspectAttachment} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} />
+    {!historical && <PendingGrantDock agentSessionId={activeId} rendered={renderedGrantCards} />}
     <form className="sa-composer agent-prompt-surface" onSubmit={event => { event.preventDefault(); void submit() }} onDragOver={event => { if (!isComposerFileDrag(event.dataTransfer.types)) return; event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'copy' }} onDrop={event => { if (!isComposerFileDrag(event.dataTransfer.types)) return; event.preventDefault(); event.stopPropagation(); void dropComposerFiles(event.dataTransfer) }}>
       {pendingSteering.length > 0 && <div className="sa-queue-list" aria-label="Pending steering messages">{pendingSteering.map(input => <div className="sa-queue sa-steering-prompt" key={input.id}>
         <strong>{input.status === 'sending' ? 'Sending' : input.status === 'accepted' ? 'Received' : input.status === 'cancelled' ? 'Not sent' : 'Delivery uncertain'}</strong>

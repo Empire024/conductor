@@ -976,6 +976,12 @@ export class PermissionGrants {
     return Boolean(told && this.ports.retryQueued?.(agentSessionId, told))
   }
 
+  /** The conversation that holds this request now, following the handoffs it was moved through;
+   *  permissions.decide refuses a caller answering what it holds itself. */
+  holder(agentSessionId: string, requestId: string): string {
+    return this.holderOf(agentSessionId, this.aliases.get(agentSessionId)?.get(requestId) ?? requestId)
+  }
+
   /** Who holds a request now: the named conversation, or the successor a handoff moved it to. */
   private holderOf(agentSessionId: string, requestId: string): string {
     for (let current = agentSessionId, hops = 0; hops < 16; hops++) {

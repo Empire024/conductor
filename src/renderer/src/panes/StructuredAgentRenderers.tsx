@@ -24,6 +24,7 @@ import { canOpenPastedText, openPastedText } from '../pasted-text-open'
 import { autoModeDenialOf } from '../../../shared/auto-mode-denial'
 import { AutoModeDenialCard } from './AutoModeDenialCard'
 import { LivePermissionGrantCard } from '../components/permission-grants/PermissionGrantCard'
+import { revealConversation } from '../components/permission-grants/PendingGrantDock'
 import { grantStatusOf, permissionGrantOf } from '../../../shared/permission-grants'
 import { localStopOf } from '../../../shared/local-stop'
 import { localEnergyOf } from '../../../shared/local-energy'
@@ -247,7 +248,7 @@ export const StructuredMarkdown = memo(function StructuredMarkdown({ text, cwd, 
       const internal = safeConductorLink(href)
       // A link to an open tab names it on hover, with its project when that is another one.
       const conversation = internal ? resolveConversationRef(currentConversationDirectory(), href) : null
-      if (conversation) return <a href="#" className={className ?? 'sa-conversation-ref'} title={title ?? 'Show ' + conversationLabel(conversation, projectId)} onClick={(event) => { event.preventDefault(); void window.conductor.agentControl.openUri(href).catch(reason => setLinkError(reason instanceof Error ? reason.message : String(reason))) }}>{children}</a>
+      if (conversation) return <a href="#" className={className ?? 'sa-conversation-ref'} title={title ?? 'Show ' + conversationLabel(conversation, projectId)} onClick={(event) => { event.preventDefault(); void window.conductor.agentControl.openUri(href).then(() => revealConversation(conversation.agentSessionId), reason => setLinkError(reason instanceof Error ? reason.message : String(reason))) }}>{children}</a>
       const external = safeExternalLink(href)
       const target = external || internal ? null : resolveFileLinkTarget(href, cwd, projects, machineId)
       const sibling = Boolean(target?.projectId && target.projectId !== projectId)
