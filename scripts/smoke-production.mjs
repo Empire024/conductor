@@ -129,8 +129,13 @@ try {
   assert.ok(resumed.events.some(event => event.kind === 'recovery' || /resum|recover/i.test(event.message)), 'no recovery event in the run journal')
   summary.runs.first = { id: first, doneBefore: doneBefore.length, relaunchSeconds: seconds }
   record('restart-resume', 'PASS', { doneBefore: doneBefore.length, relaunchSeconds: seconds }, `run ${first} resumed after app.restart and completed; no done step repeated`)
-  status = await idle('the coalesced follow-up run')
-  assert.ok(status.runs.filter(run => run.kind === 'audit').length >= 2, 'the coalesced trigger did not run once more')
+  // The follow-up is queued only after the finished run's cheap fingerprint (index.ts finished →
+  // startRun awaits it), so for a moment there is no active run and only one audit: wait for the
+  // second audit to exist and to finish, not merely for "no active run".
+  status = await poll(async () => {
+    const now = await call('production.status', {})
+    return !now.activeRun && now.runs.filter(run => run.kind === 'audit').length >= 2 ? now : null
+  }, { timeoutMs: 300_000, intervalMs: 1000, label: 'the coalesced trigger to run once more and finish' })
 
   // ---- 4. gate, finding, fix task, report ---------------------------------------------------
   step('gate, finding, task, report')
