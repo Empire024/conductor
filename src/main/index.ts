@@ -103,6 +103,8 @@ import { createLocalModelRunner, realRunnerPorts } from './local-assist/model-ru
 import { listLocalServers, stopLocalServer, type LocalStopRequest } from './local-models/servers'
 import { agentTabIds, anonymousConversations } from './local-models/anonymous'
 import { loadConfig as loadLocalConfig, readApiKey as readLocalApiKey } from './local-models/config'
+import { DECIDER_MODEL, DeciderServer, deciderPaths } from './local-models/decider-server'
+import { localRoot } from './local-models/paths'
 import type { ScheduleRunner } from './schedule-runner'
 import { createScheduledTasks, latestModelsBuiltin } from './schedule-wiring'
 import { registerScheduleIpc } from './schedule-ipc'
@@ -725,7 +727,7 @@ const disposeRuntimeServices = (): void => {
     ['idea-runs', () => { disposeIdeaRunsIpc?.(); ideaRunsRegistration?.dispose() }],
     ['ideas', () => { disposeIdeasIpc?.(); ideasRegistration?.dispose() }],
     ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); browserMcp?.close(); localAssist?.close(); permissionGrants?.close(); browserViews?.dispose(); projectFileChanges?.close() }],
-    ['model intelligence', () => { disposeModelObserver?.(); modelIntelligence?.dispose(); modelIntelligence = undefined }],
+    ['model intelligence', () => { disposeModelObserver?.(); modelIntelligence?.dispose(); modelIntelligence = undefined; deciderServer?.dispose() }],
     ['coworker auto-close', () => { coworkerAutoClose?.dispose(); finishedTabs?.dispose(); tokenBurnMeter?.dispose() }],
     ['terminals', () => terminals?.dispose()],
     ['agents', () => agents?.dispose()],
@@ -900,8 +902,28 @@ const runningLocalServers = (): ReturnType<typeof listLocalServers> => {
   try { models = Object.values(loadLocalConfig().models) } catch { /* No local stack: only the process list can show a server. */ }
   return listLocalServers({ models: () => models, record: readRunRecord, alive: llamaProcessAlive, inventory: runningLlamaProcesses })
 }
+/** The CPU decision model's sidecar (docs/model-routing.md, "CPU decider"), created on first use; null without a
+ *  local root. A test profile runs it only when CONDUCTOR_TEST_DECIDER=1 asks, so other smokes never start it. */
+let deciderServer: DeciderServer | null | undefined
+const decider = (): DeciderServer | null => {
+  if (deciderServer !== undefined) return deciderServer
+  if (process.env.CONDUCTOR_TEST_USER_DATA && process.env.CONDUCTOR_TEST_DECIDER !== '1') return deciderServer = null
+  try { deciderServer = new DeciderServer({ paths: deciderPaths(localRoot()), apiKey: readLocalApiKey, log: message => console.log(`[decider] ${message}`) }) }
+  catch { deciderServer = null }
+  return deciderServer
+}
+/** local.servers also lists the decider (CPU, never the GPU server): installed, whether running or not. */
+const localServersWithDecider = (): Array<ReturnType<typeof listLocalServers>[number] | ReturnType<DeciderServer['status']>> => {
+  const status = decider()?.status()
+  return [...runningLocalServers(), ...(status && status.state !== 'not-installed' ? [status] : [])]
+}
 /** local.stop: one Conductor-started server, refused while a turn uses it unless forced. */
-const stopRunningLocalServer = (request: LocalStopRequest): ReturnType<typeof stopLocalServer> => {
+const stopRunningLocalServer = async (request: LocalStopRequest): ReturnType<typeof stopLocalServer> => {
+  const sidecar = decider(), status = sidecar?.status()
+  if (sidecar && status && (request.model === DECIDER_MODEL || request.model === 'decider' || (request.pid !== undefined && request.pid === status.pid))) {
+    // The decider holds no conversation: stopping it only costs the next decision a cold start.
+    return { stopped: true, model: DECIDER_MODEL, pid: status.pid, port: status.port, forced: false, message: await sidecar.stop() }
+  }
   const config = loadLocalConfig(), apiKey = readLocalApiKey()
   const servers = runningLocalServers()
   return stopLocalServer(servers, request, {
@@ -2846,7 +2868,7 @@ app.whenReady().then(async () => {
       stopConfirmation: { pending: () => stopConfirmations.pending(), answer: stopWork => stopConfirmations.answer(stopWork), wouldAsk: stopQuestion }
     },
     delivery,
-    localModels: { availability: localModelAvailability, servers: runningLocalServers, stop: stopRunningLocalServer, vramTotalGb: () => vramTotalGb() },
+    localModels: { availability: localModelAvailability, servers: localServersWithDecider, stop: stopRunningLocalServer, vramTotalGb: () => vramTotalGb() },
     tabArchive: { archive: (projectId, sessionId, tabIds) => { if (!tabArchiver) throw new Error('The tab archive is still starting; try again in a moment'); return tabArchiver.archive(projectId, sessionId, tabIds) } },
     // A tab an agent opens remembers who opened it, for its "opened by" / "continued from" line.
     providers: () => agents.listProviders(), ui: request => { recordTabOpener(database, request); const reopened = reopenedConversation(request); if (reopened) agents.structured.endArchive(reopened); return agentControlUi!.request(request) },
@@ -2893,7 +2915,7 @@ app.whenReady().then(async () => {
         const result = await llamaHealth(port, apiKey, 4000)
         return { healthy: result.ok, processing: result.ok ? await slotsProcessing(port, apiKey) : false, ...(result.detail ? { detail: result.detail } : {}) }
       }
-    }), input => { modelIntelligence?.stageSettled(input) })
+    }), input => { modelIntelligence?.stageSettled(input) }, (input, verdict) => { modelIntelligence?.loopAssessed(input, verdict) })
   })
   control.setDurableJobs(durableJobs)
   if (localMachineReadiness) control.setLocalReadiness(localMachineReadiness)
@@ -3038,7 +3060,8 @@ app.whenReady().then(async () => {
     runner: async preferred => createLocalModelRunner(await realRunnerPorts(), { preferred: [preferred] }),
     localRunner: localAssist?.runner ?? null,
     cloudTurn: (key, prompt, signal, options) => control.evaluationTurn(key, prompt, signal, options),
-    weeklyUsage: provider => ['claude', 'codex', 'grok'].includes(provider) ? weeklyUsagePercent(agents.structured.usageLimits(provider as 'claude' | 'codex' | 'grok').flatMap(report => report.windows)) : null
+    weeklyUsage: provider => ['claude', 'codex', 'grok'].includes(provider) ? weeklyUsagePercent(agents.structured.usageLimits(provider as 'claude' | 'codex' | 'grok').flatMap(report => report.windows)) : null,
+    decider: decider() && { port: { predict: (state, questions, options) => decider()!.predict(state, questions, options) }, available: () => decider()?.installed().installed ?? false }
   }).then(service => {
     if (servicesDisposed) { service.dispose(); return }
     modelIntelligence = service
