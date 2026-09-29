@@ -611,11 +611,8 @@ export class PermissionGrants {
     this.changed()
     const busy = ACTIVE_PHASES.has(this.ports.phase(agentSessionId) ?? '')
     const handed = await this.deliver(agentSessionId, text, [grant], actor)
-    const later = actor === 'wizard'
-      ? 'If that turn is still running 2 min from now, Conductor interrupts it so the retry runs.'
-      : 'If that turn is still running 2 min from now, the tab says so; Esc there interrupts it and the retry runs at once.'
     const next = !handed ? 'The conversation is still stopping its last turn; Conductor hands it the retry as soon as it has stopped.'
-      : busy ? `The conversation retries it in a message of its own once its current turn ends. ${later}` : 'The conversation was told to retry it.'
+      : busy ? (this.ports.interrupt ? 'Conductor interrupts its running turn, and the retry runs at once as a message of its own.' : 'The conversation retries it in a message of its own once its current turn ends; Esc in its tab interrupts that turn so the retry runs at once.') : 'The conversation was told to retry it.'
     return { status: DECIDED[decision], grant, message: `Approved: ${grant.rule}. ${next}` }
   }
 
@@ -697,6 +694,21 @@ export class PermissionGrants {
     const waited = now - delivery.since
     if (waited >= RETRY_STALE_MS) { this.withdrawStale(key, delivery, waited); return }
     if (!ACTIVE_PHASES.has(phase)) return
+    // Any approval interrupts the running turn at once (owner 2026-09-29: while an approval waited,
+    // the model went round the refused call four times). The retry then runs as a turn of its own,
+    // which is the only form the classifier honours.
+    if (!delivery.noticed && this.ports.interrupt && phase !== 'interrupting') {
+      delivery.noticed = true
+      const rules = delivery.rules.join(', ')
+      const itemId = `grant-waiting:${delivery.grantIds[0]}`
+      const by = delivery.approver === 'wizard' ? 'A wizard tab' : 'The owner'
+      this.ports.notice(agentSessionId, `${by} approved ${rules}, so Conductor interrupted the running turn; the retry runs now as a message of its own.`, { permissionGrantWaiting: { rules: delivery.rules, interrupted: true } }, itemId)
+      void this.ports.interrupt(agentSessionId).catch(error => {
+        this.ports.notice(agentSessionId, `The approved call ${rules} is queued behind a running turn, and Conductor could not interrupt it (${error instanceof Error ? error.message : 'interrupt failed'}). Use "Interrupt and retry" on its approval card, or press Esc in this tab; the retry then runs at once.`, { permissionGrantWaiting: { rules: delivery.rules, interrupted: false } }, itemId)
+        if (this.deliveries.get(key) === delivery) { delivery.offered = true; this.changed() }
+      })
+      return
+    }
     if (delivery.headsUp === 'no' && this.ports.headsUp && STEERABLE_PHASES.has(phase)) {
       delivery.headsUp = 'sending'
       // Steered into the running turn or not sent at all (wiring headsUp), so it never comes after
@@ -846,6 +858,10 @@ export class PermissionGrants {
       open!.delete(id)
       out.add(id)
       request.holder = holder
+      // The exact call belonged to the predecessor's runtime; the successor's retry is a new call
+      // that no finished-execution report of the old runtime can match, so bind by rule instead.
+      delete request.call
+      delete request.execution
       target.set(id, request)
     }
     if (target.size) this.requests.set(toId, target)
@@ -854,6 +870,7 @@ export class PermissionGrants {
     this.grants.delete(fromId)
     for (const grant of granted) {
       grant.agentSessionId = toId
+      delete grant.execution
       this.movedFrom.set(grant.id, [...(this.movedFrom.get(grant.id) ?? []), fromId])
     }
     if (granted.length) this.grants.set(toId, [...(this.grants.get(toId) ?? []).filter(entry => !granted.some(grant => grant.rule === entry.rule)), ...granted])

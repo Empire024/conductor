@@ -532,6 +532,25 @@ describe('a pending owner approval survives a handoff (grant-survives-handoff)',
     expect(h.grants.list(successor).requests[0]!.status).toBe('used')
   })
 
+  it('spends a moved denial bound to the predecessor runtime when the successor runs it, approved before or after the move', async () => {
+    const command = 'echo moved'
+    const rule = `Bash(${command})`
+    const withCall = (toolUseId: string) => ({ ...describeGrantRequest({ tool: 'Bash', input: { command }, cwd, category: 'External System Write', toolUseId }),
+      call: grantCallIdentity({ runtimeId: 'runtime-a', nativeSessionId: 'session-a', toolUseId, tool: 'Bash', input: { command } }) })
+    for (const approvedFirst of [false, true]) {
+      const h = harness()
+      h.grants.adapterPort(tab).denied('auto-denial:a-1', withCall('a-1'))
+      if (approvedFirst) await h.grants.decide(tab, 'auto-denial:a-1', 'approve-once', 'owner')
+      await h.grants.transfer(tab, successor)
+      if (!approvedFirst) await h.grants.decide(successor, 'auto-denial:a-1', 'approve-once', 'owner')
+      expect(h.grants.rules(successor)).toEqual([{ rule, once: true }])
+      // B's retry is another runtime's call: the pre-tool report spends it, as for a permissions.request grant.
+      h.grants.adapterPort(successor).used(rule)
+      expect(h.grants.rules(successor)).toEqual([])
+      expect(h.grants.list(successor).requests.find(entry => entry.id === 'auto-denial:a-1')?.status).toBe('used')
+    }
+  })
+
   it('files a denial the superseded tab gets after the handoff as its own, even when its id repeats one its successor holds', async () => {
     const h = harness()
     h.grants.request(tab, { command: `bash ${script}`, reason: 'fix' })
@@ -803,9 +822,9 @@ describe('an approval reaches a conversation whose turn is still running (H06)',
     expect(h.retried).toEqual([{ id: tab, text: expect.stringMatching(/^\[Conductor\] approved: Bash\(.*\(once\); retry it now\..*\(Asked in this conversation at 2026-09-28 15:00 UTC; approved by the owner at 2026-09-28 15:00 UTC\.\)$/) }])
   })
 
-  it('steers one heads-up into the running turn once it can take one, never the approval itself', async () => {
+  it('steers one heads-up into the running turn once it can take one when it cannot be interrupted, never the approval itself', async () => {
     const headsUp = vi.fn(async (_id: string, _text: string) => true).mockResolvedValueOnce(false)
-    const h = timed({ headsUp })
+    const h = timed({ headsUp, interrupt: undefined })
     await h.grants.decide(tab, h.deny('toolu_h', 'Bash', { command: ssh }, 'Production Reads'), 'approve-session', 'owner')
     await settle()
     // Not steerable at the moment of the decision: tried again on the next sweep, then never again.
@@ -818,31 +837,32 @@ describe('an approval reaches a conversation whose turn is still running (H06)',
     expect(h.retried).toHaveLength(1)
   })
 
-  it('tells the owner once, after 2 min, how to interrupt the turn; it does not interrupt on its own', async () => {
+  it('interrupts the running turn at once when the owner approves, so the retry runs without waiting', async () => {
     const h = timed()
     const result = await h.grants.decide(tab, h.deny('toolu_o', 'Bash', { command: ssh }, 'Production Reads'), 'approve-once', 'owner')
-    expect(result.message).toMatch(/once its current turn ends\. If that turn is still running 2 min from now, the tab says so/)
-    h.advance(119_000); h.grants.sweep()
-    expect(waitingNotices(h)).toEqual([])
-    h.advance(2000); h.grants.sweep(); h.advance(60_000); h.grants.sweep()
-    expect(waitingNotices(h)).toEqual([expect.objectContaining({ id: tab, message: expect.stringMatching(/queued behind a turn that has run 12 min \(last tool: Bash\)\. Use "Interrupt and retry" on its approval card, or press Esc in this tab/) })])
-    expect(h.ports.interrupt).not.toHaveBeenCalled()
+    expect(result.message).toMatch(/Conductor interrupts its running turn, and the retry runs at once/)
+    expect(h.ports.interrupt).toHaveBeenCalledTimes(1)
+    expect(h.ports.interrupt).toHaveBeenCalledWith(tab)
+    expect(h.ports.headsUp).not.toHaveBeenCalled()
+    expect(waitingNotices(h)).toEqual([expect.objectContaining({ id: tab, message: expect.stringMatching(/^The owner approved Bash\(.*so Conductor interrupted the running turn/) })])
+    h.grants.sweep(); h.grants.sweep()
+    expect(h.ports.interrupt).toHaveBeenCalledTimes(1)
   })
 
-  it('offers the owner "Interrupt and retry" after the notice, and interrupts with the queue expedited', async () => {
-    const h = timed()
+  it('offers the owner "Interrupt and retry" when the automatic interrupt failed, and interrupts with the queue expedited', async () => {
+    const interrupt = vi.fn(async (_id: string) => undefined).mockRejectedValueOnce(new Error('runtime busy'))
+    const h = timed({ interrupt })
     const { grant } = await h.grants.decide(tab, h.deny('toolu_i', 'Bash', { command: ssh }, 'Production Reads'), 'approve-once', 'owner')
-    expect(h.grants.state().waiting).toBeUndefined()
-    h.advance(121_000); h.grants.sweep()
+    await settle()
     expect(h.grants.state().waiting).toEqual([{ agentSessionId: tab, grantIds: [grant!.id], rules: [grant!.rule], since: '2026-09-28T15:00:00.000Z' }])
     await h.grants.interruptForRetry(tab, grant!.id)
-    expect(h.ports.interrupt).toHaveBeenCalledWith(tab)
+    expect(interrupt).toHaveBeenCalledTimes(2)
     expect(h.grants.state().waiting).toBeUndefined()
     expect(waitingNotices(h).at(-1)).toMatchObject({ message: expect.stringMatching(/you interrupted that turn, so the retry runs now/) })
     // The retry started: a second click says so instead of interrupting the next turn.
     h.waiting.clear()
     await expect(h.grants.interruptForRetry(tab, grant!.id)).rejects.toThrow(/no longer waiting/)
-    expect(h.ports.interrupt).toHaveBeenCalledTimes(1)
+    expect(interrupt).toHaveBeenCalledTimes(2)
   })
 
   it('offers the card action again when the interrupt fails, and withdraws the offer when the retry runs', async () => {
@@ -858,14 +878,14 @@ describe('an approval reaches a conversation whose turn is still running (H06)',
     expect(h.grants.state().waiting).toBeUndefined()
   })
 
-  it('interrupts the turn once when a wizard approved and the retry has waited 2 min', async () => {
+  it('interrupts the turn once, at once, when a wizard approved', async () => {
     const h = timed()
     const result = await h.grants.decide(tab, h.deny('toolu_z', 'Bash', { command: ssh }, 'Production Reads'), 'approve-once', 'wizard')
-    expect(result.message).toMatch(/Conductor interrupts it so the retry runs/)
-    h.advance(121_000); h.grants.sweep(); h.grants.sweep()
+    expect(result.message).toMatch(/Conductor interrupts its running turn/)
+    h.grants.sweep(); h.grants.sweep()
     expect(h.ports.interrupt).toHaveBeenCalledTimes(1)
     expect(h.ports.interrupt).toHaveBeenCalledWith(tab)
-    expect(waitingNotices(h)).toEqual([expect.objectContaining({ message: expect.stringMatching(/A wizard tab approved it, so Conductor interrupted that turn/) })])
+    expect(waitingNotices(h)).toEqual([expect.objectContaining({ message: expect.stringMatching(/^A wizard tab approved Bash\(.*so Conductor interrupted the running turn/) })])
     // The retry ran after the interrupt: nothing more to follow.
     h.waiting.clear(); h.grants.sweep(); h.advance(40 * 60_000); h.grants.sweep()
     expect(h.ports.interrupt).toHaveBeenCalledTimes(1)
