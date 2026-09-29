@@ -22,7 +22,7 @@ import { isFrontierModel, isSessionPermission, MAX_PROMPT_CHARS, settingsForRunt
 import { rememberedPermission } from './app-settings'
 import type { CreateOrchestrationTaskInput, SaveRoutineInput, UpdateOrchestrationTaskInput } from '../shared/orchestration'
 import type { ConductorDatabase } from './database'
-import type { StructuredSessions } from './structured-sessions'
+import type { StructuredSessions, UsageLimitStop } from './structured-sessions'
 import type { OrchestrationStore } from './orchestration-store'
 import type { AgentCollaborationStore } from './agent-collaboration-store'
 import type { ProjectBacklogs } from './project-backlog'
@@ -122,6 +122,17 @@ const text = (args: Args, key: string, maximum = 20000): string => {
   return value
 }
 /** The refusal for an effort the chosen model does not take, naming the ones it does. */
+/** A relay or coordinator tab mostly passes messages on, and every turn re-reads its whole
+ *  context: it opens on medium effort unless the caller names an effort (codex-credit-burn 3).
+ *  The role is given as role, or read from a title naming a relay, bridge or coordinator. */
+const COORDINATION_TITLE = /\b(?:relay|bridge|coordinator)\b/i
+export const coordinationRole = (args: Args): boolean => {
+  if (args.role !== undefined) {
+    if (args.role !== 'relay' && args.role !== 'coordinator' && args.role !== 'worker') throw new ArgumentError(`role must be "relay", "coordinator" or "worker"; not ${JSON.stringify(args.role)}`)
+    return args.role !== 'worker'
+  }
+  return typeof args.title === 'string' && COORDINATION_TITLE.test(args.title)
+}
 const effortError = (model: { id: string; effort?: string[] }, effort: string): string => `Effort "${effort}" is not offered for ${model.id}; choose one of: ${model.effort?.length ? model.effort.join(', ') : 'none (omit effort)'}.`
 const object = (value: unknown): Args => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('args must be a JSON object of the method\'s arguments, e.g. {"agentSessionId":"agent_..."}; tools.list({methods:["<method>"]}) gives its signature')
@@ -204,7 +215,7 @@ const toolSignatures = {
   'machines.list': '() — this machine and the paired machines that can run a tab, with the projects each one accepts, plus execution nodes (kind "node", or a peer\'s node facet) that run commands through nodes.run; the local machine carries readiness (whether it comes back unattended after a reboot, with the missing steps in words)',
   'models.list': '() — available providers and model-specific effort choices; discovered runtime models take precedence',
   'tabs.list': '({projectId?,workspaceId?}) — open tabs in this workspace, including detached windows, or in a sibling project from projects.list',
-  'tabs.open': '({kind?,provider?,model?,effort?,permission?,exactPermission?,title?,machineId?,projectId?,workspaceId?,repository?,research?,contract?,jobId?,focus?,prompt?,anonymous?,direct?}) — visible tab, opened in the background with a "new" mark so the owner’s active tab, caret and window stay put; focus:true brings it into view once the owner pauses typing; agent default kind, provider/model must be available; a Claude, Codex or Grok coworker opens on Auto (the highest mode the provider offers) unless the controller is itself read-only or planning; only with exactPermission: true — for an agent that cannot be trusted at all — does it open on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode, clamped to the controller’s autonomy and to what the provider offers; a local model has no Auto and opens on accept-edits or read-only as before; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list: when that project has an active wizard (projects.list) and neither workspaceId nor direct:true is given, no tab opens and the prompt is delivered to the wizard as agents.steer would, prefixed with who sent it, and the result names it (deliveredTo {agentSessionId,title,projectId,workspaceId}, delivery "started"|"queued"); the wizard replies with send_message; with no wizard the tab opens in the workspace of that project’s most recently active root controller, else its first workspace; direct:true opens your own tab there as before; only the controller that opened such a tab may steer it; repository/research open a provider-local tab with its repository-writes and deep-research grants already on, under the agents.grant rules; contract ({allowedPaths?:string[],acceptance?:{command,timeoutSec?}}) opens a provider-local tab as a bounded coding task: the runtime refuses writes outside allowedPaths, runs the acceptance command itself after edits, and when it passes with only allowed paths changed tells the model to finish; kind "job" with jobId (from jobs.list) opens the view of that durable job in this workspace, and asking again returns the open one (focus:true brings it into view); prompt submits it as the new tab’s first turn exactly as agents.submit would (same path, same permission checks), and the result says submitted:true; anonymous:true (local models only) opens it as an anonymous conversation hidden from a kept controller’s history. A cloud tab (provider "cloud") takes its own narrower shape, see cloud.start. Any other key is rejected, naming it and the accepted keys',
+  'tabs.open': '({kind?,provider?,model?,effort?,role?,permission?,exactPermission?,title?,machineId?,projectId?,workspaceId?,repository?,research?,contract?,jobId?,focus?,prompt?,anonymous?,direct?}) — visible tab, opened in the background with a "new" mark so the owner’s active tab, caret and window stay put; focus:true brings it into view once the owner pauses typing; agent default kind, provider/model must be available; role "relay" or "coordinator" (or a title naming a relay, bridge or coordinator) opens on medium effort when effort is omitted and the model offers it, role "worker" keeps the model default; a Claude, Codex or Grok coworker opens on Auto (the highest mode the provider offers) unless the controller is itself read-only or planning; only with exactPermission: true — for an agent that cannot be trusted at all — does it open on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode, clamped to the controller’s autonomy and to what the provider offers; a local model has no Auto and opens on accept-edits or read-only as before; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list: when that project has an active wizard (projects.list) and neither workspaceId nor direct:true is given, no tab opens and the prompt is delivered to the wizard as agents.steer would, prefixed with who sent it, and the result names it (deliveredTo {agentSessionId,title,projectId,workspaceId}, delivery "started"|"queued"); the wizard replies with send_message; with no wizard the tab opens in the workspace of that project’s most recently active root controller, else its first workspace; direct:true opens your own tab there as before; only the controller that opened such a tab may steer it; repository/research open a provider-local tab with its repository-writes and deep-research grants already on, under the agents.grant rules; contract ({allowedPaths?:string[],acceptance?:{command,timeoutSec?}}) opens a provider-local tab as a bounded coding task: the runtime refuses writes outside allowedPaths, runs the acceptance command itself after edits, and when it passes with only allowed paths changed tells the model to finish; kind "job" with jobId (from jobs.list) opens the view of that durable job in this workspace, and asking again returns the open one (focus:true brings it into view); prompt submits it as the new tab’s first turn exactly as agents.submit would (same path, same permission checks), and the result says submitted:true; anonymous:true (local models only) opens it as an anonymous conversation hidden from a kept controller’s history. A cloud tab (provider "cloud") takes its own narrower shape, see cloud.start. Any other key is rejected, naming it and the accepted keys',
   'tabs.focus': '({tabId,projectId?,workspaceId?}) — brings a tab into view once the owner pauses typing (deferred:true when it is still waiting); any tab of this workspace, or an agent tab this caller controls in a sibling project (agents.list controlled:true); the same holds for rename, split, detach and close',
   'tabs.rename': '({tabId,title,projectId?,workspaceId?})',
   'tabs.split': '({tabId,direction:"horizontal"|"vertical",projectId?,workspaceId?})',
@@ -261,7 +272,7 @@ const toolSignatures = {
   'loops.proposals': '({id?}) — proposals in this project, optionally filtered to one loop id, each with its status (pending, applied, rejected, reverted)',
   'app.update.authorize': '({agentSessionId,allowed?}) — let another visible conversation (typically a local model) run app.update without the owner dialog; only a non-local coworker may grant it, never to itself, and allowed:false revokes',
   'router.start': '({prompt,provider?,model?}) — create/reuse the project router definition, open its tab, dispatch the requested task',
-  'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,route?:{features?,constraints?},permission?,exactPermission?,projectTaskIds?:string[],projectId?,workspaceId?,direct?,repository?,research?,contract?,deliver?:"self"|"controller"}]}) - one to four visible coworkers with actual models/efforts; a task with route and no provider/model/effort lets the router choose them (features default to the prompt’s categorisation; constraints as models.route) and opens that choice exactly as if you had named it, returning decisionId and the route explanation (decisions.get, models.outcome); a native coworker opens on Auto, exactly as tabs.open does, and exactPermission: true keeps a lower mode for an agent that cannot be trusted at all; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance, and cannot be combined with projectId because a claim belongs to the project that owns it; a task for another project with an active wizard goes to that wizard exactly as tabs.open does (result deliveredTo, no tab, no orchestration row) unless it names workspaceId or direct:true; repository/research open a provider-local worker with its grants already on, as tabs.open does; deliver (default "self") is what the worker is told about delivery: "self" ships its own local commit with git.ship and marks its orchestration task done, "controller" (you integrate the batch) reports its changed paths, a commit message and what it verified with agents.report and never commits, ships or closes the task; a worker whose prompt was refused before any turn has its tab closed and its task dropped (tabClosed: true, with the error)'
+  'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,role?,route?:{features?,constraints?},permission?,exactPermission?,projectTaskIds?:string[],projectId?,workspaceId?,direct?,repository?,research?,contract?,deliver?:"self"|"controller"}]}) - one to four visible coworkers with actual models/efforts; role is as for tabs.open; a task with route and no provider/model/effort lets the router choose them (features default to the prompt’s categorisation; constraints as models.route) and opens that choice exactly as if you had named it, returning decisionId and the route explanation (decisions.get, models.outcome); a native coworker opens on Auto, exactly as tabs.open does, and exactPermission: true keeps a lower mode for an agent that cannot be trusted at all; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance, and cannot be combined with projectId because a claim belongs to the project that owns it; a task for another project with an active wizard goes to that wizard exactly as tabs.open does (result deliveredTo, no tab, no orchestration row) unless it names workspaceId or direct:true; repository/research open a provider-local worker with its grants already on, as tabs.open does; deliver (default "self") is what the worker is told about delivery: "self" ships its own local commit with git.ship and marks its orchestration task done, "controller" (you integrate the batch) reports its changed paths, a commit message and what it verified with agents.report and never commits, ships or closes the task; a worker whose prompt was refused before any turn has its tab closed and its task dropped (tabClosed: true, with the error)'
 } as const
 
 /** The methods a caller may point at another project the owner has open in this window. Writes
@@ -444,6 +455,28 @@ export class AgentControl {
       }
     }))
     this.approvalRouting.shadow = deps.modelIntelligence?.approvalShadow
+    deps.sessions.onLimitStop?.(stop => { void this.reportLimitStop(stop).catch(() => undefined) })
+  }
+
+  /** A coworker whose turn ended on its provider's usage limit is reported to its controller at
+   *  once, as agents.report would (codex-credit-burn 4). A limit-stopped Codex tab only reads
+   *  `failed`; on 2026-09-29 a controller waiting for such a chain's report sat idle for 7 hours. */
+  private async reportLimitStop(stop: UsageLimitStop): Promise<void> {
+    const { database, sessions } = this.deps
+    const id = stop.spec.id, link = this.reportLink(id)
+    if (!link) return
+    const controllerId = this.successorOf(link.controllerProjectId ?? link.projectId, link.controllerAgentSessionId)
+    const controllerState = database.structured.snapshot(controllerId)
+    if (!controllerState || controllerId === id) return
+    const title = this.tabs({ projectId: stop.spec.projectId, sessionId: stop.spec.sessionId, agentSessionId: id }).find(tab => tab.resourceId === id)?.title || database.structured.snapshot(id)?.title || stop.spec.title || 'Coworker'
+    // An anonymous coworker's words stay out of a controller that keeps a history.
+    const said = anonymousConversations.has(id) && !anonymousConversations.has(controllerId) ? '' : `: ${stop.message.replace(/\s+/g, ' ').trim().slice(0, 400).replace(/[.\s]+$/, '')}`
+    const when = stop.resumeAt ? new Date(stop.resumeAt).toISOString() : null
+    const resume = stop.continues && when ? `Conductor sends it "continue" automatically at ${when}.`
+      : when ? `Its usage window reopens at ${when}; nothing resumes it automatically.`
+        : 'The provider gave no reset time; nothing resumes it automatically.'
+    const body = `[Conductor] Your coworker "${title}" (${id}, ${stop.spec.provider}) stopped on its provider's usage limit${said}. ${resume} Do not wait on its report: take the work over or hand it to another provider (tabs.open with another provider and model), or wait for the reset only if the work can wait.`
+    await sessions.steerOrStart(controllerId, body, controllerState.settings, [], { agentSessionId: id, label: `${title} (usage limit)` })
   }
 
   /** The reviewer routing handed to the approval gate; model intelligence rides on it as its shadow. */
@@ -1328,7 +1361,7 @@ export class AgentControl {
       const provider = (args.provider ?? source.provider) as StructuredProvider
       const { model, resolvedFrom } = pickModel(catalog, provider, args.model ?? undefined)
       if (resolvedFrom) modelResolvedFrom = resolvedFrom
-      const effort = args.effort === undefined ? model.defaultEffort : text(args, 'effort', 40)
+      const effort = args.effort === undefined ? coordinationRole(args) && model.effort?.includes('medium') ? 'medium' : model.defaultEffort : text(args, 'effort', 40)
       if (effort && !model.effort?.includes(effort)) throw new ArgumentError(effortError(model, effort))
       if (args.permission !== undefined && !isSessionPermission(args.permission)) throw new ArgumentError(`permission must be one of read-only, default, accept-edits, auto (models.list says which each provider offers); not ${JSON.stringify(args.permission)}`)
       if (args.exactPermission !== undefined && typeof args.exactPermission !== 'boolean') throw new Error('exactPermission must be true or false')
@@ -2665,6 +2698,7 @@ export class AgentControl {
    *  Work for another project's wizard, cloud runs, routed tasks (the router picks the model) and
    *  tabs on another machine (its own catalog decides) are checked where they go. */
   private checkDispatchTask(scope: AgentControlScope, request: Args): void {
+    coordinationRole(request)
     if (request.provider === 'cloud' || request.route !== undefined) return
     const handed = this.handIn(scope, request)
     if (handed && 'wizard' in handed) return

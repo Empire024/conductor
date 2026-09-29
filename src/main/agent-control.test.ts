@@ -15,6 +15,7 @@ import type { AgentProviderInfo, AgentSpec, PaneTab } from '../shared/models'
 import { LOCAL_CONNECTION, type MachineProjectLink } from '../shared/remote-control'
 import type { ProjectIdentity } from '../shared/project-identity'
 import type { AgentEventData, ProviderCapabilities, SessionProjection, StructuredProvider } from '../shared/structured-agent'
+import { PROVIDER_USAGE_LIMIT } from '../shared/structured-agent'
 import type { AdapterOptions, ProviderAdapter } from './providers/adapter'
 import { FakeDurableJobsService } from '../shared/durable-jobs-fake'
 import type { DurableJobEvent, DurableJobSummary } from '../shared/durable-jobs'
@@ -3322,5 +3323,91 @@ describe('B5-F: dispatch, list, status and artifact friction', () => {
     answer(true)
     expect(await forgetting).toEqual({ removed: true })
     expect(f.control.awaitingOwner(f.scope, 'memory.forget')).toBeNull()
+  })
+})
+
+// conductor-task:codex-credit-burn (4): a limit-stopped coworker is never silent.
+describe('a coworker stopped by its provider usage limit', () => {
+  it('is reported to its controller at once with the error and whether anything resumes it', async () => {
+    const f = fixture()
+    const tab = await f.control.call(f.scope, 'tabs.open', { title: 'Limited worker' }) as AgentControlTab
+    const id = tab.resourceId!
+    await f.control.call(f.scope, 'agents.submit', { agentSessionId: id, prompt: 'Work' })
+    await vi.waitFor(() => expect(f.database.structured.snapshot(id)!.phase).toBe('completed'))
+    const worker = f.submissions.at(-1)!
+    const before = f.submissions.length
+    // An ordinary failure says nothing to the controller.
+    worker.options.emit({ data: { type: 'error', message: 'Command failed with exit code 1' } })
+    worker.options.emit({ data: { type: 'session', phase: 'failed' } })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(f.submissions.length).toBe(before)
+    // The usage limit does, once, when the turn settles.
+    worker.options.emit({ data: { type: 'session', phase: 'running' } })
+    worker.options.emit({ data: { type: 'error', message: "You've hit your usage limit. Upgrade to Pro or try again later.", code: PROVIDER_USAGE_LIMIT } })
+    worker.options.emit({ data: { type: 'session', phase: 'failed' } })
+    await vi.waitFor(() => expect(f.submissions.length).toBe(before + 1))
+    const told = f.submissions.at(-1)!
+    expect(told.prompt).toContain(`[Conductor] Your coworker "Limited worker" (${id}, codex) stopped on its provider's usage limit: You've hit your usage limit.`)
+    expect(told.prompt).toContain('The provider gave no reset time; nothing resumes it automatically.')
+    expect(told.prompt).toContain('Do not wait on its report')
+    worker.options.emit({ data: { type: 'session', phase: 'failed' } })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(f.submissions.length).toBe(before + 1)
+  })
+
+  it('names the reset time, and says nothing for a tab nobody controls', async () => {
+    const f = fixture()
+    const tab = await f.control.call(f.scope, 'tabs.open', { title: 'Limited worker' }) as AgentControlTab
+    const id = tab.resourceId!
+    await f.control.call(f.scope, 'agents.submit', { agentSessionId: id, prompt: 'Work' })
+    await vi.waitFor(() => expect(f.database.structured.snapshot(id)!.phase).toBe('completed'))
+    const worker = f.submissions.at(-1)!
+    const before = f.submissions.length
+    worker.options.emit({ data: { type: 'session', phase: 'running' } })
+    worker.options.emit({ data: { type: 'error', message: "You've hit your usage limit. Try again in 3 hours." } })
+    worker.options.emit({ data: { type: 'session', phase: 'failed' } })
+    await vi.waitFor(() => expect(f.submissions.length).toBe(before + 1))
+    expect(f.submissions.at(-1)!.prompt).toMatch(/Its usage window reopens at \d{4}-\d\d-\d\dT[\d:.]+Z; nothing resumes it automatically\./)
+    // The owner's own uncontrolled tab: its state shows the limit, and no one is messaged.
+    const loose = agentIn(f, f.project.id, f.workspace.id, 'owner-tab')
+    await f.sessions.steerOrStart(loose.agentSessionId, 'x', f.database.structured.snapshot(loose.agentSessionId)!.settings)
+    await vi.waitFor(() => expect(f.database.structured.snapshot(loose.agentSessionId)!.phase).toBe('completed'))
+    const count = f.submissions.length
+    const ownerRun = f.submissions.at(-1)!
+    ownerRun.options.emit({ data: { type: 'session', phase: 'running' } })
+    ownerRun.options.emit({ data: { type: 'error', message: "You've hit your usage limit" } })
+    ownerRun.options.emit({ data: { type: 'session', phase: 'failed' } })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(f.submissions.length).toBe(count)
+  })
+})
+
+// conductor-task:codex-credit-burn (3): relay and coordinator tabs do not think at full effort.
+describe('coordination roles open on medium effort', () => {
+  const deep = [{ id: 'codex-deep', label: 'Codex Deep', effort: ['low', 'medium', 'high'], defaultEffort: 'high' }]
+  it('defaults a relay or coordinator to medium, keeps an explicit effort and a worker on the model default', async () => {
+    const f = fixture(false, undefined, undefined, deep)
+    const effortOf = async (args: Record<string, unknown>) => {
+      const tab = await f.control.call(f.scope, 'tabs.open', { provider: 'codex', model: 'codex-deep', ...args }) as AgentControlTab
+      return f.database.structured.snapshot(tab.resourceId!)!.settings.effort
+    }
+    expect(await effortOf({ title: 'Plain worker' })).toBe('high')
+    expect(await effortOf({ title: 'P0 bridge to the review room' })).toBe('medium')
+    expect(await effortOf({ title: 'Batch coordinator' })).toBe('medium')
+    expect(await effortOf({ title: 'Anything', role: 'relay' })).toBe('medium')
+    expect(await effortOf({ title: 'Relay that must think', effort: 'high' })).toBe('high')
+    expect(await effortOf({ title: 'Relay-named worker', role: 'worker' })).toBe('high')
+    await expect(effortOf({ role: 'boss' })).rejects.toThrow(/role must be "relay", "coordinator" or "worker"/)
+    // A model without a medium effort keeps its own default.
+    const tab = await f.control.call(f.scope, 'tabs.open', { provider: 'codex', model: 'codex-synthetic', role: 'coordinator' }) as AgentControlTab
+    expect(f.database.structured.snapshot(tab.resourceId!)!.settings.effort).toBe('low')
+  })
+
+  it('applies to router.dispatch tasks, and a bad role opens nothing', async () => {
+    const f = fixture(false, undefined, undefined, deep)
+    await expect(f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'ok', prompt: 'x', provider: 'codex', model: 'codex-deep' }, { title: 'bad', prompt: 'x', provider: 'codex', model: 'codex-deep', role: 'boss' }] })).rejects.toThrow(/Task 2 \("bad"\): role must be/)
+    const result = await f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Relay', prompt: 'Pass it on', provider: 'codex', model: 'codex-deep', role: 'relay' }] }) as { results?: Array<{ effort?: string }> } | Array<{ effort?: string }>
+    const rows = Array.isArray(result) ? result : result.results ?? []
+    expect(rows[0]?.effort).toBe('medium')
   })
 })

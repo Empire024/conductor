@@ -7,7 +7,7 @@ import { mkdirSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentActivityPhase, AgentSpec, LayoutNode, RuntimeEnsureResult } from '../shared/models'
-import { isFrontierModel, MAX_PROMPT_CHARS, PROVIDER_SAFEGUARD_REFUSAL, settingsForRuntime, WIZARD_MODEL_HINT, wizardActive } from '../shared/structured-agent'
+import { isFrontierModel, MAX_PROMPT_CHARS, PROVIDER_SAFEGUARD_REFUSAL, PROVIDER_USAGE_LIMIT, settingsForRuntime, WIZARD_MODEL_HINT, wizardActive } from '../shared/structured-agent'
 import type { ActivityStatus, AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, Json, PendingSteering, PromptDispatchAuthority, PromptOrigin, QueuedPrompt, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import type { AgentChangeHistory, RevertOutcome, RevertScope } from '../shared/agent-change-history'
 import type { ConductorDatabase } from './database'
@@ -17,7 +17,7 @@ import { createProviderAdapter } from './providers/factory'
 import type { RuntimeDetachment } from './providers/adapter'
 import { settled } from './providers/adapter-state'
 import { validateLiveTurn } from './live-test-policy'
-import { activeUsageCap, parseUsageLimitReset, usageCapKey } from './usage-limit'
+import { activeUsageCap, isUsageLimitMessage, parseUsageLimitReset, usageCapKey } from './usage-limit'
 import { carriesAccountLimits, describeAccountLimits, describeUsageCap, evaluateUsageCap, recordAccountLimits, summarizeContext, summarizeUsageRun, type AccountLimitRecord, type AccountLimitsReport, type UsageCapStatus } from '../shared/usage-accounting'
 import { LiveRuntimeBudget } from './live-runtime-budget'
 import { sanitizeDiagnostic } from './structured-store'
@@ -78,10 +78,14 @@ interface LiveSession {
   capTimer?: NodeJS.Timeout
   /** Set while the provider's own usage window is closed; the moment it reopens, in ISO. */
   limitResumeAt?: string
+  /** The usage-limit error of the turn under way; announced through onLimitStop once it settles. */
+  limitStop?: string
   currentTurn?: { text: string; settings: SessionSettings; attachments: ContextAttachment[]; origin?: PromptOrigin; fallbackAttempted: boolean }
   refusalFallback?: { text: string; settings: SessionSettings; attachments: ContextAttachment[]; origin?: PromptOrigin; model: string; notice: string }
 }
 type Factory = (provider: StructuredProvider, options: AdapterOptions) => ProviderAdapter
+/** A turn that ended on the provider's usage limit (onLimitStop). continues: Conductor sends it "continue" at resumeAt. */
+export interface UsageLimitStop { spec: AgentSpec; message: string; resumeAt: string | null; continues: boolean }
 export interface ClaudeFullAutoRefreshResult { agentSessionId: string; status: 'confirmed' | 'restart-pending' | 'blocked' | 'unchanged'; error?: string }
 /** Settings key of the conversations whose provider processes the runtime host kept running
  *  while this app restarted, by agent session id (docs/runtime-host.md). */
@@ -320,6 +324,12 @@ export class StructuredSessions {
   }
   private artifacts: AgentArtifacts
   private continuationTimers = new Map<string, NodeJS.Timeout>()
+  private limitStopListeners = new Set<(stop: UsageLimitStop) => void>()
+  /** Called once for every turn that ended on the provider's usage limit. */
+  onLimitStop(listener: (stop: UsageLimitStop) => void): () => void {
+    this.limitStopListeners.add(listener)
+    return () => { this.limitStopListeners.delete(listener) }
+  }
   constructor(
     private database: ConductorDatabase,
     private resolveExecutable: (provider: StructuredProvider) => string | null,
@@ -1602,8 +1612,17 @@ export class StructuredSessions {
     // report the wait rather than a dead end. `noteUsageLimit` re-enters `emit` for its own
     // notice; `live.limitResumeAt` is set first, so that pass is inert.
     if (data.type === 'error') {
+      // Before noteUsageLimit, which restates a phase already settled and so announces it.
+      if (!live.limitStop && data.code !== PROVIDER_SAFEGUARD_REFUSAL && (data.code === PROVIDER_USAGE_LIMIT || isUsageLimitMessage(data.message))) live.limitStop = data.message
       this.noteUsageLimit(live, data.message)
       if (data.code === PROVIDER_SAFEGUARD_REFUSAL) this.noteSafeguardRefusal(live)
+    }
+    // A turn that ended on a usage limit is announced once it settles, so whoever waits on this
+    // conversation hears of it (2026-09-29: a limit-stopped Codex chain stalled its controller 7 h).
+    if (data.type === 'session' && live.limitStop && !active.has(data.phase)) {
+      const stop: UsageLimitStop = { spec: live.spec, message: live.limitStop, resumeAt: live.limitResumeAt ?? null, continues: Boolean(live.spec.continueOnLimit && live.limitResumeAt) }
+      live.limitStop = undefined
+      queueMicrotask(() => { for (const listener of this.limitStopListeners) try { listener(stop) } catch { /* a listener never breaks the event pipeline */ } })
     }
     if (data.type === 'session') queueMicrotask(() => {
       if (data.phase === 'failed' && live.refusalFallback) void this.runSafeguardFallback(live)

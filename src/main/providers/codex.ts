@@ -6,7 +6,7 @@ import { SteeringUnavailableError, type AdapterOptions, type ProviderAdapter, ty
 import { captureAdapterState, restoreAdapterState, settled } from './adapter-state'
 import { currentRuntimeHost, JsonLineTransport, type HostedRuntimeHandle, type TransportOptions } from './transport'
 import { relayMcpConfigs, relaysMcp } from '../runtime-host/relay-config'
-import { PROVIDER_SAFEGUARD_REFUSAL } from '../../shared/structured-agent'
+import { PROVIDER_SAFEGUARD_REFUSAL, PROVIDER_USAGE_LIMIT } from '../../shared/structured-agent'
 import type { ActivityStatus, AdapterEvent, ContextAttachment, FileChange, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 import type { ClientRequest } from './generated/codex/ClientRequest'
 import type { InitializeResponse } from './generated/codex/InitializeResponse'
@@ -806,7 +806,7 @@ export class CodexAdapter implements ProviderAdapter {
           // snapshots above reconcile any input already consumed before cancellation.
           for (const [id, turnId] of this.steeringInputs) if (turnId === params.turn.id) this.inputDelivery(id, params.turn.status === 'interrupted' ? 'cancelled' : 'uncertain', native)
           this.turnId = undefined
-          if (params.turn.error) { this.sandboxSetupNotice(params.turn.error.message, context); send({ type: 'error', message: params.turn.error.message, ...(safeguardRefusal(params.turn.error.message) ? { code: PROVIDER_SAFEGUARD_REFUSAL } : {}) }) }
+          if (params.turn.error) { this.sandboxSetupNotice(params.turn.error.message, context); send({ type: 'error', message: params.turn.error.message, ...(safeguardRefusal(params.turn.error.message) ? { code: PROVIDER_SAFEGUARD_REFUSAL } : params.turn.error.codexErrorInfo === 'usageLimitExceeded' ? { code: PROVIDER_USAGE_LIMIT } : {}) }) }
           send({ type: 'session', phase: completedPhase }, { turnId: params.turn.id })
         }
         return
@@ -881,7 +881,7 @@ export class CodexAdapter implements ProviderAdapter {
         return
       case 'error':
         this.sandboxSetupNotice(params.error.message, context)
-        send({ type: 'error', message: params.error.message, ...(safeguardRefusal(params.error.message) ? { code: PROVIDER_SAFEGUARD_REFUSAL } : {}) })
+        send({ type: 'error', message: params.error.message, ...(safeguardRefusal(params.error.message) ? { code: PROVIDER_SAFEGUARD_REFUSAL } : params.error.codexErrorInfo === 'usageLimitExceeded' && !params.willRetry ? { code: PROVIDER_USAGE_LIMIT } : {}) })
         if (params.willRetry && (this.options.environment ?? process.env).CONDUCTOR_LIVE_TESTS === '1' && !this.liveRetryStopped) {
           this.liveRetryStopped = true
           this.interrupted = true

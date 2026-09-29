@@ -7,7 +7,8 @@ const RESET_LANGUAGE = /\b(?:reset(?:s|ting)?|try again|retry|available(?: again
 const AVAILABLE_RESET_CREDITS = /\b(?:you\s+have\s+)?\d+\s+(?:usage[\s-]+)?limit\s+resets?\s+available\b/i
 const BLOCKED_LIMIT_LANGUAGE = /\b(?:hit|reached|exceeded|exhausted|blocked)\b|\btoo many requests\b/i
 const PUNCTUATED_LIMIT_RESET = /(?:\b(?:(?:usage|rate)[\s-]*)?limit\b|\bquota\b)\s*[,;:.\u2013\u2014-]\s*(?:reset|try again|retry|available again|continue)/i
-const DURATION_PART = String.raw`\d+(?:\.\d+)?\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b`
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
+const DURATION_PART =String.raw`\d+(?:\.\d+)?\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b`
 
 const parseDuration = (value: string): number => {
   let milliseconds = 0
@@ -50,6 +51,19 @@ export const parseUsageLimitReset = (text: string, from = new Date()): Date | nu
     if (!Number.isNaN(parsed.getTime())) return parsed
   }
 
+  // Codex names a later day by month: "try again at Sep 29th, 2026 7:05 AM".
+  const dated = text.match(/\b(?:reset(?:s|ting)?|try again|retry|available(?: again)?|continue)\b[^\r\n]{0,20}?\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(20\d\d)?,?\s*(?:at\s+)?(?:(\d{1,2})(?::([0-5]\d))?\s*(am|pm)?)?/i)
+  if (dated) {
+    const month = MONTHS.indexOf(dated[1]!.toLowerCase()), day = Number(dated[2])
+    let hour = Number(dated[4] ?? 0)
+    const meridiem = dated[6]?.toLowerCase()
+    if (meridiem === 'pm' && hour < 12) hour += 12
+    if (meridiem === 'am' && hour === 12) hour = 0
+    const result = new Date(dated[3] ? Number(dated[3]) : from.getFullYear(), month, day, hour, Number(dated[5] ?? 0), 0, 0)
+    if (!dated[3] && result.getTime() < from.getTime() - 86_400_000) result.setFullYear(result.getFullYear() + 1)
+    if (day >= 1 && day <= 31 && hour <= 23 && !Number.isNaN(result.getTime())) return result
+  }
+
   const clock = text.match(
     /\b(?:reset(?:s|ting)?|try again|retry|available(?: again)?|continue)[^0-9\r\n]{0,20}(?:at\s*)?([0-2]?\d(?::[0-5]\d)?\s*(?:am|pm)?)\b/i
   )?.[1]
@@ -73,6 +87,12 @@ export const parseUsageLimitReset = (text: string, from = new Date()): Date | nu
   if (result.getTime() <= from.getTime() + 30_000) result.setDate(result.getDate() + 1)
   return result
 }
+
+/** Whether a provider error says the account is out of quota, reset time or not ("You've hit
+ *  your usage limit"). A turn that ends on one has stopped until the window reopens, so its
+ *  controller is told (StructuredSessions.onLimitStop); an offer of reset credits is not one. */
+export const isUsageLimitMessage = (text: string): boolean =>
+  !AVAILABLE_RESET_CREDITS.test(text) && LIMIT_LANGUAGE.test(text) && (BLOCKED_LIMIT_LANGUAGE.test(text) || PUNCTUATED_LIMIT_RESET.test(text))
 
 /* ------------------------------------------------------------------------- *
  * Usage caps

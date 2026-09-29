@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { AgentEventData, TimelineItem } from '../shared/structured-agent'
 import { accountWindowMovement, describeUsageCap, evaluateUsageCap, normalizeUsageWindows, parseUsageCapSetting, shortWindow, summarizeUsageRun, usageWindowAppliesToModel, weeklyWindow } from '../shared/usage-accounting'
-import { activeUsageCap, parseUsageLimitReset, resolveUsageCap } from './usage-limit'
+import { activeUsageCap, isUsageLimitMessage, parseUsageLimitReset, resolveUsageCap } from './usage-limit'
 
 describe('parseUsageLimitReset', () => {
   const from = new Date(2026, 8, 6, 14, 15, 0, 0)
@@ -26,6 +26,22 @@ describe('parseUsageLimitReset', () => {
   it('preserves explicit ISO instants', () => {
     expect(parseUsageLimitReset('Usage limit reached; continue at 2026-09-07T08:45:00+02:00.', from)?.toISOString())
       .toBe('2026-09-07T06:45:00.000Z')
+  })
+
+  it('parses the month-named reset Codex gives for a later day', () => {
+    const codex = "You've hit your usage limit. Upgrade to Pro (https://openai.com/chatgpt/pricing), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 29th, 2026 7:05 AM."
+    expect(parseUsageLimitReset(codex, from)).toEqual(new Date(2026, 8, 29, 7, 5, 0, 0))
+    expect(parseUsageLimitReset("You've hit your usage limit. Try again at Oct 2nd 11:30 PM.", from)).toEqual(new Date(2026, 9, 2, 23, 30, 0, 0))
+    expect(parseUsageLimitReset("You've hit your usage limit or try again at 7:05 PM.", from)).toEqual(new Date(2026, 8, 6, 19, 5, 0, 0))
+  })
+
+  it('recognizes a usage-limit stop with or without a reset time, and nothing else', () => {
+    expect(isUsageLimitMessage("You've hit your usage limit")).toBe(true)
+    expect(isUsageLimitMessage('Usage limit reached. Try again in 2 hours.')).toBe(true)
+    expect(isUsageLimitMessage('Rate limit exceeded')).toBe(true)
+    expect(isUsageLimitMessage('The layout resize limit was changed.')).toBe(false)
+    expect(isUsageLimitMessage('You have 2 usage limit resets available. Run /usage to use one.')).toBe(false)
+    expect(isUsageLimitMessage('Command failed with exit code 1')).toBe(false)
   })
 
   it('ignores unrelated or incomplete text', () => {
