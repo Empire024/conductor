@@ -51,9 +51,15 @@ const call = async (auth, method, args = {}) => {
 }
 const snapshot = id => page.evaluate(value => window.conductor.structured.snapshot(value), id)
 const stops = async () => (await readFile(stopLog, 'utf8').catch(() => '')).split('\n').filter(Boolean).map(line => JSON.parse(line))
-// Tab rows by exact title: "Claude" is also a prefix of its successor "Claude (continued)".
-const tabRow = title => page.locator('.workspace-tab-row').filter({ has: page.getByText(title, { exact: true }) })
-const tabActivity = title => tabRow(title).locator('.tab-activity').first().getAttribute('class')
+// Rows show short labels ("…W (continued)") and a finished tab sits under a collapsed Done, so rows
+// are found by tab id (data-clarity-row), with Done opened when the row is not among the live ones.
+const tabRow = async tabId => {
+  const row = page.locator(`[data-clarity-row="${tabId}"]`)
+  if (!await row.count()) await page.locator('.workspace-done-toggle[aria-expanded="false"]').first().click().catch(() => {})
+  return row.first()
+}
+/** A row's activity indicator class; null when the row shows none (a Done row never does). */
+const tabActivity = async tabId => { const indicator = (await tabRow(tabId)).locator('.tab-activity'); return await indicator.count() ? indicator.first().getAttribute('class') : null }
 const timings = {}
 
 try {
@@ -86,7 +92,7 @@ try {
   timings.handoffAt = Date.now()
   assert.equal(result.successor, true, JSON.stringify(result))
   assert.equal(result.wizard, true)
-  const callerTitle = (await call(caller, 'tabs.list')).find(tab => tab.resourceId === callerId)?.title
+  const callerTabId = (await call(caller, 'tabs.list')).find(tab => tab.resourceId === callerId)?.id
   // Mid-step nothing is stopped: the predecessor finishes the step it is in.
   const midStep = await snapshot(callerId)
   assert.equal(midStep.phase, 'running')
@@ -117,10 +123,10 @@ try {
   assert.equal((await stops()).length, 3, 'No stop reached the successor')
   check('The successor keeps the wizard and its own three background loops, untouched')
 
-  const callerClass = await tabActivity(callerTitle), successorClass = await tabActivity(result.title)
+  const callerClass = await tabActivity(callerTabId), successorClass = await tabActivity(result.tabId)
   assert.doesNotMatch(callerClass ?? '', /working|waiting_background/, 'The handed-off tab shows no spinner: ' + callerClass)
   assert.match(successorClass ?? '', /waiting_background/, 'The successor still shows its background work: ' + successorClass)
-  await tabRow(callerTitle).click()
+  await (await tabRow(callerTabId)).locator('.workspace-tab-select').click()
   await page.waitForTimeout(500)
   await page.screenshot({ path: join(output, 'handed-off-tab-settled.png') })
   check(`The handed-off tab's indicator is settled (${callerClass}) while the successor's shows its own background work (${successorClass})`)

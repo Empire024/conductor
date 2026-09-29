@@ -40,17 +40,24 @@ async function scenario(inst) {
     await window.conductor.structured.saveSettings(value, settings)
     await window.conductor.structured.submit(value, text, settings, [])
   }, [id, prompt, wizard])
-  const tabRow = title => view.locator('.workspace-tab-row').filter({ has: view.getByText(title, { exact: true }) })
-  const activity = async title => (await tabRow(title).locator('.tab-activity').first().getAttribute('class').catch(() => null)) ?? ''
+  // Rows show short labels ("…W (continued)") and a finished tab sits under a collapsed Done, so rows
+  // are found by tab id (data-clarity-row), with Done opened when the row is not among the live ones.
+  const tabRow = async tabId => {
+    const row = view.locator(`[data-clarity-row="${tabId}"]`)
+    if (!await row.count()) await view.locator('.workspace-done-toggle[aria-expanded="false"]').first().click().catch(() => {})
+    return row.first()
+  }
+  /** A row's activity indicator class; '' when the row shows none (a Done row never does). */
+  const activity = async tabId => { const indicator = (await tabRow(tabId)).locator('.tab-activity'); return (await indicator.count() ? await indicator.first().getAttribute('class') : null) ?? '' }
   const stops = async () => (await readFile(stopLog, 'utf8').catch(() => '')).split('\n').filter(Boolean).map(line => JSON.parse(line))
 
   step('control tab C arms three loops without a handoff')
-  const c = (await openTab({ provider: 'claude', model: 'claude-fable-5-1', title: 'VR6 control C' })).resourceId
+  const cTab = await openTab({ provider: 'claude', model: 'claude-fable-5-1', title: 'VR6 control C' }), c = cTab.resourceId
   await submit(c, 'SYNTHETIC WATCH LOOPS control tab, no handoff', false)
   await poll(async () => (await snap(c))?.phase === 'completed' && (await snap(c)).backgroundTasks === 3, { timeoutMs: STEP_MS + 20_000, label: 'C completed with 3 background tasks' })
 
   step('wizard W arms three loops')
-  const w = (await openTab({ provider: 'claude', model: 'claude-fable-5-1', title: 'VR6 wizard W' })).resourceId
+  const wTab = await openTab({ provider: 'claude', model: 'claude-fable-5-1', title: 'VR6 wizard W' }), w = wTab.resourceId
   await rm(capture, { force: true })
   await submit(w, 'SYNTHETIC WATCH LOOPS arm the watchers, then hand off', true)
   const briefing = await poll(async () => { const text = await readFile(capture, 'utf8').catch(() => ''); return text.includes('Conductor app control:') ? text : null }, { timeoutMs: 20_000, label: "W's control briefing" })
@@ -81,12 +88,13 @@ async function scenario(inst) {
   const wAgent = list.find(agent => agent.agentSessionId === w), cAgent = list.find(agent => agent.agentSessionId === c)
   const numbers = {
     settledMs, drainedMs,
-    w: { phase: wSnap.phase, bg: wSnap.backgroundTasks, listPhase: wAgent?.phase, supersededBy: wAgent?.superseded?.by ?? null, activity: await activity('VR6 wizard W') },
-    successor: { phase: sSnap.phase, bg: sSnap.backgroundTasks, wizard: sSnap.settings?.wizard, activity: await activity(result.title) },
-    c: { phase: cSnap.phase, bg: cSnap.backgroundTasks, listPhase: cAgent?.phase, activity: await activity('VR6 control C') },
+    w: { phase: wSnap.phase, bg: wSnap.backgroundTasks, listPhase: wAgent?.phase, supersededBy: wAgent?.superseded?.by ?? null, activity: await activity(wTab.id) },
+    successor: { phase: sSnap.phase, bg: sSnap.backgroundTasks, wizard: sSnap.settings?.wizard, activity: await activity(result.tabId) },
+    c: { phase: cSnap.phase, bg: cSnap.backgroundTasks, listPhase: cAgent?.phase, activity: await activity(cTab.id) },
     stops: (await stops()).length
   }
-  await tabRow('VR6 wizard W').click().catch(() => {})
+  await call('tabs.focus', { tabId: wTab.id }).catch(() => {})
+  await sleep(700)
   const evidence = await shot('h2-handed-off-tab')
   const wSettled = numbers.w.phase === 'completed' && numbers.w.bg === 0 && numbers.w.supersededBy === result.agentSessionId && !/working|waiting_background/.test(numbers.w.activity)
   const successorKept = numbers.successor.bg === 3 && numbers.successor.wizard === true && /waiting_background/.test(numbers.successor.activity)

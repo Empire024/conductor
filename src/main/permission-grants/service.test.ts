@@ -342,12 +342,18 @@ describe('permissions.* through app control', () => {
     expect(asked).toMatchObject({ class: 'external', rule: expect.stringMatching(/^Bash\(ssh /) })
     await expect(callPermissions(h.grants, { agentSessionId: tab }, 'permissions.request', { command: ssh, reason: 'x', allowAll: true })).rejects.toThrow('does not take allowAll')
     await expect(callPermissions(h.grants, { agentSessionId: tab }, 'permissions.list', { agentSessionId: 'agent_other' })).rejects.toThrow('Only the owner or a wizard')
-    await expect(callPermissions(h.grants, { agentSessionId: tab }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow('answers only')
-    // A wizard cannot answer its own request; another wizard tab answers even an external one (H13).
-    await expect(callPermissions(h.grants, { agentSessionId: tab, wizard: true }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow('cannot answer its own')
-    await expect(callPermissions(h.grants, { agentSessionId: 'agent_wizard', wizard: true }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).resolves.toMatchObject({ status: 'approved-once' })
+    // The same authority as agents.approve: answers(id) is the caller's answerable set (agent-control.ts).
+    const coworkerOf = (controller: string) => (id: string) => controller === 'agent_wizard' && id === tab
+    await expect(callPermissions(h.grants, { agentSessionId: tab, answers: () => true }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow('answers only')
+    // A wizard cannot answer its own request, nor a conversation it does not control.
+    await expect(callPermissions(h.grants, { agentSessionId: tab, wizard: true, answers: () => true }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow('cannot answer its own')
+    await expect(callPermissions(h.grants, { agentSessionId: 'agent_stranger', wizard: true, answers: coworkerOf('agent_stranger') }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow('not one of your coworkers')
+    await expect(callPermissions(h.grants, { agentSessionId: 'agent_stranger', wizard: true }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow('not one of your coworkers')
+    // Its controlling wizard answers even an external one (H13), attributed to a wizard tab.
+    await expect(callPermissions(h.grants, { agentSessionId: 'agent_wizard', wizard: true, answers: coworkerOf('agent_wizard') }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).resolves.toMatchObject({ status: 'approved-once', grant: { decidedBy: 'wizard' } })
     const local = await callPermissions(h.grants, { agentSessionId: tab }, 'permissions.request', { command: 'npm run build', reason: 'build' }) as { requestId: string }
-    await expect(callPermissions(h.grants, { agentSessionId: '', owner: true }, 'permissions.decide', { agentSessionId: tab, requestId: local.requestId, decision: 'approve-once' })).resolves.toMatchObject({ status: 'approved-once' })
+    await expect(callPermissions(h.grants, { agentSessionId: '', owner: true, answers: () => false }, 'permissions.decide', { agentSessionId: tab, requestId: local.requestId, decision: 'approve-once' })).rejects.toThrow('No such agent conversation')
+    await expect(callPermissions(h.grants, { agentSessionId: '', owner: true, answers: id => id === tab }, 'permissions.decide', { agentSessionId: tab, requestId: local.requestId, decision: 'approve-once' })).resolves.toMatchObject({ status: 'approved-once', grant: { decidedBy: 'owner' } })
     expect((await callPermissions(h.grants, { agentSessionId: tab }, 'permissions.list', {}) as { grants: unknown[] }).grants).toHaveLength(2)
   })
 })

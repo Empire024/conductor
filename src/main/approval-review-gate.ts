@@ -225,6 +225,15 @@ export class ApprovalReviewGate {
       await this.respond({ sessionId: binding.spec.id, runtimeId: binding.runtimeId, requestId: binding.interaction.id, decision })
     }
   }
+  /** Whether a pending request is under stronger review, and the session-rule class its action
+   *  forms there (the key covering() matches): none for a native-owner boundary, a compound command
+   *  or an action not yet prepared. What agents.approve may truthfully promise for "session". */
+  reviewedClass(workerId: string, runtimeId: string, requestId: string): { reviewed: boolean; key?: string } {
+    const binding = this.bindings.get(this.key(workerId, runtimeId, requestId))
+    if (!binding) return { reviewed: false }
+    const key = binding.action ? commandClass({ ...binding.action, cwd: binding.spec.cwd }) : undefined
+    return { reviewed: true, ...(key ? { key } : {}) }
+  }
   /** A live boundary's local allow (model intelligence, decisions.live), else undefined and the reviewer decides. */
   private async liveVerdict(spec: AgentSpec, action: ReviewAction): Promise<{ key: string; rationale: string } | undefined> {
     try { return await this.routing?.shadow?.decideLive?.(spec, action) ?? undefined } catch { return undefined }

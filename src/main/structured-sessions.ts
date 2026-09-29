@@ -176,6 +176,9 @@ const safeErrorCode = (error: unknown): string | undefined =>
 export class StructuredSessions {
   private approvalGate: ApprovalReviewGate
   private reviewRouting?: ApprovalReviewRouting
+  /** Whether this pending approval is under stronger review, the only place an app-side session
+   *  rule (approval-review-rules.ts) is consulted, and the class such a rule would cover. */
+  approvalReviewClass(id: string, runtimeId: string, requestId: string): { reviewed: boolean; key?: string } { return this.approvalGate.reviewedClass(id, runtimeId, requestId) }
   setApprovalReviewRouting(routing: ApprovalReviewRouting): void { this.reviewRouting = routing; this.approvalGate.routing = routing }
   markApprovalReviewer(id: string): void { this.database.setSetting('approval-reviewer:' + id, 'true') }
   isApprovalReviewer(id: string): boolean { return this.database.getSetting('approval-reviewer:' + id) === 'true' }

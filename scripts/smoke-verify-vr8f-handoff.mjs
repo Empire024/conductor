@@ -60,11 +60,13 @@ const credentialOf = async (marker, intervalMs = 250) => {
     return body.result
   }
 }
-const tabRow = title => view.locator('.workspace-tab-row').filter({ has: view.getByText(title, { exact: true }) }).first()
+// Rows show short labels ("…A (continued)") and a superseded tab sits under a collapsed Done, so tabs are
+// brought forward by id, as scripts/lib/grant-handoff.mjs show() does.
+const show = async tabId => { await call('tabs.focus', { tabId }); await sleep(700) }
 const article = requestId => view.locator(`article[data-native-item-id="${requestId}"]`)
 /** The owner's click: select the tab, then the button in the card. */
-const click = async (title, requestId, name) => {
-  await tabRow(title).click()
+const click = async (tabId, requestId, name) => {
+  await show(tabId)
   const button = article(requestId).getByRole('button', { name, exact: true })
   await button.waitFor({ timeout: 15_000 })
   await button.click()
@@ -116,7 +118,7 @@ async function s1() {
   const asB = await Promise.race([credentialOf('vr8f-s1-B', 20), handing.then(() => new Promise(() => {}))])
   const firstList = await asB('permissions.list').catch(error => ({ error: errorText(error) }))
   const result = await handing
-  const b = { id: result.agentSessionId, title: result.title, as: asB }
+  const b = { id: result.agentSessionId, title: result.title, tabId: result.tabId, as: asB }
   await settled(b.id, 'B settles')
   record('S1-first-instant', 'INFO', { requestsAtPrompt: firstList.requests?.length ?? firstList.error, handoffReturned: Boolean(result) }, "B's list read as soon as B's CLI received the handoff prompt (the real model needs seconds before its first call)")
   await check('S1-B-holds', async () => {
@@ -127,12 +129,12 @@ async function s1() {
     record('S1-B-holds', ok ? 'PASS' : 'FAIL', { handoffPermissions: result.permissions ?? null, listA: listA.requests.length, listB: listB.requests.map(item => ({ id: item.id, status: item.status, holder: item.holder?.title })), ownerStateHolder: held?.agentSessionId === b.id ? 'B' : held?.agentSessionId ?? null }, 'the successor lists the request, the owner state names it, A lists nothing')
   })
   await check('S1-cards', async () => {
-    await tabRow(b.title).click()
+    await show(b.tabId)
     const live = article(asked.requestId)
     await live.getByRole('button', { name: 'Approve once', exact: true }).waitFor({ timeout: 15_000 })
     const liveText = await live.innerText()
     const bShot = await shot('s1-b-card')
-    await tabRow(a.title).click()
+    await show(a.tab.id)
     await article(asked.requestId).waitFor({ timeout: 15_000 })
     const oldText = await article(asked.requestId).innerText()
     const oldButtons = await article(asked.requestId).getByRole('button').count()
@@ -148,7 +150,7 @@ async function s1() {
     record('S1-after-close', held?.agentSessionId === b.id && held?.status === 'pending' ? 'PASS' : 'FAIL', { held: held ? { holder: held.agentSessionId === b.id ? 'B' : held.agentSessionId, status: held.status } : null }, 'closing the predecessor (5 s = 5 sweeps) leaves the request pending on B')
   })
   await check('S1-approve', async () => {
-    await click(b.title, asked.requestId, 'Approve once')
+    await click(b.tabId, asked.requestId, 'Approve once')
     await poll(async () => await told(b.id, '[Conductor] approved: ' + asked.rule) === 1, { timeoutMs: 15_000, label: 'B told approved' })
     await poll(async () => await ran(b.id, asked.rule) === 1, { timeoutMs: 20_000, label: 'B ran it' })
     await settled(b.id, 'B settles after its retry')
@@ -170,7 +172,7 @@ async function s2() {
   const r1 = await a.as('permissions.request', { command: COMMAND, reason: 'B5 pool fix' })
   const r2 = await a.as('permissions.request', { path: 'C:/ProgramData/vr8f/pool-fix.sh', reason: 'write the fix script' })
   const r3 = await a.as('permissions.request', { url: 'https://example.com/vr8f-docs', reason: 'read the pool docs' })
-  await click(a.title, r1.requestId, 'Approve once')
+  await click(a.tab?.id ?? a.tabId, r1.requestId, 'Approve once')
   await poll(async () => (await texts(a.id, 'assistant')).includes('SYNTHETIC: approval noted; the retry waits.'), { timeoutMs: 15_000, label: 'A noted the approval' })
   await settled(a.id, 'A settles after the note')
   const grantA = (await grantsState()).grants.find(grant => grant.requestId === r1.requestId)
@@ -233,7 +235,7 @@ async function s3() {
   step('S3 neighbour: a denial card answered with no handoff runs in its own tab')
   const n = await wizard('VR8f S3 neighbour', 'SYNTHETIC CLASSIFIER OTHER vr8f-s3-N')
   const nDenial = await poll(async () => (await denialIds(n.id))[0], { timeoutMs: 10_000, label: 'neighbour denial card' })
-  await click(n.title, nDenial, 'Approve once')
+  await click(n.tab?.id ?? n.tabId, nDenial, 'Approve once')
   await poll(async () => (await texts(n.id, 'assistant')).some(text => text.startsWith('SYNTHETIC classified call ran:')), { timeoutMs: 20_000, label: 'neighbour ran' })
   record('S3-neighbour', 'PASS', { denial: nDenial }, 'harness drives a denial card: approve once, the same tab runs it')
 
@@ -242,10 +244,11 @@ async function s3() {
   const denial = await poll(async () => (await denialIds(a.id))[0], { timeoutMs: 10_000, label: "A's denial card" })
   const b = await handOff(a, 'SYNTHETIC CLASSIFIER PLAN OTHER successor vr8f-s3-B')
   const listB = await b.as('permissions.list')
-  await tabRow(a.title).click()
+  await show(a.tab.id)
   const aButtons = await article(denial).getByRole('button', { name: 'Approve once', exact: true }).count()
   const bHasCard = (await denialIds(b.id)).length
-  if (aButtons) await click(a.title, denial, 'Approve once')
+  // Since FX41 the unanswered card moves with the handoff: A's says Moved to B, so the owner answers in B's.
+  await click(aButtons ? a.tab?.id ?? a.tabId : b.tabId, denial, 'Approve once')
   await sleep(8000)
   const who = { aTold: await told(a.id, '[Conductor] approved:'), bTold: await told(b.id, '[Conductor] approved:'), aRan: (await texts(a.id, 'assistant')).filter(text => text.startsWith('SYNTHETIC classified call ran:')).length, bRan: (await texts(b.id, 'assistant')).filter(text => text.startsWith('SYNTHETIC classified call ran:')).length }
   // A denial's id is per CLI process (auto-denial:classified-N), so match the tab too.
@@ -268,7 +271,7 @@ async function s3b() {
   step('S3 gap 2 (CLI takes no live rules): A holds a session rule from launch, then hands off')
   const a = await wizard('VR8f S3b wizard A', 'SYNTHETIC CLASSIFIER PLAN HOLD vr8f-s3b-A')
   const asked = await a.as('permissions.request', { command: COMMAND, reason: 'B5 pool fix' })
-  await click(a.title, asked.requestId, 'Approve for this session')
+  await click(a.tab?.id ?? a.tabId, asked.requestId, 'Approve for this session')
   const launchA = await poll(async () => (await flags()).find(entry => entry.launch?.includes(asked.rule)), { timeoutMs: 40_000, label: "A's CLI relaunched with the rule" })
   // The restarted CLI is a new fixture process: told to retry, it runs the call under its launch rule.
   await poll(async () => await told(a.id, '[Conductor] approved: ' + asked.rule) >= 1, { timeoutMs: 20_000, label: 'A told after its restart' })

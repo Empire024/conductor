@@ -7,14 +7,20 @@ export const PERMISSION_METHOD_SIGNATURES: Record<string, string> = {
   'permissions.list': '({agentSessionId?}) — your own open requests and live grants; the owner or a wizard tab may name a conversation',
   'permissions.revoke': '({grantId, agentSessionId?}) — withdraw a live grant at once; your own, or any for the owner or a wizard tab'
 }
-/** Only the owner's credential or a wizard tab sees and may call this; the wand holds the owner's
- *  authority, so a wizard answers every class (never its own request). */
+/** Only the owner's credential or a wizard tab sees and may call this. The same authority as
+ *  agents.approve (wizard-approvals.ts): the owner answers any conversation of the project, a
+ *  wizard the coworkers it controls; both answer every class; nobody answers their own request. */
 export const PERMISSION_OWNER_SIGNATURES: Record<string, string> = {
-  'permissions.decide': '({agentSessionId, requestId, decision: "approve-once"|"approve-session"|"deny"}) — answer a permission request for the owner: any class, local, shared, destructive or external (production included), so review the exact call, reason and rollback first; never your own request. A wizard approval that waits 2 min behind a turn still running interrupts that turn so the retry runs'
+  'permissions.decide': '({agentSessionId, requestId, decision: "approve-once"|"approve-session"|"deny"}) — owner credential or wizard tab only: answer a permission request for the owner, the same authority as agents.approve: the owner answers any conversation of this project, a wizard the coworkers it controls (and theirs); any class, local, shared, destructive or external (production included), so review the exact call, reason and rollback first; never your own request. An approval of a conversation whose turn is still running interrupts that turn at once, so the retry runs as a message of its own'
 }
 export const PERMISSION_METHODS = [...Object.keys(PERMISSION_METHOD_SIGNATURES), ...Object.keys(PERMISSION_OWNER_SIGNATURES)]
 
-export interface PermissionCallScope { agentSessionId: string; owner?: boolean; wizard?: boolean }
+export interface PermissionCallScope {
+  agentSessionId: string; owner?: boolean; wizard?: boolean
+  /** Whether this caller may answer for that conversation: agents.approve's answerable set (the
+   *  project's conversations for the owner, a wizard's coworkers). permissions.decide requires it. */
+  answers?: (agentSessionId: string) => boolean
+}
 
 const text = (value: unknown, name: string, required = false): string | undefined => {
   if (value === undefined && !required) return undefined
@@ -43,10 +49,9 @@ export async function callPermissions(grants: PermissionGrants, scope: Permissio
     if (!sovereign) throw new Error('permissions.decide answers only the owner\'s own control credential or a wizard tab')
     const agentSessionId = text(args.agentSessionId, 'agentSessionId', true)!
     if (agentSessionId === scope.agentSessionId && !scope.owner) throw new Error('A conversation cannot answer its own permission request')
-    // Through app control an answer is automation (a wizard tab, or a script holding the owner's
-    // credential), so it is held to local actions either way: shared, destructive and external
-    // requests are answered only by the owner in the card.
-    return grants.decide(agentSessionId, text(args.requestId, 'requestId', true)!, text(args.decision, 'decision', true) as GrantDecision, 'wizard')
+    if (!scope.answers?.(agentSessionId)) throw new Error(scope.owner ? 'No such agent conversation in this project' : 'That conversation is not one of your coworkers; a wizard answers only for the coworkers it controls')
+    // Every class, as in the card: the wand holds the owner's authority (owner decision 2026-09-28, H13).
+    return grants.decide(agentSessionId, text(args.requestId, 'requestId', true)!, text(args.decision, 'decision', true) as GrantDecision, scope.owner ? 'owner' : 'wizard')
   }
   throw new Error(`Unknown permissions method: ${method}`)
 }

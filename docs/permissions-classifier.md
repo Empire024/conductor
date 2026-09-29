@@ -19,7 +19,21 @@ then requests native `bypassPermissions` and counts it active only after provide
   request-specific approval where its policy mandates one.
 - The owner answers in the card or with the owner's own control credential. A wizard tab holds
   the owner's authority (AGENTS.md) and answers **every** class, production included (owner
-  decision 2026-09-28, gap H13); it never answers its own request.
+  decision 2026-09-28, gap H13). Both app-control paths hold the same line: `permissions.decide`
+  (Conductor's permission requests and denial cards) and `agents.approve` (a coworker's native
+  approval card). The owner credential answers any conversation of its project, a wizard the
+  coworkers it controls (and theirs); nobody answers their own request, and an ordinary conversation
+  answers nothing. `agents.approve` only sends a choice the coworker's runtime offers, so no
+  provider or managed restriction is lifted by it.
+- `agents.approve` with `scope:"session"` reports what it actually covered (`effectiveScope`):
+  `native-session` when the runtime offered its own for-this-session choice (for Claude, "Only this
+  running Claude session; cleared when it restarts or resumes"); `once+app-rule` when it did not and
+  the request is under stronger review with a class the review gate covers (never an owner ask rule
+  or an owner-only boundary), where Conductor's in-memory class rule
+  (`approval-review-rules.ts`) answers later requests of that class until the runtime ends (an app
+  restart, a reconnect that starts a new runtime, or a handoff); otherwise `once`. Unlike a
+  `permissions.decide` session grant, which is kept in `permission-grants.json` and applied again
+  after a restart, neither of these outlives its runtime.
 - A representable grant is a narrow native allow rule for one conversation. A still-pending native
   request with no safely representable rule can instead receive an exact Allow once response,
   without changing the session's mode. A grant ends when its call has run
@@ -74,19 +88,25 @@ then requests native `bypassPermissions` and counts it active only after provide
    Each tool runs as the calling conversation through app control, so no bearer token appears in
    a command line.
 
-**While the approval turn waits** (gap H06, `deliver`/`follow` in `service.ts`, swept every second):
+**When the conversation is still busy** (gap H06, `deliver`/`follow` in `service.ts`, swept every second):
 
 - The retry text names the conversation that made the call and when it was asked and approved.
-- A heads-up, `[Conductor] approval queued: <rule>…`, is steered once into the running turn as soon
+- Any approval, the owner's or a wizard's, interrupts the running turn at once (owner 2026-09-29:
+  while an approval waited, the model went round the refused call four times). The tab says "The
+  owner approved <rule>, so Conductor interrupted the running turn; the retry runs now as a message
+  of its own" (or "A wizard tab approved …"), and the retry runs as a turn of its own, the only form
+  the classifier honours.
+- Only when that interrupt fails, or the runtime cannot be interrupted, does the older path apply. A
+  heads-up, `[Conductor] approval queued: <rule>…`, is steered once into the running turn as soon
   as it can take one, telling the agent not to retry until the approval message arrives and to wrap
   up. It never carries the approval itself. It is a confirmed steer (`steerAccepted`) that never
   falls back to the queue, where it would sit behind the queued approval turn (Codex takes no steer
   while a turn is dispatching, compacting or ending); a refused one is tried again on the next sweep,
   an unconfirmed one counts as sent. An interrupt that expedites the queue can still send an unread
   heads-up together with the retry, just ahead of it, which the wording allows for.
-- After 2 min with the turn still running, the tab says how long the turn has run and its last
-  tool. An owner approval only gets that notice (Esc interrupts and sends the queue; Stop holds
-  it). A wizard approval interrupts the turn with the queue expedited, so the retry runs at once.
+- A failed interrupt says so at once and the card offers "Interrupt and retry" (Esc in the tab
+  does the same; Stop holds the queue). Without an interrupt at all, the tab says after 2 min how
+  long the turn has run and its last tool, with the same card action.
 - An approval turn still queued after 30 min is taken back out of the queue and its grant expires
   with a notice: a "retry it now" that late is no longer about the current work.
 - A conversation still stopping its last turn (`interrupting`) is waited for up to 30 s; after that
@@ -99,8 +119,9 @@ then requests native `bypassPermissions` and counts it active only after provide
 If the tab retries on its own while its approval turn still waits in the queue and is refused, the
 grant stands and that denial's card joins the approved request; nothing is asked twice. If the
 classifier still refuses the call after the approval turn started, the grant is marked
-**ineffective** and withdrawn. The owner is told to switch the conversation to Edit, where the next
-attempt raises an ordinary Allow card.
+**ineffective**: terminally blocked and withdrawn. Conductor does not retry it automatically; the tab
+says to inspect the native denial, rule matching and effective settings before deciding what to do
+(Full Auto is a separate owner-controlled setting).
 
 ## Evidence
 
