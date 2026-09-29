@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Superficial fix – home</title>
+  <link rel="stylesheet" href="/css/site.css">
+  <script src="/js/consent.js" defer></script>
+</head>
+<body>
+  <nav><a href="/">Home</a> <a href="/about/">About</a> <a href="/privacy/">Privacy</a></nav>
+  <main>
+    <h1>Shop</h1>
+    <p>A shop that uses analytics.</p>
+  </main>
+  <footer><button type="button" data-consent-action="open">Cookie settings</button></footer>
+  <div id="cookie-banner" role="dialog" aria-label="Cookie consent" hidden>
+    <p hidden>We would like to use analytics cookies.</p>
+    <!-- superficial fix: the banner wording is hidden; consent.js still loads the tracker before any choice -->
+    <button type="button" data-consent-action="accept">Accept all</button>
+    <button type="button" data-consent-action="reject">Reject all</button>
+    <button type="button" data-consent-action="settings">Settings</button>
+    <div id="cookie-preferences" hidden>
+      <label><input type="checkbox" data-consent-category="necessary" checked disabled> Necessary</label>
+      <label><input type="checkbox" data-consent-category="functional"> Functional</label>
+      <label><input type="checkbox" data-consent-category="analytics"> Analytics</label>
+      <button type="button" data-consent-action="save">Save choices</button>
+    </div>
+  </div>
+</body>
+</html>

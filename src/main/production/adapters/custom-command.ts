@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import type {
   CommerceOrder, CommerceSandboxAdapter, CommerceSubscription, CredentialRef, DataRecordsAdapter, MutationKind, NetworkPolicy, TestAccountRef,
 } from '../../../shared/production'
@@ -74,7 +74,7 @@ export function createCustomCommandAdapter(options: CustomCommandOptions): Custo
 /** Runs a command line with stdin, bounded in time and output; rejects on a non-zero exit with the tail of stderr. */
 export function runCommand(command: string, stdin: string, options: { cwd?: string; timeoutMs: number; env?: Record<string, string>; signal?: AbortSignal }): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, { cwd: options.cwd, shell: true, windowsHide: true, env: { ...process.env, ...options.env }, stdio: ['pipe', 'pipe', 'pipe'] })
+    const child = spawn(command, { cwd: options.cwd, shell: true, windowsHide: true, detached: process.platform !== 'win32', env: { ...process.env, ...options.env }, stdio: ['pipe', 'pipe', 'pipe'] })
     const out: Buffer[] = []
     let outBytes = 0
     let err = ''
@@ -86,7 +86,7 @@ export function runCommand(command: string, stdin: string, options: { cwd?: stri
       options.signal?.removeEventListener('abort', onAbort)
       if (error) reject(error); else resolve(value ?? '')
     }
-    const kill = (): void => { try { child.kill() } catch { /* already gone */ } }
+    const kill = (): void => killTree(child)
     const onAbort = (): void => { kill(); finish(new CommandFailed('cancelled')) }
     const timer = setTimeout(() => { kill(); finish(new CommandFailed(`timed out after ${options.timeoutMs} ms`)) }, options.timeoutMs)
     options.signal?.addEventListener('abort', onAbort, { once: true })
@@ -104,6 +104,19 @@ export function runCommand(command: string, stdin: string, options: { cwd?: stri
     child.stdin.on('error', () => undefined)
     child.stdin.end(stdin)
   })
+}
+
+/**
+ * Ends a shell command and everything it started. Killing only the shell leaves its child holding
+ * the output pipes on Windows, so the command would neither stop nor report back.
+ */
+export function killTree(child: ChildProcess): void {
+  if (child.pid === undefined || child.exitCode !== null) return
+  try {
+    if (process.platform === 'win32') spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
+    else process.kill(-child.pid, 'SIGKILL')
+  } catch { /* already gone */ }
+  try { child.kill('SIGKILL') } catch { /* already gone */ }
 }
 
 function list(value: unknown, action: string): unknown[] {

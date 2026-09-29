@@ -1,9 +1,8 @@
 import {
-  CONTROL_RESULT_SEVERITY,
   type AuditPage, type CheckContext, type CheckOutcome, type CommerceSandboxAdapter, type ControlResultStatus, type DataRecordsAdapter, type DeviceClass,
   type FindingDraft, type HumanReviewItem, type MutationKind, type NavigationResult, type RouteCoverage, type RouteEntry, type TestAccountRef,
 } from '../../../shared/production'
-import { provenanceFor } from '../registry'
+import { draft, review, statusOf, notRun, emptyCoverage, throwIfAborted, pathOf, browserProblem, isAllowed, normalise, fold } from './check-support'
 
 /**
  * Shared machinery of the commerce and lifecycle checks (docs/production-agent.md module M6: C07
@@ -18,12 +17,6 @@ export const MAX_ROUTES = 8
 
 /** The mutation kind a sandbox refund request needs; no other authorization covers one. */
 export const REFUND_MUTATION: MutationKind = 'refund-request'
-
-export const emptyCoverage = (): RouteCoverage => ({ tested: [], sampled: [], excluded: [], unobservable: [] })
-
-export function throwIfAborted(context: CheckContext): void {
-  if (context.signal.aborted) throw new Error(`${context.control.id} check cancelled`)
-}
 
 /** Routes carrying any of the tags (full first, one per sampled group), bounded; excluded ones are listed, never opened. */
 export function routesTagged(context: CheckContext, tags: string[], coverage: RouteCoverage, max = MAX_ROUTES): RouteEntry[] {
@@ -83,20 +76,6 @@ export async function visit(page: AuditPage, url: string): Promise<Visit> {
   if (navigation.outcome !== 'ok') return { navigation, ok: false, problem: `${pathOf(url)}: ${navigation.outcome}` }
   if (navigation.status !== null && navigation.status >= 400) return { navigation, ok: false, problem: `${pathOf(url)}: HTTP ${navigation.status}` }
   return { navigation, ok: true, problem: null }
-}
-
-export function pathOf(url: string): string {
-  try { const parsed = new URL(url); return parsed.pathname + parsed.search } catch { return url }
-}
-
-export const isAllowed = (context: CheckContext, url: string): boolean => {
-  try { return context.policy.allowedOrigins.includes(new URL(url).origin) } catch { return false }
-}
-
-/** Browser availability as an unconcluded reason, or null when a browser is there. */
-export async function browserProblem(context: CheckContext): Promise<string | null> {
-  const availability = await context.browser.availability()
-  return availability.available ? null : `no audit browser: ${availability.reason ?? 'unavailable'}`
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -160,47 +139,6 @@ export function recordsFor(context: CheckContext): DataRecordsAdapter | null {
 // Findings, human review and status
 // ---------------------------------------------------------------------------------------------
 
-type DraftInput = Pick<FindingDraft, 'key' | 'title' | 'expected' | 'observed' | 'severity' | 'confidence' | 'proposedFix'>
-  & Partial<Pick<FindingDraft, 'route' | 'component' | 'scope' | 'category' | 'reproduction' | 'evidence' | 'owner'>>
-
-/** A finding of this check with the control's owner and, for legal findings, the provenance that applies to the project. */
-export function draft(context: CheckContext, checkId: string, input: DraftInput): FindingDraft {
-  const category = input.category ?? (context.control.classification === 'legal' ? 'legal' : 'technical')
-  const sources = category === 'legal' ? provenanceFor(context.control, context.profile.facts).filter(source => source.kind !== 'video-source') : []
-  const reviewBy = sources.map(source => source.reviewBy).filter((date): date is string => !!date).sort()[0] ?? null
-  return {
-    controlId: context.control.id,
-    checkId,
-    key: input.key,
-    route: input.route ?? null,
-    component: input.component ?? null,
-    scope: input.scope ?? (input.route ? 'page' : 'site'),
-    category,
-    severity: input.severity,
-    confidence: input.confidence,
-    title: input.title,
-    expected: input.expected,
-    observed: input.observed,
-    reproduction: input.reproduction ?? [],
-    evidence: input.evidence ?? [],
-    proposedFix: input.proposedFix,
-    owner: input.owner ?? context.control.owner,
-    legal: category === 'legal' ? { sources, effectiveDate: null, reviewBy } : null,
-  }
-}
-
-export function review(context: CheckContext, key: string, question: string, why: string, route: string | null = null, evidence: string[] = []): HumanReviewItem {
-  return { id: `${context.control.id}:${key}`, controlId: context.control.id, question, why, route, evidence }
-}
-
-/** FAIL for a critical/high finding, WARN for a lesser one, UNVERIFIED when a part could not conclude; worst wins, PASS only when all is clean. */
-export function statusOf(findings: readonly FindingDraft[], unconcluded: readonly string[], floor: ControlResultStatus = 'PASS'): ControlResultStatus {
-  const statuses: ControlResultStatus[] = [floor]
-  for (const finding of findings) statuses.push(finding.severity === 'critical' || finding.severity === 'high' ? 'FAIL' : 'WARN')
-  if (unconcluded.length) statuses.push('UNVERIFIED')
-  return statuses.sort((a, b) => CONTROL_RESULT_SEVERITY[b] - CONTROL_RESULT_SEVERITY[a])[0]!
-}
-
 export interface OutcomeParts {
   findings: FindingDraft[]
   unconcluded: string[]
@@ -227,19 +165,9 @@ export function outcome(checkId: string, parts: OutcomeParts): CheckOutcome {
 
 export const newParts = (): OutcomeParts => ({ findings: [], unconcluded: [], evidence: [], humanReview: [], coverage: emptyCoverage(), observations: [] })
 
-/** The outcome of a check that decided not to run: not applicable, or applicability unknown. */
-export function notRun(checkId: string, status: 'NOT_APPLICABLE' | 'UNVERIFIED', reason: string): CheckOutcome {
-  return { checkId, status, reason, findings: [], evidence: [], humanReview: [], coverage: emptyCoverage(), observations: [reason] }
-}
-
 // ---------------------------------------------------------------------------------------------
 // Text and money
 // ---------------------------------------------------------------------------------------------
-
-export const normalise = (text: string): string => text.normalize('NFKC').replace(/\s+/g, ' ').trim()
-
-/** Accents removed and lower-cased, for label comparison. */
-export const fold = (text: string): string => normalise(text).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
 
 export interface Money {
   /** Minor units (cents). */
@@ -299,3 +227,5 @@ export const linkMatches = (link: { text: string; href: string }, pattern: RegEx
 }
 
 export const sleep = (ms: number): Promise<void> => new Promise(done => setTimeout(done, ms))
+
+export { draft, review, statusOf, notRun, emptyCoverage, throwIfAborted, pathOf, browserProblem, isAllowed, normalise, fold }

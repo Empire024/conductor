@@ -1,9 +1,9 @@
 import {
-  CONTROL_RESULT_SEVERITY,
-  type AuditPage, type CheckContext, type CheckOutcome, type ControlResultStatus, type DeviceClass, type FindingDraft, type HumanReviewItem,
+  type AuditPage, type CheckContext, type CheckOutcome, type DeviceClass, type FindingDraft, type HumanReviewItem,
   type NavigationResult, type ObservedRequest, type RouteCoverage, type RouteEntry,
 } from '../../../shared/production'
-import { factIsUnknown, provenanceFor } from '../registry'
+import { factIsUnknown } from '../registry'
+import { draft, review, statusOf, notRun, emptyCoverage, throwIfAborted, pathOf, browserProblem, isAllowed, normalise, fold } from './check-support'
 
 /**
  * Shared machinery of the document and claims checks (docs/production-agent.md module M5: C01
@@ -66,12 +66,6 @@ export function mergeCoverage(into: RouteCoverage, from: RouteCoverage): RouteCo
   return into
 }
 
-export const emptyCoverage = (): RouteCoverage => ({ tested: [], sampled: [], excluded: [], unobservable: [] })
-
-export function throwIfAborted(context: CheckContext): void {
-  if (context.signal.aborted) throw new Error(`${context.control.id} check cancelled`)
-}
-
 /** Opens one fresh page, runs `use`, and always closes it. */
 export async function withPage<T>(context: CheckContext, device: DeviceClass, use: (page: AuditPage) => Promise<T>): Promise<T> {
   throwIfAborted(context)
@@ -95,63 +89,9 @@ export async function visit(page: AuditPage, url: string): Promise<Visit> {
   return { navigation, ok: true, problem: null }
 }
 
-/** Pathname of a URL relative to the environment, for finding routes and coverage. */
-export function pathOf(url: string): string {
-  try { const parsed = new URL(url); return parsed.pathname + parsed.search } catch { return url }
-}
-
-export const isAllowed = (context: CheckContext, url: string): boolean => {
-  try { return context.policy.allowedOrigins.includes(new URL(url).origin) } catch { return false }
-}
-
 // ---------------------------------------------------------------------------------------------
 // Findings, human review and status
 // ---------------------------------------------------------------------------------------------
-
-type DraftInput = Pick<FindingDraft, 'key' | 'title' | 'expected' | 'observed' | 'severity' | 'confidence' | 'proposedFix'>
-  & Partial<Pick<FindingDraft, 'route' | 'component' | 'scope' | 'category' | 'reproduction' | 'evidence' | 'owner'>>
-
-/** A finding of this check with the control's owner and, for legal controls, the provenance that applies to the project. */
-export function draft(context: CheckContext, checkId: string, input: DraftInput): FindingDraft {
-  const category = input.category ?? (context.control.classification === 'legal' ? 'legal' : 'technical')
-  const sources = category === 'legal' ? provenanceFor(context.control, context.profile.facts).filter(source => source.kind !== 'video-source') : []
-  const reviewBy = sources.map(source => source.reviewBy).filter((date): date is string => !!date).sort()[0] ?? null
-  return {
-    controlId: context.control.id,
-    checkId,
-    key: input.key,
-    route: input.route ?? null,
-    component: input.component ?? null,
-    scope: input.scope ?? (input.route ? 'page' : 'site'),
-    category,
-    severity: input.severity,
-    confidence: input.confidence,
-    title: input.title,
-    expected: input.expected,
-    observed: input.observed,
-    reproduction: input.reproduction ?? [],
-    evidence: input.evidence ?? [],
-    proposedFix: input.proposedFix,
-    owner: input.owner ?? context.control.owner,
-    legal: category === 'legal' ? { sources, effectiveDate: null, reviewBy } : null,
-  }
-}
-
-export function review(context: CheckContext, key: string, question: string, why: string, route: string | null = null, evidence: string[] = []): HumanReviewItem {
-  return { id: `${context.control.id}:${key}`, controlId: context.control.id, question, why, route, evidence }
-}
-
-/**
- * The check's status: FAIL for a critical or high finding, WARN for a lesser one, UNVERIFIED when
- * a part could not conclude, worst of these; PASS only when everything concluded clean. Human
- * review items do not lower the status here; the gate caps controls that always need review.
- */
-export function statusOf(findings: readonly FindingDraft[], unconcluded: readonly string[]): ControlResultStatus {
-  const statuses: ControlResultStatus[] = ['PASS']
-  for (const finding of findings) statuses.push(finding.severity === 'critical' || finding.severity === 'high' ? 'FAIL' : 'WARN')
-  if (unconcluded.length) statuses.push('UNVERIFIED')
-  return statuses.sort((a, b) => CONTROL_RESULT_SEVERITY[b] - CONTROL_RESULT_SEVERITY[a])[0]!
-}
 
 export function outcome(checkId: string, parts: {
   findings: FindingDraft[]; unconcluded: string[]; evidence: string[]; humanReview: HumanReviewItem[]; coverage: RouteCoverage; observations: string[]
@@ -169,24 +109,9 @@ export function outcome(checkId: string, parts: {
   }
 }
 
-/** The outcome of a check that decided not to run: not applicable, or applicability unknown. */
-export function notRun(checkId: string, status: 'NOT_APPLICABLE' | 'UNVERIFIED', reason: string): CheckOutcome {
-  return { checkId, status, reason, findings: [], evidence: [], humanReview: [], coverage: emptyCoverage(), observations: [reason] }
-}
-
-/** Browser availability as an unconcluded reason, or null when a browser is there. */
-export async function browserProblem(context: CheckContext): Promise<string | null> {
-  const availability = await context.browser.availability()
-  return availability.available ? null : `no audit browser: ${availability.reason ?? 'unavailable'}`
-}
-
 // ---------------------------------------------------------------------------------------------
 // Text rules (English, Slovak and Czech)
 // ---------------------------------------------------------------------------------------------
-
-export const normalise = (text: string): string => text.normalize('NFKC').replace(/\s+/g, ' ').trim()
-/** Lower-case, accents and punctuation removed: for name comparison only. */
-export const fold = (text: string): string => normalise(text).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
 
 /** Link text or URL patterns for the documents the checks follow. */
 export const LINK_PATTERNS = {
@@ -306,3 +231,5 @@ export function trackerRequests(context: CheckContext, requests: readonly Observ
     return TRACKER_HOSTS.some(known => host === known || host.endsWith(`.${known}`)) || TRACKER_PATH.test(path)
   })
 }
+
+export { draft, review, statusOf, notRun, emptyCoverage, throwIfAborted, pathOf, browserProblem, isAllowed, normalise, fold }

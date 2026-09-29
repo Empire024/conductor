@@ -1,0 +1,8 @@
+{
+  "collectPaths": [
+    "/collect"
+  ],
+  "delayMs": {
+    "/js/analytics.js": 400
+  }
+}
