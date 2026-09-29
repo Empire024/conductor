@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>{{origin}}/</loc></url>
+  <url><loc>{{origin}}/shop/</loc></url>
+  <url><loc>{{origin}}/product/alpha/</loc></url>
+  <url><loc>{{origin}}/product/beta/</loc></url>
+  <url><loc>{{origin}}/product/gamma/</loc></url>
+  <url><loc>{{origin}}/product/delta/</loc></url>
+  <url><loc>{{origin}}/product/epsilon/</loc></url>
+  <url><loc>{{origin}}/product/zeta/</loc></url>
+  <url><loc>{{origin}}/privacy-policy/</loc></url>
+  <url><loc>{{origin}}/terms/</loc></url>
+  <url><loc>{{origin}}/contact/</loc></url>
+</urlset>

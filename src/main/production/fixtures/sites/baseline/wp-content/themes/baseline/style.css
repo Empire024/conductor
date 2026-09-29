@@ -1,0 +1,7 @@
+/*
+Theme Name: Baseline
+Version: 1.0.0
+*/
+body { font-family: system-ui, sans-serif; font-size: 16px; margin: 0 auto; max-width: 960px; padding: 16px; }
+a:focus-visible, button:focus-visible, input:focus-visible { outline: 3px solid #1a5fb4; outline-offset: 2px; }
+#cookie-banner { position: fixed; bottom: 0; left: 0; right: 0; background: #fff; border-top: 1px solid #333; padding: 12px; }

@@ -1,0 +1,15 @@
+{
+  "setCookie": {
+    "/": [
+      "baseline_session=abc123; Path=/; HttpOnly; SameSite=Lax"
+    ]
+  },
+  "delayMs": {
+    "/js/late.js": 300
+  },
+  "headers": {
+    "/csp.html": {
+      "content-security-policy": "default-src 'self'; script-src 'self'; img-src 'self'"
+    }
+  }
+}
