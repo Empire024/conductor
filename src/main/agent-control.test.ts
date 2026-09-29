@@ -2221,7 +2221,7 @@ describe('control catalog and dispatch repairs', () => {
     const steering = await running()
     const steered: string[] = []
     live(steering.resourceId!).steer = async text => { steered.push(text) }
-    expect(await f.control.call(f.scope, 'agents.steer', { agentSessionId: steering.resourceId, prompt: 'Into the running turn' })).toMatchObject({ delivery: 'queued' })
+    expect(await f.control.call(f.scope, 'agents.steer', { agentSessionId: steering.resourceId, prompt: 'Into the running turn' })).toMatchObject({ delivery: 'steered' })
     await settle()
     expect(steered).toEqual(['Into the running turn'])
     // One that cannot steer holds it behind the turn.

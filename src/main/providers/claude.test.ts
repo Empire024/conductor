@@ -1658,6 +1658,28 @@ describe('owner permission grants (src/main/permission-grants)', () => {
     expect(reviewer.transport.options.args).not.toContain('--settings')
   })
 
+  it('exempts the conductor request tools from the classifier with exact allow rules, kept beside the grants', async () => {
+    const exempt = ['mcp__conductor__request_permission', 'mcp__conductor__list_permissions']
+    const settingsOf = (args: string[]) => JSON.parse(readFileSync(args[args.indexOf('--settings') + 1]!, 'utf8'))
+    // With no grants at all, a tab with the conductor server still launches with the two rules.
+    const bare = fixture({ conductorMcpConfig: 'conductor.json' }); await bare.adapter.start()
+    expect(settingsOf(bare.transport.options.args)).toEqual({ permissions: { allow: exempt } })
+    // apply_flag_settings replaces the whole layer, so a live grant change keeps them too.
+    let rules = [{ rule: 'Bash(git push)', once: true }]
+    const f = fixture({ conductorMcpConfig: 'conductor.json', permissionGrants: { rules: () => rules, used: vi.fn() } }); await f.adapter.start()
+    expect(settingsOf(f.transport.options.args)).toEqual({ permissions: { allow: [...exempt, 'Bash(git push)'] } })
+    rules = []
+    await expect(f.adapter.applyPermissionRules()).resolves.toBe('applied')
+    expect(f.transport.sent.at(-1)).toMatchObject({ request: { subtype: 'apply_flag_settings', settings: { permissions: { allow: exempt } } } })
+    // Only exact tool names: no server-wide mcp__conductor rule, so control and send_message stay judged.
+    expect(exempt.every(rule => /^mcp__conductor__[a-z_]+$/.test(rule))).toBe(true)
+    // An approval reviewer or an evaluation turn has no conductor tools and gets no rules.
+    for (const options of [{ approvalReviewer: true }, { profile: 'evaluation' as const }]) {
+      const isolated = fixture({ ...options, conductorMcpConfig: 'conductor.json' }); await isolated.adapter.start()
+      expect(isolated.transport.options.args).not.toContain('--settings')
+    }
+  })
+
   it('reports a CLI that cannot take flag settings while it runs as unsupported', async () => {
     const f = fixture({ permissionGrants: { rules: () => [], used: vi.fn() } }); await f.adapter.start()
     f.transport.autoControlResponses = false

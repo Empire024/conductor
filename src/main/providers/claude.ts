@@ -14,6 +14,7 @@ import { BROWSER_MCP_SERVER_NAME, BROWSER_TOOLS } from '../../shared/browser-mcp
 import { LOCAL_ASSIST_MCP_SERVER_NAME } from '../local-assist/contract'
 import { LOCAL_ASSIST_TOOLS } from '../local-assist/tools'
 import { grantCallIdentity, type NativeGrantCall } from '../permission-grants/identity'
+import { CONDUCTOR_MCP_ALLOWED_TOOLS } from '../permission-grants/control-mcp'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 
 /** The local CLI bridge is checked against the official CLI/extension 2.1.278: the 2026-09-21
@@ -330,12 +331,13 @@ export class ClaudeAdapter implements ProviderAdapter {
     const mcpConfigs = await this.relayMcp(this.options.approvalReviewer || this.options.profile === 'evaluation' ? [] : [this.options.mcpConfig, this.options.localAssistMcpConfig, this.options.conductorMcpConfig].filter((config): config is string => Boolean(config)))
     if (mcpConfigs.length) args.push('--mcp-config', ...mcpConfigs)
     if (this.nativeSessionId) args.push(this.options.newNativeSession ? '--session-id' : '--resume', this.nativeSessionId)
-    // Rules the owner granted this conversation (src/main/permission-grants) ride in the flag
-    // settings layer, the same layer apply_flag_settings changes while it runs. Nothing else is
-    // ever put there, so a launch without grants passes no --settings at all.
-    const grantRules = this.options.approvalReviewer || this.options.profile === 'evaluation' ? [] : this.options.permissionGrants?.rules() ?? []
-    if (grantRules.length) {
-      this.grantSettingsFile = privateConfigFile(JSON.stringify({ permissions: { allow: grantRules.flatMap(entry => nativeGrantRules(entry.rule)) } }), `claude-grants-${this.options.runtimeId}`)
+    // Rules the owner granted this conversation (src/main/permission-grants), and the exemption of
+    // Conductor's request tools, ride in the flag settings layer, the same layer
+    // apply_flag_settings changes while it runs. Nothing else is ever put there, so a launch with
+    // neither passes no --settings at all.
+    const allow = this.flagAllowRules()
+    if (allow.length) {
+      this.grantSettingsFile = privateConfigFile(JSON.stringify({ permissions: { allow } }), `claude-grants-${this.options.runtimeId}`)
       this.relayFiles.push(this.grantSettingsFile)
       args.push('--settings', this.grantSettingsFile)
     }
@@ -636,14 +638,21 @@ export class ClaudeAdapter implements ProviderAdapter {
     for (const id of array(receipt.cancelled)) if (typeof id === 'string') this.inputDelivery(id, 'cancelled', { method: 'interrupt', payload: receipt })
   }
 
+  /** The flag-settings allow list: exact rules for Conductor's request tools when this tab has the
+   *  conductor server (filing a request is never the classifier's to refuse), then the owner's
+   *  current grants. A reviewer or evaluation turn gets neither. */
+  private flagAllowRules(): string[] {
+    if (this.options.approvalReviewer || this.options.profile === 'evaluation') return []
+    return [...this.options.conductorMcpConfig ? CONDUCTOR_MCP_ALLOWED_TOOLS : [], ...(this.options.permissionGrants?.rules() ?? []).flatMap(entry => nativeGrantRules(entry.rule))]
+  }
+
   /** Hands the running CLI the owner's current grants (permissionGrants.rules()) in its flag
    *  settings layer, replacing the previous set, so a revoked or used rule is gone at once.
    *  'unsupported' when this CLI does not take apply_flag_settings here: the rules then reach it
    *  through --settings when the conversation next starts. */
   async applyPermissionRules(): Promise<'applied' | 'unsupported'> {
     if (this.options.approvalReviewer || !this.ready || this.disposed || !this.transport?.connected) return 'unsupported'
-    const rules = this.options.permissionGrants?.rules() ?? []
-    try { await this.control({ subtype: 'apply_flag_settings', settings: { permissions: { allow: rules.flatMap(entry => nativeGrantRules(entry.rule)) } } }) }
+    try { await this.control({ subtype: 'apply_flag_settings', settings: { permissions: { allow: this.flagAllowRules() } } }) }
     catch (error) {
       if (/not supported|not implemented|unknown|unsupported/i.test(error instanceof Error ? error.message : '')) return 'unsupported'
       throw error

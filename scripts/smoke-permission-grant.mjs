@@ -37,6 +37,10 @@ const check = label => { checks.push(label); console.log('PASS ' + label) }
 const snapshot = id => page.evaluate(value => window.conductor.structured.snapshot(value), id)
 const grantsState = () => page.evaluate(() => window.conductor.permissionGrants.state())
 const flags = async () => (await readFile(flagLog, 'utf8').catch(() => '')).split('\n').filter(Boolean).map(line => JSON.parse(line))
+// Every Claude tab with the conductor server holds these in its flag layer (CONDUCTOR_MCP_ALLOWED_TOOLS),
+// beside the owner's grants: filing a request is never the classifier's to refuse.
+const EXEMPT = ['mcp__conductor__request_permission', 'mcp__conductor__list_permissions']
+const granted = rules => rules?.filter(rule => !EXEMPT.includes(rule))
 const denials = async id => (await snapshot(id)).items.filter(item => item.data.type === 'notice' && item.data.payload?.autoModeDenial)
 const settled = async id => expect.poll(async () => (await snapshot(id))?.phase, { timeout: 20000 }).toMatch(/^(completed|idle)$/)
 const submit = (id, text) => page.evaluate(async ([value, prompt]) => {
@@ -92,16 +96,20 @@ try {
 
   // 3. Approve once: exactly that rule reaches the live CLI, the tab retries by itself, and the grant is spent.
   await writeCard.getByRole('button', { name: 'Approve once' }).click()
-  await expect.poll(async () => (await flags()).some(entry => entry.applied?.length === 1 && entry.applied[0] === request.rule)).toBe(true)
+  await expect.poll(async () => (await flags()).some(entry => granted(entry.applied)?.length === 1 && granted(entry.applied)[0] === request.rule)).toBe(true)
+  const exempted = (await flags()).filter(entry => entry.launch || entry.applied)
+  assert.ok(exempted.length && exempted.every(entry => EXEMPT.every(rule => (entry.launch ?? entry.applied).includes(rule))), 'request_permission and list_permissions are allowed at launch and in every live rule set: ' + JSON.stringify(exempted))
   await expect.poll(async () => (await snapshot(id)).items.some(item => item.data.type === 'text' && item.data.role === 'user' && item.data.text.startsWith('[Conductor] approved: ' + request.rule))).toBe(true)
   await expect.poll(async () => (await snapshot(id)).items.some(item => item.data.type === 'text' && item.data.role === 'assistant' && item.data.text === 'SYNTHETIC classified call ran: ' + request.rule), { timeout: 20000 }).toBe(true)
   await settled(id)
   assert.ok((await stat(request.resource)).isFile(), 'The retried write created the stand-in script')
   await expect.poll(async () => (await grantsState()).grants.length).toBe(0)
-  await expect.poll(async () => (await flags()).at(-1)?.applied?.length).toBe(0)
+  await expect.poll(async () => granted((await flags()).at(-1)?.applied)?.length).toBe(0)
   await expect.poll(async () => (await grantsState()).requests.find(entry => entry.id === writeDenial.nativeItemId)?.status).toBe('used')
-  await expect(writeCard).toContainText('Approved once, and used')
-  check('Approve once handed the live tab exactly that rule, the tab retried and wrote the script, and the grant was spent and withdrawn')
+  // Since 19ba9c9 a spent grant's card reports the call's observed result, not the grant state.
+  await expect(writeCard).toHaveAttribute('data-grant-status', 'used')
+  await expect(writeCard).toContainText('Action succeeded')
+  check('Approve once handed the live tab exactly that rule (beside the request_permission/list_permissions exemption it launched with), the tab retried and wrote the script, and the grant was spent and withdrawn')
 
   // 3b. The live case of 2026-09-28: the refused turn keeps working, and the owner approves for this
   // session meanwhile. The approval waits as a turn of its own (a steer would be folded into the
@@ -112,8 +120,10 @@ try {
   const probeRule = probeDenial.data.payload.autoModeDenial.request.rule
   assert.equal((await snapshot(id)).phase, 'running', 'The refused turn is still working when the owner approves')
   await card(probeDenial.nativeItemId).getByRole('button', { name: 'Approve for this session' }).click()
-  await expect.poll(async () => (await snapshot(id)).queuedPrompts?.some(prompt => prompt.text.startsWith('[Conductor] approved: ' + probeRule) && !prompt.steer)).toBe(true)
-  assert.equal((await snapshot(id)).phase, 'running')
+  // Since 404f175 (owner decision 2026-09-29) the approval interrupts the running turn at once and
+  // the retry runs as a user turn of its own, instead of waiting behind the turn.
+  await expect.poll(async () => (await snapshot(id)).items.some(item => item.data.type === 'notice' && /interrupted the running turn/.test(item.data.message ?? ''))).toBe(true)
+  await expect.poll(async () => (await snapshot(id)).items.some(item => item.data.type === 'text' && item.data.role === 'user' && item.data.text.startsWith('[Conductor] approved: ' + probeRule))).toBe(true)
   assert.ok(!(await snapshot(id)).pendingSteering?.some(prompt => prompt.text.startsWith('[Conductor] approved:')), 'The approval is not steered into the running turn')
   await expect.poll(async () => (await snapshot(id)).items.some(item => item.data.type === 'text' && item.data.role === 'assistant' && item.data.text === 'SYNTHETIC classified call ran: ' + probeRule), { timeout: 20000 }).toBe(true)
   await settled(id)
@@ -121,7 +131,7 @@ try {
   assert.equal((await grantsState()).grants.filter(grant => grant.agentSessionId === id && grant.rule === probeRule && grant.scope === 'session').length, 1)
   await card(probeDenial.nativeItemId).getByRole('button', { name: 'Revoke' }).click()
   await expect.poll(async () => (await grantsState()).grants.filter(grant => grant.agentSessionId === id).length).toBe(0)
-  check('An approval given while the refused turn kept working waited as a turn of its own (not steered), and the call ran in that turn')
+  check('An approval given while the refused turn kept working interrupted it and arrived as a turn of its own (not steered), and the call ran in that turn')
 
   // 4. A different sensitive action is still refused; Deny keeps it blocked.
   await submit(id, 'SYNTHETIC CLASSIFIER OTHER restart the web server')
@@ -150,7 +160,8 @@ try {
   await expect.poll(async () => (await snapshot(id)).items.some(item => item.data.type === 'text' && item.data.role === 'assistant' && item.data.text === 'SYNTHETIC classified call ran: ' + otherRequest.rule), { timeout: 20000 }).toBe(true)
   await settled(id)
   assert.equal((await grantsState()).grants.filter(grant => grant.agentSessionId === id && grant.scope === 'session').length, 1)
-  await expect(card(again.nativeItemId)).toContainText('Approved for this session · in force now')
+  await expect(card(again.nativeItemId)).toHaveAttribute('data-grant-status', 'approved-session')
+  await expect(card(again.nativeItemId)).toContainText('Action succeeded · in force now')
   await expect(card(again.nativeItemId).getByRole('button', { name: 'Revoke' })).toBeVisible()
   await page.screenshot({ path: join(output, 'session-grant.png') })
   await page.locator('.pane-tab').first().click({ button: 'right' })
@@ -158,7 +169,7 @@ try {
   // Closing only changes the layout; the grant service notices the tab is gone (two sweeps) and
   // hands the runtime, which may still run for the undo window, an empty rule set.
   await expect.poll(async () => (await grantsState()).grants.filter(grant => grant.agentSessionId === id).length, { timeout: 15000 }).toBe(0)
-  await expect.poll(async () => (await flags()).at(-1)?.applied?.length, { timeout: 10000 }).toBe(0)
+  await expect.poll(async () => granted((await flags()).at(-1)?.applied)?.length, { timeout: 10000 }).toBe(0)
   check('Approve for this session let the tab run it; closing the tab ended the grant and took the rule back out of the runtime')
 
   assert.deepEqual(errors, [])

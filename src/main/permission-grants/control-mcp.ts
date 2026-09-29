@@ -7,6 +7,12 @@ import type { AgentSpec } from '../../shared/models'
 
 /** Tools reach an agent as `mcp__conductor__<tool>`. */
 export const CONDUCTOR_MCP_SERVER_NAME = 'conductor'
+/** Tools that only ask the owner, never act: filing a request must not itself be refusable (the
+ *  auto-mode classifier refused a request_permission for a production step on 2026-09-28, so no
+ *  card reached the owner). Every Claude tab with the server gets an exact allow rule for each in
+ *  its flag settings; in claude 2.1.282 an exact allow rule decides before the classifier is asked
+ *  (docs/permissions-classifier.md, Precedence). */
+export const CONDUCTOR_MCP_ALLOWED_TOOLS = ['request_permission', 'list_permissions'].map(tool => `mcp__${CONDUCTOR_MCP_SERVER_NAME}__${tool}`)
 const PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26']
 const MAX_BODY = 256 * 1024
 /** Codex stops waiting for an MCP tool after 60 s by default; git.ship.status({waitSeconds:100})

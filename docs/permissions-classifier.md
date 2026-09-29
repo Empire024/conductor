@@ -63,7 +63,7 @@ then requests native `bypassPermissions` and counts it active only after provide
    a denial already reaches the phone through `phone-notifications.ts`.
 3. **The grant.** On approval, `PermissionGrants` (`src/main/permission-grants/service.ts`) hands the
    live CLI its complete current rule set through the `apply_flag_settings` control request (the
-   flag-settings layer, which nothing else uses). A CLI that cannot take it live is restarted
+   flag-settings layer, which holds nothing else but the request-tool exemption in step 4). A CLI that cannot take it live is restarted
    with `--settings` once its turn ends. Conductor then tells the tab
    `[Conductor] approved: <rule> (once|for this session); retry it now` as **a user turn of its
    own**: queued behind a turn that is still working, never steered into it, and started at once
@@ -85,6 +85,16 @@ then requests native `bypassPermissions` and counts it active only after provide
    with exactly one of `{command | path | url}`, plus `reason` and `rollback`. The per-turn
    briefing (`PERMISSION_GRANT_HINT` in `src/main/turn-briefing.ts`) tells Claude tabs to do this,
    to split writing a script from running it, and never to hand the step to the owner to run.
+   **Filing a request is never the classifier's to refuse.** On 2026-09-28 the classifier refused a
+   `request_permission` naming a production apply, so no card reached the owner. Every Claude tab
+   with the `conductor` server therefore holds exact allow rules for
+   `mcp__conductor__request_permission` and `mcp__conductor__list_permissions`
+   (`CONDUCTOR_MCP_ALLOWED_TOOLS` in `control-mcp.ts`) in its flag-settings layer: in `--settings`
+   at launch, and in every `apply_flag_settings` set, which replaces the layer, ahead of the owner's
+   grants (`flagAllowRules` in `providers/claude.ts`). Both tools only ask or read; neither runs
+   anything. Only these two exact names are allowed, never a server-wide `mcp__conductor` rule, so
+   `control`, `send_message` and the rest are still judged. An approval reviewer and an evaluation
+   turn have no conductor server and get no rules. See Evidence, "request_permission exemption".
 5. **Messaging without a shell.** The `conductor` MCP server
    (`src/main/permission-grants/control-mcp.ts`) exposes `send_message` (agents.steer),
    `submit_task` (agents.submit), `report`, `handoff`, `request_permission` and `list_permissions`.
@@ -216,17 +226,33 @@ says to inspect the native denial, rule matching and effective settings before d
     message in Auto, rule-allowed calls included. It does not show that the classifier judged a
     call.
   - Evidence: `docs/verification/2026-09-29-approvals-residual.md`.
+- **request_permission exemption, measured (2026-09-29, claude 2.1.282).**
+  `scripts/probe-request-permission-exempt.mjs` (headless, sonnet/low, a stub stdio `conductor`
+  server that runs nothing, `CONDUCTOR_REAL_CLAUDE=1`) asks for a `request_permission` naming the
+  production apply that was refused on 2026-09-28:
+  - Without a rule, the classifier decides the MCP call: 596 ms and 1037 ms in two runs. So conductor
+    MCP calls are judged in Auto, and an unexempted request could be refused.
+  - With the two rules in `--settings`: 0 ms (both runs), `list_permissions` 0 and 1 ms; the rules
+    delivered live through `apply_flag_settings`: 0 ms (both runs). The call ran every time.
+  - The CLI logs an MCP call as `tool_dispatch_start tool=mcp_tool … permissionDecisionMs=N`,
+    followed by `MCP server "conductor": Calling MCP tool: <name>`.
+  - In the app, `scripts/smoke-permission-grant.mjs` checks that the tab's CLI holds both rules at
+    launch and in every live rule set a grant change sends.
+  - Evidence: `docs/verification/2026-09-29-approvals-clauses-3-5.md`.
 
 ## UNCONFIRMED
 
 - **Precedence in later CLI versions:** the behaviour above is claude 2.1.282's. Rerun
-  `CONDUCTOR_REAL_CLAUDE=1 node scripts/probe-classifier-precedence.mjs` after a CLI upgrade.
+  `CONDUCTOR_REAL_CLAUDE=1 node scripts/probe-classifier-precedence.mjs` and
+  `scripts/probe-request-permission-exempt.mjs` after a CLI upgrade.
   Conductor still detects a grant that does not take effect (`ineffective`), and still delivers the
   approval as a user turn of its own, which the classifier sees as the owner's consent when no rule
   decides.
-- Whether the classifier also judges `conductor` MCP tool calls (`send_message` and the rest), and
-  with which reasons. A message is no longer a `curl` command line, which removes the shape that
-  was refused as `[Auto-Mode Bypass]`. The topic of a message may still be judged.
+- With which reasons the classifier refuses `conductor` MCP calls other than the two exempt request
+  tools (`send_message`, `control` and the rest). It does judge them (about 0.6-1 s without a rule,
+  measured above), but no refusal of one has been drawn. A message is no longer a `curl` command
+  line, which removes the shape that was refused as `[Auto-Mode Bypass]`. The topic of a message may
+  still be judged.
 - **Not built:** a per-project "Edit inside this project's folders" setting. It only makes sense
   once precedence is confirmed (it now is, for exact rules in 2.1.282; a folder-wide rule is a
   broader question for the owner), and Edit mode already

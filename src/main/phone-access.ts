@@ -85,7 +85,7 @@ export interface PhoneSessions {
   ensure(spec: AgentSpec): RuntimeEnsureResult
   connectSession(id: string): Promise<void>
   submit(id: string, text: string, settings: SessionSettings, attachments?: ContextAttachment[], origin?: PromptOrigin): Promise<void>
-  steer(id: string, text: string, settings: SessionSettings, attachments?: ContextAttachment[], origin?: PromptOrigin): Promise<void>
+  steer(id: string, text: string, settings: SessionSettings, attachments?: ContextAttachment[], origin?: PromptOrigin): Promise<unknown>
   queue(id: string, text: string, settings: SessionSettings, attachments?: ContextAttachment[], origin?: PromptOrigin): Promise<void>
   respond(response: InteractionResponse): Promise<void>
   interrupt(id: string, expediteSubmittedInput?: boolean): Promise<void>

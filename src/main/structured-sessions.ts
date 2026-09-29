@@ -42,7 +42,7 @@ interface LiveSession {
   dispatchingQueue?: boolean
   dispatchingPromptId?: string
   dispatchingPromptIds?: Set<string>
-  queueing?: Promise<void>
+  queueing?: Promise<unknown>
   steering?: boolean
   interrupting?: Promise<void>
   expediteInput?: Set<string>
@@ -100,6 +100,9 @@ export interface DetachedRuntimeRecord {
   at: string
 }
 const active = new Set<SessionPhase>(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
+/** What steerOrStart did with a message: started a turn with it, steered it into the running turn
+ *  (the provider took it), or queued it behind that turn. */
+export type SteerDelivery = 'started' | 'steered' | 'queued'
 /** Settings row holding the newest reported allowance per provider and bucket (`usageLimits`). */
 const ACCOUNT_LIMITS_KEY = 'usageLimits.latest'
 /** The most events one `structured:events` IPC message carries. A burst can stage tens of
@@ -765,36 +768,35 @@ export class StructuredSessions {
   }
 
   async queue(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = [], origin?: PromptOrigin): Promise<void> {
-    return this.followup(id, text, settings, attachments, false, undefined, origin)
+    await this.followup(id, text, settings, attachments, false, undefined, origin)
   }
-  async steer(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = [], origin?: PromptOrigin): Promise<void> {
+  /** 'steered' when the provider took the message into the running turn, 'queued' when it waits
+   *  behind that turn in Conductor's queue. */
+  async steer(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = [], origin?: PromptOrigin): Promise<'steered' | 'queued'> {
     return this.followup(id, text, settings, attachments, true, undefined, origin)
   }
   /** What the composer does with a message, for a caller that cannot see the conversation: steer
    *  it into (or queue it behind) a turn that is under way, and otherwise start a turn with it
    *  exactly as `submit` does. A turn that is still stopping is refused rather than raced. */
-  async steerOrStart(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = [], origin?: PromptOrigin): Promise<'started' | 'queued'> {
+  async steerOrStart(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = [], origin?: PromptOrigin): Promise<SteerDelivery> {
     const live = this.get(id), phase = this.database.structured.snapshot(id)!.phase
     if (phase === 'interrupting') throw new Error('The conversation is still stopping its last turn; send the message again once it has stopped')
-    if (live.submitting || live.steering || live.queueing || active.has(phase)) {
-      await this.steer(id, text, settings, attachments, origin)
-      return 'queued'
-    }
+    if (live.submitting || live.steering || live.queueing || active.has(phase)) return this.steer(id, text, settings, attachments, origin)
     await this.submit(id, text, settings, attachments, origin)
     return 'started'
   }
   /** Project-task ownership is transferred only after the native runtime acknowledges custody.
    * Unlike an ordinary composer steer, this never degrades into an unbounded host-side queue. */
   async steerAccepted(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = [], origin?: PromptOrigin): Promise<void> {
-    return this.followup(id, text, settings, attachments, true, undefined, origin, true)
+    await this.followup(id, text, settings, attachments, true, undefined, origin, true)
   }
-  private async followup(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[], steer: boolean, queuedPromptIds?: readonly string[], origin?: PromptOrigin, requireNativeAcceptance = false): Promise<void> {
+  private async followup(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[], steer: boolean, queuedPromptIds?: readonly string[], origin?: PromptOrigin, requireNativeAcceptance = false): Promise<'steered' | 'queued'> {
     const live = this.get(id), adapter = live.adapter, runtimeId = live.runtimeId, turnId = live.turnId
     const captured = structuredClone(attachments)
     settings = structuredClone(settings)
     // Serialize validation as well as insertion so slow file reads cannot reorder messages.
     const previous = live.queueing
-    const queued = (async () => {
+    const queued = (async (): Promise<'steered' | 'queued'> => {
       if (previous) await previous.catch(() => undefined)
       const state = this.database.structured.snapshot(id)!
       if (live.handoff || this.cliOwned(id)) throw new Error('Switch this conversation from CLI to Chat first')
@@ -835,7 +837,7 @@ export class StructuredSessions {
             await Promise.race([acceptance.promise, transport.then(() => acceptance.promise)])
           } else await transport
           if (live.closed || this.live.get(id) !== live || live.runtimeId !== runtimeId) throw new Error('The runtime changed after steering was sent. Check the conversation before resending; your draft was kept.')
-          return
+          return 'steered'
         } catch (error) {
           acceptance?.cancel()
           // Receipt-level cancellation/uncertainty is already durable. Never make a second,
@@ -867,9 +869,10 @@ export class StructuredSessions {
       if (refusedInputId) this.setSteering(live, (this.database.structured.snapshot(id)?.pendingSteering ?? []).filter(input => input.id !== refusedInputId))
       if (steer) this.emit(live, { data: { type: 'notice', message: 'Message queued instead of steered: ' + refusal } })
       void this.drainQueue(live)
+      return 'queued'
     })()
     live.queueing = queued
-    try { await queued } finally { if (live.queueing === queued) live.queueing = undefined; void this.drainQueue(live) }
+    try { return await queued } finally { if (live.queueing === queued) live.queueing = undefined; void this.drainQueue(live) }
   }
   private setSteering(live: LiveSession, prompts: import('../shared/structured-agent').PendingSteering[], native?: AdapterEvent['native']): void {
     this.emit(live, { data: { type: 'steering', prompts }, native })
@@ -1070,7 +1073,8 @@ export class StructuredSessions {
         if (active.has(state.phase)) {
           resumedIntoActiveTurn = true
           live.submitting = false
-          return await this.followup(id, text, settingsForRuntime(settings, live.runtimeId), attachments, true, undefined, origin)
+          await this.followup(id, text, settingsForRuntime(settings, live.runtimeId), attachments, true, undefined, origin)
+          return
         }
       }
       settings = settingsForRuntime(settings, live.adapter ? live.runtimeId : undefined)

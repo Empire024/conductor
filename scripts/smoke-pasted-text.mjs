@@ -43,13 +43,15 @@ try {
   await page.keyboard.insertText(Array.from({ length: 612 }, (_, index) => 'log line ' + index).join('\n'))
   await expect(composer()).toHaveValue(prompt + '[Pasted text #1: 612 lines]')
   await expect(page.locator('.sa-context-chips')).toContainText('Pasted text #1: 612 lines')
+  // Since 0f968a8 the chip opens the text read-only in the document strip (smoke-pasted-text-open.mjs),
+  // and putting it back is the chip's own button.
   await page.locator('.sa-context-chips button').filter({ hasText: 'Pasted text #1' }).click()
-  await expect(page.getByRole('dialog')).toContainText('log line 611')
+  await expect(page.locator('.workspace-files .text-preview')).toContainText('log line 611')
   await page.screenshot({ path: join(output, 'inspect.png') })
-  await page.getByRole('button', { name: 'Put back in the message as text', exact: true }).click()
+  await page.getByRole('button', { name: 'Put Pasted text #1: 612 lines back in the message as text', exact: true }).click()
   await expect(composer()).toHaveValue(new RegExp('^' + prompt + 'log line 0\\n'))
   await expect(page.locator('.sa-context-chips > span')).toHaveCount(0)
-  results.checks.push('The chip is inspectable and can be put back into the message as text')
+  results.checks.push('The chip opens the text as a file and can be put back into the message as text')
 
   await composer().fill(prompt)
   await composer().press('End')

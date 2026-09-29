@@ -491,7 +491,7 @@ export class StructuredAgentStore {
   }
   events(id: string, after = 0): AgentEvent[] {
     if (this.volatileSpecs.has(id)) return []
-    return (this.db.prepare('SELECT event_json FROM structured_events WHERE session_id=? AND sequence>? ORDER BY sequence LIMIT 20001').all(id, after) as Array<{ event_json: string }>).map(row => JSON.parse(row.event_json) as AgentEvent)
+    return this.readBack((this.db.prepare('SELECT event_json FROM structured_events WHERE session_id=? AND sequence>? ORDER BY sequence LIMIT 20001').all(id, after) as Array<{ event_json: string }>).map(row => JSON.parse(row.event_json) as AgentEvent))
   }
   /** The oldest sequence the journal still holds for a conversation; a primary-key seek. */
   journalFloor(id: string): number | null {
@@ -499,7 +499,12 @@ export class StructuredAgentStore {
   }
   /** One primary-key-bounded slice of the journal, `from` <= sequence < `to`, at most `limit` rows. */
   journalRange(id: string, from: number, to: number, limit: number): AgentEvent[] {
-    return (this.db.prepare('SELECT event_json FROM structured_events WHERE session_id=? AND sequence>=? AND sequence<? ORDER BY sequence LIMIT ?').all(id, from, to, limit) as Array<{ event_json: string }>).map(row => JSON.parse(row.event_json) as AgentEvent)
+    return this.readBack((this.db.prepare('SELECT event_json FROM structured_events WHERE session_id=? AND sequence>=? AND sequence<? ORDER BY sequence LIMIT ?').all(id, from, to, limit) as Array<{ event_json: string }>).map(row => JSON.parse(row.event_json) as AgentEvent))
+  }
+  /** Journal rows handed out (agents.history, raw included) before the one-off redaction has
+   *  reached them may predate `maskSecrets`: mask them on the way out until it has finished. */
+  private readBack(events: AgentEvent[]): AgentEvent[] {
+    return this.redactionPending ? events.map(maskStrings) : events
   }
   /**
    * A narrow durable journal for shared weekly accounting. It bypasses history()'s UI cap and

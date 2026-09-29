@@ -373,6 +373,10 @@ describe('the control token is masked in every form it is stored in (H17)', () =
     const db = new DatabaseSync(f.path); databases.push(db)
     const store = new StructuredAgentStore(db, f.root)
     expect(JSON.stringify(store.snapshot('one'))).toContain(token)
+    // Until the walk has reached them, rows are masked as they are read back (agents.history raw).
+    expect(JSON.stringify(store.journalRange('one', 0, 100, 100))).not.toContain(token)
+    expect(JSON.stringify(store.events('one'))).not.toContain(token)
+    expect(JSON.stringify(store.journalRange('one', 0, 100, 100))).toContain('CONDUCTOR_CONTROL_TOKEN=[REDACTED]')
     const raw = (): string => (db.prepare('SELECT group_concat(event_json) AS body FROM structured_events').get() as { body: string }).body
     const before = raw()
     const dry = redactSecretsChunk(db, REDACTION_TARGETS[0], 0, false)

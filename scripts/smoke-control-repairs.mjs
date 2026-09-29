@@ -132,7 +132,7 @@ try {
   assert.equal(started.delivery, 'started')
   await expect.poll(async () => (await snapshot(id)).phase, { timeout: 30_000 }).toBe('running')
   const into = await call('agents.steer', { agentSessionId: id, prompt: 'SYNTHETIC STEER DATA while running' })
-  assert.equal(into.delivery, 'queued')
+  assert.equal(into.delivery, 'steered')
   await expect.poll(async () => (await snapshot(id)).items.some(item => item.data.type === 'text' && item.data.role === 'assistant' && /Synthetic steering input received/.test(item.data.text)), { timeout: 30_000 }).toBe(true)
   assert.equal((await snapshot(id)).phase, 'running')
   await call('agents.interrupt', { agentSessionId: id })
