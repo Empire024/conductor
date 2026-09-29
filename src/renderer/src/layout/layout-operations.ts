@@ -210,8 +210,10 @@ export const closeTab = (
  * live in workspace chrome so their lifecycles cannot be confused with PTY sessions.
  * A job tab stays because it is a durable identity (its resourceId is the job id):
  * a reload must bring back the same job, not drop the view of it. A cloud tab stays for the
- * same reason: its resourceId is the cloud run id (src/shared/cloud.ts). */
-export const RUNTIME_TAB_KINDS: readonly string[] = ['launcher', 'agent', 'terminal', 'job', 'cloud']
+ * same reason: its resourceId is the cloud run id (src/shared/cloud.ts). The production queue
+ * stays because it is a cross-project view whose row click loads another project: stripping it on
+ * that load would close the view the owner was just using. */
+export const RUNTIME_TAB_KINDS: readonly string[] = ['launcher', 'agent', 'terminal', 'job', 'cloud', 'production-queue']
 export const stripWorkspaceUtilityTabs = (layout: WorkspaceLayout): WorkspaceLayout => {
   let next = layout
   const utilityTabs = listGroups(layout.root).flatMap((group) =>

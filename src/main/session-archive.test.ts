@@ -172,6 +172,19 @@ describe('session archive validation', () => {
     expect(() => parseSessionArchive(JSON.stringify(archive))).toThrow('duplicate object identity')
   })
 
+  it('imports a workspace holding a production queue tab, open and closed', () => {
+    const archive = fixture()
+    const root = archive.workspaces[0]!.layout.root
+    if (root.type !== 'group') throw new Error('Expected group')
+    root.tabs.push({ id: 'queue-tab', kind: 'production-queue', title: 'Production queue' })
+    archive.workspaces[0]!.closedTabs.push({ id: 'closed-queue', kind: 'production-queue', title: 'Production queue' })
+    const parsed = parseSessionArchive(JSON.stringify(archive))
+    const imported = parsed.workspaces[0]!.layout.root
+    if (imported.type !== 'group') throw new Error('Expected group')
+    expect(imported.tabs.find(tab => tab.id === 'queue-tab')).toEqual({ id: 'queue-tab', kind: 'production-queue', title: 'Production queue', state: {} })
+    expect(parsed.workspaces[0]!.closedTabs.map(tab => tab.kind)).toContain('production-queue')
+  })
+
   it('marks imported terminals and browsers dormant and strips command-bearing state', () => {
     const archive = fixture(), workspace = archive.workspaces[0]!
     if (workspace.layout.root.type !== 'group') throw new Error('fixture layout')

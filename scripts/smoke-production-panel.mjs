@@ -94,6 +94,15 @@ const installFixture = projectId => app.evaluate(({ ipcMain, BrowserWindow }, pr
       finding.status = 'waived'; finding.waiverId = waiver.id
       changed(); return clone(waiver)
     },
+    'production:revoke-waiver': (id, waiverId, reason) => {
+      const waiver = state.snapshot.waivers.find(item => item.id === waiverId)
+      if (!waiver || waiver.revokedAt) throw new Error('No live waiver ' + waiverId)
+      if (!reason) throw new Error('A revocation needs a reason')
+      Object.assign(waiver, { revokedAt: new Date().toISOString(), revokedReason: reason })
+      const finding = state.snapshot.findings.find(item => item.id === waiver.findingId)
+      finding.status = 'open'; finding.waiverId = null
+      changed(); return clone(waiver)
+    },
     'production:open-evidence': () => undefined,
     'production:open-report': () => undefined
   }
@@ -112,6 +121,7 @@ try {
   check('The preload mounts window.conductor.production with the full ProductionBridge')
 
   const project = await page.evaluate(() => window.conductor.projects.create('Production smoke'))
+  const other = await page.evaluate(() => window.conductor.projects.create('Other smoke'))
   result.fixture = await installFixture(project.id)
   assert.equal(result.fixture, 'fixture', 'real production IPC handlers are registered; this smoke assumes the fixture (update it for M8)')
   await page.reload()
@@ -175,6 +185,32 @@ try {
   await queue.getByRole('button', { name: 'Open Production for Production smoke' }).click()
   await expect(page.locator('.production-pane .production-gate').first()).toBeVisible()
   check('A queue row opens that project’s Production drawer')
+
+  // Revoking asks in the panel, not in a browser dialog, and a required reason is enforced there.
+  page.on('dialog', dialog => { result.errors.push('unexpected browser dialog: ' + dialog.message()); void dialog.dismiss() })
+  const drawer = page.locator('.production-pane').filter({ has: page.locator('.production-gate') }).first()
+  const waivers = drawer.getByRole('region', { name: 'Waivers' })
+  await waivers.getByRole('button', { name: 'Revoke…' }).click()
+  const revoke = waivers.getByRole('form', { name: 'Revoke waiver' })
+  await expect(revoke).toContainText('reopens its finding')
+  await revoke.getByRole('button', { name: 'Revoke waiver' }).click()
+  await expect(revoke.getByText('Give a reason; it is kept with the record.')).toBeVisible()
+  assert.equal(await app.evaluate(() => globalThis.__productionSmoke.calls.filter(call => call.channel === 'production:revoke-waiver').length), 0, 'an empty revocation reached the bridge')
+  await revoke.getByLabel('Why revoke it').fill('Consent mode slipped')
+  await revoke.getByRole('button', { name: 'Revoke waiver' }).click()
+  await expect(waivers.getByRole('form', { name: 'Revoke waiver' })).toHaveCount(0)
+  await expect(waivers.locator('li[data-state="revoked"]')).toContainText('Consent mode slipped')
+  await expect(drawer.locator('li[data-finding-id="f-tracker"]')).toHaveAttribute('data-status', 'open')
+  assert.deepEqual(result.errors, [], 'a browser dialog opened')
+  check('Revoking a waiver is confirmed in the panel with a required reason, and reopens the finding')
+
+  // A project switch saves this workspace and loads it back through stripWorkspaceUtilityTabs.
+  await page.locator('.project-row').filter({ hasText: other.name }).click()
+  await expect(page.locator('.production-queue-pane')).toHaveCount(0)
+  await page.locator('.project-row').filter({ hasText: project.name }).click()
+  await expect(page.locator('.production-queue-pane')).toHaveCount(1)
+  await expect(page.locator('table.production-queue')).toBeVisible()
+  check('The production queue tab survives switching project away and back')
 
 } catch (error) {
   result.errors.push(error.stack ?? String(error)); process.exitCode = 1

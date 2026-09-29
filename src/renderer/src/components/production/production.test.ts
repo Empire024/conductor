@@ -12,8 +12,11 @@ import { QuestionList } from './QuestionList'
 import { WaiverForm } from './WaiverForm'
 import { DriftSettingsForm } from './DriftSettingsForm'
 import { WriteAuthorizations } from './WriteAuthorizations'
+import { ReasonForm } from './ReasonForm'
+import { readdirSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import {
-  answerQuestion, GATE_LABELS, orderQueue, progressText, runControls, validateEnvironment, validateWaiver, validateWrites, waiveFinding
+  answerQuestion, GATE_LABELS, validateReason, orderQueue, progressText, runControls, validateEnvironment, validateWaiver, validateWrites, waiveFinding
 } from './production-model'
 
 const NOW = Date.parse('2026-09-29T09:00:00.000Z')
@@ -21,7 +24,7 @@ const noop = (): void => {}
 
 const handlers = (): Omit<ProductionViewProps, 'snapshot' | 'environmentId' | 'selected' | 'openFindingId' | 'waivingFindingId' | 'driftOpen' | 'busy' | 'failure' | 'notice' | 'now'> => ({
   onEnvironment: noop, onDesignate: noop, onAudit: noop, onRetest: noop, onVerify: noop, onCreateTasks: noop, onOpenEvidence: noop,
-  onOpenReport: noop, onOpenQueue: noop, onOpenTasks: noop, onAnswer: noop, onDismiss: noop, onToggleFinding: noop, onOpenFinding: noop,
+  onOpenReport: noop, onOpenQueue: noop, onOpenTasks: noop, onAnswer: noop, onPending: noop, onDismiss: noop, onToggleFinding: noop, onOpenFinding: noop,
   onStartWaive: noop, onWaive: noop, onRevokeWaiver: noop, onPause: noop, onResume: noop, onCancel: noop, onAddEnvironment: noop,
   onRemoveEnvironment: noop, onDriftForm: noop, onSaveDrift: noop, onGrantWrites: noop, onRevokeWrites: noop
 })
@@ -327,6 +330,76 @@ describe('forms', () => {
     expect(html).toContain('value="24"')
     expect(html).toContain('<option value="mark-stale" selected="">Mark the audit stale</option>')
     expect(html).toContain('<option value="audit">Mark stale and start an audit</option>')
+  })
+})
+
+describe('in-panel confirmations', () => {
+  const inside = (html: string, container: string, form: string): boolean => {
+    const start = html.indexOf(container)
+    const next = html.indexOf('</li>', start) === -1 ? html.length : html.indexOf('</li>', start)
+    const div = html.indexOf('</div></div>', start)
+    const end = Math.max(next, div)
+    const at = html.indexOf(form)
+    return start !== -1 && at > start && at < end
+  }
+
+  it('confirms a question dismissal under that question with a required reason, beside (not inside) the answer form', async () => {
+    const { snapshot } = story()
+    const idle = view(await snapshot())
+    expect(idle).toContain('>Dismiss…</button>')
+    expect(idle).not.toContain('aria-label="Dismiss question"')
+    const html = view(await snapshot(), { pending: { kind: 'dismiss', questionId: 'q-analytics' } })
+    expect(inside(html, 'data-question-id="q-analytics"', 'aria-label="Dismiss question"')).toBe(true)
+    expect(html).toContain('the controls this question blocks stay unverified')
+    expect(html).toMatch(/aria-label="Dismiss question"[^]*?<span>Why dismiss it<\/span><input required=""/)
+    // No form is nested in another: every <form> closes before the next one opens.
+    const forms = html.match(/<\/?form\b/g) ?? []
+    forms.forEach((tag, index) => expect(tag).toBe(index % 2 === 0 ? '<form' : '</form'))
+  })
+
+  it('confirms revoking a waiver, cancelling a run and removing an environment in place', async () => {
+    const { bridge, snapshot } = story()
+    const revoke = view(await snapshot(), { pending: { kind: 'revoke', waiverId: 'waiver-1' } })
+    expect(inside(revoke, 'data-waiver-id="waiver-1"', 'aria-label="Revoke waiver"')).toBe(true)
+    expect(revoke).toContain('reopens its finding')
+    expect(revoke).not.toContain('>Revoke…</button>')
+    const run = await bridge.audit('shop', {})
+    const cancel = view(await snapshot(), { pending: { kind: 'cancel', runId: run.id } })
+    expect(inside(cancel, `data-run-id="${run.id}"`, 'aria-label="Cancel run"')).toBe(true)
+    expect(cancel).toContain('Reason (optional)')
+    expect(cancel).toMatch(/Cancel run…<\/button>/)
+    const remove = view(await snapshot(), { pending: { kind: 'remove-environment', environmentId: 'env-staging' } })
+    expect(inside(remove, 'data-environment-id="env-staging"', 'aria-label="Remove environment"')).toBe(true)
+    expect(remove).toContain('keeps its past runs and findings')
+  })
+
+  it('validates the reason and shows the bridge error inside the confirmation', () => {
+    expect(validateReason('  ', true)).toBe('Give a reason; it is kept with the record.')
+    expect(validateReason('', false)).toBe('')
+    expect(validateReason('x'.repeat(501), false)).toBe('Keep the reason under 500 characters.')
+    const html = renderToStaticMarkup(createElement(ReasonForm, { label: 'Revoke waiver', consequence: 'c', reasonLabel: 'Why revoke it', reasonRequired: true, confirmLabel: 'Revoke waiver', busy: false, error: 'No waiver waiver-9', onSubmit: noop, onCancel: noop }))
+    expect(html).toContain('No waiver waiver-9')
+    expect(html).toContain('>Keep</button>')
+    expect(renderToStaticMarkup(createElement(ReasonForm, { label: 'Remove environment', consequence: 'c', reasonLabel: null, reasonRequired: false, confirmLabel: 'Remove environment', busy: false, error: '', onSubmit: noop, onCancel: noop }))).not.toContain('<input')
+  })
+
+  it('settles the confirmed actions over the bridge', async () => {
+    const { bridge, snapshot } = story()
+    await bridge.dismissQuestion('shop', 'q-analytics', 'Not decided yet')
+    await bridge.revokeWaiver('shop', 'waiver-1', 'Fonts still remote')
+    const run = await bridge.audit('shop', {})
+    await bridge.cancel('shop', run.id, 'Wrong environment')
+    const after = await snapshot()
+    expect(after.profile!.questions.find(question => question.id === 'q-analytics')).toMatchObject({ status: 'dismissed', answer: 'Not decided yet' })
+    expect(after.waivers[0]).toMatchObject({ revokedReason: 'Fonts still remote' })
+    expect(after.findings.find(finding => finding.id === 'f-font')!.status).toBe('open')
+    expect(after.runs.find(item => item.id === run.id)).toMatchObject({ status: 'cancelled', statusReason: 'Wrong environment' })
+  })
+
+  it('uses no browser dialogs anywhere in the Production UI', () => {
+    const root = join(__dirname, '..')
+    const files = [join(root, 'ProductionPane.tsx'), join(root, '..', 'panes', 'ProductionQueuePane.tsx'), ...readdirSync(__dirname).filter(name => name.endsWith('.tsx')).map(name => join(__dirname, name))]
+    for (const file of files) expect(readFileSync(file, 'utf8'), file).not.toMatch(/window\.(prompt|confirm|alert)\(/)
   })
 })
 

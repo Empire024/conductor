@@ -149,6 +149,30 @@ export function validateWaiver(findingId: string, draft: WaiverDraft, now: numbe
   return { request: { findingId, reason: draft.reason.trim(), scope: draft.scope.trim(), owner: draft.owner.trim(), expiresAt: new Date(expiresAt).toISOString() }, errors }
 }
 
+/** A reason a confirmation keeps in the record: required ones must say something, and all stay short. */
+export function validateReason(reason: string, required: boolean): string {
+  if (required && !reason.trim()) return 'Give a reason; it is kept with the record.'
+  if (reason.length > 500) return 'Keep the reason under 500 characters.'
+  return ''
+}
+
+/** The settling actions the panel confirms in place (ReasonForm) instead of a browser dialog. */
+export type PendingAction =
+  | { kind: 'dismiss'; questionId: string }
+  | { kind: 'revoke'; waiverId: string }
+  | { kind: 'cancel'; runId: string }
+  | { kind: 'remove-environment'; environmentId: string }
+
+export const pendingId = (action: PendingAction | null, kind: PendingAction['kind']): string | null => {
+  if (!action || action.kind !== kind) return null
+  switch (action.kind) {
+    case 'dismiss': return action.questionId
+    case 'revoke': return action.waiverId
+    case 'cancel': return action.runId
+    case 'remove-environment': return action.environmentId
+  }
+}
+
 export interface EnvironmentDraft { label: string; kind: EnvironmentKind; baseUrl: string; extraOrigins: string }
 export type EnvironmentErrors = Partial<Record<keyof EnvironmentDraft, string>>
 

@@ -34,11 +34,13 @@ export function EnvironmentForm({ existing, busy, error, onSave, onCancel }: {
 }
 
 /** The project's environments with their allowlists; removing one keeps its past runs. */
-export function EnvironmentList({ environments, designatedId, busy, onRemove }: {
+export function EnvironmentList({ environments, designatedId, busy, onRemove, confirmId = null, confirm = null }: {
   environments: ProductionEnvironment[]
   designatedId: string | null
   busy: string
   onRemove(environmentId: string): void
+  confirmId?: string | null
+  confirm?: React.ReactNode
 }): React.JSX.Element {
   if (!environments.length) return <p className="production-muted">No environments yet.</p>
   return <ul className="production-environments">
@@ -48,7 +50,7 @@ export function EnvironmentList({ environments, designatedId, busy, onRemove }: 
         {designatedId === environment.id && <span className="production-chip tone-good">production-ready</span>}
       </div>
       <small>{environment.baseUrl} · allowed {environment.allowedOrigins.join(', ')}</small>
-      <button type="button" className="danger" disabled={Boolean(busy) || designatedId === environment.id} title={designatedId === environment.id ? 'Remove the designation first' : 'Remove this environment'} onClick={() => onRemove(environment.id)}>Remove</button>
+      {confirmId === environment.id ? confirm : <button type="button" className="danger" disabled={Boolean(busy) || designatedId === environment.id} title={designatedId === environment.id ? 'Remove the designation first' : 'Remove this environment'} onClick={() => onRemove(environment.id)}>Remove…</button>}
     </li>)}
   </ul>
 }

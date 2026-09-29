@@ -47,12 +47,14 @@ export function WaiverForm({ finding, busy, error, now, initialDraft, initialErr
 }
 
 /** Waivers of the project, live ones first; revoking keeps the record and reopens the finding. */
-export function WaiverList({ waivers, findings, busy, now, onRevoke }: {
+export function WaiverList({ waivers, findings, busy, now, onRevoke, confirmId = null, confirm = null }: {
   waivers: Waiver[]
   findings: Finding[]
   busy: string
   now: number
   onRevoke(waiverId: string): void
+  confirmId?: string | null
+  confirm?: React.ReactNode
 }): React.JSX.Element {
   if (!waivers.length) return <p className="production-muted">No waivers.</p>
   const title = (findingId: string): string => findings.find(finding => finding.id === findingId)?.title ?? findingId
@@ -62,7 +64,8 @@ export function WaiverList({ waivers, findings, busy, now, onRevoke }: {
       <strong>{title(waiver.findingId)}</strong>
       <small>{waiver.reason} · scope {waiver.scope} · owner {waiver.owner} · granted by {waiver.grantedBy.kind} {formatTime(waiver.grantedAt)}</small>
       <small>{state(waiver) === 'revoked' ? `Revoked ${formatTime(waiver.revokedAt)}${waiver.revokedReason ? `: ${waiver.revokedReason}` : ''}` : `${state(waiver) === 'expired' ? 'Expired' : 'Expires'} ${formatTime(waiver.expiresAt)}`}</small>
-      {state(waiver) === 'live' && <button type="button" className="danger" disabled={Boolean(busy)} onClick={() => onRevoke(waiver.id)}>Revoke</button>}
+      {state(waiver) === 'live' && confirmId !== waiver.id && <button type="button" className="danger" disabled={Boolean(busy)} onClick={() => onRevoke(waiver.id)}>Revoke…</button>}
+      {confirmId === waiver.id && confirm}
     </li>)}
   </ul>
 }

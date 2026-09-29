@@ -3,6 +3,7 @@ import type { PaneGroupNode, SplitNode } from '../../../shared/models'
 import { createDefaultLayout, makeLauncherTab } from '../../../shared/models'
 import { addTab, applyTabDrop, closeTab, dockTab, dockTabsBeside, findGroup, insertForeignTab, instantiateLayout, listGroups, moveTabToGroup, reorderTab, splitGroup, stripWorkspaceUtilityTabs, tabDropLands } from './layout-operations'
 import { gapAnchorId } from './tab-drag'
+import { createPaneTab } from '../panes/pane-factory'
 
 describe('layout operations', () => {
   it('splits recursively and preserves both groups', () => {
@@ -152,6 +153,14 @@ describe('layout operations', () => {
     layout = addTab(layout, layout.root.id, { id: 'job-view', kind: 'job', title: 'Overnight job', resourceId: 'job_0001' })
     const reloaded = stripWorkspaceUtilityTabs(layout)
     expect(listGroups(reloaded.root).flatMap((group) => group.tabs).find((tab) => tab.kind === 'job')).toMatchObject({ id: 'job-view', resourceId: 'job_0001' })
+  })
+
+  it('keeps the production queue tab across a project reload', () => {
+    let layout = createDefaultLayout()
+    layout = addTab(layout, layout.root.id, createPaneTab('production-queue'))
+    layout = addTab(layout, layout.root.id, { id: 'memory', kind: 'memory', title: 'Memory' })
+    const reloaded = stripWorkspaceUtilityTabs(layout)
+    expect(listGroups(reloaded.root).flatMap((group) => group.tabs).map((tab) => [tab.kind, tab.title])).toEqual([['launcher', 'New tab'], ['production-queue', 'Production queue']])
   })
 
   it('inserts a tab at a specific index instead of always appending', () => {

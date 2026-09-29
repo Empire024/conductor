@@ -13,7 +13,8 @@ import { RunList } from './production/RunList'
 import { EnvironmentForm, EnvironmentList } from './production/EnvironmentForm'
 import { WriteAuthorizations } from './production/WriteAuthorizations'
 import { DriftSettingsForm } from './production/DriftSettingsForm'
-import { answerQuestion, chosenEnvironment, errorText, isOpenFinding, reportRun } from './production/production-model'
+import { ReasonForm } from './production/ReasonForm'
+import { answerQuestion, chosenEnvironment, errorText, isOpenFinding, pendingId, reportRun, type PendingAction } from './production/production-model'
 import './ProductionPane.css'
 
 /**
@@ -46,15 +47,18 @@ export interface ProductionHandlers {
   onOpenQueue(): void
   onOpenTasks(): void
   onAnswer(questionId: string, answer: string): void
-  onDismiss(questionId: string): void
+  /** Opens (or closes, with null) the in-panel confirmation of a settling action. */
+  onPending(action: PendingAction | null): void
+  /** The confirmed actions; each runs only from its ReasonForm. */
+  onDismiss(questionId: string, reason: string): void
   onToggleFinding(findingId: string): void
   onOpenFinding(findingId: string | null): void
   onStartWaive(findingId: string | null): void
   onWaive(request: WaiverRequest): void
-  onRevokeWaiver(waiverId: string): void
+  onRevokeWaiver(waiverId: string, reason: string): void
   onPause(runId: string): void
   onResume(runId: string): void
-  onCancel(runId: string): void
+  onCancel(runId: string, reason: string): void
   onAddEnvironment(environment: ProductionEnvironment): void
   onRemoveEnvironment(environmentId: string): void
   onDriftForm(open: boolean): void
@@ -70,6 +74,8 @@ export interface ProductionViewProps extends ProductionHandlers {
   openFindingId: string | null
   waivingFindingId: string | null
   driftOpen: boolean
+  /** The settling action awaiting confirmation in the panel, if any. */
+  pending?: PendingAction | null
   busy: string
   failure: Failure | null
   notice: string
@@ -107,6 +113,10 @@ export function ProductionView(props: ProductionViewProps): React.JSX.Element {
   const failureAt = (scope: string): string => failure?.scope === scope ? failure.message : ''
   const activeHere = snapshot.activeRun && snapshot.activeRun.environmentId === envId ? snapshot.activeRun : null
   const gateForOther = snapshot.gate.environmentId && envId && snapshot.gate.environmentId !== envId
+  const pending = props.pending ?? null
+  const closePending = (): void => props.onPending(null)
+  const dismissing = pendingId(pending, 'dismiss'), revoking = pendingId(pending, 'revoke')
+  const cancelling = pendingId(pending, 'cancel'), removing = pendingId(pending, 'remove-environment')
 
   return <div className="production-pane" data-project-id={snapshot.projectId}>
     <header className="production-header">
@@ -149,7 +159,11 @@ export function ProductionView(props: ProductionViewProps): React.JSX.Element {
 
     {profile && <>
       <Section title="Owner questions" count={openQuestions}>
-        <QuestionList questions={questions} busy={busy} error={failureAt('questions')} onAnswer={props.onAnswer} onDismiss={props.onDismiss} />
+        <QuestionList questions={questions} busy={busy} error={failureAt('questions')} onAnswer={props.onAnswer}
+          onDismiss={questionId => props.onPending({ kind: 'dismiss', questionId })} confirmId={dismissing}
+          confirm={dismissing && <ReasonForm key={dismissing} label="Dismiss question" consequence="Dismissing keeps the fact unknown: the controls this question blocks stay unverified."
+            reasonLabel="Why dismiss it" reasonRequired confirmLabel="Dismiss question" busy={busy === `dismiss:${dismissing}`} error={failureAt('pending')}
+            onSubmit={reason => props.onDismiss(dismissing, reason)} onCancel={closePending} />} />
       </Section>
       <Section title="Controls">
         <ControlTable results={snapshot.results} gate={snapshot.gate} />
@@ -161,14 +175,26 @@ export function ProductionView(props: ProductionViewProps): React.JSX.Element {
         {waiving && <WaiverForm key={waiving.id} finding={waiving} busy={busy === 'waive'} error={failureAt('waive')} now={now} onSubmit={props.onWaive} onCancel={() => props.onStartWaive(null)} />}
       </Section>
       <Section title="Waivers" count={snapshot.waivers.filter(waiver => !waiver.revokedAt && Date.parse(waiver.expiresAt) > now).length}>
-        <WaiverList waivers={snapshot.waivers} findings={snapshot.findings} busy={busy} now={now} onRevoke={props.onRevokeWaiver} />
+        <WaiverList waivers={snapshot.waivers} findings={snapshot.findings} busy={busy} now={now}
+          onRevoke={waiverId => props.onPending({ kind: 'revoke', waiverId })} confirmId={revoking}
+          confirm={revoking && <ReasonForm key={revoking} label="Revoke waiver" consequence="Revoking keeps the waiver on record and reopens its finding."
+            reasonLabel="Why revoke it" reasonRequired confirmLabel="Revoke waiver" busy={busy === `revoke:${revoking}`} error={failureAt('pending')}
+            onSubmit={reason => props.onRevokeWaiver(revoking, reason)} onCancel={closePending} />} />
       </Section>
       <Section title="Runs">
         {failureAt('runs') && <p className="production-error" role="alert">{failureAt('runs')}</p>}
-        <RunList runs={runs} busy={busy} onPause={props.onPause} onResume={props.onResume} onCancel={props.onCancel} onOpenReport={props.onOpenReport} />
+        <RunList runs={runs} busy={busy} onPause={props.onPause} onResume={props.onResume} onOpenReport={props.onOpenReport}
+          onCancel={runId => props.onPending({ kind: 'cancel', runId })} confirmId={cancelling}
+          confirm={cancelling && <ReasonForm key={cancelling} label="Cancel run" consequence="Cancelling stops the run; its finished steps and evidence are kept."
+            reasonLabel="Reason" reasonRequired={false} confirmLabel="Cancel run" busy={busy === `cancel:${cancelling}`} error={failureAt('pending')}
+            onSubmit={reason => props.onCancel(cancelling, reason || 'Cancelled from the Production panel')} onCancel={closePending} />} />
       </Section>
       <Section title="Environments" count={environments.length}>
-        <EnvironmentList environments={environments} designatedId={designation?.productionReady ? designation.environmentId : null} busy={busy} onRemove={props.onRemoveEnvironment} />
+        <EnvironmentList environments={environments} designatedId={designation?.productionReady ? designation.environmentId : null} busy={busy}
+          onRemove={environmentId => props.onPending({ kind: 'remove-environment', environmentId })} confirmId={removing}
+          confirm={removing && <ReasonForm key={removing} label="Remove environment" consequence="Removing the environment keeps its past runs and findings."
+            reasonLabel={null} reasonRequired={false} confirmLabel="Remove environment" busy={busy === `environment:${removing}`} error={failureAt('pending')}
+            onSubmit={() => props.onRemoveEnvironment(removing)} onCancel={closePending} />} />
         <details className="production-add-environment">
           <summary>Add environment</summary>
           <EnvironmentForm existing={environments} busy={busy === 'environment'} error={failureAt('environment')} onSave={props.onAddEnvironment} />
@@ -189,6 +215,7 @@ export function ProductionPane({ projectId, bridge = window.conductor.production
   const [openFindingId, setOpenFindingId] = useState<string | null>(null)
   const [waivingFindingId, setWaivingFindingId] = useState<string | null>(null)
   const [driftOpen, setDriftOpen] = useState(false)
+  const [pending, setPending] = useState<PendingAction | null>(null)
   const [busy, setBusy] = useState('')
   const [failure, setFailure] = useState<Failure | null>(null)
   const [notice, setNotice] = useState('')
@@ -212,7 +239,7 @@ export function ProductionPane({ projectId, bridge = window.conductor.production
   useEffect(() => {
     shownProject.current = projectId
     setSnapshot(null); setEnvironmentId(null); setSelected(new Set()); setOpenFindingId(null); setWaivingFindingId(null)
-    setDriftOpen(false); setBusy(''); setFailure(null); setNotice('')
+    setDriftOpen(false); setPending(null); setBusy(''); setFailure(null); setNotice('')
     void load()
   }, [projectId, load])
   useEffect(() => bridge.onChanged(changed => { if (changed === projectId) void load() }), [bridge, load, projectId])
@@ -243,10 +270,14 @@ export function ProductionPane({ projectId, bridge = window.conductor.production
   const selectedIds = snapshot.findings.filter(finding => selected.has(finding.id) && finding.environmentId === environment?.id).map(finding => finding.id)
   const clearSelection = (): void => setSelected(new Set())
   const saveEnvironments = (environments: ProductionEnvironment[]): Promise<unknown> => bridge.updateProfile(projectId, { environments })
+  /** A confirmed settling action: its error stays in the confirmation, which closes only on success. */
+  const settle = async (key: string, action: () => Promise<unknown>): Promise<void> => {
+    if (await act(key, 'pending', action)) setPending(null)
+  }
 
   return <ProductionView
     snapshot={snapshot} environmentId={environment?.id ?? null} selected={selected} openFindingId={openFindingId} waivingFindingId={waivingFindingId}
-    driftOpen={driftOpen} busy={busy} failure={failure} notice={notice} now={now}
+    driftOpen={driftOpen} pending={pending} busy={busy} failure={failure} notice={notice} now={now}
     onEnvironment={id => { setEnvironmentId(id); clearSelection(); setOpenFindingId(null); setWaivingFindingId(null) }}
     onDesignate={productionReady => void act('designate', 'pane', () => bridge.designate(projectId, {
       productionReady, environmentId: environment?.id ?? null, note: productionReady ? 'Designated from the Production panel' : 'Withdrawn from the Production panel'
@@ -267,34 +298,21 @@ export function ProductionPane({ projectId, bridge = window.conductor.production
     onOpenQueue={() => window.dispatchEvent(new CustomEvent(OPEN_PRODUCTION_QUEUE_EVENT))}
     onOpenTasks={() => window.dispatchEvent(new CustomEvent(OPEN_PROJECT_TASKS_EVENT))}
     onAnswer={(questionId, answer) => void act(`answer:${questionId}`, 'questions', () => answerQuestion(bridge, projectId, questionId, answer))}
-    onDismiss={questionId => {
-      const reason = window.prompt('Why dismiss this question? The controls it blocks stay unverified.', '')
-      if (reason === null) return
-      void act(`dismiss:${questionId}`, 'questions', () => bridge.dismissQuestion(projectId, questionId, reason))
-    }}
+    onPending={action => { setFailure(null); setPending(action) }}
+    onDismiss={(questionId, reason) => void settle(`dismiss:${questionId}`, () => bridge.dismissQuestion(projectId, questionId, reason))}
     onToggleFinding={id => setSelected(current => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next })}
     onOpenFinding={id => { setOpenFindingId(id); if (id !== waivingFindingId) setWaivingFindingId(null) }}
     onStartWaive={id => { setFailure(null); setWaivingFindingId(id) }}
     onWaive={request => void act('waive', 'waive', async () => { await bridge.waive(projectId, request); setWaivingFindingId(null) })}
-    onRevokeWaiver={waiverId => {
-      const reason = window.prompt('Why revoke this waiver? The finding reopens.', '')
-      if (reason === null) return
-      void act(`revoke:${waiverId}`, 'pane', () => bridge.revokeWaiver(projectId, waiverId, reason))
-    }}
+    onRevokeWaiver={(waiverId, reason) => void settle(`revoke:${waiverId}`, () => bridge.revokeWaiver(projectId, waiverId, reason))}
     onPause={runId => void act(`pause:${runId}`, 'runs', () => bridge.pause(projectId, runId))}
     onResume={runId => void act(`resume:${runId}`, 'runs', () => bridge.resume(projectId, runId))}
-    onCancel={runId => {
-      if (!window.confirm('Cancel this run? Its finished steps and evidence are kept.')) return
-      void act(`cancel:${runId}`, 'runs', () => bridge.cancel(projectId, runId, 'Cancelled from the Production panel'))
-    }}
+    onCancel={(runId, reason) => void settle(`cancel:${runId}`, () => bridge.cancel(projectId, runId, reason))}
     onAddEnvironment={added => void act('environment', 'environment', async () => {
       await saveEnvironments([...(profile?.environments ?? []), added])
       setEnvironmentId(added.id)
     })}
-    onRemoveEnvironment={removed => {
-      if (!window.confirm('Remove this environment? Its past runs and findings are kept.')) return
-      void act(`environment:${removed}`, 'pane', () => saveEnvironments((profile?.environments ?? []).filter(item => item.id !== removed)))
-    }}
+    onRemoveEnvironment={removed => void settle(`environment:${removed}`, () => saveEnvironments((profile?.environments ?? []).filter(item => item.id !== removed)))}
     onDriftForm={setDriftOpen}
     onSaveDrift={drift => void act('drift', 'drift', async () => { await bridge.updateProfile(projectId, { drift }); setDriftOpen(false) })}
     onGrantWrites={request => void act('writes', 'writes', () => bridge.authorizeWrites(projectId, request))}
