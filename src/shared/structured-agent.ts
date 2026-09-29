@@ -1,4 +1,5 @@
 import type { AgentChangeHistory, RevertOutcome, RevertScope } from './agent-change-history'
+import { promotedFrontier } from './promoted-models'
 /** Versioned, provider-neutral envelope. Native IDs never double as Conductor IDs. */
 export type StructuredProvider = 'codex' | 'claude' | 'grok' | 'local'
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json }
@@ -73,6 +74,8 @@ export interface SessionSettings {
  *  conversation the owner's authority over the whole app, which only the strongest models get. */
 export const isFrontierModel = (provider: string | undefined, model: string | undefined): boolean => {
   if (!model) return false
+  // A model an auto model upgrade put in a frontier model's place (docs/model-upgrades.md).
+  if (promotedFrontier(provider, model)) return true
   if (provider === 'claude') return /(?:^|[-/])(?:opus|fable)/i.test(model)
   if (provider === 'codex') return /^gpt-6(?:[-.]|$)|astra/i.test(model)
   // xAI's frontier tier from Grok 4.6 on (Grok Build 1.0.41 describes 4.6 and 4.7 that way, 2026-09-24).

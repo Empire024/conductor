@@ -24,7 +24,7 @@ export const MUTATION_FAMILIES = {
     'ideas.run', 'ideas.run.approve', 'ideas.run.decide', 'ideas.run.pause', 'ideas.run.resume', 'ideas.run.stop'
   ],
   permissions: ['permissions.request', 'permissions.decide', 'permissions.revoke'],
-  models: ['models.refresh', 'models.outcome', 'models.evaluate', 'decisions.live'],
+  models: ['models.refresh', 'models.outcome', 'models.evaluate', 'decisions.live', 'models.upgrades.check', 'models.upgrades.prepared', 'models.upgrades.accept', 'models.upgrades.decline', 'models.upgrades.retry', 'models.upgrades.configure'],
   production: [
     'production.profile.update', 'production.designate', 'production.answer', 'production.review.answer', 'production.audit', 'production.retest', 'production.verify',
     'production.pause', 'production.resume', 'production.cancel', 'production.tasks.create', 'production.waive', 'production.waivers.revoke',
@@ -48,7 +48,7 @@ export const CONTROL_METHOD_CLASSES = new Set<`${ControlMethodClass}:${string}`>
     'jobs.list', 'jobs.status', 'jobs.events', 'schedules.list', 'schedules.get',
     'loops.list', 'loops.get', 'loops.history', 'loops.proposals', 'ideas.list', 'ideas.get', 'ideas.runs',
     'nodes.list', 'nodes.jobs', 'nodes.job', 'nodes.log', 'cloud.list', 'cloud.status', 'cloud.transcript', 'permissions.list',
-    'models.registry', 'models.route', 'decisions.list', 'decisions.get',
+    'models.registry', 'models.route', 'decisions.list', 'decisions.get', 'models.upgrades.status',
     'production.status', 'production.queue', 'production.registry', 'production.runs', 'production.run', 'production.findings', 'production.report', 'production.evidence', 'production.profile.get'
   ].map(method => `read:${method}` as const),
   ...[...FAMILY_OF.keys()].map(method => `mutation:${method}` as const)

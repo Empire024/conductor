@@ -15,6 +15,8 @@ const ENV: Record<PinnableCli, string> = { claude: 'CONDUCTOR_CLAUDE_PATH', code
 const EXE = process.platform === 'win32' ? '.exe' : ''
 const PINS = 'cli-pins.json'
 const MANIFEST = 'cli-version.json'
+/** The restorePoint an auto model upgrade's pin records instead of a restore point version. */
+export const MODEL_UPGRADE_PIN = 'model-upgrade'
 
 export const isPinnableCli = (value: string): value is PinnableCli => (PINNABLE_CLIS as string[]).includes(value)
 /** `2.1.281 (Claude Code)`, `codex-cli 0.155.1` → the bare version the restore point means. */
@@ -48,8 +50,12 @@ const findInstalled = (provider: PinnableCli): string | null => {
   // In-process, not where.exe: a process start on main's thread delays every keystroke (path-lookup.ts).
   return cachedLookupOnPath(provider)
 }
-const runVersion = (executable: string): Promise<string | null> => new Promise(resolve => {
-  execFile(executable, ['--version'], { windowsHide: true, timeout: 15_000, maxBuffer: 16_384 }, (error, stdout) => resolve(error ? null : plainCliVersion(String(stdout))))
+/** An npm shim (.cmd) cannot be started without a shell on Windows; a native executable is started directly. */
+export const runVersion = (executable: string): Promise<string | null> => new Promise(resolve => {
+  const done = (error: Error | null, stdout: string | Buffer): void => resolve(error ? null : plainCliVersion(String(stdout)))
+  const options = { windowsHide: true, timeout: 15_000, maxBuffer: 16_384 }
+  if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(executable)) execFile(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `""${executable}" --version"`], { ...options, windowsVerbatimArguments: true }, done)
+  else execFile(executable, ['--version'], options, done)
 })
 const atomicJson = (path: string, value: unknown): void => {
   const temporary = `${path}.${process.pid}.${Date.now()}.tmp`
@@ -141,6 +147,24 @@ export class CliVersionStore {
     }
     if (pins.length) this.writePins(next)
     return plan.clis.filter(change => change.action === 'pin' || change.action === 'unpin')
+  }
+  /** Auto model upgrade (docs/model-upgrades.md): saves the CLI a scratch npm install produced
+   *  (its executable's folder, or the platform folder above it) and pins it, so every new tab of
+   *  that provider launches it without the owner's global CLI being touched. */
+  async adopt(provider: PinnableCli, version: string, executable: string): Promise<string> {
+    safeVersion(version)
+    const folder = dirname(executable)
+    const root = basename(folder) === provider ? dirname(folder) : folder
+    const saved = await this.save(provider, version, { kind: 'package', root, entry: relative(root, executable) })
+    const next = this.readPins()
+    next.pins[provider] = { version, executable: saved, pinnedAt: new Date(this.now()).toISOString(), restorePoint: MODEL_UPGRADE_PIN }
+    this.writePins(next)
+    return saved
+  }
+  /** True when the provider's pin was made by adopt(). */
+  adoptedPin(provider: PinnableCli): string | null {
+    const pin = this.readPins().pins[provider]
+    return pin?.restorePoint === MODEL_UPGRADE_PIN ? pin.version : null
   }
   /** "Use installed CLIs": every tab launches what CONDUCTOR_<CLI>_PATH or PATH names again. */
   clearPins(provider?: PinnableCli): void {
@@ -303,4 +327,5 @@ export function restorePlan(input: RestorePlanInput): RestorePlan {
 /** The store every provider launch consults; set once by the UpdateManager that owns it. */
 let active: CliVersionStore | null = null
 export const setActiveCliVersions = (store: CliVersionStore | null): void => { active = store }
+export const activeCliVersions = (): CliVersionStore | null => active
 export const pinnedCliExecutable = (provider: string): string | null => active && isPinnableCli(provider) ? active.pinnedExecutable(provider) : null

@@ -97,6 +97,7 @@ import { playAgentSound } from './agent-sounds'
 import { AppUpdateButton } from './components/AppUpdateButton'
 import { AppControlHistory } from './components/ControlActivity'
 import { UpdatePrompt } from './components/UpdatePrompt'
+import { ModelUpgradeCard } from './components/ModelUpgradeCard'
 import { AgentConfirmDialog } from './components/AgentConfirmDialog'
 import { useAgentConfirm } from './use-agent-confirm'
 import { summarizeSubagents } from './panes/usage-summary'
@@ -1868,6 +1869,7 @@ export function App(): React.JSX.Element {
           onDismiss={() => setDismissedUpdateVersion(updateState.availableVersion ?? null)}
         />
       )}
+      <ModelUpgradeCard />
       {agentConfirm.request && <AgentConfirmDialog key={agentConfirm.request.id} request={agentConfirm.request} onRespond={agentConfirm.respond} />}
       {appSettings.debugLogging && debugConsoleOpen && (
         <DebugConsole

@@ -48,6 +48,8 @@ import type { OrchestrationBridge } from './orchestration'
 import type { AgentCollaborationBridge } from './agent-collaboration'
 import type { StructuredAgentBridge } from './structured-agent'
 import type { BrowserPresentation, BrowserSurfaceCommand, BrowserSurfaceRequest, BrowserSurfaceState } from './browser-surface'
+import type { ModelUpgradeOffer, ModelUpgradesStatus } from './model-upgrades'
+import type { PromotedModels } from './promoted-models'
 
 export interface FileSearchOptions { showHidden?: boolean; activeProjectId?: string; recentPaths?: Array<{ projectId: string; path: string }> }
 
@@ -155,6 +157,15 @@ export interface ConductorBridge {
     acknowledgePrepare(requestId: string): void
     onState(callback: (state: AppUpdateState) => void): () => void
     onPrepareInstall(callback: (payload: { requestId: string }) => void): () => void
+  }
+  /** Auto model upgrade (docs/model-upgrades.md): status, the owner's answer, the wizard opt-in. */
+  modelUpgrades: {
+    status(): Promise<ModelUpgradesStatus | null>
+    answer(id: string, answer: 'accept' | 'decline' | 'retry'): Promise<ModelUpgradeOffer>
+    setWizardMayAccept(enabled: boolean): Promise<ModelUpgradesStatus | null>
+    promoted(): Promise<PromotedModels>
+    onStatus(callback: (status: ModelUpgradesStatus) => void): () => void
+    onPromoted(callback: (promoted: PromotedModels) => void): () => void
   }
   sessions: {
     onRestored(callback: (session: SessionRecord) => void): () => void

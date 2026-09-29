@@ -107,6 +107,10 @@ import { DECIDER_MODEL, DeciderServer, deciderPaths } from './local-models/decid
 import { localRoot } from './local-models/paths'
 import type { ScheduleRunner } from './schedule-runner'
 import { createScheduledTasks, latestModelsBuiltin, registerScheduleKindExecutor } from './schedule-wiring'
+import { LATEST_MODELS_BUILTIN } from './schedule-builtins/latest-models'
+import { createModelUpgrades, isConductorCheckout } from './model-upgrades/app-wiring'
+import type { ModelUpgradeService } from './model-upgrades/service'
+import { promotedModels } from '../shared/promoted-models'
 import { createProductionApp, type ProductionApp } from './production/app-wiring'
 import { registerProductionIpc } from './production-ipc'
 import { registerScheduleIpc } from './schedule-ipc'
@@ -215,6 +219,8 @@ let browserMcp: BrowserMcpServer | undefined
 let localAssist: LocalAssist | undefined
 /** Model intelligence and routing (docs/model-routing.md); started in the background after launch. */
 let modelIntelligence: ModelIntelligence | undefined
+/** Auto model upgrade (docs/model-upgrades.md): notices a better model, prepares it, asks one OK. */
+let modelUpgrades: ModelUpgradeService | undefined
 let disposeModelObserver: (() => void) | undefined
 let permissionGrants: Awaited<ReturnType<typeof startPermissionGrants>> | undefined
 let claudeFullAuto: ClaudeFullAutoPolicy
@@ -2020,6 +2026,19 @@ const registerIpc = (): void => {
   ipcMain.handle('updates:rollback', (event, version: string, scope?: RestoreScope) => { trustedStructured(event); return updates.rollback(version, scope === 'clis' ? 'clis' : 'all') })
   ipcMain.handle('updates:cli-pins', (event) => { trustedStructured(event); return updates.cliPins() })
   ipcMain.handle('updates:use-installed-clis', (event) => { trustedStructured(event); return updates.useInstalledClis() })
+  // The owner's one OK (or No) on a model upgrade card; the renderer is the owner at the keyboard.
+  ipcMain.handle('model-upgrades:status', (event) => { trustedStructured(event); return modelUpgrades?.status() ?? null })
+  ipcMain.handle('model-upgrades:answer', (event, id: unknown, answer: unknown) => {
+    trustedStructured(event)
+    if (!modelUpgrades) throw new Error('The auto model upgrade is unavailable in this Conductor')
+    if (typeof id !== 'string' || id.length > 200) throw new Error('Invalid model upgrade id')
+    if (answer === 'accept') return modelUpgrades.accept(id, 'owner')
+    if (answer === 'decline') return modelUpgrades.decline(id)
+    if (answer === 'retry') return modelUpgrades.retry(id)
+    throw new Error('answer must be accept, decline or retry')
+  })
+  ipcMain.handle('model-upgrades:set-wizard', (event, enabled: unknown) => { trustedStructured(event); if (typeof enabled !== 'boolean') throw new Error('enabled must be true or false'); return modelUpgrades?.setWizardMayAccept(enabled) ?? null })
+  ipcMain.handle('model-upgrades:promoted', (event) => { trustedStructured(event); return promotedModels() })
   ipcMain.handle('updates:download', (event) => { trustedStructured(event); return updates.download() })
   ipcMain.handle('updates:install', (event) => { trustedStructured(event); return updates.install() })
   // The owner answering a wizard's restart request when no update is waiting to install.
@@ -2869,7 +2888,22 @@ app.whenReady().then(async () => {
   })
   // Annotated because the browser bridge is built earlier and reaches back through this handle;
   // without it the two initializers form an inference cycle.
-  const control: AgentControl = new AgentControl({ database, sessions: agents.structured,
+  // Offline test profiles never reach npm unless a smoke points the watch at its fake registry.
+  modelUpgrades = createModelUpgrades({
+    userData: app.getPath('userData'), appVersion: app.getVersion(),
+    enabled: !process.env.CONDUCTOR_TEST_USER_DATA ? process.env.CONDUCTOR_OFFLINE_TESTS !== '1' : Boolean(process.env.CONDUCTOR_NPM_REGISTRY),
+    getSetting: key => database.getSetting(key), setSetting: (key, value) => database.setSetting(key, value),
+    conductorProject: () => { const found = database.listProjects().find(project => isConductorCheckout(project.path)); return found ? { id: found.id, path: found.path } : null },
+    control: (projectId, method, args) => control.call(control.ownerScope(projectId ? { projectId } : undefined), method, args),
+    agentOpen: agentId => control.agentTabOpen(agentId),
+    localUpdates: localUpdateBuilder,
+    updates: () => updates ?? null,
+    catalogScript: LATEST_MODELS_BUILTIN.scripts.find(script => script.name === 'cli-catalogs')!.content,
+    recordObservations: batch => { modelIntelligence?.recordObservations(batch) },
+    broadcast: (channel, payload) => { for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send(channel, payload) },
+    log: message => console.warn(message)
+  })
+  const control: AgentControl = new AgentControl({ database, sessions: agents.structured, modelUpgrades,
     // A test launch may lower the context bound at which a relay rolls to a fresh session.
     relayContextTokens: !app.isPackaged && process.env.CONDUCTOR_TEST_USER_DATA ? Number(process.env.CONDUCTOR_TEST_RELAY_CONTEXT_TOKENS) || undefined : undefined,
     orchestration, collaboration, backlogs: projectBacklogs,
@@ -3179,6 +3213,7 @@ app.whenReady().then(async () => {
   snapshotPruneTimer.unref?.()
   disposeOrchestrationIpc = registerOrchestrationIpc(orchestration, { startAgent: input => startRosterAgent({ agent: id => orchestration.getAgent(id), ownerScope: scope => control.ownerScope(scope), call: (scope, method, args) => control.call(scope as ReturnType<AgentControl['ownerScope']>, method, args) }, input) })
   scheduleRunner.start()
+  modelUpgrades?.start()
   disposeCollaborationIpc = registerAgentCollaborationIpc(collaboration)
   // How the previous process stopped, read once before anything is told about the restart.
   const initiator = takeLaunchInitiator(), previousStop = takeRestartIntent(), recoveryReport = recovery?.takeReport() ?? null
@@ -3262,6 +3297,7 @@ app.on('will-quit', () => {
   phoneAccess?.dispose()
   void phoneServer?.dispose().catch(error => console.warn('Phone access did not shut down cleanly', error))
   if (snapshotPruneTimer) clearInterval(snapshotPruneTimer)
+  modelUpgrades?.stop()
   projectPreview.close()
   updates?.dispose()
   disposeRuntimeServices()

@@ -74,6 +74,8 @@ import { callModelMethod, modelMethods, modelSignatures, routeFeatures, type Mod
 import { routeConstraints, routeUsage, type ModelIntelligence } from './model-intelligence'
 import { categorize } from './model-intelligence/categorize'
 import { EvaluationTurnError, evaluationTokens } from './model-intelligence/evaluation-ports'
+import type { ModelUpgradeService } from './model-upgrades/service'
+import { freshestCatalog } from './model-upgrades/better'
 
 type Args = Record<string, unknown>
 /** waitSeconds caps over HTTP; the conductor MCP control tool cuts any wait to
@@ -381,9 +383,24 @@ const jobKeys: Record<string, string[]> = {
   'jobs.cancel': ['jobId', 'reason'],
   'jobs.report': ['jobId']
 }
+/** Auto model upgrade (docs/model-upgrades.md): a better model noticed, prepared and offered to
+ *  the owner for one OK. Reading, checking and the preparing coworker's report are open; answering
+ *  the offer is the owner's (a wizard tab only when the owner opted in), configuring it the owner's
+ *  credential alone. */
+const upgradeSignatures: Record<string, string> = {
+  'models.upgrades.status': '() — the auto model upgrade: each native CLI on npm (installed, latest, last check, error) and every offer (id, model, the model it replaces, reasons, state preparing|blocked|ready|applying|applied|declined, the newer CLI it needs, whether this Conductor needs a protocol bump, the verified candidate commit, the preparing coworker, steps and reason), the declined models and whether a wizard tab may accept',
+  'models.upgrades.check': '() — check npm and the current CLI catalogs now instead of waiting for the 6-hourly check; returns the status once the pass ends',
+  'models.upgrades.prepared': '({id,commit?,blocked?}) — the coworker preparing a protocol bump reports: commit is the sha whose app.update build app.update.status shows verified (the offer becomes ready for the owner), or blocked is why the bump cannot be made safely (nothing half done left behind)',
+  'models.upgrades.accept': '({id}) — the owner’s one OK: switch to that model. The owner credential always; a wizard tab only when the owner opted in (models.upgrades.configure or the switch on the upgrade card). Installs the verified Conductor build when one is needed (waiting while any tab works), makes new tabs launch the newer CLI (a Conductor-owned copy, the global CLI is not touched) and makes the model the pick where the old one was',
+  'models.upgrades.decline': '({id}) — owner credential or wizard tab only: not this model; remembered, never offered again',
+  'models.upgrades.retry': '({id}) — owner credential or wizard tab only: prepare a blocked upgrade again',
+  'models.upgrades.configure': '({wizardMayAccept}) — owner credential only: whether a wizard tab may answer model upgrade offers for the owner (off by default)'
+}
+const upgradeMethods = new Set(Object.keys(upgradeSignatures))
+const upgradeOpenMethods = new Set(['models.upgrades.status', 'models.upgrades.check', 'models.upgrades.prepared'])
 /** Every method some caller of this build can reach, for the unknown-method refusal: a method
  *  that is merely unavailable here (no job controller, not the owner) keeps its own refusal. */
-const KNOWN_METHODS = new Set<string>([...Object.keys(toolSignatures), ...Object.keys(ownerSignatures), ...Object.keys(jobSignatures), ...Object.keys(nodeSignatures), ...Object.keys(cloudSignatures), ...Object.keys(scheduleSignatures), ...Object.keys(ideaSignatures), ...Object.keys(ideaRunSignatures), ...Object.keys(productionSignatures), ...Object.keys(modelSignatures), ...modelMethods, ...PERMISSION_METHODS, ...WIZARD_APPROVAL_METHODS])
+const KNOWN_METHODS = new Set<string>([...Object.keys(toolSignatures), ...Object.keys(ownerSignatures), ...Object.keys(jobSignatures), ...Object.keys(nodeSignatures), ...Object.keys(cloudSignatures), ...Object.keys(scheduleSignatures), ...Object.keys(ideaSignatures), ...Object.keys(ideaRunSignatures), ...Object.keys(productionSignatures), ...Object.keys(modelSignatures), ...modelMethods, ...upgradeMethods, ...PERMISSION_METHODS, ...WIZARD_APPROVAL_METHODS])
 const strings = (value: unknown, key: string, count: number, length: number): string[] => {
   if (!Array.isArray(value) || value.length > count || value.some(item => typeof item !== 'string' || !item.trim() || item.length > length || item.includes('\0'))) throw new Error(`${key} must be a list of at most ${count} non-empty strings of up to ${length} characters`)
   return value as string[]
@@ -434,6 +451,8 @@ export interface AgentControlDependencies {
   /** Model intelligence and routing (src/main/model-intelligence); plugged in with
    *  AgentControl.setModelIntelligence. Without it models.list is unchanged and routing is unavailable. */
   modelIntelligence?: ModelIntelligence
+  /** The auto model upgrade service (models.upgrades.*); absent outside the app. */
+  modelUpgrades?: ModelUpgradeService
   /** Whether a local model could start its server now; absent where the local runtime is not wired. */
   localModels?: {
     availability(modelId: string): Promise<{ available: boolean; reason?: string; note?: string }>
@@ -654,6 +673,11 @@ export class AgentControl {
    * conversation that was closed or crashed mid-task would otherwise hold the item forever:
    * no other agent may move it, and the owner can never come back to release it.
    */
+  /** Whether a tab in any open project shows this conversation. */
+  agentTabOpen(agentSessionId: string): boolean {
+    return this.deps.database.listProjects().some(project => this.claimHolderIsOpen(project.id, agentSessionId))
+  }
+
   private claimHolderIsOpen(projectId: string, agentSessionId: string): boolean {
     return this.deps.database.listSessions(projectId).some(workspace =>
       this.tabs({ projectId, sessionId: workspace.id, agentSessionId: '' }).some(tab => tab.resourceId === agentSessionId))
@@ -1471,7 +1495,14 @@ export class AgentControl {
 
   private catalog(scope: AgentControlScope): Array<{ provider: StructuredProvider; available: boolean; source: 'runtime' | 'configured'; models: Array<{ id: string; label: string; effort?: string[]; defaultEffort?: string; isDefault?: boolean }> }> {
     return this.deps.providers().filter(provider => provider.id === 'codex' || provider.id === 'claude' || provider.id === 'grok' || provider.id === 'local').map(provider => {
-      const runtime = this.tabs(scope).filter(tab => tab.kind === 'agent' && tab.state?.provider === provider.id).map(tab => this.deps.database.structured.snapshot(tab.resourceId!)?.capabilities).find(capabilities => capabilities?.models.length)
+      // The newest runtime wins: a tab still running the CLI from before an upgrade must not keep
+      // offering the old catalog, and the auto model upgrade's own probe of the CLI new tabs launch
+      // (a short-lived app-server model/list) counts even when no tab runs it yet.
+      const candidates = this.tabs(scope).filter(tab => tab.kind === 'agent' && tab.state?.provider === provider.id).map(tab => this.deps.database.structured.snapshot(tab.resourceId!)?.capabilities).filter(capabilities => capabilities?.models.length)
+        .map(capabilities => ({ version: capabilities!.runtimeVersion as string | null, models: capabilities!.models }))
+      const discovered = this.deps.modelUpgrades?.discoveredCatalog(provider.id)
+      if (discovered) candidates.push(discovered)
+      const runtime = freshestCatalog(candidates)
       return { provider: provider.id as StructuredProvider, available: provider.available, source: runtime ? 'runtime' : 'configured', models: runtime?.models ?? provider.models.filter(model => !['default', 'auto'].includes(model.id)).map(model => ({ ...model, effort: provider.efforts.map(effort => effort.id).filter(id => id !== 'auto') })) }
     })
   }
@@ -1749,13 +1780,14 @@ export class AgentControl {
     // Naming another project is only meaningful for the methods that were opened to a sibling;
     // everywhere else it is still an attempt to act outside the authorized scope.
     if (args.projectId !== undefined && args.projectId !== scope.projectId && !crossProjectMethods.includes(method)) throw new Error('This method only runs in the authorized project. Use projects.list to see what else is open, and hand work to a sibling project with tabs.open({projectId}).')
-    if (method === 'tools.list') return filterSignatures({ ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.cloud ? cloudSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(this.deps.ideaRuns ? ideaRunSignatures : {}), ...(this.deps.production ? productionSignatures : {}), ...(this.deps.modelIntelligence ? modelSignatures : {}), ...(sovereign(scope) ? { ...ownerSignatures, ...WIZARD_APPROVAL_SIGNATURES } : {}), ...(this.deps.permissionGrants ? { ...PERMISSION_METHOD_SIGNATURES, ...(sovereign(scope) ? PERMISSION_OWNER_SIGNATURES : {}) } : {}) }, args)
+    if (method === 'tools.list') return filterSignatures({ ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.cloud ? cloudSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(this.deps.ideaRuns ? ideaRunSignatures : {}), ...(this.deps.production ? productionSignatures : {}), ...(this.deps.modelIntelligence ? modelSignatures : {}), ...(this.deps.modelUpgrades ? Object.fromEntries(Object.entries(upgradeSignatures).filter(([name]) => upgradeOpenMethods.has(name) || sovereign(scope))) : {}), ...(sovereign(scope) ? { ...ownerSignatures, ...WIZARD_APPROVAL_SIGNATURES } : {}), ...(this.deps.permissionGrants ? { ...PERMISSION_METHOD_SIGNATURES, ...(sovereign(scope) ? PERMISSION_OWNER_SIGNATURES : {}) } : {}) }, args)
     if (PERMISSION_METHODS.includes(method)) {
       if (!this.deps.permissionGrants) throw new Error('Permission grants are not available in this Conductor')
       const approver = { agentSessionId: scope.agentSessionId, projectId: scope.projectId, owner: scope.owner === true, wizard: scope.wizard === true }
       return callPermissions(this.deps.permissionGrants, { ...approver, answers: id => id !== scope.agentSessionId && this.answerable(approver).some(entry => entry.agentSessionId === id) }, method, args)
     }
     if (WIZARD_APPROVAL_METHODS.includes(method)) return callWizardApprovals({ answerable: current => this.answerable(current), snapshot: id => database.structured.snapshot(id), respond: response => sessions.respond(response), persistence: database, reviewClass: (id, runtimeId, requestId) => sessions.approvalReviewClass?.(id, runtimeId, requestId) ?? { reviewed: false } }, { agentSessionId: scope.agentSessionId, projectId: scope.projectId, owner: scope.owner === true, wizard: scope.wizard === true }, method, args)
+    if (upgradeMethods.has(method)) return this.modelUpgradesMethod(scope, method, args)
     if (ownerMethods.has(method)) {
       if (!sovereign(scope)) throw new Error(`${method} answers only the owner's own control credential (control-owner.json) or a wizard tab (the wand toggle, frontier models only), not an ordinary conversation`)
       return this.ownerCall(scope, method, args)
@@ -2804,6 +2836,31 @@ export class AgentControl {
     const state = this.deps.database.structured.snapshot(scope.agentSessionId), spec = this.deps.database.structured.spec<AgentSpec>(scope.agentSessionId)
     const request = host.requestRestart({ agentSessionId: scope.agentSessionId, title: state?.title || spec?.title || 'Wizard tab', reason })
     return { requested: true, ...request, note: 'The owner sees this on the Restart to update control. The next launch brings this tab back and tells it to continue; the request lapses after that launch or 24 h.' }
+  }
+
+  private async modelUpgradesMethod(scope: AgentControlScope, method: string, args: Args): Promise<unknown> {
+    const service = this.deps.modelUpgrades
+    if (!service) throw new Error('The auto model upgrade is unavailable in this Conductor')
+    if (!upgradeOpenMethods.has(method) && !sovereign(scope)) throw new Error(`${method} answers only the owner's own control credential or a wizard tab; the owner answers the upgrade card in the app`)
+    if (method === 'models.upgrades.status') { validateArgs(method, args, []); return service.status() }
+    if (method === 'models.upgrades.check') { validateArgs(method, args, []); await service.check(); return service.status() }
+    if (method === 'models.upgrades.configure') {
+      validateArgs(method, args, ['wizardMayAccept'])
+      if (scope.owner !== true) throw new Error('models.upgrades.configure answers only the owner credential: letting wizard tabs accept model upgrades is the owner\'s own decision')
+      if (typeof args.wizardMayAccept !== 'boolean') throw new Error('wizardMayAccept must be true or false')
+      return service.setWizardMayAccept(args.wizardMayAccept)
+    }
+    const id = text(args, 'id', 200)
+    if (method === 'models.upgrades.prepared') {
+      validateArgs(method, args, ['id', 'commit', 'blocked'])
+      if ((args.commit === undefined) === (args.blocked === undefined)) throw new Error('pass exactly one of commit (the verified sha) or blocked (why not)')
+      return service.prepared(id, { ...(args.commit !== undefined ? { commit: text(args, 'commit', 60) } : {}), ...(args.blocked !== undefined ? { blocked: text(args, 'blocked', 2000) } : {}) })
+    }
+    validateArgs(method, args, ['id'])
+    if (method === 'models.upgrades.accept') return service.accept(id, scope.owner === true ? 'owner' : 'wizard')
+    if (method === 'models.upgrades.decline') return service.decline(id)
+    if (method === 'models.upgrades.retry') return service.retry(id)
+    throw new Error(this.unknownMethod(method))
   }
 
   private async localUpdate(scope: AgentControlScope, source: AgentSpec, method: string, args: Args): Promise<unknown> {

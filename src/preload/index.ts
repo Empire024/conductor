@@ -259,6 +259,14 @@ const bridge: ConductorBridge = {
     onState: (callback) => subscribe('updates:state', callback),
     onPrepareInstall: (callback) => subscribe('updates:prepare-install', callback)
   },
+  modelUpgrades: {
+    status: () => ipcRenderer.invoke('model-upgrades:status'),
+    answer: (id, answer) => ipcRenderer.invoke('model-upgrades:answer', id, answer),
+    setWizardMayAccept: (enabled) => ipcRenderer.invoke('model-upgrades:set-wizard', enabled),
+    promoted: () => ipcRenderer.invoke('model-upgrades:promoted'),
+    onStatus: (callback) => subscribe('model-upgrades:status', callback),
+    onPromoted: (callback) => subscribe('model-upgrades:promoted', callback)
+  },
   sessions: {
     closed: () => ipcRenderer.invoke('sessions:closed'),
     onRestored: (callback) => subscribe('sessions:restored', callback),

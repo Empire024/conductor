@@ -867,6 +867,10 @@ kbd {
 .update-prompt > footer button:hover:not(:disabled) { color: var(--text); background: var(--surface-hover); }
 .update-prompt > footer button.primary { border-color: var(--accent); color: #10140c; background: var(--accent); font-weight: 650; }
 .update-prompt > footer button:disabled { opacity: .55; }
+/* The auto model upgrade's one-OK card: the update prompt's look, non-modal, bottom right. */
+.model-upgrade-card { position: fixed; right: 16px; bottom: 34px; z-index: 1340; width: min(420px, calc(100vw - 32px)); }
+.model-upgrade-card > p.model-upgrade-detail { padding-top: 0; color: var(--text-3); font-size: 9px; }
+.model-upgrade-card > p.model-upgrade-error { padding-top: 0; color: var(--danger, #f87171); }
 .create-project-dialog { width: 440px; overflow: hidden; border: 1px solid #3a434d; border-radius: 8px; background: #14191f; box-shadow: 0 24px 80px #000b; }
 .create-project-dialog > header { min-height: 68px; padding: 12px 13px; display: flex; align-items: center; gap: 11px; border-bottom: 1px solid #292f37; }
 .dialog-icon { width: 36px; height: 36px; flex: 0 0 auto; display: grid; place-items: center; border: 1px solid #46552e; border-radius: 7px; color: var(--accent); background: #1b2314; }

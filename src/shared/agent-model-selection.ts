@@ -1,4 +1,5 @@
 import { DEFAULT_LOCAL_MODEL } from './local-models'
+import { promotedModel } from './promoted-models'
 import type { ProviderCapabilities } from './structured-agent'
 
 export const explicitModel = (value: unknown): value is string => typeof value === 'string' && Boolean(value.trim()) && !['default', 'auto'].includes(value.trim().toLowerCase())
@@ -23,5 +24,9 @@ export function concreteModel(provider: string, configured?: string, capabilitie
   const effective = capabilities?.effectiveSettings
   if (effective && typeof effective === 'object' && !Array.isArray(effective) && explicitModel(effective.model)) return effective.model
   const models = capabilities?.models.filter(model => explicitModel(model.id)) ?? []
+  // The owner's accepted auto model upgrade (docs/model-upgrades.md) is the default where the
+  // runtime offers it, before discovery included.
+  const promoted = promotedModel(provider)
+  if (promoted && (!models.length || models.some(model => model.id === promoted))) return promoted
   return models.find(model => model.isDefault)?.id ?? models[0]?.id ?? (provider === 'claude' ? CLAUDE_FALLBACK_MODEL : provider === 'grok' ? GROK_FALLBACK_MODEL : provider === 'local' ? DEFAULT_LOCAL_MODEL : CODEX_FALLBACK_MODEL)
 }

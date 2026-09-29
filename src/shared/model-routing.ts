@@ -6,11 +6,15 @@
  * weights behind two providers are two records with separate prices, limits and reputations.
  */
 import type { AgentProviderId } from './models'
+import { promotedRank } from './promoted-models'
 
 /** Capability comes before quota. This intentionally classifies names conservatively. */
 export function capabilityRank(provider: AgentProviderId, modelId: string): 0 | 1 | 2 | 3 {
   const id = modelId.toLowerCase()
   if (provider === 'local' || id.startsWith('local/')) return 0
+  // A model the owner accepted through an auto model upgrade ranks as the one it replaced.
+  const promoted = promotedRank(provider, modelId)
+  if (promoted !== null) return promoted
   // GPT-6.1 Sol is the frontier workhorse ("near-Astra performance at a lower cost", codex-cli 0.159.1
   // model/list); the owner prefers it over Astra, so it ranks with the frontier despite its tier name.
   if (/gpt-6\.1-sol/.test(id)) return 3

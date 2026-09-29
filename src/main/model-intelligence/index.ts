@@ -1,7 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite'
 import {
   modelKeyId, TASK_CATEGORIES, type Decider, type DeciderOutcome, type DecisionKind, type DecisionRecord, type DecisionRequest, type ExecutionOutcome, type ModelKey, type RegistryRecord,
-  type RouteConstraints, type RouteDecision, type RouteDetails, type TaskCategory, type TaskFeatures
+  type IngestionBatch, type RouteConstraints, type RouteDecision, type RouteDetails, type TaskCategory, type TaskFeatures
 } from '../../shared/model-routing'
 import { makeId } from '../../shared/models'
 import type { SessionPhase, TimelineItem } from '../../shared/structured-agent'
@@ -446,6 +446,9 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
     refresh,
     /** The latest-models schedule ran: its script outputs are new evidence. */
     latestModelsRan(): void { quietly(['latest-models']) },
+    /** A batch from outside the daily sources: the auto model upgrade's probe of a newer CLI
+     *  (docs/model-upgrades.md). Applied atomically; the linked pass fills price and context. */
+    recordObservations(batch: IngestionBatch): RefreshResult['changes'] { return [...registry.applyBatch(batch).changes, ...link()] },
 
     /** Routes and stores what the router made of it (selection, fallback, escalation, reasons, and
      *  the close candidates when the caller was escalated to) with the decision. */
