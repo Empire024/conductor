@@ -16,14 +16,14 @@ afterEach(async () => { for (const service of services.splice(0)) await service.
 
 interface World { service: ProductionService; ports: RecordingPorts; board: FakeBoard; browsers: FakeBrowser[]; target: { value: TargetFingerprint } }
 
-function world(checks: readonly ControlCheck[], options: { ports?: RecordingPorts; board?: FakeBoard; ownerId?: string; target?: { value: TargetFingerprint } } = {}): World {
+function world(checks: readonly ControlCheck[], options: { ports?: RecordingPorts; board?: FakeBoard; ownerId?: string; target?: { value: TargetFingerprint }; gitHead?: (target: { value: TargetFingerprint }) => Promise<string | null> } = {}): World {
   const ports = options.ports ?? recordingPorts()
   const board = options.board ?? fakeBoard()
   const target = options.target ?? { value: fingerprint({ registryVersion: REGISTRY.version }) }
   const { factory, browsers } = fakeBrowserFactory()
   const service = createProductionService({
     store: temp.store, userData: temp.dir, interpreter: ports, board, projectRoot: () => null, checks, ownerId: options.ownerId ?? 'owner-A',
-    gitHead: async () => target.value.commit,
+    gitHead: options.gitHead ? () => options.gitHead!(target) : async () => target.value.commit,
     browserFactory: policy => factory(policy),
     browserAvailability: async () => ({ available: true, engine: 'playwright-chromium', reason: null }),
     fingerprint: async () => ({ ...target.value }),
@@ -141,6 +141,58 @@ describe('audit runs end to end (fake ports)', () => {
     const runs = temp.store.runs('project-a')
     expect(runs).toHaveLength(2)
     expect(runs.find(run => run.id !== first.run!.id)!.trigger.kind).toBe('manual')
+    expect(slow.calls).toBe(2)
+  })
+
+  it('keeps a coalesced rerun when its follow-up cannot be created, and the next start runs it', async () => {
+    const hold = deferred()
+    const slow = scriptedCheck('C13', 'accessibility', async (_context, call) => { if (call === 1) await hold.promise; return outcome('accessibility', 'PASS') })
+    const a = world([slow], { ownerId: 'launch-A' })
+    const first = await a.service.audit('project-a', { controls: ['C13'] })
+    await waitFor(() => slow.calls === 1)
+    expect((await a.service.audit('project-a', { controls: ['C13'] })).outcome).toBe('coalesced')
+    const createRun = temp.store.createRun.bind(temp.store)
+    let refused = 0
+    temp.store.createRun = input => { if (!refused++) throw new Error('disk full'); return createRun(input) }
+    hold.resolve()
+    await waitFor(() => temp.store.events(first.run!.id, 0, 500).some(event => /Follow-up run not started \(Error: disk full\)/.test(event.message)))
+    expect(temp.store.runs('project-a')).toHaveLength(1)
+    expect(temp.store.run(first.run!.id).rerunRequested?.kind).toBe('manual')
+    await a.service.stop()
+
+    const b = world([slow], { ownerId: 'launch-B', target: a.target })
+    b.service.start()
+    await waitFor(() => temp.store.runs('project-a').length === 2)
+    await b.service.runner.idle()
+    await waitFor(() => temp.store.runs('project-a').every(run => run.status === 'completed'))
+    expect(temp.store.run(first.run!.id).rerunRequested).toBeNull()
+    expect(slow.calls).toBe(2)
+  })
+
+  it('a restart between the finished run and its follow-up still runs the coalesced trigger exactly once', async () => {
+    const hold = deferred()
+    const slow = scriptedCheck('C13', 'accessibility', async (_context, call) => { if (call === 1) await hold.promise; return outcome('accessibility', 'PASS') })
+    // Launch A dies while the follow-up's fingerprint (git HEAD) is still being read: that read never answers.
+    let stall = false, stalled = 0
+    const a = world([slow], { ownerId: 'launch-A', gitHead: target => stall ? (stalled++, new Promise<string | null>(() => undefined)) : Promise.resolve(target.value.commit) })
+    const first = await a.service.audit('project-a', { controls: ['C13'] })
+    await waitFor(() => slow.calls === 1)
+    expect((await a.service.audit('project-a', { controls: ['C13'] })).outcome).toBe('coalesced')
+    stall = true
+    hold.resolve()
+    await waitFor(() => stalled === 1)
+    expect(temp.store.run(first.run!.id).status).toBe('completed')
+    expect(temp.store.runs('project-a')).toHaveLength(1)
+    expect(temp.store.run(first.run!.id).rerunRequested?.kind).toBe('manual')
+    await a.service.runner.abandon()
+
+    const b = world([slow], { ownerId: 'launch-B', target: a.target })
+    b.service.start()
+    await waitFor(() => temp.store.runs('project-a').length === 2)
+    await b.service.runner.idle()
+    await waitFor(() => temp.store.runs('project-a').every(run => run.status === 'completed'))
+    expect(temp.store.runs('project-a')).toHaveLength(2)
+    expect(temp.store.run(first.run!.id).rerunRequested).toBeNull()
     expect(slow.calls).toBe(2)
   })
 

@@ -545,6 +545,11 @@ export class ProductionStore {
     })
   }
 
+  /** Completed or failed runs whose rerunRequested has no follow-up yet (a crash or failure in between); bounded. */
+  pendingReruns(limit = 50): AuditRun[] {
+    return this.withSteps(this.db.prepare(`SELECT * FROM ${T.runs} WHERE status IN ('completed', 'failed') AND json_extract(data, '$.rerunRequested') IS NOT NULL ORDER BY updated_at LIMIT ?`).all(bound(limit, 50, 500)) as Row[])
+  }
+
   // ---- lease ------------------------------------------------------------------------------------
 
   lease(runId: string): RunLease | null {

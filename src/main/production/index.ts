@@ -148,9 +148,27 @@ export function createProductionService(deps: ProductionDeps) {
   const finished = (run: AuditRun): void => {
     if (run.status === 'completed') current.set(key(run.projectId, run.environmentId), run.fingerprint)
     if (run.status === 'cancelled') { store.takeRerun(run.id); return }
-    const rerun = store.takeRerun(run.id)
-    // Whatever triggered the rerun, it re-audits: a change or drift trigger only what its changes invalidate.
-    if (rerun) void startRun(run.projectId, run.environmentId, rerun.kind === 'drift' ? 'drift' : 'audit', rerun, { full: rerun.kind !== 'change' && rerun.kind !== 'drift' }).catch(error => deps.log?.(`production rerun of ${run.id} not started: ${String(error)}`))
+    void followUp(run.id)
+  }
+
+  /**
+   * Starts the follow-up a finished run's rerunRequested asks for. The flag is cleared only once the
+   * follow-up exists, so a crash or a failed fingerprint in between leaves it for start() to retry.
+   */
+  const following = new Set<string>()
+  const followUp = async (runId: string): Promise<void> => {
+    const run = store.findRun(runId)
+    const rerun = run?.rerunRequested
+    if (!run || !rerun || following.has(runId)) return
+    following.add(runId)
+    try {
+      // Whatever triggered the rerun, it re-audits: a change or drift trigger only what its changes invalidate.
+      await startRun(run.projectId, run.environmentId, rerun.kind === 'drift' ? 'drift' : 'audit', rerun, { full: rerun.kind !== 'change' && rerun.kind !== 'drift' })
+      store.takeRerun(runId)
+    } catch (error) {
+      deps.log?.(`production rerun of ${runId} not started: ${String(error)}`)
+      store.event(runId, OWNER, 'note', `Follow-up run not started (${String(error).slice(0, 300)}); the rerun request is kept and retried when Conductor starts`)
+    } finally { following.delete(runId) }
   }
 
   const startRun = async (projectId: string, environmentId: string, kind: AuditRun['kind'], by: AuditTrigger, options: { controls?: AuditRequest['controls']; full?: boolean; findingIds?: string[] } = {}): Promise<RunRequestOutcome> => {
@@ -231,6 +249,7 @@ export function createProductionService(deps: ProductionDeps) {
 
     start(): ReconcileRunOutcome[] {
       const outcomes = runner.start()
+      for (const run of store.pendingReruns()) void followUp(run.id)
       for (const profile of store.latestProfiles({ designatedOnly: true, limit: 200 })) watchProject(profile.projectId)
       void (deps.browserAvailability ?? (async () => { const engine = await resolveEngine(); return { available: engine.available, engine: engine.engine, reason: engine.reason } }))()
         .then(result => { availability = result }, () => undefined)
