@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { AgentControl } from './agent-control'
+import { AgentControl, COORDINATION_ROLE_PREFIX, relayBrief } from './agent-control'
 import { AgentControlServer } from './agent-control-server'
 import { controlMethodClass } from './control-method-classes'
 import { ConductorDatabase } from './database'
@@ -3501,5 +3501,82 @@ describe('waiting for results (src/shared/awaiting-results.ts)', () => {
     expect(f.control.awaitingFact(f.scope.agentSessionId)!.agents.map(agent => agent.agentSessionId)).toEqual([other.agentSessionId])
     // ... and after a restart (a fresh AgentControl over the same database).
     expect(new AgentControl(f.deps).awaitingFact(f.scope.agentSessionId)!.agents.map(agent => agent.agentSessionId)).toEqual([other.agentSessionId])
+  })
+})
+
+// conductor-task:codex-credit-burn (3): a relay or coordinator stays a short-lived session.
+describe('relay and coordinator tabs roll to a fresh session past the context bound', () => {
+  const settle = (run: { options: AdapterOptions }, used: number) => {
+    run.options.emit({ data: { type: 'session', phase: 'running' } })
+    run.options.emit({ data: { type: 'usage', scope: 'session', source: 'provider', inputTokens: used, outputTokens: 100, limits: { contextUsedTokens: used, contextCapacityTokens: 400_000, modelContextWindow: 400_000 } } })
+    run.options.emit({ itemId: 'relay-answer', data: { type: 'text', role: 'assistant', text: 'Passed B the review verdict.', mode: 'snapshot' } })
+    run.options.emit({ data: { type: 'session', phase: 'completed' } })
+  }
+  it('continues a long relay in a successor tab with a short brief, and forwards its controller there', async () => {
+    const f = fixture()
+    const relay = await f.control.call(f.scope, 'tabs.open', { title: 'P0 bridge to the review room' }) as AgentControlTab
+    const id = relay.resourceId!
+    expect(f.database.getSetting(COORDINATION_ROLE_PREFIX + id)).toBe('relay')
+    await f.control.call(f.scope, 'agents.submit', { agentSessionId: id, prompt: 'Relay every verdict from room A to room B, word for word.' })
+    await vi.waitFor(() => expect(f.database.structured.snapshot(id)!.phase).toBe('completed'))
+    const run = f.submissions.at(-1)!
+    // Under the bound nothing happens.
+    settle(run, 59_000)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    const before = f.submissions.length
+    expect(f.control.tabs(f.scope).filter(tab => tab.kind === 'agent')).toHaveLength(2)
+    // Past it, the relay continues in a fresh session.
+    settle(run, 61_000)
+    await vi.waitFor(() => expect(f.submissions.length).toBe(before + 1))
+    const successorTab = f.control.tabs(f.scope).find(tab => tab.kind === 'agent' && tab.resourceId !== id && tab.resourceId !== f.spec.id)!
+    const successor = successorTab.resourceId!
+    expect(successorTab.title).toBe('P0 bridge to the review room (continued)')
+    const brief = f.submissions.at(-1)!
+    expect(brief.options.runtimeId).not.toBe(run.options.runtimeId)
+    expect(brief.prompt.startsWith('[Conductor] Fresh session: this tab continues the relay “P0 bridge to the review room” (')).toBe(true)
+    expect(brief.prompt).toContain('Its context reached 61,000 tokens (the bound for a relay is 60,000)')
+    expect(brief.prompt).toContain('Relay every verdict from room A to room B, word for word.')
+    expect(brief.prompt).toContain('- Answered: Passed B the review verdict.')
+    expect(brief.prompt.length).toBeLessThan(2500)
+    // The successor is a relay too, controlled by the same controller; the old tab says where it went.
+    expect(f.database.getSetting(COORDINATION_ROLE_PREFIX + successor)).toBe('relay')
+    const listed = await f.control.call(f.scope, 'agents.list', {}) as Array<{ agentSessionId: string; superseded?: { by: string } }>
+    expect(listed.find(entry => entry.agentSessionId === id)?.superseded?.by).toBe(successor)
+    expect(listed.some(entry => entry.agentSessionId === successor)).toBe(true)
+    expect(f.database.structured.snapshot(id)!.items.some(item => item.data.type === 'notice' && item.data.message.includes('Conductor rolled it to a fresh native session'))).toBe(true)
+    // The controller still addresses the old id; its message reaches the fresh session.
+    const steered = await f.control.call(f.scope, 'agents.steer', { agentSessionId: id, prompt: 'Next verdict: accepted' }) as { agentSessionId: string; forwardedFrom?: string }
+    expect(steered).toMatchObject({ agentSessionId: successor, forwardedFrom: id })
+    expect(f.submissions.at(-1)).toMatchObject({ prompt: 'Next verdict: accepted' })
+    expect(f.submissions.at(-1)!.options.runtimeId).toBe(brief.options.runtimeId)
+    // A short successor does not roll again; one past the bound does, as the next link of the chain.
+    const count = f.control.tabs(f.scope).filter(tab => tab.kind === 'agent').length
+    settle(f.submissions.at(-1)!, 12_000)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(f.control.tabs(f.scope).filter(tab => tab.kind === 'agent')).toHaveLength(count)
+    settle(f.submissions.at(-1)!, 80_000)
+    await vi.waitFor(() => expect(f.control.tabs(f.scope).filter(tab => tab.kind === 'agent')).toHaveLength(count + 1))
+    const third = f.control.tabs(f.scope).find(tab => tab.kind === 'agent' && ![id, successor, f.spec.id].includes(tab.resourceId!))!
+    expect(third.title).toBe('P0 bridge to the review room (continued)')
+    // Its brief carries the relay's original instructions, not the previous brief nested inside.
+    const second = f.submissions.find(submission => submission.options.runtimeId !== brief.options.runtimeId && submission.options.runtimeId !== run.options.runtimeId && submission.prompt.startsWith('[Conductor] Fresh session'))!
+    expect(second.prompt).toContain('Your role, as it was first given:\nRelay every verdict from room A to room B, word for word.')
+    expect(second.prompt.split('Fresh session').length).toBe(2)
+    expect(await f.control.call(f.scope, 'agents.steer', { agentSessionId: id, prompt: 'Still reaches the newest' })).toMatchObject({ agentSessionId: third.resourceId, forwardedFrom: id })
+  })
+
+  it('never rolls a worker, records a coordinator, and clips the brief', async () => {
+    const f = fixture()
+    const worker = await f.control.call(f.scope, 'tabs.open', { title: 'Relay-named worker', role: 'worker' }) as AgentControlTab
+    expect(f.database.getSetting(COORDINATION_ROLE_PREFIX + worker.resourceId!)).toBeNull()
+    await f.control.call(f.scope, 'agents.submit', { agentSessionId: worker.resourceId, prompt: 'Build it' })
+    await vi.waitFor(() => expect(f.database.structured.snapshot(worker.resourceId!)!.phase).toBe('completed'))
+    settle(f.submissions.at(-1)!, 300_000)
+    const coordinator = await f.control.call(f.scope, 'tabs.open', { title: 'Batch', role: 'coordinator' }) as AgentControlTab
+    expect(f.database.getSetting(COORDINATION_ROLE_PREFIX + coordinator.resourceId!)).toBe('coordinator')
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(f.control.tabs(f.scope).filter(tab => tab.kind === 'agent')).toHaveLength(3)
+    expect(relayBrief({ role: 'coordinator', title: 'Batch', from: 'agent_x', used: 70_000, bound: 60_000, instructions: 'x'.repeat(9000) })).toContain(' […]')
+    expect(relayBrief({ role: 'coordinator', title: 'Batch', from: 'agent_x', used: 70_000, bound: 60_000 })).toContain('(not recorded)')
   })
 })

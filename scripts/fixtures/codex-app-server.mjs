@@ -324,6 +324,15 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     finish()
     return
   }
+  // A relay whose context grows by 25k tokens a message (last = this call's context), for the
+  // relay roll smoke; and the short first turn of the fresh session Conductor rolls it into.
+  if (scenario === 'synthetic:relay-context' || promptText.startsWith('[Conductor] Fresh session:')) {
+    const fresh = scenario !== 'synthetic:relay-context', context = fresh ? 3_000 : 25_000 * turnNumber
+    itemEvent('item/completed', { type: 'agentMessage', id: 'relay-' + turnNumber, text: fresh ? 'Ready.' : `Relayed message ${turnNumber} (context ${context}).`, phase: null, memoryCitation: null, delivery: null, questions: null })
+    notify('thread/tokenUsage/updated', { threadId, turnId: currentTurn, tokenUsage: { total: { inputTokens: 25_000 * turnNumber * turnNumber, outputTokens: 50 * turnNumber, cachedInputTokens: 20_000 * turnNumber * turnNumber }, last: { inputTokens: context - 50, outputTokens: 50, totalTokens: context, cachedInputTokens: context - 5_000 }, modelContextWindow: 400000 } })
+    finish()
+    return
+  }
   // A quota that has run out, exactly as Codex reports it: a failed turn whose error names a
   // reset time. Seconds rather than hours so the smoke run can actually wait for the reopening.
   if (scenario === 'synthetic:usage-limit') {

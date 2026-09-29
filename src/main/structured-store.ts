@@ -162,6 +162,9 @@ function usageEvent(row: Record<string, unknown>, data: AgentEventData): WeeklyU
 export class StructuredAgentStore {
   private artifactBytes = 0
   private projections = new Map<string, SessionProjection>()
+  /** Top-level usage reports projected this run, per conversation: the token burn meter's cache
+   *  key (token-burn.ts), so a reading cached before a report never hides that report. */
+  private usageReports = new Map<string, number>()
   private archiveTails = new Map<string, ArchiveTail>()
   private checkpointed = new Map<string, { at: number; phase: SessionProjection['phase'] }>()
   private checkpointTimers = new Map<string, NodeJS.Timeout>()
@@ -364,6 +367,7 @@ export class StructuredAgentStore {
     const needsArchiveTail = !this.volatileSpecs.has(event.sessionId) && (next.sequence > JOURNAL_WINDOW || this.archiveTails.has(event.sessionId))
     const tailBefore = needsArchiveTail ? this.archiveTail(event.sessionId) : null
     this.projections.set(event.sessionId, next)
+    if (safe.data.type === 'usage' && !safe.parentId) this.usageReports.set(event.sessionId, (this.usageReports.get(event.sessionId) ?? 0) + 1)
     // Past the journal window, every event also grows the durable archive's live tail in memory,
     // exactly like the resident projection above, so a checkpoint never depends on the journal
     // still holding an event by the time it gets around to flushing it.
@@ -574,6 +578,8 @@ export class StructuredAgentStore {
     try { const spec = JSON.parse(session.spec_json) as { model?: unknown }; if (typeof spec.model === 'string') model = spec.model } catch { /* malformed legacy spec: session events may still name it */ }
     return { sessionId, provider: session.provider, ...(model ? { model } : {}), events, runtimeStarts, truncated: (first?.sequence ?? 1) > 1 }
   }
+  /** How many top-level usage reports this conversation has projected in this run. */
+  usageMark(sessionId: string): number { return this.usageReports.get(sessionId) ?? 0 }
   /** One conversation's top-level usage reports since `from`, for the per-tab burn meter
    *  (token-burn.ts). A range scan of the accounting index over this conversation alone, usage
    *  rows only, so its session events and their capability payloads are never parsed. */

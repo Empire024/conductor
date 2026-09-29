@@ -2868,7 +2868,10 @@ app.whenReady().then(async () => {
   })
   // Annotated because the browser bridge is built earlier and reaches back through this handle;
   // without it the two initializers form an inference cycle.
-  const control: AgentControl = new AgentControl({ database, sessions: agents.structured, orchestration, collaboration, backlogs: projectBacklogs,
+  const control: AgentControl = new AgentControl({ database, sessions: agents.structured,
+    // A test launch may lower the context bound at which a relay rolls to a fresh session.
+    relayContextTokens: !app.isPackaged && process.env.CONDUCTOR_TEST_USER_DATA ? Number(process.env.CONDUCTOR_TEST_RELAY_CONTEXT_TOKENS) || undefined : undefined,
+    orchestration, collaboration, backlogs: projectBacklogs,
     localUpdates: localUpdateBuilder,
     // The owner credential's reach into the app itself. `updates` is assigned further down this
     // function and only read at call time, so the closures are safe.

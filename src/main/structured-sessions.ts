@@ -339,6 +339,12 @@ export class StructuredSessions {
     this.limitStopListeners.add(listener)
     return () => { this.limitStopListeners.delete(listener) }
   }
+  private turnSettledListeners = new Set<(spec: AgentSpec) => void>()
+  /** Called after every turn settles (a running phase gave way to an idle, finished or failed one). */
+  onTurnSettled(listener: (spec: AgentSpec) => void): () => void {
+    this.turnSettledListeners.add(listener)
+    return () => { this.turnSettledListeners.delete(listener) }
+  }
   constructor(
     private database: ConductorDatabase,
     private resolveExecutable: (provider: StructuredProvider) => string | null,
@@ -1642,6 +1648,10 @@ export class StructuredSessions {
       const stop: UsageLimitStop = { spec: live.spec, message: live.limitStop, resumeAt: live.limitResumeAt ?? null, continues: Boolean(live.spec.continueOnLimit && live.limitResumeAt) }
       live.limitStop = undefined
       queueMicrotask(() => { for (const listener of this.limitStopListeners) try { listener(stop) } catch { /* a listener never breaks the event pipeline */ } })
+    }
+    if (data.type === 'session' && data.phase && active.has(state.phase) && !active.has(data.phase) && this.turnSettledListeners.size) {
+      const spec = live.spec
+      queueMicrotask(() => { for (const listener of this.turnSettledListeners) try { listener(spec) } catch { /* a listener never breaks the event pipeline */ } })
     }
     if (data.type === 'session') queueMicrotask(() => {
       if (data.phase === 'failed' && live.refusalFallback) void this.runSafeguardFallback(live)

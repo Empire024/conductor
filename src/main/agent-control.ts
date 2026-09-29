@@ -131,12 +131,33 @@ const text = (args: Args, key: string, maximum = 20000): string => {
  *  context: it opens on medium effort unless the caller names an effort (codex-credit-burn 3).
  *  The role is given as role, or read from a title naming a relay, bridge or coordinator. */
 const COORDINATION_TITLE = /\b(?:relay|bridge|coordinator)\b/i
-export const coordinationRole = (args: Args): boolean => {
+export const coordinationRole = (args: Args): boolean => coordinationRoleOf(args) !== null
+export const coordinationRoleOf = (args: Args): 'relay' | 'coordinator' | null => {
   if (args.role !== undefined) {
     if (args.role !== 'relay' && args.role !== 'coordinator' && args.role !== 'worker') throw new ArgumentError(`role must be "relay", "coordinator" or "worker"; not ${JSON.stringify(args.role)}`)
-    return args.role !== 'worker'
+    return args.role === 'worker' ? null : args.role
   }
-  return typeof args.title === 'string' && COORDINATION_TITLE.test(args.title)
+  if (typeof args.title !== 'string' || !COORDINATION_TITLE.test(args.title)) return null
+  return /\bcoordinator\b/i.test(args.title) ? 'coordinator' : 'relay'
+}
+/** A relay or coordinator also stays short-lived (codex-credit-burn 3): once one of its turns
+ *  settles with more than this much context, Conductor continues it in a fresh native session
+ *  (AgentControl.rollIfLong) through the successor path, with a short brief as the first prompt. */
+export const RELAY_CONTEXT_TOKENS = 60_000
+export const COORDINATION_ROLE_PREFIX = 'coordinationRole:'
+/** A rolled relay's instructions as first given, carried down the chain so briefs never nest. */
+const COORDINATION_INSTRUCTIONS_PREFIX = 'coordinationInstructions:'
+const clip = (value: string, maximum: number): string => value.length > maximum ? value.slice(0, maximum).trimEnd() + ' […]' : value
+/** The first prompt of a rolled relay's fresh session: its role as first given and the last
+ *  exchange, not the transcript it would otherwise re-read on every call. */
+export function relayBrief(input: { role: 'relay' | 'coordinator'; title: string; from: string; used: number; bound: number; instructions?: string; lastIn?: string; lastOut?: string }): string {
+  const lines = [
+    `[Conductor] Fresh session: this tab continues the ${input.role} “${input.title}” (${input.from}). Its context reached ${input.used.toLocaleString('en-US')} tokens (the bound for a ${input.role} is ${input.bound.toLocaleString('en-US')}), so Conductor rolled it to a new native session instead of re-reading that transcript on every call.`,
+    '', 'Your role, as it was first given:', clip(input.instructions?.trim() || '(not recorded)', 6000)
+  ]
+  if (input.lastIn?.trim() || input.lastOut?.trim()) lines.push('', 'The last exchange before the roll:', `- Received: ${clip(input.lastIn?.trim() || '(nothing)', 1500)}`, `- Answered: ${clip(input.lastOut?.trim() || '(nothing)', 1500)}`)
+  lines.push('', `Messages addressed to ${input.from} now reach you, and your controller and coworkers are yours. The full transcript stays readable with agents.history({agentSessionId:"${input.from}"}) if you really need it. Do not redo anything above: reply "Ready." and wait for the next message.`)
+  return lines.join('\n')
 }
 const effortError = (model: { id: string; effort?: string[] }, effort: string): string => `Effort "${effort}" is not offered for ${model.id}; choose one of: ${model.effort?.length ? model.effort.join(', ') : 'none (omit effort)'}.`
 const object = (value: unknown): Args => {
@@ -220,7 +241,7 @@ const toolSignatures = {
   'machines.list': '() — this machine and the paired machines that can run a tab, with the projects each one accepts, plus execution nodes (kind "node", or a peer\'s node facet) that run commands through nodes.run; the local machine carries readiness (whether it comes back unattended after a reboot, with the missing steps in words)',
   'models.list': '() — available providers and model-specific effort choices; discovered runtime models take precedence',
   'tabs.list': '({projectId?,workspaceId?}) — open tabs in this workspace, including detached windows, or in a sibling project from projects.list',
-  'tabs.open': '({kind?,provider?,model?,effort?,role?,permission?,exactPermission?,title?,machineId?,projectId?,workspaceId?,repository?,research?,contract?,jobId?,focus?,prompt?,anonymous?,direct?}) — visible tab, opened in the background with a "new" mark so the owner’s active tab, caret and window stay put; focus:true brings it into view once the owner pauses typing; agent default kind, provider/model must be available; role "relay" or "coordinator" (or a title naming a relay, bridge or coordinator) opens on medium effort when effort is omitted and the model offers it, role "worker" keeps the model default; a Claude, Codex or Grok coworker opens on Auto (the highest mode the provider offers) unless the controller is itself read-only or planning; only with exactPermission: true — for an agent that cannot be trusted at all — does it open on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode, clamped to the controller’s autonomy and to what the provider offers; a local model has no Auto and opens on accept-edits or read-only as before; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list: when that project has an active wizard (projects.list) and neither workspaceId nor direct:true is given, no tab opens and the prompt is delivered to the wizard as agents.steer would, prefixed with who sent it, and the result names it (deliveredTo {agentSessionId,title,projectId,workspaceId}, delivery "started"|"steered"|"queued"); the wizard replies with send_message; with no wizard the tab opens in the workspace of that project’s most recently active root controller, else its first workspace; direct:true opens your own tab there as before; only the controller that opened such a tab may steer it; repository/research open a provider-local tab with its repository-writes and deep-research grants already on, under the agents.grant rules; contract ({allowedPaths?:string[],acceptance?:{command,timeoutSec?}}) opens a provider-local tab as a bounded coding task: the runtime refuses writes outside allowedPaths, runs the acceptance command itself after edits, and when it passes with only allowed paths changed tells the model to finish; kind "job" with jobId (from jobs.list) opens the view of that durable job in this workspace, and asking again returns the open one (focus:true brings it into view); prompt submits it as the new tab’s first turn exactly as agents.submit would (same path, same permission checks), and the result says submitted:true; anonymous:true (local models only) opens it as an anonymous conversation hidden from a kept controller’s history. A cloud tab (provider "cloud") takes its own narrower shape, see cloud.start. Any other key is rejected, naming it and the accepted keys',
+  'tabs.open': '({kind?,provider?,model?,effort?,role?,permission?,exactPermission?,title?,machineId?,projectId?,workspaceId?,repository?,research?,contract?,jobId?,focus?,prompt?,anonymous?,direct?}) — visible tab, opened in the background with a "new" mark so the owner’s active tab, caret and window stay put; focus:true brings it into view once the owner pauses typing; agent default kind, provider/model must be available; role "relay" or "coordinator" (or a title naming a relay, bridge or coordinator) opens on medium effort when effort is omitted and the model offers it, and once one of its turns ends with more than 60,000 tokens of context Conductor continues it in a fresh session (a successor tab whose first prompt is a short brief; its controller link and coworkers move there and messages to it are forwarded); role "worker" keeps the model default; a Claude, Codex or Grok coworker opens on Auto (the highest mode the provider offers) unless the controller is itself read-only or planning; only with exactPermission: true — for an agent that cannot be trusted at all — does it open on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode, clamped to the controller’s autonomy and to what the provider offers; a local model has no Auto and opens on accept-edits or read-only as before; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list: when that project has an active wizard (projects.list) and neither workspaceId nor direct:true is given, no tab opens and the prompt is delivered to the wizard as agents.steer would, prefixed with who sent it, and the result names it (deliveredTo {agentSessionId,title,projectId,workspaceId}, delivery "started"|"steered"|"queued"); the wizard replies with send_message; with no wizard the tab opens in the workspace of that project’s most recently active root controller, else its first workspace; direct:true opens your own tab there as before; only the controller that opened such a tab may steer it; repository/research open a provider-local tab with its repository-writes and deep-research grants already on, under the agents.grant rules; contract ({allowedPaths?:string[],acceptance?:{command,timeoutSec?}}) opens a provider-local tab as a bounded coding task: the runtime refuses writes outside allowedPaths, runs the acceptance command itself after edits, and when it passes with only allowed paths changed tells the model to finish; kind "job" with jobId (from jobs.list) opens the view of that durable job in this workspace, and asking again returns the open one (focus:true brings it into view); prompt submits it as the new tab’s first turn exactly as agents.submit would (same path, same permission checks), and the result says submitted:true; anonymous:true (local models only) opens it as an anonymous conversation hidden from a kept controller’s history. A cloud tab (provider "cloud") takes its own narrower shape, see cloud.start. Any other key is rejected, naming it and the accepted keys',
   'tabs.focus': '({tabId,projectId?,workspaceId?}) — brings a tab into view once the owner pauses typing (deferred:true when it is still waiting); any tab of this workspace, or an agent tab this caller controls in a sibling project (agents.list controlled:true); the same holds for rename, split, detach and close',
   'tabs.rename': '({tabId,title,projectId?,workspaceId?})',
   'tabs.split': '({tabId,direction:"horizontal"|"vertical",projectId?,workspaceId?})',
@@ -375,6 +396,9 @@ export interface AgentControlDependencies {
   /** The app process itself, for the owner credential; absent outside the app. */
   host?: AgentControlHost
   sessions: StructuredSessions
+  /** The context bound past which a relay or coordinator rolls to a fresh session; a test launch
+   *  may lower it (default RELAY_CONTEXT_TOKENS). */
+  relayContextTokens?: number
   orchestration: OrchestrationStore
   collaboration: AgentCollaborationStore
   backlogs: ProjectBacklogs
@@ -464,6 +488,47 @@ export class AgentControl {
     }))
     this.approvalRouting.shadow = deps.modelIntelligence?.approvalShadow
     deps.sessions.onLimitStop?.(stop => { void this.reportLimitStop(stop).catch(() => undefined) })
+    deps.sessions.onTurnSettled?.(spec => { void this.rollIfLong(spec).catch(() => undefined) })
+  }
+
+  /** Relays and coordinators being rolled now, and ones whose roll failed (not retried this run). */
+  private readonly rolling = new Set<string>()
+  private readonly rollRefused = new Set<string>()
+  /**
+   * codex-credit-burn 3: a relay or coordinator mostly passes messages on, yet every call re-reads
+   * its whole transcript (one bridge tab: 12.2M tokens a day at a mean 116k context per call). Once
+   * one of its turns settles with its context past the bound, Conductor continues it as its
+   * successor (the agents.handoff successor:true path: its controller link, coworkers, handed-in
+   * senders and grants move, and messages to it are forwarded), in a fresh native session whose
+   * first prompt is a short brief. Only between turns, never with input queued, never a wizard.
+   */
+  private async rollIfLong(spec: AgentSpec): Promise<void> {
+    const { database, sessions } = this.deps
+    const id = spec.id, role = database.getSetting(COORDINATION_ROLE_PREFIX + id)
+    if (role !== 'relay' && role !== 'coordinator') return
+    if (this.rolling.has(id) || this.rollRefused.has(id) || spec.provider === 'local' || sessions.isApprovalReviewer(id)) return
+    const state = database.structured.snapshot(id)
+    if (!state || (state.phase !== 'completed' && state.phase !== 'idle') || state.queued || state.queuedPrompts?.length || wizardActive(state.settings, spec.provider)) return
+    const bound = this.deps.relayContextTokens ?? RELAY_CONTEXT_TOKENS
+    const context = summarizeContext(state.items, state.runtimeId)
+    if (!context || context.used < bound) return
+    if (this.recovery().status(spec.projectId, id).superseded) return
+    const scope: AgentControlScope = { projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: id }
+    const source = this.tabs(scope).find(tab => tab.resourceId === id)
+    if (!source || source.state?.remotePeerId || tabMachineId(source) !== LOCAL_MACHINE_ID) return
+    this.rolling.add(id)
+    try {
+      const texts = state.items.filter(item => !item.parentId && item.data.type === 'text')
+      const said = (role: 'user' | 'assistant') => texts.filter(item => item.data.type === 'text' && item.data.role === role).map(item => item.data.type === 'text' ? item.data.text : '')
+      const title = source.title ?? spec.title
+      const instructions = database.getSetting(COORDINATION_INSTRUCTIONS_PREFIX + id) ?? said('user')[0]
+      const handoff = relayBrief({ role, title, from: id, used: context.used, bound, instructions, lastIn: said('user').at(-1), lastOut: said('assistant').at(-1) })
+      const receiver = this.handoffReceiver(scope, spec, settingsForRuntime(state.settings), {})
+      await this.succeed(scope, spec, source, { handoff, receiver, title: title.slice(0, 100).replace(/ \(continued\)$/, '') + ' (continued)', roll: { role, used: context.used, bound, ...(instructions ? { instructions } : {}) } })
+    } catch (error) {
+      this.rollRefused.add(id)
+      sessions.notice(id, `Conductor could not roll this ${role} to a fresh session (its context is ${context.used.toLocaleString('en-US')} tokens): ${error instanceof Error ? error.message : String(error)}`)
+    } finally { this.rolling.delete(id) }
   }
 
   /** A coworker whose turn ended on its provider's usage limit is reported to its controller at
@@ -662,7 +727,7 @@ export class AgentControl {
    *  but its work, and the reports about it, are its successor's. Followed to the newest open one. */
   private successorOf(projectId: string, agentSessionId: string): string {
     let id = agentSessionId
-    for (let hops = 0; hops < 8; hops++) {
+    for (let hops = 0; hops < 64; hops++) {
       const by = this.recovery().status(projectId, id).superseded?.by
       if (!by || by === id || by === agentSessionId || !this.deps.database.structured.snapshot(by)) break
       id = by
@@ -674,7 +739,7 @@ export class AgentControl {
    *  agents.supersede), open or not. */
   private successorsOf(projectId: string, agentSessionId: string): string[] {
     const chain: string[] = []
-    for (let id = agentSessionId; chain.length < 8;) {
+    for (let id = agentSessionId; chain.length < 64;) {
       const by = this.recovery().status(projectId, id).superseded?.by
       if (!by || by === agentSessionId || chain.includes(by)) break
       chain.push(by); id = by
@@ -1482,6 +1547,9 @@ export class AgentControl {
       const spec: AgentSpec = { id: tab.resourceId, projectId: target.projectId, sessionId: target.sessionId, provider, model: model.id, title: tab.title, cwd, ...(sovereign(scope) ? { continueOnLimit: true } : {}), ...(anonymous ? { anonymous: true } : {}), ...(args.profile === 'evaluation' ? { profile: 'evaluation' as const } : {}) }
       const result = this.deps.sessions.ensure(spec)
       if (!result.available) throw new Error(result.message || `Provider "${provider}" is unavailable here now; models.list shows which providers are`)
+      // A relay or coordinator rolls to a fresh session once its context passes the bound (rollIfLong).
+      const role = coordinationRoleOf(args)
+      if (role && provider !== 'local') this.deps.database.setSetting(COORDINATION_ROLE_PREFIX + spec.id, role)
       const created = this.deps.database.structured.snapshot(spec.id)!
       // Claude and Grok have no read-only permission; their read-only is plan mode, where the model
       // reads and searches but changes nothing and asks for nothing a stronger-model review answers.
@@ -1718,6 +1786,14 @@ export class AgentControl {
     if (method === 'models.list') return this.withModelFacts(this.deps.cloud ? [...this.catalog(scope), cloudCatalogEntry(this.deps.cloud.available())] : this.catalog(scope))
     if (method === 'tabs.list') return this.tabs(this.sibling(scope, args))
     if (method === 'tabs.open') return this.callOpen(scope, source, args)
+    // A controller's message to a relay Conductor rolled (rollIfLong) belongs to its fresh session.
+    if ((method === 'agents.steer' || method === 'agents.submit') && typeof args.agentSessionId === 'string' && database.getSetting(COORDINATION_ROLE_PREFIX + args.agentSessionId)) {
+      const named = args.agentSessionId, rolled = this.successorOf(database.structured.spec<AgentSpec>(named)?.projectId ?? scope.projectId, named)
+      if (rolled !== named && rolled !== scope.agentSessionId && !this.successorsOf(scope.projectId, scope.agentSessionId).includes(named)) {
+        const result = await this.call(scope, method, { ...args, agentSessionId: rolled })
+        return result && typeof result === 'object' ? { ...result, forwardedFrom: named } : result
+      }
+    }
     // A superseded main's message to the conversation that continues it takes no control either.
     if ((method === 'agents.steer' || method === 'agents.submit') && !scope.owner && typeof args.agentSessionId === 'string' && this.successorsOf(scope.projectId, scope.agentSessionId).includes(args.agentSessionId)) return this.toSuccessor(scope, args.agentSessionId, text(args, 'prompt', MAX_PROMPT_CHARS))
     // A coworker's message to its controller, or to any ancestor, is a report and takes no
@@ -3186,11 +3262,13 @@ export class AgentControl {
     return { kind: 'agent', provider, model, permission: settings.permission, exactPermission: true, ...(effort ? { effort } : {}) }
   }
 
-  private async succeed(scope: AgentControlScope, spec: AgentSpec, source: AgentControlTab | undefined, request: { handoff: string; receiver: Args & { provider: StructuredProvider; model: string }; title: string }): Promise<unknown> {
+  private async succeed(scope: AgentControlScope, spec: AgentSpec, source: AgentControlTab | undefined, request: { handoff: string; receiver: Args & { provider: StructuredProvider; model: string }; title: string; roll?: { role: 'relay' | 'coordinator'; used: number; bound: number; instructions?: string } }): Promise<unknown> {
     const { database, sessions } = this.deps
     const wizard = scope.wizard === true
     const coworkers = this.controlledBy(scope.agentSessionId)
-    if (!wizard && !coworkers.length) throw new Error('successor:true is for a main brain: a wizard tab, or a controller with live coworkers. This conversation is neither; call agents.handoff without successor to hand your work to a fresh tab')
+    // A rolled relay (rollIfLong) is Conductor's doing, not the caller's, and needs no main brain.
+    const roll = request.roll
+    if (!roll && !wizard && !coworkers.length) throw new Error('successor:true is for a main brain: a wizard tab, or a controller with live coworkers. This conversation is neither; call agents.handoff without successor to hand your work to a fresh tab')
     if (source?.state?.remotePeerId || this.callerMachineId(scope) !== LOCAL_MACHINE_ID) throw new Error('A successor opens on this machine, and this conversation runs on or is driven by another one; call agents.handoff without successor')
     const { handoff, receiver, title } = request
     // Refused before anything opens: the wand, the coworkers and any restart stay with the caller.
@@ -3200,6 +3278,9 @@ export class AgentControl {
     const agentSessionId = tab.resourceId
     if (!agentSessionId) throw new Error(`The successor tab “${title}” opened, but this machine cannot deliver a prompt to it; nothing was handed over — keep working in this conversation`)
     const successorTitle = tab.title ?? title
+    // A rolled relay's successor is a relay too, so it rolls again past the same bound.
+    if (roll) database.setSetting(COORDINATION_ROLE_PREFIX + agentSessionId, roll.role)
+    if (roll?.instructions) database.setSetting(COORDINATION_INSTRUCTIONS_PREFIX + agentSessionId, clip(roll.instructions, 6000))
     // The successor is the same brain: wizard mode and limit continuation come with it.
     const opened = database.structured.snapshot(agentSessionId)!
     if (wizard) database.structured.update(agentSessionId, { settings: { ...opened.settings, wizard: true } })
@@ -3209,7 +3290,8 @@ export class AgentControl {
     const key = (id: string) => 'agentControlParent:' + id
     const previous = coworkers.map(link => [link.targetAgentSessionId, database.getSetting(key(link.targetAgentSessionId))] as const)
     for (const link of coworkers) database.setSetting(key(link.targetAgentSessionId), JSON.stringify({ ...link, controllerAgentSessionId: agentSessionId, controllerTabId: tab.id }))
-    const prompt = handoff + `\n\nConductor: you are the successor of “${source?.title ?? spec.title}” (${scope.agentSessionId}), not its coworker${wizard ? ', and this tab is now the wizard' : ''}. ${coworkers.length ? `You now control ${coworkers.length} coworker${coworkers.length === 1 ? '' : 's'} (${coworkers.map(link => link.targetAgentSessionId).join(', ')}); their reports, approvals and steering come to you. ` : ''}The previous tab finishes its current step and stops.`
+    const prompt = roll ? handoff + (coworkers.length ? `\n\nYou control ${coworkers.length} coworker${coworkers.length === 1 ? '' : 's'} (${coworkers.map(link => link.targetAgentSessionId).join(', ')}); their reports, approvals and steering come to you.` : '')
+      : handoff + `\n\nConductor: you are the successor of “${source?.title ?? spec.title}” (${scope.agentSessionId}), not its coworker${wizard ? ', and this tab is now the wizard' : ''}. ${coworkers.length ? `You now control ${coworkers.length} coworker${coworkers.length === 1 ? '' : 's'} (${coworkers.map(link => link.targetAgentSessionId).join(', ')}); their reports, approvals and steering come to you. ` : ''}The previous tab finishes its current step and stops.`
     // Straight to the session rather than through agents.submit, which would take control of the
     // tab it prompts and so make the successor the caller's coworker after all.
     const origin: PromptOrigin = { agentSessionId: scope.agentSessionId, label: source?.title || spec.title }
@@ -3246,14 +3328,15 @@ export class AgentControl {
     if (callerState.settings.wizard) database.structured.update(scope.agentSessionId, { settings: { ...callerState.settings, wizard: false } })
     // Superseded, not failed: nobody resumes it as unfinished work. It is still finishing its
     // step, but by the handoff contract it is done once that step is, so it is recorded as such.
-    const superseded = this.recovery().supersede(scope, scope.agentSessionId, 'completed', agentSessionId, `Continued in “${successorTitle}” (agents.handoff successor)`.slice(0, 300))
+    const superseded = this.recovery().supersede(scope, scope.agentSessionId, 'completed', agentSessionId, (roll ? `Rolled to a fresh session in “${successorTitle}” at ${roll.used} tokens of context (${roll.role} bound ${roll.bound})` : `Continued in “${successorTitle}” (agents.handoff successor)`).slice(0, 300))
     // It owns no work any more: its watch loops and backgrounded shells stop once its step settles.
     sessions.retireBackgroundWork(scope.agentSessionId)
-    sessions.notice(scope.agentSessionId, `Continued in “${successorTitle}”. This conversation handed itself on${wizard ? ', with wizard mode,' : ''} and ${coworkers.length ? `its ${coworkers.length} coworker${coworkers.length === 1 ? '' : 's'}` : 'its work'}; it finishes its current step and stops.`, { succession: { agentSessionId, tabId: tab.id, title: successorTitle, uri: tab.uri } })
+    if (roll) sessions.notice(scope.agentSessionId, `Continued in “${successorTitle}”. This ${roll.role}'s context reached ${roll.used.toLocaleString('en-US')} tokens (bound ${roll.bound.toLocaleString('en-US')}), so Conductor rolled it to a fresh native session; messages to it go there now.`, { succession: { agentSessionId, tabId: tab.id, title: successorTitle, uri: tab.uri }, relayRoll: { used: roll.used, bound: roll.bound } })
+    else sessions.notice(scope.agentSessionId, `Continued in “${successorTitle}”. This conversation handed itself on${wizard ? ', with wizard mode,' : ''} and ${coworkers.length ? `its ${coworkers.length} coworker${coworkers.length === 1 ? '' : 's'}` : 'its work'}; it finishes its current step and stops.`, { succession: { agentSessionId, tabId: tab.id, title: successorTitle, uri: tab.uri } })
     const touched = new Map<string, { projectId: string; sessionId: string }>([[scope.projectId + '\0' + scope.sessionId, scope]])
     for (const link of coworkers) touched.set(link.projectId + '\0' + link.sessionId, { projectId: link.projectId, sessionId: link.sessionId })
     for (const workspace of touched.values()) this.deps.linksChanged?.(workspace)
-    this.deps.collaboration.postMessage({ projectId: scope.projectId, sessionId: scope.sessionId, agentSessionId: scope.agentSessionId, toAgentSessionId: agentSessionId, kind: 'handoff', body: `Continued in “${successorTitle}”${coworkers.length ? `, which now controls ${coworkers.length} coworker${coworkers.length === 1 ? '' : 's'}` : ''}. This conversation finishes its current step and stops.`, metadata: { handoff: 'successor', fromTabId: source?.id, toTabId: tab.id, characters: handoff.length, wizard, coworkers: coworkers.map(link => link.targetAgentSessionId) } })
+    this.deps.collaboration.postMessage({ projectId: scope.projectId, sessionId: scope.sessionId, agentSessionId: scope.agentSessionId, toAgentSessionId: agentSessionId, kind: 'handoff', body: `Continued in “${successorTitle}”${coworkers.length ? `, which now controls ${coworkers.length} coworker${coworkers.length === 1 ? '' : 's'}` : ''}. This conversation finishes its current step and stops.`, metadata: { handoff: roll ? 'relay-roll' : 'successor', fromTabId: source?.id, toTabId: tab.id, characters: handoff.length, wizard, coworkers: coworkers.map(link => link.targetAgentSessionId) } })
     const permissions = await moving
     const created = database.structured.snapshot(agentSessionId)
     return {

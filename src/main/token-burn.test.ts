@@ -83,6 +83,28 @@ describe('per-tab token burn (codex-credit-burn 2)', () => {
     expect(formatBurn(820_400)).toBe('820k/h')
   })
 
+  it('drops a cached reading once the conversation reports usage (smoke-token-burn read 0 for 55 s)', () => {
+    // The meter's publisher ticks while a tab's runtime starts, before its first turn reported
+    // anything, and cached that empty reading for 55 s: a turn finishing inside that minute read 0.
+    const { store, append } = fixture()
+    const service = new TokenBurnService(store, () => null, () => NOW)
+    expect(store.usageMark('codex')).toBe(0)
+    expect(service.measure('codex')).toBeNull()
+    append('codex', 1, usage({ scope: 'session', inputTokens: 6_400_000, cachedTokens: 6_000_000, outputTokens: 20_000 }))
+    // A nested report is not the conversation's own and leaves the mark alone.
+    append('codex', 1, usage({ scope: 'session', inputTokens: 1 }), { parentId: 'task:1' })
+    expect(store.usageMark('codex')).toBe(1)
+    expect(service.measure('codex')).toMatchObject({ tokensPerHour: 6_420_000, cachedPerHour: 6_000_000, reports: 1 })
+    // Nothing new: the cached reading is served without another scan.
+    let reads = 0
+    const counted = new TokenBurnService({ usageBurn: (id, from) => { reads++; return store.usageBurn(id, from) }, usageMark: id => store.usageMark(id) }, () => null, () => NOW)
+    counted.measure('codex'); counted.measure('codex')
+    expect(reads).toBe(1)
+    append('codex', 0, usage({ scope: 'session', inputTokens: 6_500_000, cachedTokens: 6_000_000, outputTokens: 20_000 }))
+    expect(counted.measure('codex')).toMatchObject({ tokensPerHour: 6_520_000 })
+    expect(reads).toBe(2)
+  })
+
   it('broadcasts only when a rate or an alert moves, and validates the alert setting over IPC', async () => {
     const settings = new Map<string, string>(), published: unknown[] = []
     const tokens = 400_000

@@ -17,6 +17,8 @@ const PUBLISH_MS = 60_000
 
 export interface TokenBurnSource {
   usageBurn(sessionId: string, from: string): WeeklyUsageConversation | null
+  /** Changes whenever the conversation reports usage; a cached measure taken under another mark is stale. */
+  usageMark?(sessionId: string): number
 }
 export type BurnMeasure = Omit<TokenBurnRate, 'agentSessionId' | 'title' | 'provider' | 'alert'>
 export interface LiveConversation { agentSessionId: string; title: string; provider: string }
@@ -35,16 +37,18 @@ export function measureBurn(conversation: WeeklyUsageConversation | null, throug
 }
 
 export class TokenBurnService {
-  private readonly cache = new Map<string, { at: number; value: BurnMeasure | null }>()
+  private readonly cache = new Map<string, { at: number; mark: number; value: BurnMeasure | null }>()
   constructor(private readonly source: TokenBurnSource, private readonly getSetting: (key: string) => string | null, private readonly now: () => number = Date.now) {}
 
   alertPerHour(): number { return tokenBurnAlertPerHour(this.getSetting) }
 
   measure(agentSessionId: string): BurnMeasure | null {
-    const at = this.now(), cached = this.cache.get(agentSessionId)
-    if (cached && at - cached.at < CACHE_MS) return cached.value
+    const at = this.now(), cached = this.cache.get(agentSessionId), mark = this.source.usageMark?.(agentSessionId) ?? 0
+    // A turn's usage report lands after the meter may already have measured the tab (the publisher
+    // ticks while its runtime starts): the mark moves with every report, so that reading is dropped.
+    if (cached && cached.mark === mark && at - cached.at < CACHE_MS) return cached.value
     const value = measureBurn(this.source.usageBurn(agentSessionId, new Date(at - TOKEN_BURN_WINDOW_MS - BASELINE_LOOKBACK_MS).toISOString()), at)
-    this.cache.set(agentSessionId, { at, value })
+    this.cache.set(agentSessionId, { at, mark, value })
     return value
   }
 
