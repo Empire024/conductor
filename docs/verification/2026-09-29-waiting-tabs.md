@@ -77,3 +77,13 @@ that agent's baseline, even if a catch-up read already moved the cursor past a t
 judges journal and projection arrivals per agent the same way, so an older message from a newly awaited
 recipient never counts. Regressions (src/main/awaiting-results.test.ts): the delayed broadcast after a
 25,000-event trim, then a restart; per-agent baselines with add().
+
+## Fourth review (on fcd3558)
+
+1. add() gave a new recipient the shared scan cursor (min of the cursor and its baseline) as its
+   baseline, so an older message from it, just past a page-budgeted cursor, counted. The new recipient
+   now gets its own pre-send baseline; the cursor may still start earlier.
+2. A record from before per-agent baselines took the advanced cursor as every agent's baseline once
+   consume() moved it. consume() now writes the baselines out, from the original sinceSequence, the
+   first time it saves such a record.
+Regressions in src/main/awaiting-results.test.ts; both fail on fcd3558 and pass now.

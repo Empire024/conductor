@@ -73,7 +73,9 @@ export class AwaitingResults {
     // Everything owed before was read through at least up to now, so rereading from the earlier
     // baseline only finds what consume() already removed.
     const from = current ? Math.min(current.sinceSequence, baseline) : baseline
-    const kept = current ? Object.fromEntries(current.agents.filter(id => id !== agentSessionId).map(id => [id, baselineOf(current, id)])) : {}
+    // The shared cursor may start earlier, but the new recipient counts only from its own pre-send
+    // baseline; one already owed keeps its earlier baseline.
+    const kept = { ...current ? Object.fromEntries(current.agents.map(id => [id, baselineOf(current, id)])) : {}, ...current?.agents.includes(agentSessionId) ? {} : { [agentSessionId]: baseline } }
     return this.declare(waiter, [...current?.agents ?? [], agentSessionId], reason ?? current?.reason, from, kept)
   }
 
@@ -111,8 +113,10 @@ export class AwaitingResults {
     // Each sender's newest message counts only when it is newer than that agent's own baseline.
     const owed = record.agents.filter(id => ![id, ...this.deps.successors(id)].some(sender => (arrived.get(sender) ?? -Infinity) > baselineOf(record, id)))
     if (!owed.length) { this.clear(waiter); return null }
-    const next: AwaitingRecord = { ...record, agents: owed, sinceSequence: Math.max(record.sinceSequence, through), ...(record.baselines ? { baselines: Object.fromEntries(owed.map(id => [id, baselineOf(record, id)])) } : {}) }
-    if (next.sinceSequence !== record.sinceSequence || owed.length !== record.agents.length) this.save(waiter, next)
+    // Baselines are written out before the cursor moves: a record from before they existed would
+    // otherwise take the advanced cursor as every agent's baseline.
+    const next: AwaitingRecord = { ...record, agents: owed, sinceSequence: Math.max(record.sinceSequence, through), baselines: Object.fromEntries(owed.map(id => [id, baselineOf(record, id)])) }
+    if (next.sinceSequence !== record.sinceSequence || owed.length !== record.agents.length || !record.baselines) this.save(waiter, next)
     return next
   }
 
@@ -136,7 +140,7 @@ export class AwaitingResults {
         return !arrived.some(reply => senders.has(reply.from) && reply.sequence > baselineOf(record, id))
       })
       if (!owed.length) { this.clear(waiter); continue }
-      if (owed.length !== record.agents.length) this.save(waiter, { ...record, agents: owed, ...(record.baselines ? { baselines: Object.fromEntries(owed.map(id => [id, baselineOf(record, id)])) } : {}) })
+      if (owed.length !== record.agents.length) this.save(waiter, { ...record, agents: owed, baselines: Object.fromEntries(owed.map(id => [id, baselineOf(record, id)])) })
       this.consume(waiter)
     }
   }

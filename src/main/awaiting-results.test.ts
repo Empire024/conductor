@@ -200,6 +200,35 @@ describe('AwaitingResults', () => {
     expect(h.ledger.record('reviewer')).toMatchObject({ agents: ['other'] })
   })
 
+  it('gives a newly awaited recipient its own pre-send baseline, not the shared scan cursor (review of fcd3558)', () => {
+    const h = harness()
+    h.emit('reviewer', [text(1)])
+    h.ledger.declare('reviewer', ['other'])
+    // Then the journal fills to 5,001..25,001 after a trim; its last row is an older message from the fixer.
+    h.emit('reviewer', Array.from({ length: 25_000 }, (_, index) => text(2 + index, 2 + index === 25_001 ? 'fixer' : undefined)))
+    h.floors.set('reviewer', 5_001)
+    // The reviewer asks the fixer at 25,001. add()'s own catch-up stops at 25,000 (one consume's page
+    // budget), before the fixer's old message: that message must still not count.
+    const added = h.ledger.add('reviewer', 'fixer', 25_001)
+    expect(added.agents).toEqual(['other', 'fixer'])
+    expect(h.ledger.record('reviewer')).toMatchObject({ agents: ['other', 'fixer'], baselines: { other: 1, fixer: 25_001 } })
+  })
+
+  it('writes the baselines of a legacy record out before its cursor first moves (review of fcd3558)', () => {
+    const h = harness()
+    const reply = text(2, 'fixer')
+    h.emit('reviewer', [text(1), reply, ...Array.from({ length: 25_000 }, (_, index) => text(3 + index))])
+    h.floors.set('reviewer', 5_002)
+    // A record written before per-agent baselines existed.
+    h.settings.set('awaitingResults:reviewer', JSON.stringify({ agents: ['fixer', 'other'], since: '2026-09-29T09:00:00.000Z', sinceSequence: 1 }))
+    h.ledger.consume('reviewer')
+    expect(h.ledger.record('reviewer')).toMatchObject({ agents: ['fixer', 'other'], baselines: { fixer: 1, other: 1 } })
+    expect(h.ledger.record('reviewer')!.sinceSequence).toBeGreaterThan(1)
+    // The late broadcast of the reply at 2 still counts against the fixer's original baseline.
+    h.ledger.noteEvents([h.toEvent('reviewer', reply)])
+    expect(h.ledger.record('reviewer')).toMatchObject({ agents: ['other'] })
+  })
+
   it('the archive refuses a waiting tab', () => {
     expect(archiveRefusal({ wizard: false, controlsLiveCoworkers: false, remote: false, awaiting: 'it is waiting for results from Fixer (fixer)' }, null)).toBe('it is waiting for results from Fixer (fixer)')
     expect(archiveRefusal({ wizard: false, controlsLiveCoworkers: false, remote: false }, null)).toBeNull()
