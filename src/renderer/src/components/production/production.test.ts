@@ -200,6 +200,18 @@ describe('production panel', () => {
     expect(html).toContain('7 of 20 steps · control C05')
     expect(progressText({ ...(await snapshot()).runs[0]!, progress: { done: 3, total: 4, currentStep: null } })).toBe('3 of 4 steps')
   })
+
+  it('marks text the audit quoted (a percent-encoded tracker URL) apart from the panel\'s own wording', async () => {
+    const { bridge, snapshot } = story()
+    const observed = 'GET http://localhost:5/collect?dl=http%3A%2F%2F127.0.0.1%3A5%2F on first load'
+    bridge.update('shop', current => { const finding = current.findings.find(entry => entry.id === 'f-tracker')!; finding.observed = observed; finding.reproduction = ['Open /?utm=50%25'] })
+    const html = view(await snapshot(), { openFindingId: 'f-tracker' })
+    expect(html).toContain(`<dd data-audit-text="true">${observed}</dd>`)
+    expect(html).toMatch(/<ol data-audit-text="true"><li>Open \/\?utm=50%25<\/li><\/ol>/)
+    // Every "%" in the markup sits inside an element marked as quoted audit text.
+    const chrome = html.replace(/<(dd|ol|li|p|small|strong|span)[^>]*data-audit-text="true"[^>]*>[\s\S]*?<\/\1>/g, '')
+    expect(chrome).not.toContain('%')
+  })
 })
 
 describe('owner questions', () => {

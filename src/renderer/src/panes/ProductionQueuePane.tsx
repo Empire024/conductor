@@ -25,7 +25,7 @@ export function ProductionQueueView({ entries, currentProjectId, onOpen }: {
       className={entry.projectId === currentProjectId ? 'current' : ''} tabIndex={0} role="button" aria-label={`Open Production for ${entry.projectName}`}
       onClick={() => onOpen(entry.projectId)} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onOpen(entry.projectId) } }}>
       <td><strong>{entry.projectName}</strong></td>
-      <td><GateBadge gate={entry.gate} compact />{entry.gate.reasons[0] && <small>{entry.gate.reasons[0]}</small>}</td>
+      <td><GateBadge gate={entry.gate} compact />{entry.gate.reasons[0] && <small data-audit-text>{entry.gate.reasons[0]}</small>}</td>
       <td data-fact="critical-high">{entry.openFindings.critical} / {entry.openFindings.high}</td>
       <td data-fact="questions">{entry.openQuestions}</td>
       <td>{entry.activeRun ? <small>{entry.activeRun.kind} {entry.activeRun.status} · {progressText(entry.activeRun)}</small> : <small className="production-muted">none</small>}</td>

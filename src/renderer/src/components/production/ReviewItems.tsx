@@ -52,15 +52,15 @@ export function ReviewItems({ results, busy, error, errorId = null, changingId =
         const answer = item.answer ?? null
         const changing = changingId === item.id
         return <div key={item.id} className="production-question production-review" data-review-id={item.id} data-answer={answer ?? 'none'}>
-          <strong>{item.question}</strong>
-          <small>{item.why}</small>
+          <strong data-audit-text>{item.question}</strong>
+          <small data-audit-text>{item.why}</small>
           {item.route && <small>Route {item.route}</small>}
           {item.evidence.length > 0 && <small>Evidence {item.evidence.join(', ')}</small>}
           {answer && <div className="production-review-answered">
             <span className="production-chips">
               <span className={`production-chip tone-${REVIEW_ANSWER_LABEL[answer].tone}`}>{REVIEW_ANSWER_LABEL[answer].label}</span>
             </span>
-            {item.note && <small>Note: {item.note}</small>}
+            {item.note && <small data-audit-text>Note: {item.note}</small>}
             <small>By {item.answeredBy ?? 'unknown'} · {formatTime(item.answeredAt ?? null)}</small>
             {!changing && <button type="button" className="production-link" disabled={Boolean(busy)}
               onClick={() => { setDrafts(current => ({ ...current, [item.id]: item.note ?? '' })); onChange(item.id) }}>Change answer</button>}

@@ -43,8 +43,8 @@ export function ControlTable({ results, gate }: { results: ControlResult[]; gate
     <tbody>{sortResults(results).map(result => <tr key={result.controlId} data-control={result.controlId} data-status={result.status}>
       {head(result.controlId, result.status)}
       <td>
-        {result.rationale && <small className="production-rationale">{result.rationale}</small>}
-        <small>{result.applicability.status}: {result.applicability.rationale}</small>
+        {result.rationale && <small className="production-rationale" data-audit-text>{result.rationale}</small>}
+        <small data-audit-text>{result.applicability.status}: {result.applicability.rationale}</small>
         <small data-fact="coverage">{coverageText(result)}</small>
         {result.humanReview.length > 0 && <small data-fact="human-review">{reviewLine(result)}</small>}
       </td>

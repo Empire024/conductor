@@ -17,7 +17,7 @@ export function GateBadge({ gate, compact = false }: { gate: GateState; compact?
     </div>
     <p className="production-fingerprint" data-fact="fingerprint">{fingerprintLine(gate.fingerprint)}</p>
     {gate.reasons.length > 0 && <ul className="production-gate-reasons" aria-label="Why the state is not verified">
-      {gate.reasons.map((reason, index) => <li key={index}>{reason}</li>)}
+      {gate.reasons.map((reason, index) => <li key={index} data-audit-text>{reason}</li>)}
     </ul>}
   </div>
 }

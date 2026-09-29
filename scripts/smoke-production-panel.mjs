@@ -18,6 +18,14 @@ configure({ name: 'production-panel' })
 watchdog(900)
 const build = process.env.CONDUCTOR_SMOKE_MAIN ? resolve(process.env.CONDUCTOR_SMOKE_MAIN) : BUILD
 const sites = await createFixtureServer({ sites: ['consent-tracker-before', 'consent-good'], root: resolve('src/main/production/fixtures/sites') })
+/** The panel's own wording: everything except text the audit quoted from the site, a check or a
+ *  person (`data-audit-text`, for example a percent-encoded tracker URL) and form fields. A score
+ *  or percentage the panel itself rendered would show up here. */
+const chromeText = locator => locator.evaluate(element => {
+  const copy = element.cloneNode(true)
+  for (const node of copy.querySelectorAll('[data-audit-text], input, textarea, select')) node.remove()
+  return copy.textContent ?? ''
+})
 const OTHERS = ['C01', 'C02', 'C04', 'C05', 'C06', 'C07', 'C08', 'C09', 'C10', 'C11', 'C12', 'C14', 'C15', 'C16']
 
 /** A local fixture environment, only C03 and C13 audited, one route, desktop. */
@@ -72,7 +80,10 @@ try {
   await expect(pane.locator('.production-gate[data-state="AUDITING"]').first()).toBeVisible({ timeout: 20_000 })
   const status = await settled(project.id, 'the audit of the tracker site')
   assert.equal(status.gate.state, 'BLOCKED', `gate ${status.gate.state}: ${status.gate.reasons.join(' | ')}`)
-  const tracker = status.openFindings.find(finding => finding.controlId === 'C03')
+  // The finding that quotes the tracker request, whose URL is percent-encoded: its detail must not
+  // read as a percentage (candidate bd03de5 opened it by chance and the check tripped).
+  const c03 = await call('production.findings', { controlId: 'C03' }, { projectId: project.id })
+  const tracker = c03.find(finding => finding.observed.includes('%')) ?? c03[0]
   assert.ok(tracker, 'no C03 finding')
   await expect(pane.locator('.production-gate[data-state="BLOCKED"]').first()).toBeVisible({ timeout: 20_000 })
   await expect(pane.getByRole('checkbox', { name: 'Production-ready' })).toBeChecked()
@@ -119,9 +130,9 @@ try {
   await expect(pane.locator(`li[data-finding-id="${tracker.id}"]`)).toHaveAttribute('data-status', 'waived')
   record('waiver', 'PASS', {}, 'missing expiry refused in the panel; the granted waiver keeps the finding as waived')
 
-  const text = await pane.innerText()
-  assert.ok(!text.includes('%'), 'the Production panel shows a percentage')
-  writeFileSync(join(inst.root, 'production-drawer.txt'), text)
+  writeFileSync(join(inst.root, 'production-drawer.txt'), await pane.innerText())
+  const chrome = await chromeText(pane)
+  assert.ok(chrome.length > 200 && !chrome.includes('%'), `the Production panel shows a percentage: ${chrome.slice(Math.max(0, chrome.indexOf('%') - 80), chrome.indexOf('%') + 40)}`)
   await shot('production-drawer')
 
   // Queue: BLOCKED before the rest, row opens the project's drawer.
@@ -135,7 +146,7 @@ try {
   assert.ok(names.indexOf('Settled shop') >= 0 && names.indexOf('Production smoke') >= 0, `queue rows ${names.join(', ')}`)
   const blockedFirst = queued.find(entry => entry.projectId === project.id).gate.state === 'BLOCKED' || queued.find(entry => entry.projectId === project.id).gate.state === 'VERIFIED_WITH_WAIVERS'
   assert.ok(blockedFirst)
-  assert.ok(!(await view.locator('.production-queue-pane').innerText()).includes('%'), 'the queue shows a percentage')
+  assert.ok(!(await chromeText(view.locator('.production-queue-pane'))).includes('%'), 'the queue shows a percentage')
   await shot('production-queue')
   await view.getByTitle('Close workspace view').click()
   await queue.getByRole('button', { name: 'Open Production for Production smoke' }).click()

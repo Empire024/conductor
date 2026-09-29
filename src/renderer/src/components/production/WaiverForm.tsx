@@ -33,7 +33,7 @@ export function WaiverForm({ finding, busy, error, now, initialDraft, initialErr
       setErrors(result.errors)
       if (result.request) onSubmit(result.request)
     }}>
-    <strong>Waive: {finding.title}</strong>
+    <strong data-audit-text>Waive: {finding.title}</strong>
     {field('reason', 'Reason', <textarea rows={2} value={draft.reason} onChange={set('reason')} />)}
     {field('scope', 'Scope', <input value={draft.scope} onChange={set('scope')} placeholder="For example /checkout on desktop" />)}
     {field('owner', 'Risk owner', <input value={draft.owner} onChange={set('owner')} />)}

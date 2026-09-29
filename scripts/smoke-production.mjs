@@ -40,6 +40,14 @@ const proxy = createServer((req, res) => {
 await new Promise(done => proxy.listen(0, '127.0.0.1', done))
 const origin = `http://127.0.0.1:${proxy.address().port}`
 
+/** The panel's own wording: everything except text the audit quoted from the site, a check or a
+ *  person (`data-audit-text`, for example a percent-encoded tracker URL) and form fields. A score
+ *  or percentage the panel itself rendered would show up here. */
+const chromeText = locator => locator.evaluate(element => {
+  const copy = element.cloneNode(true)
+  for (const node of copy.querySelectorAll('[data-audit-text], input, textarea, select')) node.remove()
+  return copy.textContent ?? ''
+})
 const TERMINAL = ['completed', 'failed', 'cancelled']
 const summary = { origin, runs: {} }
 const waitRun = async (runId, label, timeoutMs = 240_000) => poll(async () => {
@@ -162,7 +170,7 @@ try {
   const pane = view.locator('.production-pane').first()
   await pane.locator('.production-gate[data-state="BLOCKED"]').first().waitFor({ timeout: 20_000 })
   await pane.locator(`li[data-finding-id="${tracker.id}"]`).waitFor({ timeout: 10_000 })
-  assert.ok(!(await pane.innerText()).includes('%'), 'the panel shows a percentage')
+  assert.ok(!(await chromeText(pane)).includes('%'), 'the panel shows a percentage')
   await shot('production-blocked')
   await pane.getByRole('button', { name: 'Queue', exact: true }).click()
   const queue = view.locator('table.production-queue')

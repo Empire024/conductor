@@ -18,12 +18,12 @@ export function FindingDetail({ finding, waiver, busy, onOpenEvidence, onOpenTas
   const verification = finding.verification
   return <article className="production-finding-detail" aria-label={`Finding ${finding.title}`} data-finding-id={finding.id}>
     <dl className="production-facts">
-      <div><dt>Expected</dt><dd>{finding.expected}</dd></div>
-      <div><dt>Observed</dt><dd>{finding.observed}</dd></div>
+      <div><dt>Expected</dt><dd data-audit-text>{finding.expected}</dd></div>
+      <div><dt>Observed</dt><dd data-audit-text>{finding.observed}</dd></div>
     </dl>
     {finding.reproduction.length > 0 && <div>
       <h4>Reproduction</h4>
-      <ol>{finding.reproduction.map((step, index) => <li key={index}>{step}</li>)}</ol>
+      <ol data-audit-text>{finding.reproduction.map((step, index) => <li key={index}>{step}</li>)}</ol>
     </div>}
     <div>
       <h4>Evidence</h4>
@@ -35,7 +35,7 @@ export function FindingDetail({ finding, waiver, busy, onOpenEvidence, onOpenTas
     </div>
     <div>
       <h4>Proposed fix</h4>
-      <p>{finding.proposedFix || 'None proposed.'}</p>
+      <p data-audit-text>{finding.proposedFix || 'None proposed.'}</p>
     </div>
     <dl className="production-facts">
       <div><dt>Fix task</dt><dd>{finding.taskId
@@ -43,7 +43,7 @@ export function FindingDetail({ finding, waiver, busy, onOpenEvidence, onOpenTas
         : 'none yet'}</dd></div>
       <div><dt>Verification</dt><dd data-fact="verification">{verification
         ? <>{verification.status} · run {verification.verifierRunId} · {shortCommit(verification.fingerprint.commit)} · {formatTime(verification.at)}
-            {verification.disagreement && <small className="production-disagreement">Disagreement: {verification.disagreement}</small>}</>
+            {verification.disagreement && <small className="production-disagreement" data-audit-text>Disagreement: {verification.disagreement}</small>}</>
         : 'not independently verified'}</dd></div>
       <div><dt>History</dt><dd>first {finding.firstSeenRunId}, last {finding.lastSeenRunId} at {shortCommit(finding.lastSeenFingerprint.commit)}</dd></div>
       <div><dt>Owner</dt><dd>{finding.owner}</dd></div>

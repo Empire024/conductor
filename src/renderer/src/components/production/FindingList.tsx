@@ -18,7 +18,7 @@ export function FindingList({ findings, selected, openId, onToggle, onOpen }: {
       <input type="checkbox" aria-label={`Select finding ${finding.title}`} checked={selected.has(finding.id)} onChange={() => onToggle(finding.id)} />
       <button type="button" className="production-finding-open" onClick={() => onOpen(openId === finding.id ? null : finding.id)} aria-expanded={openId === finding.id}>
         <span className={`production-chip tone-${SEVERITY_TONE[finding.severity]}`}>{finding.severity}</span>
-        <span className="production-finding-title">{finding.controlId} · {finding.title}</span>
+        <span className="production-finding-title" data-audit-text>{finding.controlId} · {finding.title}</span>
         <span className={`production-chip tone-${STATUS_TONE[finding.status]}`}>{finding.status}</span>
         {finding.taskId && <span className="production-chip tone-quiet">task</span>}
       </button>
