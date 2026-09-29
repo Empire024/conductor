@@ -6,7 +6,7 @@ export const migrateLegacyCodexTab = (tab: PaneTab): PaneTab => {
   if (tab.kind !== 'agent' || tab.state?.provider !== 'codex') return tab
   const model = tab.state.model
   if (typeof model !== 'string' || !RETIRED_CODEX_MODELS.has(model)) return tab
-  return { ...tab, state: { ...tab.state, model: 'gpt-6-astra' } }
+  return { ...tab, state: { ...tab.state, model: 'gpt-6.1-sol' } }
 }
 
 export const migrateLegacyCodexModels = (layout: WorkspaceLayout): WorkspaceLayout => {

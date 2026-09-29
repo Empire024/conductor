@@ -8,7 +8,8 @@
 import readline from 'node:readline'
 
 if (process.env.CONDUCTOR_TEST_PROVIDER_START_CAPTURE) { const { writeFileSync } = await import('node:fs'); writeFileSync(process.env.CONDUCTOR_TEST_PROVIDER_START_CAPTURE, `${process.pid}\n`) }
-if (process.argv.includes('--version')) { console.log('codex-cli 0.155.1'); process.exit(0) }
+const codexVersion = process.env.CONDUCTOR_FAKE_CODEX_VERSION || '0.159.1'
+if (process.argv.includes('--version')) { console.log(`codex-cli ${codexVersion}`); process.exit(0) }
 
 const efforts = (...levels) => levels.map(reasoningEffort => ({ reasoningEffort, description: `${reasoningEffort} reasoning (synthetic copy of the CLI description)` }))
 const tier = [{ id: 'priority', name: 'Fast', description: '2x speed, increased usage' }]
@@ -53,7 +54,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   if (message.method === 'initialize') {
     if (initialized) throw new Error('duplicate initialization')
     initialized = true
-    send({ id: message.id, result: { userAgent: 'codex/0.155.1 synthetic capability fixture', codexHome: '/synthetic/not-read', platformFamily: 'windows', platformOs: 'windows' } })
+    send({ id: message.id, result: { userAgent: `codex/${codexVersion} synthetic capability fixture`, codexHome: '/synthetic/not-read', platformFamily: 'windows', platformOs: 'windows' } })
     return
   }
   if (message.method === 'initialized') { if (!initialized) throw new Error('initialized before initialize response'); acknowledged = true; return }

@@ -36,6 +36,7 @@ Model ids resolve from what callers actually write (`resolveModel`, `src/main/co
 | fable | `claude-fable-5-1` (Claude) |
 | sonnet | `sonnet` (Claude) |
 | haiku | `haiku` (Claude) |
+| sol 6.1 | `gpt-6.1-sol` (Codex; the stack's Codex pick, needs codex-cli 0.159) |
 | astra | `gpt-6-astra` (Codex) |
 | sol | `gpt-5.6-sol` (Codex) |
 

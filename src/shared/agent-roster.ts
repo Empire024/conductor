@@ -39,39 +39,39 @@ const role = (entry: Omit<RosterRole, 'instructions'> & { job: string }): Roster
 
 export const ROSTER_ROLES: ReadonlyArray<RosterRole> = [
   role({
-    name: 'Swarm orchestrator', role: 'swarm-orchestrator', provider: 'codex', model: 'gpt-6-astra', effort: 'high', permission: 'auto',
+    name: 'Swarm orchestrator', role: 'swarm-orchestrator', provider: 'codex', model: 'gpt-6.1-sol', effort: 'high', permission: 'auto',
     briefs: ['docs/swarm/orchestrator.md', 'docs/swarm/worker-rules.md'],
     whenToUse: 'A batch of owner items: plan it, partition files, dispatch up to four fixers, verify, ship each locally and publish once. Turn the wand on in its composer to make it the wizard controller (owner authority, approvals, restarts).',
-    job: 'You coordinate the batch, dispatch Sol implementers and an independent Astra verifier, and keep delivery in this controller tab.'
+    job: 'You coordinate the batch, dispatch Sol 6.1 implementers and an independent Sol 6.1 verifier, and keep delivery in this controller tab.'
   }),
   role({
-    name: 'Fixer', role: 'swarm-fixer', provider: 'codex', model: 'gpt-6-sol', effort: 'medium', permission: 'auto',
+    name: 'Fixer', role: 'swarm-fixer', provider: 'codex', model: 'gpt-6.1-sol', effort: 'medium', permission: 'auto',
     briefs: ['docs/swarm/worker-rules.md'],
     whenToUse: 'One bounded item group with the files it owns, usually dispatched by the orchestrator with the worker rules appended to its brief.',
     job: 'Own only the files your brief names, test first, prove the scenario in a parked run and deliver with git.ship.'
   }),
   role({
-    name: 'Verifier', role: 'verifier', provider: 'codex', model: 'gpt-6-astra', effort: 'high', permission: 'auto',
+    name: 'Verifier', role: 'verifier', provider: 'codex', model: 'gpt-6.1-sol', effort: 'high', permission: 'auto',
     briefs: ['docs/verification/verifier-brief.md', '.conductor/loops/verify.md'],
     whenToUse: 'After a batch is delivered: independently plan and judge adversarial scenarios against the owner\'s own words (verify loop v6); a distinct Sol executor runs them.',
     job: 'Plan and judge independently of the implementer and executor. Dispatch bounded execution to a distinct Sol tab; every verdict carries its evidence path.'
   }),
   role({
-    name: 'Verifier runner', role: 'verifier-runner', provider: 'codex', model: 'gpt-6-sol', effort: 'low', permission: 'auto',
+    name: 'Verifier runner', role: 'verifier-runner', provider: 'codex', model: 'gpt-6.1-sol', effort: 'low', permission: 'auto',
     briefs: ['.conductor/loops/verify.md'],
     whenToUse: 'Bounded command churn: re-run committed smokes unchanged and collect their logs when the verifier asks; scenario execution uses a distinct Sol medium tab.',
     job: 'Re-run the named committed smokes unchanged through scripts/smoke-lock.mjs and collect their logs. Never write harness code and never give verdicts.'
   }),
   role({
-    name: 'Architect', role: 'architect', provider: 'codex', model: 'gpt-6-astra', effort: 'high', permission: 'auto',
+    name: 'Architect', role: 'architect', provider: 'codex', model: 'gpt-6.1-sol', effort: 'high', permission: 'auto',
     briefs: ['.conductor/loops/batch-delivery.md'],
     whenToUse: 'The contract step of batch delivery and task triage: before any fixer starts, write the failing tests, the acceptance commands and the allowedPaths. Alternate: Claude opus[1m] when Codex has no allowance.',
     job: 'Write the contract only: failing tests, acceptance commands and allowedPaths, pointing at code by file:line. Do not implement.'
   }),
   role({
-    name: 'Code reviewer', role: 'code-reviewer', provider: 'codex', model: 'gpt-6-astra', effort: 'high', permission: 'auto',
+    name: 'Code reviewer', role: 'code-reviewer', provider: 'codex', model: 'gpt-6.1-sol', effort: 'high', permission: 'auto',
     briefs: ['.conductor/loops/batch-delivery.md'],
-    whenToUse: 'The locked review step of batch delivery: a fresh Astra tab, never the implementer, reads the batch\'s git diff once within allowedPaths. Alternate: Claude opus[1m] when quota permits.',
+    whenToUse: 'The locked review step of batch delivery: a fresh Sol 6.1 tab, never the implementer, reads the batch\'s git diff once within allowedPaths. Alternate: Claude opus[1m] when quota permits.',
     job: 'Read the git diff limited to allowedPaths once and answer approve or a specific list of changes. Change nothing yourself.'
   }),
   role({
@@ -95,7 +95,7 @@ export const ROSTER_ROLES: ReadonlyArray<RosterRole> = [
     job: 'Start the loop with loops.run, run each step on its stated model and effort, and loops.record every step\'s outcome.'
   }),
   role({
-    name: 'Loop improver', role: 'loop-improver', provider: 'codex', model: 'gpt-6-astra', effort: 'high', permission: 'auto',
+    name: 'Loop improver', role: 'loop-improver', provider: 'codex', model: 'gpt-6.1-sol', effort: 'high', permission: 'auto',
     briefs: ['docs/logic-loops.md'],
     whenToUse: 'After loop runs have metrics: find the step that costs or fails most and propose a better version of the loop.',
     job: 'Read the loops\' recorded metrics, propose one evidence-backed change with loops.propose, and apply it with loops.apply only when it is auto-safe.'
@@ -119,7 +119,7 @@ export const ROSTER_ROLES: ReadonlyArray<RosterRole> = [
     job: 'Open that project\'s coworkers with tabs.open({projectId}), run its smokes (nodes.run for the Mac), and report back to whoever started you.'
   }),
   role({
-    name: 'Autopilot controller', role: 'autopilot-controller', provider: 'codex', model: 'gpt-6-astra', effort: 'high', permission: 'auto',
+    name: 'Autopilot controller', role: 'autopilot-controller', provider: 'codex', model: 'gpt-6.1-sol', effort: 'high', permission: 'auto',
     briefs: ['docs/autopilot-brief.md'],
     whenToUse: 'A long durable sweep over the whole app: audit, backlog and dispatch in priority order, resumed from its brief and backlog rather than restarted.',
     job: 'Resume from docs/autopilot-backlog.md; do not restart the sweep.'

@@ -4,7 +4,7 @@ import type { ProviderCapabilities } from './structured-agent'
 
 describe('concrete conversation model', () => {
   it('chooses explicit defaults before connecting and preserves selected models', () => {
-    expect(concreteModel('codex', 'default')).toBe('gpt-6-astra')
+    expect(concreteModel('codex', 'default')).toBe('gpt-6.1-sol')
     // The Claude account default resolves to Opus with the 1M window, and `opus[1m]` is the only
     // Opus entry the CLI advertises (2026-09-21); a bare `opus` is not in its picker.
     expect(concreteModel('claude', 'auto')).toBe('opus[1m]')

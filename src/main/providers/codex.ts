@@ -31,10 +31,15 @@ import type { ThreadForkResponse } from './generated/codex/v2/ThreadForkResponse
 import type { ThreadGoalGetResponse } from './generated/codex/v2/ThreadGoalGetResponse'
 import type { SkillsListResponse } from './generated/codex/v2/SkillsListResponse'
 import { BROWSER_MCP_SERVER_NAME } from '../../shared/browser-mcp'
+import { CODEX_FALLBACK_MODEL } from '../../shared/agent-model-selection'
 import { codexConductorThreadConfig, codexLocalAssistThreadConfig, mergeCodexMcpConfigs } from '../local-assist/mcp-config'
 import { canonicalAction } from '../approval-review'
 
-export const CODEX_PROTOCOL_BASELINE = '0.155.1'
+export const CODEX_PROTOCOL_BASELINE = '0.159.1'
+/** Exact runtimes the fixture suite covers: the baseline and the previous minor, whose wire the
+ *  adapter still speaks unchanged (docs/codex-compatibility.md, "Rebaseline 0.155.1 → 0.159.1"),
+ *  so the installed app keeps its Codex tabs across a global CLI upgrade in either order. */
+export const CODEX_VERIFIED_RUNTIMES: readonly string[] = [CODEX_PROTOCOL_BASELINE, '0.155.1']
 const safeguardRefusal = (message: string): boolean => /(?:safeguards? flagged this message|safety (?:policy|classifier).*(?:blocked|refused)|request (?:was )?refused by.*safety)/i.test(message)
 type WireTransport = Pick<JsonLineTransport, 'start' | 'send' | 'close' | 'connected'> & Partial<Pick<JsonLineTransport, 'closeAndWait' | 'detach' | 'detachable'>>
 /** Adapter fields that hold promises, timers or callbacks, and never travel in a detachment. */
@@ -420,9 +425,10 @@ export class CodexAdapter implements ProviderAdapter {
         execFile(this.options.executable, ['--version'], { cwd: this.options.cwd, env: providerEnvironment(this.options.environment ?? process.env), windowsHide: true, timeout: 10_000, maxBuffer: 4096 }, (error, stdout) => error ? reject(error) : resolve(stdout.trim()))
       }))
       this.capabilities.runtimeVersion = version.replace(/^codex-cli\s+/, '')
-      if (!/^0\.155\./.test(this.capabilities.runtimeVersion)) throw new Error(`Codex ${this.capabilities.runtimeVersion} is outside the tested 0.155.x protocol baseline; regenerate and verify the adapter before connecting`)
-      if (this.capabilities.runtimeVersion !== CODEX_PROTOCOL_BASELINE) this.capabilities.limitations.push(`Runtime ${this.capabilities.runtimeVersion} is not fixture-verified; baseline is ${CODEX_PROTOCOL_BASELINE}. Experimental features are disabled.`)
-      this.experimental = (this.options.environment ?? process.env).CONDUCTOR_CODEX_EXPERIMENTAL === '1' && this.capabilities.runtimeVersion === CODEX_PROTOCOL_BASELINE
+      if (!/^0\.(?:155|159)\./.test(this.capabilities.runtimeVersion)) throw new Error(`Codex ${this.capabilities.runtimeVersion} is outside the tested 0.155.x/0.159.x protocol baseline; regenerate and verify the adapter before connecting`)
+      const verified = CODEX_VERIFIED_RUNTIMES.includes(this.capabilities.runtimeVersion)
+      if (!verified) this.capabilities.limitations.push(`Runtime ${this.capabilities.runtimeVersion} is not fixture-verified; baseline is ${CODEX_PROTOCOL_BASELINE}. Experimental features are disabled.`)
+      this.experimental = (this.options.environment ?? process.env).CONDUCTOR_CODEX_EXPERIMENTAL === '1' && verified
       this.capabilities.plans = this.experimental
       this.transport = this.createTransport()
       this.transport.start()
@@ -523,7 +529,10 @@ export class CodexAdapter implements ProviderAdapter {
     if (this.disposed || this.failed || !this.threadId || !this.defaults || !this.transport?.connected) throw new Error('Codex session is disconnected; resume explicitly')
     if (this.turnId || this.dispatching || this.pending.size) throw new Error('A Codex turn or interaction is already active')
     if (settings.plan && !this.experimental) throw new Error('Codex plan mode requires the explicitly enabled experimental protocol')
-    const model = settings.model || this.defaults.model
+    // A conversation opened before discovery carries the stand-in CODEX_FALLBACK_MODEL. A CLI too
+    // old to be served it (gpt-6.1-sol needs codex-cli 0.159) runs its own default instead.
+    const standIn = settings.model === CODEX_FALLBACK_MODEL && this.models.length > 0 && !this.models.some(candidate => candidate.model === CODEX_FALLBACK_MODEL)
+    const model = (standIn ? undefined : settings.model) || this.defaults.model
     const modelInfo = this.models.find(candidate => candidate.model === model)
     if (settings.effort && modelInfo && !modelInfo.supportedReasoningEfforts.some(option => option.reasoningEffort === settings.effort)) throw new Error(`Reasoning effort ${settings.effort} is not offered for ${model}`)
     if (settings.effort && !['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(settings.effort)) throw new Error('Unsupported Codex reasoning effort')

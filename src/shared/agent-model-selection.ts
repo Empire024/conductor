@@ -7,7 +7,8 @@ export const explicitModel = (value: unknown): value is string => typeof value =
  *  picker offers (a bare `opus` is not advertised). Passing it is the same model the CLI would
  *  choose on its own for this account. */
 export const CLAUDE_FALLBACK_MODEL = 'opus[1m]'
-export const CODEX_FALLBACK_MODEL = 'gpt-6-astra'
+/** codex-cli 0.159.1's own default (`model/list` isDefault, 2026-09-30); 0.155 does not list it. */
+export const CODEX_FALLBACK_MODEL = 'gpt-6.1-sol'
 /** A signed-in Grok 1.0.41's own default model (`initialize` modelState, 2026-09-24). */
 export const GROK_FALLBACK_MODEL = 'grok-4.7'
 /** True when a Claude selection is only Conductor's pre-discovery stand-in, not something the

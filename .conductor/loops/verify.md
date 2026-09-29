@@ -7,19 +7,19 @@ inputs: [taskIds, commits]
 steps:
   - id: plan
     role: verifier
-    model: codex:gpt-6-astra
+    model: codex:gpt-6.1-sol
     alternate: claude:opus[1m]
     effort: high
     output: triaged plan - day lane ≤12 scenarios (≤3 per item, owner's words first, each ≤5 min) with pass rule and control case; overnight queue; owner-gated list asked once before running
   - id: execute
     role: verifier
-    model: codex:gpt-6-sol
+    model: codex:gpt-6.1-sol
     alternate: claude:opus[1m]
     effort: medium
     output: per-scenario PASS / FAIL / NOT RUN (reason) with evidence path, numbers, reproductions n/n and the control run
   - id: judge
     role: verifier
-    model: codex:gpt-6-astra
+    model: codex:gpt-6.1-sol
     alternate: claude:opus[1m]
     effort: high
     output: per item VERIFIED / REOPEN (failing scenario, evidence, control) / UNVERIFIED (must-have scenario NOT RUN, and what unblocks it)

@@ -22,7 +22,7 @@ function create(extraEnvironment: NodeJS.ProcessEnv = {}, nativeSessionId?: stri
   const sent: Json[] = []
   let closed = true
   const adapter = new CodexAdapter({ executable: 'not-a-real-provider', cwd, runtimeId: 'runtime-1', settings: sessionSettings, nativeSessionId, ...(mcpConfig ? { mcpConfig } : {}), ...extraOptions, environment: { ...process.env, ...extraEnvironment }, emit: event => events.push(event) }, {
-    version: async () => `codex-cli ${CODEX_PROTOCOL_BASELINE}`,
+    version: async () => `codex-cli ${extraEnvironment.CONDUCTOR_FAKE_CODEX_VERSION ?? CODEX_PROTOCOL_BASELINE}`,
     requestTimeoutMs,
     transport: options => {
       closed = false
@@ -48,7 +48,18 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
     expect(sent.map(message => (message as { method: string }).method)).toEqual(['initialize', 'initialized', 'thread/start', 'model/list'])
     expect(adapter.capabilities.models).toEqual([{ id: 'synthetic-model', label: 'Synthetic model', effort: ['low'], defaultEffort: 'low', isDefault: true }])
     expect(adapter.capabilities.plans).toBe(false)
-    expect(adapter.capabilities.runtimeVersion).toBe('0.155.1')
+    expect(adapter.capabilities.runtimeVersion).toBe('0.159.1')
+  })
+
+  it('connects to the previous verified minor (0.155.1) unlimited, flags an unverified patch, and refuses another minor', async () => {
+    const previous = create({ CONDUCTOR_FAKE_CODEX_VERSION: '0.155.1' }).adapter
+    await previous.start()
+    expect(previous.capabilities.runtimeVersion).toBe('0.155.1')
+    expect(previous.capabilities.limitations.some(text => /not fixture-verified/.test(text))).toBe(false)
+    const patch = create({ CONDUCTOR_FAKE_CODEX_VERSION: '0.159.4' }).adapter
+    await patch.start()
+    expect(patch.capabilities.limitations).toContain('Runtime 0.159.4 is not fixture-verified; baseline is 0.159.1. Experimental features are disabled.')
+    await expect(create({ CONDUCTOR_FAKE_CODEX_VERSION: '0.156.0' }).adapter.start()).rejects.toThrow('outside the tested 0.155.x/0.159.x protocol baseline')
   })
 
   it('keeps real tool results and child activity while excluding root self-status noise', async () => {
@@ -157,6 +168,16 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
     await adapter.submit('synthetic:stream', settings)
     const last = sent.filter(message => (message as { method?: string }).method === 'turn/start').at(-1)
     expect(last).toMatchObject({ params: { approvalPolicy: 'on-request', sandboxPolicy: { type: 'workspaceWrite' }, collaborationMode: { mode: 'default' } } })
+  })
+
+  it('runs the runtime default instead of the pre-discovery stand-in model a CLI is not offered, and keeps any other model', async () => {
+    const { adapter, events, sent } = create()
+    await adapter.submit('synthetic:stream', { ...settings, model: 'gpt-6.1-sol' })
+    await waitFor(() => completed(events))
+    expect(sent.find(message => (message as { method?: string }).method === 'turn/start')).toMatchObject({ params: { model: 'synthetic-model' } })
+    await adapter.submit('synthetic:stream', { ...settings, model: 'gpt-6-astra' })
+    await waitFor(() => events.filter(event => event.data.type === 'session' && event.data.phase === 'completed').length >= 2)
+    expect(sent.filter(message => (message as { method?: string }).method === 'turn/start').at(-1)).toMatchObject({ params: { model: 'gpt-6-astra' } })
   })
 
   it('carries each composer mode into the Codex approval preset it names', async () => {

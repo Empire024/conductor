@@ -50,7 +50,9 @@ try {
   assert.ok(codexId)
   await page.evaluate(id => window.conductor.structured.connect(id), codexId)
   await expect.poll(async () => (await snapshot(codexId)).capabilities?.models.map(model => model.id)).toEqual(['gpt-6-astra', 'gpt-5.6-sol'])
-  assert.equal((await snapshot(codexId)).settings.model, 'gpt-6-astra')
+  // A tab opened before discovery holds the stand-in CODEX_FALLBACK_MODEL (gpt-6.1-sol); this fixture's
+  // older catalog does not offer it, so the adapter runs the runtime default, Astra (codex.test.ts).
+  assert.equal((await snapshot(codexId)).settings.model, 'gpt-6.1-sol')
 
   await page.locator('.activity-rail').getByRole('button', { name: 'Project tasks', exact: true }).click()
   const title = 'Choose a provider and model with real remaining allowance'

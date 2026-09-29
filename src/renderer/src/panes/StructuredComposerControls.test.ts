@@ -25,7 +25,7 @@ describe('compact composer controls (synthetic, zero inference)', () => {
     expect(html).toContain('role="combobox"')
     expect(html).toContain('aria-label="Model"')
     expect(html).toContain('aria-expanded="false"')
-    expect(html).toContain('GPT-6-Astra</span>')
+    expect(html).toContain('GPT-6.1-Sol</span>')
     expect(html).not.toContain('role="listbox"')
     expect(html).not.toContain('Search models')
     expect(html).not.toContain('Provider')

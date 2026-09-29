@@ -152,7 +152,7 @@ export class IdeaRunController {
       const active = this.deps.store.list({ ideaId: idea.id }).find(run => !IDEA_RUN_FINAL.has(run.status))
       if (active) throw new Error(`This idea already has a run that is ${active.status} (${active.id}); stop it before starting another`)
       const provider = input.planner?.provider === 'codex' ? 'codex' : 'claude'
-      const model = input.planner?.model?.trim() || (provider === 'codex' ? 'gpt-6-astra' : 'opus[1m]')
+      const model = input.planner?.model?.trim() || (provider === 'codex' ? 'gpt-6.1-sol' : 'opus[1m]')
       const run = this.deps.store.create({ ideaId: idea.id, projectId, dryRun: input.dryRun === true, planner: { provider, model } })
       this.event(run, `Idea run started${run.dryRun ? ' (dry run)' : ''}: ${provider} ${model} is writing the staged plan; nothing runs until you approve it`, { provider, model }, actor)
       try {

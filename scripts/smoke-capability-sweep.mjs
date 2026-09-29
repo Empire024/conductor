@@ -324,9 +324,11 @@ try {
   const codex = await sweepProvider('codex')
   if (!live) {
     // R12: the static label and the discovered display name read the same ("GPT-6-Astra", as
-    // model/list names it), never re-spaced. R1/R2: the pre-discovery ladder is the CLI's union
-    // (low … ultra, six positions, no minimal) and Astra's discovered ladder matches it.
-    expect(codex.report.beforeDiscovery.label).toBe('GPT-6-Astra')
+    // model/list names it), never re-spaced. Before discovery the composer shows the stand-in
+    // CODEX_FALLBACK_MODEL, codex-cli 0.159.1's own default GPT-6.1-Sol (this fixture keeps the
+    // older catalog). R1/R2: the pre-discovery ladder is the CLI's union (low … ultra, six
+    // positions, no minimal) and Astra's discovered ladder matches it.
+    expect(codex.report.beforeDiscovery.label).toBe('GPT-6.1-Sol')
     expect(codex.report.beforeDiscovery.effortControl?.positions).toBe(6)
     expect(codex.report.pickerOptions).toEqual(expect.arrayContaining(['GPT-6-Astra', 'GPT-5.6-Sol', 'GPT-5.6-Terra', 'GPT-5.6-Luna', 'GPT-5.5']))
     expect(codex.report.models.find(model => model.id === 'gpt-6-astra')?.shown?.label).toBe('GPT-6-Astra')

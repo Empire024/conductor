@@ -25,7 +25,7 @@ describe('resolved composer settings', () => {
     expect(resolvedComposerSettings(settings('opus[1m]'), undiscovered).label).toBe('Account default')
     expect(resolvedComposerSettings(settings('sonnet'), undiscovered).label).toBe('sonnet')
     expect(resolvedComposerSettings({ permission: 'default', plan: false }, { ...undiscovered, effectiveSettings: { model: 'claude-opus-5[1m]' } }).label).toBe('claude-opus-5[1m]')
-    expect(resolvedComposerSettings({ permission: 'default', plan: false }, undefined)).toEqual({ model: 'gpt-6-astra', label: 'GPT-6-Astra' })
+    expect(resolvedComposerSettings({ permission: 'default', plan: false }, undefined)).toEqual({ model: 'gpt-6.1-sol', label: 'GPT-6.1-Sol' })
     // Before the pane has any capabilities the provider is unknown here; the stand-in id is Claude's alone.
     expect(resolvedComposerSettings(settings('opus[1m]'), undefined)).toEqual({ model: 'opus[1m]', label: 'Account default' })
   })

@@ -43,7 +43,7 @@ export function IdeaRunPanel({ ideaId, projectId }: { ideaId: string; projectId:
           <div className="ideas-action-row">
             <select aria-label="Planner" value={planner} onChange={event => setPlanner(event.target.value as 'claude' | 'codex')}>
               <option value="claude">Claude Opus plans</option>
-              <option value="codex">Codex Astra plans</option>
+              <option value="codex">Codex Sol 6.1 plans</option>
             </select>
             <label className="idea-run-dry"><input type="checkbox" checked={dryRun} onChange={event => setDryRun(event.target.checked)} /> Dry run</label>
             <button className="primary" disabled={busy !== null || !projectId} onClick={() => void act('start', () => bridge.start({ ideaId, projectId, planner: { provider: planner }, dryRun }))} title="Plan this idea as a durable run in the chosen project">

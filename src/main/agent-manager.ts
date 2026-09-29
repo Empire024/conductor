@@ -71,11 +71,12 @@ const standardEfforts: Array<{ id: AgentEffort; label: string }> = CODEX_EFFORTS
 
 const claudeEfforts: Array<{ id: AgentEffort; label: string }> = [...standardEfforts]
 
-/** Labels are the CLI's own `displayName`s from `model/list` (0.153.4, 2026-09-21), so the
+/** Labels are the CLI's own `displayName`s from `model/list` (0.159.1, 2026-09-30), so the
  *  pre-discovery picker and the discovered one read the same. GPT-5.5 (retires 2026-10-14) is
  *  deliberately left to discovery. */
 export const CODEX_MODELS = [
   { id: 'default', label: 'Default for account' },
+  { id: 'gpt-6.1-sol', label: 'GPT-6.1-Sol' },
   { id: 'gpt-6-astra', label: 'GPT-6-Astra' },
   { id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol' },
   { id: 'gpt-5.6-terra', label: 'GPT-5.6-Terra' },

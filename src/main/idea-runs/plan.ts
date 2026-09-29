@@ -19,7 +19,7 @@ function agentOf(value: unknown): IdeaStageAgent {
   if (!value || typeof value !== 'object') return { ...DEFAULT_AGENT }
   const entry = value as Record<string, unknown>
   const provider = entry.provider === 'codex' || entry.provider === 'local' || entry.provider === 'claude' ? entry.provider : 'claude'
-  const model = str(entry.model, 120) || (provider === 'codex' ? 'gpt-6-astra' : provider === 'local' ? 'qwen3.6-35b-a3b' : DEFAULT_AGENT.model)
+  const model = str(entry.model, 120) || (provider === 'codex' ? 'gpt-6.1-sol' : provider === 'local' ? 'qwen3.6-35b-a3b' : DEFAULT_AGENT.model)
   const effort = str(entry.effort, 20)
   return { provider, model, ...(effort ? { effort } : {}) }
 }

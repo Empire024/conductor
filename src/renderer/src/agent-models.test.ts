@@ -3,20 +3,20 @@ import { createDefaultLayout } from '../../shared/models'
 import { migrateLegacyCodexModels, migrateLegacyCodexTab, processModelLabel, runtimeModelLabel } from './agent-models'
 
 describe('Codex model migration', () => {
-  it('replaces retired persisted selections with Astra', () => {
+  it('replaces retired persisted selections with Sol 6.1', () => {
     const tab = migrateLegacyCodexTab({
       id: 'codex',
       kind: 'agent',
       title: 'Codex',
       state: { provider: 'codex', model: 'gpt-5.3-codex' }
     })
-    expect(tab.state?.model).toBe('gpt-6-astra')
+    expect(tab.state?.model).toBe('gpt-6.1-sol')
 
     const layout = createDefaultLayout()
     if (layout.root.type !== 'group') throw new Error('Expected a tab group')
     layout.root.tabs[0] = { ...tab, state: { provider: 'codex', model: 'gpt-5.2-codex' } }
     expect(migrateLegacyCodexModels(layout).root).toMatchObject({
-      tabs: [{ state: { model: 'gpt-6-astra' } }]
+      tabs: [{ state: { model: 'gpt-6.1-sol' } }]
     })
   })
 

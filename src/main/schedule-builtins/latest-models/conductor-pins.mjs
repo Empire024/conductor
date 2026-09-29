@@ -156,7 +156,9 @@ function main() {
   const agent = read('src/shared/structured-agent.ts') ?? ''
   const routing = read('src/shared/model-routing.ts') ?? ''
   const generator = read('scripts/generate-codex-protocol.mjs') ?? ''
-  const gate = /\/\^(\d+)\\\.(\d+)\\\.\/\.test\([^)]*runtimeVersion\)/.exec(codexAdapter)
+  // /^0\.155\./ or, keeping the previous minor, /^0\.(?:155|159)\./ → '0.155.x' or '0.155.x|0.159.x'.
+  const gate = /\/\^(\d+)\\\.(?:(\d+)|\(\?:([\d|]+)\))\\\.\/\.test\([^)]*runtimeVersion\)/.exec(codexAdapter)
+  const verified = /export const CODEX_VERIFIED_RUNTIMES[^=]*=\s*\[([^\]]*)\]/.exec(codexAdapter)?.[1]
   const constant = (text, name) => new RegExp(`export const ${name}\\s*=\\s*'([^']+)'`).exec(text)?.[1] ?? null
   const frontier = provider => new RegExp(`provider === '${provider}'\\) return /(.+?)/([a-z]*)\\.test\\(model\\)`).exec(agent)
   const rank = [...routing.matchAll(/if \(\/(.+?)\/([a-z]*)\.test\(id\)\) return (\d)/g)].map(match => ({ pattern: match[1], flags: match[2], rank: Number(match[3]) }))
@@ -174,7 +176,8 @@ function main() {
     },
     claudeCompatibility: constant(claudeAdapter, 'CLAUDE_COMPATIBILITY'),
     codexProtocolBaseline: constant(codexAdapter, 'CODEX_PROTOCOL_BASELINE'),
-    codexVersionGate: gate ? `${gate[1]}.${gate[2]}.x` : null,
+    codexVersionGate: gate ? (gate[2] ? [gate[2]] : gate[3].split('|')).map(minor => `${gate[1]}.${minor}.x`).join('|') : null,
+    codexVerifiedRuntimes: verified ? verified.split(',').map(entry => entry.trim()).map(entry => entry === 'CODEX_PROTOCOL_BASELINE' ? constant(codexAdapter, 'CODEX_PROTOCOL_BASELINE') : /^'([^']+)'$/.exec(entry)?.[1]).filter(Boolean) : null,
     codexGeneratorExpected: /const expected = '([^']+)'/.exec(generator)?.[1] ?? null,
     efforts: {
       catalog: objects(declaration(manager, 'CODEX_EFFORTS')).map(object => field(object, 'id')).filter(Boolean),

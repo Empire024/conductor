@@ -234,17 +234,18 @@ if (codexVersion && pins) {
   const evidence = `codex --version ${codexVersion}; CODEX_PROTOCOL_BASELINE '${baseline}', gate ${gate ?? 'unreadable'} in ${CODEX_ADAPTER}`
   const [major, minor] = (codexVersion.match(/^(\d+)\.(\d+)/) ?? []).slice(1)
   const rebaseline = `Rebaseline per docs/codex-compatibility.md: set expected in scripts/generate-codex-protocol.mjs and CODEX_PROTOCOL_BASELINE in ${CODEX_ADAPTER} to '${codexVersion}'${major ? ` and the version gate to /^${major}\\.${minor}\\./ in CodexAdapter.start()` : ''}, run node scripts/generate-codex-protocol.mjs, diff src/main/providers/generated/codex against the committed bundle, update scripts/fixtures/codex-app-server.mjs where the wire moved, then npm run test:agent-contracts.`
-  const inGate = gate ? codexVersion.startsWith(gate.replace(/x$/, '')) : null
+  const inGate = gate ? gate.split('|').some(minor => codexVersion.startsWith(minor.replace(/x$/, ''))) : null
+  const verified = pins.codexVerifiedRuntimes?.length ? pins.codexVerifiedRuntimes : [baseline]
   const installed = parseVersion(codexVersion), base = parseVersion(baseline)
   if (inGate === null) add('watch', 'codex-version', `Could not read the Codex version gate in ${CODEX_ADAPTER}, so ${cx} was only compared with CODEX_PROTOCOL_BASELINE ${baseline}.`, evidence)
   if (inGate === false) {
     const older = installed && base && compareVersions(installed, base) < 0
     add('action', 'codex-version', `${cx} is outside the tested ${gate} protocol gate: Conductor refuses to connect Codex conversations ("outside the tested ${gate} protocol baseline").`, evidence,
       { proposedEdit: older ? `Install codex-cli ${baseline} (the fixture-verified baseline), or rebaseline down only after verifying ${codexVersion}.` : rebaseline, files: [CODEX_ADAPTER, 'scripts/generate-codex-protocol.mjs', 'scripts/fixtures/codex-app-server.mjs'] })
-  } else if (baseline && codexVersion !== baseline) {
+  } else if (baseline && !verified.includes(codexVersion)) {
     add('watch', 'codex-version', `${cx} is inside the ${gate ?? 'version'} gate but is not the fixture-verified CODEX_PROTOCOL_BASELINE ${baseline}: Conductor connects with the "not fixture-verified" limitation and experimental features (plan mode) disabled.`, evidence,
       { proposedEdit: rebaseline, files: [CODEX_ADAPTER, 'scripts/generate-codex-protocol.mjs'] })
-  } else if (baseline) add('info', 'codex-version', `${cx} is the fixture-verified CODEX_PROTOCOL_BASELINE.`, evidence)
+  } else if (baseline) add('info', 'codex-version', codexVersion === baseline ? `${cx} is the fixture-verified CODEX_PROTOCOL_BASELINE.` : `${cx} is fixture-verified (CODEX_VERIFIED_RUNTIMES); the protocol baseline is ${baseline}.`, evidence)
   if (pins.codexGeneratorExpected && baseline && pins.codexGeneratorExpected !== baseline) add('watch', 'codex-version', `scripts/generate-codex-protocol.mjs expects codex-cli ${pins.codexGeneratorExpected} but CODEX_PROTOCOL_BASELINE is ${baseline}; the next regeneration would refuse or target the wrong version.`, 'const expected in scripts/generate-codex-protocol.mjs', { proposedEdit: `Set const expected = '${baseline}' in scripts/generate-codex-protocol.mjs.`, files: ['scripts/generate-codex-protocol.mjs'] })
   for (const fixture of (pins.fixtures ?? []).filter(fixture => fixture.provider === 'codex' && !fixture.models && fixture.reportsVersion && fixture.reportsVersion !== codexVersion)) {
     add('watch', 'fixtures', `${fixture.file} speaks the codex-cli ${fixture.reportsVersion} protocol; the installed Codex is ${codexVersion}, so the contract tests do not cover the installed wire.`, `fixture --version codex-cli ${fixture.reportsVersion}`, { files: [fixture.file] })

@@ -2,9 +2,10 @@ import { describe, expect, it } from 'vitest'
 import { CLAUDE_MODELS, CODEX_EFFORTS, CODEX_MODELS } from './agent-manager'
 
 describe('Codex model catalog', () => {
-  it('shows Astra and the current model family instead of retired Codex models', () => {
+  it('shows Sol 6.1, Astra and the current model family instead of retired Codex models', () => {
     expect(CODEX_MODELS.map((model) => model.id)).toEqual([
       'default',
+      'gpt-6.1-sol',
       'gpt-6-astra',
       'gpt-5.6-sol',
       'gpt-5.6-terra',
@@ -13,9 +14,9 @@ describe('Codex model catalog', () => {
   })
 
   it('labels the static catalog with the display names the CLI itself reports', () => {
-    // model/list on codex-cli 0.153.4 (2026-09-21) says GPT-6-Astra, GPT-5.6-Sol, ...; the composer
+    // model/list on codex-cli 0.159.1 (2026-09-30) says GPT-6.1-Sol, GPT-6-Astra, GPT-5.6-Sol, ...; the composer
     // shows a discovered label verbatim, so the pre-discovery label must read the same.
-    expect(CODEX_MODELS.map((model) => model.label)).toEqual(['Default for account', 'GPT-6-Astra', 'GPT-5.6-Sol', 'GPT-5.6-Terra', 'GPT-5.6-Luna'])
+    expect(CODEX_MODELS.map((model) => model.label)).toEqual(['Default for account', 'GPT-6.1-Sol', 'GPT-6-Astra', 'GPT-5.6-Sol', 'GPT-5.6-Terra', 'GPT-5.6-Luna'])
   })
 
   it('offers the full reasoning ladder the installed CLI advertises, including max and ultra', () => {

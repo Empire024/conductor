@@ -1,12 +1,14 @@
 // SYNTHETIC OFFLINE FIXTURE. No provider executable, network, credentials, or inference.
-// Raw JSONL messages mirror the generated codex-cli 0.155.1 App Server protocol.
+// Raw JSONL messages mirror the generated codex-cli 0.159.1 App Server protocol, whose wire the adapter
+// still shares with 0.155.1; CONDUCTOR_FAKE_CODEX_VERSION makes it report either (or any) version.
 import readline from 'node:readline'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 
 if (process.env.CONDUCTOR_TEST_PROVIDER_START_CAPTURE) writeFileSync(process.env.CONDUCTOR_TEST_PROVIDER_START_CAPTURE, `${process.pid}\n`)
-if (process.argv.includes('--version')) { console.log('codex-cli 0.155.1'); process.exit(0) }
+const codexVersion = process.env.CONDUCTOR_FAKE_CODEX_VERSION || '0.159.1'
+if (process.argv.includes('--version')) { console.log(`codex-cli ${codexVersion}`); process.exit(0) }
 
 let initialized = false
 let acknowledged = false
@@ -85,7 +87,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     if (initialized) throw new Error('duplicate initialization')
     setTimeout(() => {
       initialized = true
-      send({ id: message.id, result: { userAgent: 'codex/0.155.1 synthetic', codexHome: '/synthetic/not-read', platformFamily: 'windows', platformOs: 'windows' } })
+      send({ id: message.id, result: { userAgent: `codex/${codexVersion} synthetic`, codexHome: '/synthetic/not-read', platformFamily: 'windows', platformOs: 'windows' } })
     }, 12)
     return
   }

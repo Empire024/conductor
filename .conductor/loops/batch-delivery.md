@@ -12,24 +12,24 @@ budget:
 steps:
   - id: contract
     role: architect
-    model: codex:gpt-6-astra   # owner rule 2026-09-24: Astra and Fable are the brains
+    model: codex:gpt-6.1-sol   # owner 2026-09-30: GPT-6.1 Sol replaces Astra (near-Astra, cheaper); was codex:gpt-6-astra
     alternate: claude:opus[1m]   # owner 2026-09-24: Fable is too expensive; Opus when Codex has no allowance
     effort: high
     output: failing tests + acceptance (commands, allowedPaths)
   - id: implement
     role: implementer
-    model: codex:gpt-6-sol
+    model: codex:gpt-6.1-sol
     alternate: claude:opus[1m]
     effort: medium
   - id: churn
     role: churn
-    model: codex:gpt-6-sol
+    model: codex:gpt-6.1-sol
     effort: low
     optional: true
     output: last line `OK` or `FAILED <stage>` + ≤20 lines
   - id: review
     role: reviewer
-    model: codex:gpt-6-astra
+    model: codex:gpt-6.1-sol
     alternate: claude:opus[1m]
     effort: high
     input: git diff limited to allowedPaths, once

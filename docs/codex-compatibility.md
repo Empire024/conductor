@@ -1,6 +1,6 @@
 # Codex adapter compatibility baseline
 
-Recorded 2026-09-07 against `codex-cli 0.153.4`; rebaselined 2026-09-21 to `codex-cli 0.155.1` (see "Rebaseline 0.153.4 → 0.155.1" below). This document separates implementation from verification. It is not a claim of complete VS Code extension parity or a successful live turn.
+Recorded 2026-09-07 against `codex-cli 0.153.4`; rebaselined 2026-09-21 to `codex-cli 0.155.1` (see "Rebaseline 0.153.4 → 0.155.1" below) and 2026-09-30 to `codex-cli 0.159.1`, keeping 0.155.1 accepted (see "Rebaseline 0.155.1 → 0.159.1"). This document separates implementation from verification. It is not a claim of complete VS Code extension parity or a successful live turn.
 
 The inspected local runtime reports `codex-cli 0.155.1`. The executable is a native Windows `codex.exe` under the owner's installed OpenAI Codex program directory. `codex login status` reported **Logged in using ChatGPT**. No token, credential file, inherited environment, or account secret was inspected. The adapter uses this user-managed CLI connection, not an Agent SDK/API connection. It does not change account or billing configuration. No OpenAI/Codex VS Code extension directory was present under the inspected `C:/Users/stilj/.vscode/extensions`; its local extension version is therefore **unavailable**, not inferred from the CLI version.
 
@@ -16,20 +16,49 @@ codex app-server generate-json-schema --experimental --out src/main/providers/ge
 npx.cmd vitest run src/main/providers/codex.test.ts
 ```
 
-`node scripts/generate-codex-protocol.mjs` performs the two generation steps after requiring version 0.155.1 (`CODEX_PROTOCOL_BASELINE` in `src/main/providers/codex.ts`). Generated files must not be edited manually. The generated bundle includes experimental types for compile-time checking; that does **not** enable experimental protocol behavior. `initialize.capabilities.experimentalApi` defaults to false. Plan controls require `CONDUCTOR_CODEX_EXPERIMENTAL=1` and exact runtime 0.155.1. Other 0.155.x patch versions receive a visible unverified-version limitation and experimental features remain disabled. Other minor versions fail connection with a recoverable compatibility error.
+`node scripts/generate-codex-protocol.mjs` empties the bundle, performs the two generation steps after requiring version 0.159.1 (`CODEX_PROTOCOL_BASELINE` in `src/main/providers/codex.ts`) and prints the SHA-256 values recorded below. `CONDUCTOR_CODEX_PATH` may point it at a scratch CLI. Generated files must not be edited manually. The generated bundle includes experimental types for compile-time checking; that does **not** enable experimental protocol behavior. `initialize.capabilities.experimentalApi` defaults to false. Plan controls require `CONDUCTOR_CODEX_EXPERIMENTAL=1` and an exact runtime in `CODEX_VERIFIED_RUNTIMES` (0.159.1 or 0.155.1). Other 0.155.x and 0.159.x patch versions receive a visible unverified-version limitation and experimental features remain disabled. Other minor versions fail connection with a recoverable compatibility error.
 
-To move the baseline to a new CLI minor: bump `expected` in the generator and `CODEX_PROTOCOL_BASELINE` plus the `/^0\.<minor>\./` gate in `codex.ts`, regenerate, then diff the bundle against the committed one (the request/notification/item unions are single lines, so split them on ` | ` before diffing). Anything the adapter reads or sends that moved must change in `codex.ts` and in `scripts/fixtures/codex-app-server.mjs` together; then run the contract suite and `node scripts/inspect-codex-baseline.mjs` against the live executable.
+To move the baseline to a new CLI minor (every step is a script, so the model-upgrade pipeline can run them unattended; none touches the global CLI or `~/.codex`):
+
+1. `node scripts/probe-codex-catalog.mjs --version <x.y.z>` installs `@openai/codex@<x.y.z>` into `.conductor-scratch/codex-<x.y.z>/`, runs its App Server with an isolated `CODEX_HOME` holding only a copy of `auth.json`, and prints the served catalog (ids, efforts, default, context windows) plus the native `executable`. This is also how a new model is confirmed before the owner upgrades: **OpenAI serves the model catalog filtered by client version**, so Conductor's discovery (which reads the running CLI's `model/list`) cannot see a model the installed CLI is too old to be offered.
+2. Set `expected` in `scripts/generate-codex-protocol.mjs` and `CODEX_PROTOCOL_BASELINE` in `codex.ts`; widen the gate `/^0\.(?:<previous>|<new>)\./` and `CODEX_VERIFIED_RUNTIMES` so the previous minor stays accepted while its wire is unchanged (the installed app then survives the global CLI upgrade in either order). `src/main/schedule-builtins/latest-models/conductor-pins.mjs` reads both forms.
+3. `CONDUCTOR_CODEX_PATH=<executable> node scripts/generate-codex-protocol.mjs`, then copy the four printed hashes into the table below.
+4. `node scripts/diff-codex-protocol.mjs` prints the member-level delta against the committed bundle (files added/removed, then each union or type member added `+` or removed `-`). Anything the adapter reads or sends that moved or disappeared must change in `codex.ts` and in `scripts/fixtures/codex-app-server.mjs` together; if it did, the previous minor can no longer be kept in the gate.
+5. Bump the version the synthetic fixtures report (`CONDUCTOR_FAKE_CODEX_VERSION` overrides it per run), `npx tsc --noEmit`, `npm run test:agent-contracts`, one Codex smoke, and `node scripts/inspect-codex-baseline.mjs` against the live executable once it is installed.
 
 SHA-256 of the generated baseline (before Git line-ending normalization):
 
 | File under `src/main/providers/generated/codex` | SHA-256 |
 | --- | --- |
-| `ClientRequest.ts` | `38C6718F0F5AADA55187788547DF6756189035C6E23D6DD6F2D5B0F5D6828416` |
-| `ServerNotification.ts` | `711F5014883DA724EEFE4AB1151CA6A0425C8FF8D5DE5480F773626EC7228F4B` |
+| `ClientRequest.ts` | `F21E6307C8C2C7F2B5A32D434CDCA238E3EC19B71A1F40B60F8C305289860436` |
+| `ServerNotification.ts` | `459D76DEFB8B368E906B2AFBDD14F5EA8CAE33EABDD28DE097FD703C6F38C4AD` |
 | `ServerRequest.ts` | `1C5837ADBFBDD005F387478BA87840808D1353B47B82DCF63739A78BB1C8D3BE` (unchanged since 0.153.4) |
-| `schema/codex_app_server_protocol.v2.schemas.json` | `F82D3752F35E2F16348E4CDD59E774855C79B4D8903B70187C4EFEAB9722263C` |
+| `schema/codex_app_server_protocol.v2.schemas.json` | `E77B7D1436A78F431A74B2CB263A862E92AE40D70411BC63835B47AB2168827C` |
 
-The 0.153.4 hashes were `83418E6F…B910F2`, `DFD31C72…556D54`, `1C5837AF…C8D3BE` (unchanged) and `E5F798FD…4F7D0A` respectively; the full values remain in this file's Git history.
+The 0.155.1 hashes were `38C6718F…828416`, `711F5014…7228F4B`, `1C5837AD…C8D3BE` (unchanged) and `F82D3752…22263C`. The 0.153.4 hashes were `83418E6F…B910F2`, `DFD31C72…556D54`, `1C5837AF…C8D3BE` (unchanged) and `E5F798FD…4F7D0A` respectively; the full values remain in this file's Git history.
+
+## Rebaseline 0.155.1 → 0.159.1 (2026-09-30)
+
+Why: the owner asked for GPT-6.1 Sol. The installed `codex-cli 0.155.1` never listed it, and neither did Conductor's discovery, because discovery is the running CLI's `model/list` and OpenAI serves that catalog filtered by client version. Same account, one minute apart, isolated `CODEX_HOME`s: 0.155.1 got `gpt-6-astra` (default), `gpt-6-sol` ("Previous generation workhorse model"), `gpt-6-luna`, `gpt-5.6-*`, `gpt-5.5` and the hidden `gpt-reserve`/`codex-auto-review`; 0.159.1 got the same list plus **`gpt-6.1-sol`** as the new default: "GPT-6.1-Sol", "Latest workhorse model for coding and everyday work", efforts `low, medium, high, xhigh, max, ultra` (default `low`), text+image input, Fast tier "2x speed, increased usage", context window 272,000 (max 872,000, the same as Astra), availability note "Try it on complex work for near-Astra performance at a lower cost." The catalog carries no prices.
+
+Regenerated from `@openai/codex@0.159.1` installed into `.conductor-scratch`; the global CLI was not changed. `scripts/diff-codex-protocol.mjs` delta, all of it read:
+
+| Change in 0.159.1 | Adapter consequence |
+| --- | --- |
+| `thread/rollback` request (and `ThreadRollbackParams/Response`) removed | Never sent; checkpoints/rollback were already a native GUI gap. |
+| New client methods `rollout/compress`, `account/gatewayOAuth/{read,login,cancel}`; notification `account/gatewayOAuth/changed` | Not called; the notification would land on the unknown-event path. |
+| `UserInput` image and `ContentItem` `input_image`: `url`/`image_url` becomes one arm of a union with `fileId`/`file_id` | The adapter sends only `{ type: "localImage", path }`; unchanged on the wire. |
+| `personality` deprecated on thread start/resume/settings/turn start | Never sent. |
+| `disabledPluginIds` added to thread start/resume/fork responses, `ThreadSettings`, `TurnStartParams`; `ThreadResumeResponse.collaborationMode`; `Thread`/`ThreadItemEntry` timestamps; `ThreadStartParams.daybreakEnabled` | Optional or nullable; not read or sent. |
+| `Model.availableAccessPrograms`; `supportsPersonality` deprecated | Not read. |
+| `McpServerElicitationRequestParams` `openai/userVerification` gains `_meta` | Still answered with the explicit unsupported error. |
+| `CodexErrorInfo` gains `flexUnavailable`, `tooManyDenials`; `PlanType` gains `promax` | Shown as the native error text; no mapping depends on them. |
+| `ConfigRequirements` gains `modelProvider`, `modelProviders`, `allowedLoginMethods`; drops `windowsSandboxPrivateDesktop`; `WindowsSandboxSetupMode` → `WindowsSandboxImplementation` | The live-isolation check reads only which requirement keys are set. |
+| `GetAccountResponse.workspaceRouting`, `McpServerStatus.httpOrigin/serverCapabilities`, `PluginDetail.onboardingSkill`, `ThreadItem` `mcpAppUi`, `InitializeCapabilities.explicitGatewayOauth`, `EnvironmentAddParams.authBearerToken`, `ThreadItemsListParams.cursor` anchor, `ListMcpServerStatusParams.serverName`, `McpResourceReadParams.target`, `ThreadRealtimeStartParams.backendReasoningStatus` | Not read or sent. |
+
+`ServerRequest.ts`, every approval request/response, `turn/start`, `turn/interrupt`, `model/list` params, `AskForApproval`, `SandboxMode` and `collaborationMode` are unchanged. `npx tsc --noEmit` passed against the new bundle with no adapter change. Nothing the adapter sends or reads moved, so **both 0.155.1 and 0.159.1 are accepted** (`CODEX_VERIFIED_RUNTIMES`, gate `/^0\.(?:155|159)\./`) and the installed app keeps its Codex tabs across the global CLI upgrade in either order; `codex.test.ts` connects the fixture reporting each version and refuses 0.156.0.
+
+Stack choice: `gpt-6.1-sol` replaces `gpt-6-astra` (and `gpt-6-sol`) as the stack's Codex pick: `CODEX_FALLBACK_MODEL`, the static `CODEX_MODELS` catalog (Astra stays selectable), the agent roster's Codex roles, the heavy project-task weight, idea-run Codex planners and the retired-model migration. `capabilityRank` gives `gpt-6.1-sol` 3 (Astra's rank) although "Sol" is otherwise a rank-1 tier name, and the wizard frontier check (`/^gpt-6(?:[-.]|$)|astra/`) already admits it. On a 0.155 CLI `gpt-6.1-sol` is not offered, so those explicit picks work once the CLI is 0.159.
 
 ## Rebaseline 0.153.4 → 0.155.1
 
@@ -79,6 +108,8 @@ All rows were recorded against CLI protocol 0.153.4 and re-verified against the 
 | Cloud/browser/hosted workflows | Provider-specific events retained | Native control gap; no private endpoints, token extraction, or invented hosted integration |
 
 ## Verification record
+
+Rebaseline 0.159.1, 2026-09-30: see "Rebaseline 0.155.1 → 0.159.1" above; the contract suite runs against the fixture reporting 0.159.1 by default and 0.155.1 on request. Live catalog evidence is the metadata-only `scripts/probe-codex-catalog.mjs` run (zero threads, zero turns) against the scratch 0.159.1 and the installed 0.155.1.
 
 Rebaseline 0.155.1, 2026-09-21: `npx tsc --noEmit` passed against the regenerated bundle without adapter type changes. `npm.cmd run test:agent-contracts`: **13 files, 305 tests passed** (`codex.test.ts` **42 passed**, fixture reporting `codex-cli 0.155.1`), plus the live-acceptance guard. `npm.cmd run build` passed. Live, metadata-only, zero threads and zero turns: `node scripts/inspect-codex-baseline.mjs` against the installed 0.155.1 executable returned the same five-model catalog and effort ladders as the 0.153.4 capture (GPT-6-Astra default), and `--usage-only` returned one `codex` bucket through `account/rateLimits/read` with the response shape the adapter maps. `codex login status` still reports **Logged in using ChatGPT**. No live turn was submitted; live round-trip evidence below is unchanged.
 

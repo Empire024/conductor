@@ -11,6 +11,9 @@ import type { AgentProviderId } from './models'
 export function capabilityRank(provider: AgentProviderId, modelId: string): 0 | 1 | 2 | 3 {
   const id = modelId.toLowerCase()
   if (provider === 'local' || id.startsWith('local/')) return 0
+  // GPT-6.1 Sol is the frontier workhorse ("near-Astra performance at a lower cost", codex-cli 0.159.1
+  // model/list); the owner prefers it over Astra, so it ranks with the frontier despite its tier name.
+  if (/gpt-6\.1-sol/.test(id)) return 3
   // Tier names first: a generation prefix (gpt-6) says nothing about the tier within it.
   if (/astra|opus/.test(id)) return 3
   if (/terra|sonnet/.test(id)) return 2

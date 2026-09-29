@@ -79,7 +79,7 @@ export const isFrontierModel = (provider: string | undefined, model: string | un
   if (provider === 'grok') return /^grok-(?:4\.(?:[6-9]|\d{2,})|[5-9]|\d{2,})(?:[-.]|$)/i.test(model)
   return false
 }
-export const WIZARD_MODEL_HINT = 'Claude Opus or Fable, GPT-6 Astra, or Grok 4.6 and later'
+export const WIZARD_MODEL_HINT = 'Claude Opus or Fable, GPT-6.1 Sol or GPT-6 Astra, or Grok 4.6 and later'
 /** Whether a conversation is a wizard right now: the toggle, a frontier model, and no read-only
  *  or planning restriction, since a restricted controller could not hand out what it lacks. */
 export const wizardActive = (settings: SessionSettings | undefined, provider: string | undefined): boolean =>

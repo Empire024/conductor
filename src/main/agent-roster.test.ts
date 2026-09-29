@@ -51,8 +51,8 @@ describe('the Agent roster lists the roles Conductor actually runs', () => {
     const loopRoles = new Set(readdirSync(loops).filter(name => name.endsWith('.md')).flatMap(name => [...readFileSync(join(loops, name), 'utf8').matchAll(/^\s+role: (\w[\w-]*)/gm)].map(match => match[1]!)))
     expect([...loopRoles]).toEqual(expect.arrayContaining(['architect', 'reviewer']))
     for (const loopRole of loopRoles) expect(rosterRole(playedBy[loopRole] ?? loopRole), loopRole).toBeDefined()
-    expect(rosterRole('architect')).toMatchObject({ provider: 'codex', model: 'gpt-6-astra', effort: 'high', briefs: ['.conductor/loops/batch-delivery.md'] })
-    expect(rosterRole('code-reviewer')).toMatchObject({ provider: 'codex', model: 'gpt-6-astra', effort: 'high', briefs: ['.conductor/loops/batch-delivery.md'] })
+    expect(rosterRole('architect')).toMatchObject({ provider: 'codex', model: 'gpt-6.1-sol', effort: 'high', briefs: ['.conductor/loops/batch-delivery.md'] })
+    expect(rosterRole('code-reviewer')).toMatchObject({ provider: 'codex', model: 'gpt-6.1-sol', effort: 'high', briefs: ['.conductor/loops/batch-delivery.md'] })
     expect(rosterRole('code-reviewer')!.instructions).toMatch(/diff/)
   })
 
@@ -80,7 +80,7 @@ describe('the Agent roster lists the roles Conductor actually runs', () => {
     ] as const) {
       expect(rosterRole(role), role).toMatchObject({ ...primary(expected.model!), effort: expected.effort, permission: 'auto' })
     }
-    expect(step(verify.steps, 'execute')).toMatchObject({ model: 'codex:gpt-6-sol', effort: 'medium' })
+    expect(step(verify.steps, 'execute')).toMatchObject({ model: 'codex:gpt-6.1-sol', effort: 'medium' })
     expect(rosterRole('verifier')!.instructions).toMatch(/distinct Sol tab/)
     expect(rosterRole('verifier-runner')!.instructions).toMatch(/committed smokes unchanged/)
     expect(rosterRole('verifier-runner')!.instructions).toMatch(/Never write harness code and never give verdicts/)
@@ -135,21 +135,21 @@ describe('starting a roster entry', () => {
     const fixer = store.snapshot(projectId).agents.find(agent => agent.role === 'swarm-fixer')!
     const { calls, deps } = rig(store)
     const result = await startRosterAgent(deps, { agentId: fixer.id, goal: 'Fix the energy price editor' })
-    expect(calls[0]).toEqual({ method: 'tabs.open', args: { kind: 'agent', provider: 'codex', model: 'gpt-6-sol', effort: 'medium', permission: 'auto', exactPermission: true, title: 'Fixer', focus: true } })
+    expect(calls[0]).toEqual({ method: 'tabs.open', args: { kind: 'agent', provider: 'codex', model: 'gpt-6.1-sol', effort: 'medium', permission: 'auto', exactPermission: true, title: 'Fixer', focus: true } })
     expect(calls[1]!.method).toBe('agents.submit')
     expect(calls[1]!.args.agentSessionId).toBe('agent_1')
     expect(calls[1]!.args.prompt).toBe(rosterStartPrompt(rosterRole('swarm-fixer')!.instructions, 'Fix the energy price editor'))
     expect(String(calls[1]!.args.prompt)).toContain('docs/swarm/worker-rules.md')
-    expect(result).toMatchObject({ tabId: 'tab_1', agentSessionId: 'agent_1', provider: 'codex', model: 'gpt-6-sol', effort: 'medium', permission: 'auto' })
+    expect(result).toMatchObject({ tabId: 'tab_1', agentSessionId: 'agent_1', provider: 'codex', model: 'gpt-6.1-sol', effort: 'medium', permission: 'auto' })
   }))
 
-  it('starts the committed-command Verifier runner on Sol low in Auto mode', withProject(everyBrief, async (store, projectId) => {
+  it('starts the committed-command Verifier runner on Sol 6.1 low in Auto mode', withProject(everyBrief, async (store, projectId) => {
     const runner = store.snapshot(projectId).agents.find(agent => agent.role === 'verifier-runner')!
     const { calls, deps } = rig(store)
     const result = await startRosterAgent(deps, { agentId: runner.id, goal: 'Rerun the named committed smoke' })
-    expect(calls[0]).toEqual({ method: 'tabs.open', args: { kind: 'agent', provider: 'codex', model: 'gpt-6-sol', effort: 'low', permission: 'auto', exactPermission: true, title: 'Verifier runner', focus: true } })
+    expect(calls[0]).toEqual({ method: 'tabs.open', args: { kind: 'agent', provider: 'codex', model: 'gpt-6.1-sol', effort: 'low', permission: 'auto', exactPermission: true, title: 'Verifier runner', focus: true } })
     expect(String(calls[1]!.args.prompt)).toContain('Never write harness code and never give verdicts')
-    expect(result).toMatchObject({ provider: 'codex', model: 'gpt-6-sol', effort: 'low', permission: 'auto' })
+    expect(result).toMatchObject({ provider: 'codex', model: 'gpt-6.1-sol', effort: 'low', permission: 'auto' })
   }))
 
   it('starts the Approval reviewer read only, which tabs.open runs as plan mode on Claude', withProject(everyBrief, async (store, projectId) => {
