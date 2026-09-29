@@ -114,13 +114,14 @@ function addSample(into: Map<string, { row: WeeklyModelUsage; sessions: Set<stri
 }
 
 /**
- * Totals durable usage reports in a rolling seven-day window. Session-scoped reports are
+ * Totals durable usage reports in a rolling window (seven days unless windowMs says otherwise;
+ * the token burn meter reads one hour). Session-scoped reports are
  * cumulative counters, so only their measured deltas are added. Turn totals replace message
  * snapshots for the same turn. Missing pre-window counter baselines are excluded rather than
  * relabelling a whole conversation total as weekly usage.
  */
-export function summarizeWeeklyModelUsage(conversations: WeeklyUsageConversation[], throughMs = Date.now()): WeeklyModelUsageReport {
-  const sinceMs = throughMs - WEEKLY_USAGE_DAYS * DAY_MS
+export function summarizeWeeklyModelUsage(conversations: WeeklyUsageConversation[], throughMs = Date.now(), windowMs = WEEKLY_USAGE_DAYS * DAY_MS): WeeklyModelUsageReport {
+  const sinceMs = throughMs - windowMs
   const totals = new Map<string, { row: WeeklyModelUsage; sessions: Set<string> }>()
   let conversationsWithUsage = 0, countersWithoutBaseline = 0, nestedReportsExcluded = 0
 
@@ -201,7 +202,7 @@ export function summarizeWeeklyModelUsage(conversations: WeeklyUsageConversation
     ...(nestedReportsExcluded ? ['Nested usage without an exact model attribution was excluded.'] : [])
   ]
   return {
-    since: new Date(sinceMs).toISOString(), through: new Date(throughMs).toISOString(), days: WEEKLY_USAGE_DAYS, models,
+    since: new Date(sinceMs).toISOString(), through: new Date(throughMs).toISOString(), days: windowMs / DAY_MS, models,
     coverage: {
       complete: notes.length === 0,
       notes,

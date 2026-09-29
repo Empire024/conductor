@@ -569,6 +569,31 @@ export class StructuredAgentStore {
     try { const spec = JSON.parse(session.spec_json) as { model?: unknown }; if (typeof spec.model === 'string') model = spec.model } catch { /* malformed legacy spec: session events may still name it */ }
     return { sessionId, provider: session.provider, ...(model ? { model } : {}), events, runtimeStarts, truncated: (first?.sequence ?? 1) > 1 }
   }
+  /** One conversation's top-level usage reports since `from`, for the per-tab burn meter
+   *  (token-burn.ts). A range scan of the accounting index over this conversation alone, usage
+   *  rows only, so its session events and their capability payloads are never parsed. */
+  usageBurn(sessionId: string, from: string): WeeklyUsageConversation | null {
+    const session = this.db.prepare('SELECT provider FROM structured_sessions WHERE id=?').get(sessionId) as { provider: StructuredProvider } | undefined
+    if (!session) return null
+    const rows = this.db.prepare(`
+      SELECT ${ACCOUNTING_COLUMNS} FROM structured_events
+      WHERE session_id=? AND event_kind IN ('usage','session') AND event_at>=? AND event_kind='usage'
+        AND json_extract(event_json,'$.parentId') IS NULL
+      ORDER BY sequence
+    `).all(sessionId, from) as Array<Record<string, unknown>>
+    const events = rows.map(row => {
+      const data: AgentEventData = { type: 'usage', source: row.source === 'estimate' ? 'estimate' : 'provider' }
+      if (row.scope === 'session' || row.scope === 'turn' || row.scope === 'message') data.scope = row.scope
+      for (const field of TOKEN_FIELDS) {
+        const value = row[field]
+        if (typeof value === 'number' && Number.isFinite(value)) data[field] = value
+      }
+      return usageEvent(row, data)
+    })
+    const runtimeStarts = Object.fromEntries((this.db.prepare('SELECT runtime_id,started_at FROM structured_runtimes WHERE session_id=?').all(sessionId) as Array<{ runtime_id: string; started_at: string }>).map(row => [row.runtime_id, row.started_at]))
+    const first = this.db.prepare('SELECT sequence FROM structured_events WHERE session_id=? ORDER BY sequence LIMIT 1').get(sessionId) as { sequence: number } | undefined
+    return { sessionId, provider: session.provider, events, runtimeStarts, truncated: (first?.sequence ?? 1) > 1 }
+  }
   /**
    * The newest reported allowance windows for one provider. Auto Fixer keeps only the latest
    * observation per window key, so it never needed the whole journal: a window that has not been

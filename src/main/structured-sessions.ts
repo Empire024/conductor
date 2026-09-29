@@ -183,6 +183,8 @@ export class StructuredSessions {
   markApprovalReviewer(id: string): void { this.database.setSetting('approval-reviewer:' + id, 'true') }
   isApprovalReviewer(id: string): boolean { return this.database.getSetting('approval-reviewer:' + id) === 'true' }
   /** Whether this process holds a runtime for the conversation (connected or connecting). */
+  /** Conversations with a runtime up or starting, for the token burn meter (token-burn.ts). */
+  liveSessionIds(): string[] { return [...this.live.values()].filter(live => !live.closed && (live.adapter || live.starting)).map(live => live.spec.id) }
   hasRuntime(id: string): boolean { const live = this.live.get(id); return Boolean(live?.adapter || live?.starting) }
   /** The conductor-local MCP server (src/main/local-assist): every Claude and Codex conversation
    *  gets it, unlike the browser tools, which the owner switches on per conversation. */

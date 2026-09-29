@@ -1,0 +1,34 @@
+/* Token burn: a flame on a tab spending faster than the owner's alert rate (TokenBurn.tsx). */
+.pane-tab > .pane-tab-burn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 4px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+  color: var(--danger);
+  font-size: 8.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 14px;
+}
+
+.token-burn-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
+.token-burn-list > li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 4px 9px 4px 11px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--surface-0);
+  font-size: 8.5px;
+  color: var(--text-2);
+}
+.token-burn-list > li.alert { border-color: color-mix(in srgb, var(--danger) 45%, var(--border-soft)); color: var(--danger); }
+.token-burn-list > li.token-burn-empty { display: block; color: var(--text-3); }
+.token-burn-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.token-burn-provider { color: var(--text-3); }
+.token-burn-rate { font-variant-numeric: tabular-nums; font-weight: 600; }

@@ -133,6 +133,7 @@ import { LocalUpdateBuilder } from './local-update-build'
 import { localEndpointOverride, localModelAvailability, localTurnsInFlight, onLocalTurnStart, releaseVerdict, setLocalEndpointOverride, slotsProcessing } from './providers/local'
 import { DeliveryService } from './delivery'
 import { COWORKER_AUTOCLOSE_SETTING, CoworkerAutoClose, coworkerAutoCloseMinutes, normalizeCoworkerAutoCloseMinutes } from './coworker-autoclose'
+import { registerTokenBurnIpc, TokenBurnMeter, TokenBurnService } from './token-burn'
 import { FinishedTabs, agentTabFacts, findLayoutTab } from './workspace-clarity'
 import { FINISHED_TAB_SWEEP_SETTING, finishedTabSweepHours, normalizeFinishedTabSweepHours, type AgentTabFacts } from '../shared/workspace-clarity'
 import { registerDeliveryIpc } from './delivery-ipc'
@@ -175,6 +176,7 @@ let disposeDurableJobsGate: (() => void) | undefined
 let disposeScheduleIpc: (() => void) | undefined
 let disposeDeliveryIpc: (() => void) | undefined
 let coworkerAutoClose: CoworkerAutoClose | undefined
+let tokenBurnMeter: TokenBurnMeter | undefined
 let finishedTabs: FinishedTabs | undefined
 let tabArchiver: TabArchiver | undefined
 /** The owner's Ideas inbox (src/main/ideas/register.ts); undefined until the app is ready. */
@@ -721,7 +723,7 @@ const disposeRuntimeServices = (): void => {
     ['ideas', () => { disposeIdeasIpc?.(); ideasRegistration?.dispose() }],
     ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); browserMcp?.close(); localAssist?.close(); permissionGrants?.close(); browserViews?.dispose(); projectFileChanges?.close() }],
     ['model intelligence', () => { disposeModelObserver?.(); modelIntelligence?.dispose(); modelIntelligence = undefined }],
-    ['coworker auto-close', () => { coworkerAutoClose?.dispose(); finishedTabs?.dispose() }],
+    ['coworker auto-close', () => { coworkerAutoClose?.dispose(); finishedTabs?.dispose(); tokenBurnMeter?.dispose() }],
     ['terminals', () => terminals?.dispose()],
     ['agents', () => agents?.dispose()],
     ['schedule runner', () => scheduleRunner?.stop()],
@@ -1890,6 +1892,7 @@ const registerIpc = (): void => {
     return getAppSettings()
   })
 
+  registerTokenBurnIpc(ipcMain, () => tokenBurnMeter, event => trustedStructured(event))
   ipcMain.handle('settings:coworker-autoclose', (event) => { trustedStructured(event); return coworkerAutoCloseMinutes(key => database.getSetting(key)) })
   ipcMain.handle('settings:set-coworker-autoclose', (event, minutes: unknown) => {
     trustedStructured(event)
@@ -2898,6 +2901,19 @@ app.whenReady().then(async () => {
   control.setCoworkerAutoClose(coworkerAutoClose)
   delivery.onChanged(run => coworkerAutoClose?.noteDelivery(run))
   coworkerAutoClose.start()
+  // Each live tab's token burn over the last hour, broadcast to the tab strip every minute
+  // (src/main/token-burn.ts). A test launch may shorten the interval.
+  const burnOverride = !app.isPackaged && process.env.CONDUCTOR_TEST_USER_DATA ? Number(process.env.CONDUCTOR_TEST_TOKEN_BURN_MS) || undefined : undefined
+  tokenBurnMeter = new TokenBurnMeter({
+    service: new TokenBurnService(database.structured, key => database.getSetting(key)),
+    live: () => agents.structured.liveSessionIds().flatMap(id => {
+      const spec = database.structured.spec<{ title?: string; provider: string }>(id), state = database.structured.snapshot(id)
+      return spec && state ? [{ agentSessionId: id, title: state.title || spec.title || 'Agent', provider: spec.provider }] : []
+    }),
+    setSetting: (key, value) => database.setSetting(key, value), publish,
+    ...(burnOverride ? { intervalMs: burnOverride } : {})
+  })
+  tokenBurnMeter.start()
   // Finished tabs nobody looked at for the owner's age close themselves (default a day), and the
   // sidebar's "Close finished tabs" closes a workspace's at once; both keep history.
   const sweepOverride = !app.isPackaged && process.env.CONDUCTOR_TEST_USER_DATA ? Number(process.env.CONDUCTOR_TEST_FINISHED_TAB_SWEEP_MS) || undefined : undefined

@@ -5,6 +5,7 @@ import { THEME_OPTIONS } from '../../../shared/models'
 import { playAgentSound } from '../agent-sounds'
 import { UsageCapDefaultSetting } from './UsageCapDefaultSetting'
 import { CoworkerAutoCloseSetting, FinishedTabSweepSetting } from './CoworkerAutoCloseSetting'
+import { TokenBurnSetting } from './TokenBurn'
 import { RemoteControlSettings } from './RemoteControlSettings'
 import { AlwaysOnSettings } from './AlwaysOnSettings'
 import { PhoneAccessSettings } from './PhoneAccessSettings'
@@ -231,6 +232,7 @@ export function SettingsPanel({
             </>}
             {activeSection === 'usage' && <>
               <UsageCapDefaultSetting />
+              <TokenBurnSetting />
               <CoworkerAutoCloseSetting />
               <FinishedTabSweepSetting />
             </>}

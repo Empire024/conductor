@@ -23,6 +23,7 @@ import { rememberedPermission } from './app-settings'
 import type { CreateOrchestrationTaskInput, SaveRoutineInput, UpdateOrchestrationTaskInput } from '../shared/orchestration'
 import type { ConductorDatabase } from './database'
 import type { StructuredSessions, UsageLimitStop } from './structured-sessions'
+import { TokenBurnService } from './token-burn'
 import type { OrchestrationStore } from './orchestration-store'
 import type { AgentCollaborationStore } from './agent-collaboration-store'
 import type { ProjectBacklogs } from './project-backlog'
@@ -749,11 +750,16 @@ export class AgentControl {
       lastError: lastError && lastError.data.type === 'error' ? lastError.data.message.slice(0, 400) : null,
       lastAnswer: lastText && lastText.data.type === 'text' ? lastText.data.text.slice(-600) : null,
       filesChanged: [...changed].slice(0, 100),
+      // Tokens over the last hour (token-burn.ts); alert:true past the owner's rate.
+      burn: this.burn().rate(tab.resourceId!),
       taskState: this.deps.sessions.runStatus(tab.resourceId!),
       ...supervise(state, this.reviewsFor(scope.projectId, tab.resourceId!)),
       recovery: this.recovery().status(scope.projectId, tab.resourceId!)
     }
   }
+
+  private burnMeter?: TokenBurnService
+  private burn(): TokenBurnService { return this.burnMeter ??= new TokenBurnService(this.deps.database.structured, key => this.deps.database.getSetting(key)) }
 
   /** A conversation's background task count as agents.list reports it. The projection keeps the
    *  count its last lifecycle event carried, and a runtime that disconnected or was stopped never

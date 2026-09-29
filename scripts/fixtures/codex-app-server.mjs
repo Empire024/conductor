@@ -317,6 +317,13 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     finish()
     return
   }
+  // A relay-sized burn: one call re-reading a large cached context, for the token burn meter smoke.
+  if (scenario === 'synthetic:token-burn') {
+    itemEvent('item/completed', { type: 'agentMessage', id: 'burn-' + turnNumber, text: 'Synthetic relay: passed the message on.', phase: null, memoryCitation: null, delivery: null, questions: null })
+    notify('thread/tokenUsage/updated', { threadId, turnId: currentTurn, tokenUsage: { total: { inputTokens: 6_400_000 * turnNumber, outputTokens: 20_000 * turnNumber, cachedInputTokens: 6_000_000 * turnNumber }, modelContextWindow: 400000 } })
+    finish()
+    return
+  }
   // A quota that has run out, exactly as Codex reports it: a failed turn whose error names a
   // reset time. Seconds rather than hours so the smoke run can actually wait for the reopening.
   if (scenario === 'synthetic:usage-limit') {

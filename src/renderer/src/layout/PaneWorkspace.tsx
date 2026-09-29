@@ -95,6 +95,7 @@ import { openWorkspaceFile } from '../components/workspace-files-state'
 import { fileMachineId, isRemoteFileMachine, statMachineFile } from '../remote-files'
 import { coworkerCloseTargets, coworkerTabGroups } from './coworker-tab-groups'
 import { ControlledByBadge } from '../components/ControlActivity'
+import { TokenBurnBadge } from '../components/TokenBurn'
 import { guardTabClose, offerCloseUndo } from './close-work-guard'
 import { applyBulkTabAction, dockTabsAt, EMPTY_SELECTION, insertForeignTabs, isBulk, moveTabsToBar, orderedSelection, pruneSelection, selectAll, selectionClick, type BulkTabAction, type TabSelection } from './tab-selection'
 import '../components/TabArchiveDialog.css'
@@ -784,6 +785,7 @@ function PaneGroup({
         {tab.kind === 'agent' && (tab.state?.continueOnLimit === undefined ? workspace.session.continueOnLimit : Boolean(tab.state.continueOnLimit)) && (
           <span className="tab-limit-continuation" title="Limit continuation is on for this agent"><TimerReset size={12} /></span>
         )}
+        {tab.kind === 'agent' && <TokenBurnBadge agentSessionId={tab.resourceId} />}
         {tab.kind === 'agent' && <TabActivityIndicator phase={tabPhase} title={tab.title} spinEpoch={spinEpoch} />}
         <i
           className="tab-close"
