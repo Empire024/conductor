@@ -28,7 +28,7 @@ import { ConversationFindBar } from './ConversationFindBar'
 import { CLOSED_FIND, clearFindRanges, collectQueryRanges, conversationMatches, findReducer, paintFindRanges, type ConversationMatch, type FindAction } from './conversation-find'
 import { useOlderHistory, withStoredMatches } from './conversation-paging'
 import { FileAttachmentInput } from '../components/FileAttachmentInput'
-import { composerChildKey, composerSendBlock, nextComposerSettings, promptCharacterCount, resolvedComposerSettings } from './composer-settings'
+import { composerChildKey, composerSendBlock, nextComposerSettings, resolvedComposerSettings } from './composer-settings'
 import { activateBrowserMention, CommandAutocomplete } from './CommandAutocomplete'
 import { composerCommands, matchingComposerCommands, type ComposerCommand } from './composer-commands'
 import { ComposerStarterMenu } from './ComposerStarterMenu'
@@ -36,7 +36,7 @@ import { composerStarterChoices, prepareComposerDraft } from './composer-starter
 import { CONDUCTOR_FILE_DRAG, decodeConductorFileDrag, isComposerFileDrag } from '../components/composer-file-drop'
 import { concreteModel } from '../../../shared/agent-model-selection'
 import { localModelLabel } from '../../../shared/local-models'
-import { attachToDraft, useComposerDraft } from './use-composer-draft'
+import { attachToDraft, useComposerDraft, useComposerTextSync } from './use-composer-draft'
 import { foldInsertedText, foldOversizedMessage, isPastedText, mayFoldInput, removePastedText, unfoldPastedText } from '../../../shared/pasted-text'
 import { canOpenPastedText, openPastedText } from '../pasted-text-open'
 import { initialPermission, rememberPermission } from './permission-memory'
@@ -95,6 +95,14 @@ const historyTime = (timestamp?: string): string => {
 }
 type PinnedPrompt = { id: string; text: string; sequence: number; origin?: PromptOrigin }
 
+/** The composer's textarea is uncontrolled: a keystroke writes the draft store from onChange and
+ *  renders nothing, neither this element nor the conversation pane around it. The draft's other
+ *  changes are written into it by useComposerTextSync. */
+function ComposerTextarea({ projectId, sessionId, textareaRef, ...props }: { projectId: string; sessionId: string; textareaRef: React.RefObject<HTMLTextAreaElement | null> } & Omit<React.ComponentProps<'textarea'>, 'value' | 'defaultValue' | 'ref'>): React.JSX.Element {
+  useComposerTextSync(projectId, sessionId, textareaRef)
+  return <textarea {...props} ref={textareaRef} />
+}
+
 export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Element {
   const restoredView = useRef(suspendedViews.get(props.resourceId) ?? null)
   const [activeId, setActiveId] = useState(() => restoredView.current?.activeId ?? props.conversationId ?? props.resourceId)
@@ -118,9 +126,12 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   useLayoutEffect(() => { renderedProjection.current = projection; streamIngest.current?.committed() }, [projection])
   const [ready, setReady] = useState(false)
   const [error, setError] = useState('')
-  const { draft, setMessage, setAttachments, setDraft, clearSubmitted, flush: flushDraft } = useComposerDraft(props.project.id, activeId, props.anonymous === true)
-  const { message, attachments } = draft
-  const draftRef = useRef(draft); draftRef.current = draft
+  // The pane renders from a view of the draft that ordinary typing leaves unchanged, and the
+  // textarea is uncontrolled (ComposerTextarea), so a keystroke renders nothing. Handlers read the
+  // draft as it is now through draftRef.
+  const { view: draftView, current: currentDraft, setMessage, setAttachments, setDraft, clearSubmitted, flush: flushDraft } = useComposerDraft(props.project.id, activeId, props.anonymous === true)
+  const { attachments } = draftView
+  const draftRef = useMemo(() => ({ get current() { return currentDraft() } }), [currentDraft])
   const composer = useRef<HTMLTextAreaElement>(null)
   const pane = useRef<HTMLElement>(null)
   // Recall silently edits the prompt, so the ledger of what it injected is loaded alongside
@@ -197,7 +208,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const [commandDismissed, setCommandDismissed] = useState(false)
   const [commandIndex, setCommandIndex] = useState(0)
   const commandListId = useId()
-  const commands = matchingComposerCommands(message, composerCommands(projection.capabilities, commandDiscovery))
+  const commands = matchingComposerCommands(draftView.commandQuery, composerCommands(projection.capabilities, commandDiscovery))
   const starterChoices = useMemo(() => composerStarterChoices(projection.capabilities, commandDiscovery), [projection.capabilities, commandDiscovery])
   const commandsOpen = !commandDismissed && !addFileOpen && !historical && commands.length > 0
   const [newOutput, setNewOutput] = useState(false)
@@ -427,12 +438,13 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   }, [activeId])
   const submit = async (): Promise<void> => {
     // A draft past the per-message ceiling goes as pasted context rather than being refused.
-    const oversized = foldOversizedMessage(message, attachments)
-    const text = oversized ? oversized.message : message.trim()
-    const sent = oversized ? [...attachments, oversized.attachment] : attachments
+    const draft = draftRef.current
+    const oversized = foldOversizedMessage(draft.message, draft.attachments)
+    const text = oversized ? oversized.message : draft.message.trim()
+    const sent = oversized ? [...draft.attachments, oversized.attachment] : draft.attachments
     const connectingMetadata = projection.phase === 'starting' && metadataConnectionId.current === activeId
     const queuing = ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase)
-    if (composerSendBlock(message, attachments) || submitLock.current || conversationSwitch.current || !ready || historical || (activePhases.has(projection.phase) && !connectingMetadata && !queuing) || projection.archived) return
+    if (composerSendBlock(draft.message, draft.attachments) || submitLock.current || conversationSwitch.current || !ready || historical || (activePhases.has(projection.phase) && !connectingMetadata && !queuing) || projection.archived) return
     // Captured before the turn starts, and off actual user turns rather than
     // unstartedConversation: focusing the composer alone can already connect a runtime (to load
     // its model catalog) and set a native session id, well before anything is sent. This is the
@@ -609,15 +621,17 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     return () => window.removeEventListener('keydown', openFind)
   }, [activeId, addFileOpen, dispatchFind])
 
-  const promptChars = promptCharacterCount(message, attachments)
-  const sendBlocked = composerSendBlock(message, attachments)
+  const promptChars = draftView.nearLimitChars
+  // Also decides whether the composer has a placeholder: only while the draft is empty, because
+  // Blink rewrites a present placeholder's inline style on every keystroke (a style recalc per key).
+  const sendBlocked = draftView.sendBlock
   // The native CLI holds the conversation while it is open in the drawer; Chat sends again once
   // the owner continues here, which stops the CLI and brings its turns into this timeline.
   const cliOwned = Boolean(props.cliDrawer?.owned)
   const cliIdle = !activePhases.has(projection.phase) && !projection.queued
   const canSubmit = !cliOwned && ready && !historical && !resuming && sendBlocked !== 'oversized' && (!activePhases.has(projection.phase) || ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) || (projection.phase === 'starting' && metadataConnectionId.current === activeId)) && !projection.archived && (projection.phase !== 'disconnected' || unstartedConversation || Boolean(projection.nativeSessionId))
   const steering = ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) && Boolean(projection.capabilities?.steering)
-  const sendIntent = sendButtonIntent({ active: activePhases.has(projection.phase), interrupting: projection.phase === 'interrupting', draft: Boolean(message.trim()), needsResume, autoResumeOnSend: projection.phase === 'disconnected', steering, historical, canSubmit, submitting })
+  const sendIntent = sendButtonIntent({ active: activePhases.has(projection.phase), interrupting: projection.phase === 'interrupting', draft: sendBlocked !== 'empty', needsResume, autoResumeOnSend: projection.phase === 'disconnected', steering, historical, canSubmit, submitting })
   const pendingSteering = projection.pendingSteering ?? []
   const queuedPrompts = projection.queuedPrompts ?? (projection.queued ? [projection.queued] : [])
   const capabilities = projection.capabilities
@@ -1037,7 +1051,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       {cliOwned && provider === 'claude' && <p className="sa-request-summary" role="status">The interactive CLI owns this conversation. Its permission mode is shown in its terminal; the previous Chat runtime confirmation does not apply.</p>}
       {provider === 'claude' && <details className="sa-full-auto-details"><summary>Claude Full Auto authorization</summary><ClaudeFullAutoControl /></details>}
       {commandsOpen && <CommandAutocomplete id={commandListId} commands={commands} selected={Math.min(commandIndex, commands.length - 1)} loading={commandLoading} onSelect={setCommandIndex} onChoose={chooseCommand} />}
-      <textarea ref={composer} aria-autocomplete="list" aria-controls={commandsOpen ? commandListId : undefined} aria-expanded={commandsOpen} aria-activedescendant={commandsOpen ? commandListId + '-' + Math.min(commandIndex, commands.length - 1) : undefined} aria-label={'Message ' + name} placeholder={succession ? `Continued in ${succession.title}; send messages there` : cliOwned ? 'The native CLI has this conversation. Continue in Chat to send here.' : historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : steering ? (pendingSteering.some(input => input.status === 'sending' || input.status === 'accepted') ? 'Add another message' : 'Message after the next tool use') : activePhases.has(projection.phase) ? 'Queue a message after this turn' : 'Message ' + name} value={message} disabled={!ready || historical || resuming || projection.archived || cliOwned || Boolean(succession)} rows={2} onFocus={() => { if (ready && !historical && !projection.nativeSessionId && !activePhases.has(projection.phase)) void connect().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }} onBlur={() => { setCommandDismissed(true); flushDraft() }} onChange={event => {
+      <ComposerTextarea projectId={props.project.id} sessionId={activeId} textareaRef={composer} aria-autocomplete="list" aria-controls={commandsOpen ? commandListId : undefined} aria-expanded={commandsOpen} aria-activedescendant={commandsOpen ? commandListId + '-' + Math.min(commandIndex, commands.length - 1) : undefined} aria-label={'Message ' + name} placeholder={sendBlocked !== 'empty' ? undefined : succession ? `Continued in ${succession.title}; send messages there` : cliOwned ? 'The native CLI has this conversation. Continue in Chat to send here.' : historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : steering ? (pendingSteering.some(input => input.status === 'sending' || input.status === 'accepted') ? 'Add another message' : 'Message after the next tool use') : activePhases.has(projection.phase) ? 'Queue a message after this turn' : 'Message ' + name} disabled={!ready || historical || resuming || projection.archived || cliOwned || Boolean(succession)} rows={2} onFocus={() => { if (ready && !historical && !projection.nativeSessionId && !activePhases.has(projection.phase)) void connect().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }} onBlur={() => { setCommandDismissed(true); flushDraft() }} onChange={event => {
         // A long paste or drop folds into a "[Pasted text #N: L lines]" chip, as the Claude CLI does.
         // Only an event that could have inserted a long run pays for diffing the whole draft.
         const input = event.nativeEvent as Partial<InputEvent>
@@ -1046,9 +1060,14 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
           setDraft(fold.message, [...draftRef.current.attachments, fold.attachment])
           const caret = fold.caret
           requestAnimationFrame(() => composer.current?.setSelectionRange(caret, caret))
-        } else if ('error' in fold) setError(fold.error)
-        else setMessage(event.target.value)
-        setCommandDismissed(false); setCommandIndex(0)
+        } else if ('error' in fold) {
+          // Refused, so the textarea goes back to the draft (a controlled one did this by itself).
+          event.target.value = draftRef.current.message
+          setError(fold.error)
+        } else setMessage(event.target.value)
+        // Only a change re-renders the pane; a plain keystroke leaves it alone.
+        if (commandDismissed) setCommandDismissed(false)
+        if (commandIndex) setCommandIndex(0)
       }} onKeyDown={event => {
         if (event.nativeEvent.isComposing) return
         if (commandsOpen) {

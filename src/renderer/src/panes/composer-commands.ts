@@ -29,9 +29,14 @@ export function composerCommands(capabilities?: ProviderCapabilities, discovery?
   return commands
 }
 const triggerPatterns: Record<'/' | '@', RegExp> = { '/': /^\/[a-zA-Z0-9:_-]*$/, '@': /^@[a-zA-Z0-9:_-]*$/ }
-export function matchingComposerCommands(message: string, commands: ComposerCommand[]): ComposerCommand[] {
+/** The draft while it can open the / or @ command list, '' otherwise: all matchingComposerCommands needs of it. */
+export function composerCommandQuery(message: string): string {
   const trigger = message.startsWith('@') ? '@' : message.startsWith('/') ? '/' : undefined
-  if (!trigger || !triggerPatterns[trigger].test(message)) return []
+  return trigger && triggerPatterns[trigger].test(message) ? message : ''
+}
+export function matchingComposerCommands(message: string, commands: ComposerCommand[]): ComposerCommand[] {
+  if (!composerCommandQuery(message)) return []
+  const trigger = message[0] as '/' | '@'
   const query = message.slice(1).toLowerCase()
   return commands.filter(command => (command.trigger ?? '/') === trigger && command.name.toLowerCase().startsWith(query)).slice(0, 30)
 }
