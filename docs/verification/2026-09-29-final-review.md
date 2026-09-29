@@ -228,3 +228,92 @@ cross-project router.dispatch (or have the owner restate it for the wizard route
   pass with a longer timeout; unrelated to the reviewed items, but the 5 s default is tight.
 - **handoff-cross-provider (P1):** a successor tab is titled "<A> (continued)" while refusal texts
   name it by its auto-title from the handoff's first line; two names for one tab.
+
+## Round 2 (2026-09-29, 18:10-18:50 local): the three reworked items, plus 3645a32 and 0d11807
+
+Same reviewer and rules: read-only on product code, parked smokes one at a time under smoke-lock, no
+local model server (llama-server of the soak untouched; the durable-jobs real-model smoke of another
+tab held the lock for ~19 min and our runs queued behind it), installed app not restarted.
+
+- **Installed:** `0.1.55-local.1790698147304`, `conductor-local-build.json` commit
+  `0d118078af563c64ddaa3715c3abb5b84d06899a`, `dirty:false`. HEAD = 0d11807. d16b4bd, 893f4c3,
+  1c57459, 3645a32 and 0d11807 are all ancestors of (or equal to) 0d11807.
+- **Build under test:** the review worktree moved to 0d11807 (`git checkout --detach 0d11807`),
+  electron-vite build under smoke-lock (`.conductor-scratch/final-review/build2.log`).
+- **Tests:** changed suites (durable-jobs/controller, model-intelligence/shadow-decider,
+  providers/claude, agent-control, structured-sessions, structured-store, token-burn,
+  production/service, phone-access): 9 files, 560/560 pass. Full suite on 0d11807: 5381 pass,
+  54 skipped, 3 fail, the same three 5 s timeouts under load as round 1
+  (conversation-history.test.ts x2, database-wal.test.ts); with `--testTimeout=60000` 11/11 pass.
+  test:scripts 197 pass, 0 fail. Logs: `fullsuite2.log`, `scripts-tests2.log`.
+- **Smokes on 0d11807** (`smokes-r2a.txt`, `smokes-r2b.txt`, logs `smoke-smoke-*.log`):
+
+| smoke | result |
+| --- | --- |
+| smoke-dispatch-listing | D1-D5 PASS (D3: agents.steer into a running turn answers `delivery:"steered"`) |
+| smoke-permission-grant | 7/7 PASS (the live tab's flag layer holds the request_permission/list_permissions exemption beside each grant rule) |
+| smoke-relay-roll | 6/6 PASS (3 rolls at 75k vs bound 60k, briefs 844/856/856 chars, successors at 3k, peak 75k vs 200k unrolled, rolled sessions listed superseded) |
+| smoke-credit-burn-controller | 3/3 PASS ((1) cross-workspace steer and reply, no relay tab; (4) controller told within 30 ms of the coworker's usage-limit stop) |
+| smoke-token-burn | 5/5 PASS, 2 of 2 runs (round 1: 0 of 4) |
+| smoke-cpu-shadow-decider --no-gpu | all PASS, C skipped by design (CPU Laya sidecar only, pid 74176 not on nvidia-smi; E: retry journaled, escalate journaled for completed stages with both "escalate" and "continue"; decisions.list: route 1, approval 2, retry 1, escalate 3, completion 5, classify 1 asked) |
+| smoke-production | all PASS, 2 of 2 runs (dedup sets rerunRequested; restart-resume; the coalesced follow-up audit is awaited to exist and finish) |
+| regression: approvals-residual, grant-interrupt, pasted-text, waiting-tabs | 5/5, 3/3, 4/4 (now updated for 0f968a8), W1-W4 PASS |
+
+- **Real CLI** (claude 2.1.282, `CONDUCTOR_REAL_CLAUDE=1 node scripts/probe-request-permission-exempt.mjs`,
+  stub conductor server that runs nothing; log `.conductor-scratch/final-review/probe-rp-exempt.log`):
+  A no rule → classifier, permissionDecisionMs 6290; R launch rules → rule, 0 ms; P list_permissions
+  → rule, 1 ms; L rules applied live → rule, 0 ms. 4/4 as expected, exit 0.
+
+### Verdicts, round 2
+
+| item | commit(s) | G1 | G2 | G3 | G4 | verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| cpu-shadow-decider | 9167480, f7e7c0b, d16b4bd | yes | pass | yes | smoke --no-gpu section E rerun | ACCEPT |
+| permission-approval-delivery-classifier | (round 1 list) + 893f4c3 | yes | pass | yes | dispatch-listing D1-D5, permission-grant 7/7, real-CLI exemption probe 4/4, residual/grant-interrupt rerun | ACCEPT |
+| codex-credit-burn | 3ba57d5, 2fdd0d5, f6789be, 1c57459 | yes | pass | yes | relay-roll 6/6, credit-burn-controller 3/3, token-burn 2 of 2 | ACCEPT |
+| 3645a32 (smoke-production race), not a list item | 3645a32 | sound | n/a | yes | smoke-production 2 of 2 | sound |
+| 0d11807 (Production coalesced-rerun durability), not a list item | 0d11807 | sound | 56 new test lines pass in service.test.ts | yes | smoke-production 2 of 2 | sound |
+
+**cpu-shadow-decider (d16b4bd).** The round-1 defect is fixed where the decision is made:
+`DurableJobController` now calls `stageConcluded` on every exit of the completed-stage branch
+(controller.ts: next planned stage, job done, stage limit, stall of an implicit stage, next stage
+planned, no next step), each with `escalated` true or false, and `modelIntelligence.stageConcluded`
+journals kind `escalate` (shadow) from it; `loopAssessed` now returns early for a completed stage, so
+the stall check is not journaled twice and keeps kind `retry` for failed attempts. Wiring:
+`withStageCapture(…, concluded)` adds `stageConcluded` to the service options (index.ts:2932), passed
+to the controller. Smoke E shows escalate asked 3 with both answers. Note: the installed app has
+journaled no escalate yet (no durable-job stage has completed there since the install); the parked
+run is the evidence.
+
+**permission-approval-delivery-classifier (893f4c3).** Clause 3: `CONDUCTOR_MCP_ALLOWED_TOOLS`
+(control-mcp.ts) = exact rules for `mcp__conductor__request_permission` and `…__list_permissions`;
+`ClaudeAdapter.flagAllowRules` puts them in `--settings` at launch and in every
+`apply_flag_settings` set for a tab with the conductor server, never for a reviewer or evaluation
+turn, never a server-wide rule. The real-CLI probe reproduces rule-before-classifier for both tools,
+at launch and live. Clause 5: no code change needed; the new smoke shows same-project and
+cross-project dispatched coworkers listed, a finished one listed `finished:true` and reopened by
+agents.steer, and a wizard-owned project taking the task. Also closes round-1 notes (i) steer
+delivery `steered|queued` and (ii) history read-back masked while the H17 backfill is pending.
+
+**codex-credit-burn (1c57459).** Fix (3) now complete: a relay/coordinator tab rolls through the
+successor path to a fresh native session with a short brief once a settled turn's context passes
+60k (never mid-turn, with input queued, a wizard, local, reviewer or remote tab); a controller's
+steer to the old id is forwarded (`forwardedFrom`). The token-burn failure is fixed at its cause:
+the meter's 55 s cache is keyed on a per-conversation usage mark, so a reading taken before the
+turn's usage report is dropped when the report lands. (1) and (4) now have parked checks.
+Observations, not blocking: a failed roll is not retried in the same run (a notice says so); the
+roll bound is a fixed 60k (test override only).
+
+**3645a32.** Smoke-only: waits for the second audit to exist and finish instead of "no active run",
+which the ~200 ms fingerprint gap could satisfy early. Correct, bounded (300 s poll).
+
+**0d11807.** `finished()` no longer clears `rerunRequested` before the follow-up exists:
+`followUp` awaits `startRun` (which resolves once the run is requested, not when it finishes) and
+only then `takeRerun`; on a throw the flag stays and a run note says it will be retried at start;
+`start()` retries `store.pendingReruns()` (completed/failed runs still flagged, bounded to 50); an
+in-process `following` set prevents the finish path and start() from both following one run. Sound.
+Residual, minor: if startRun succeeds and the process dies before `takeRerun`, the next start
+requests the follow-up again (coalesced into the follow-up if it is still active, else at most one
+extra audit; never a lost one), the safe direction.
+
+**Totals after round 2: 44 ACCEPT, 0 REJECT** (the three still-open items are outside this review).
