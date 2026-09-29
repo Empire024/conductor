@@ -84,6 +84,21 @@ export async function retryAck(fn, { attempts = 5, delayMs = 8000, wait = sleep,
   }
 }
 
+/** Windows PowerShell 5.1's ConvertTo-Json copies a command line's raw control characters (an ESC,
+ *  a bell, a bare newline) into its strings, which JSON forbids; one such process on the machine made
+ *  every inventory, and so every smoke launch and delivery, fail. They are escaped inside strings only. */
+function escapeRawControls(text) {
+  let out = '', inString = false, escaped = false
+  for (const char of text) {
+    if (inString && !escaped && char < ' ') { out += '\\u' + char.charCodeAt(0).toString(16).padStart(4, '0'); continue }
+    out += char
+    if (escaped) escaped = false
+    else if (char === '\\') escaped = inString
+    else if (char === '"') inString = !inString
+  }
+  return out
+}
+
 /** Win32_Process rows from `ConvertTo-Json` (an object for one row, an array otherwise). creationTime
  *  is the OS creation time normalized to microseconds since 1601 UTC (WMI's own precision) as a
  *  decimal string, and executable the image path; either is null where the OS would not say. A row
@@ -91,7 +106,7 @@ export async function retryAck(fn, { attempts = 5, delayMs = 8000, wait = sleep,
 export function parseProcessList(json) {
   const text = String(json ?? '').trim()
   if (!text) return []
-  const rows = JSON.parse(text)
+  const rows = JSON.parse(escapeRawControls(text))
   return (Array.isArray(rows) ? rows : [rows]).map(row => {
     const pid = Number(row.ProcessId)
     // Only field names and types go into the error: a raw row can carry an API-key command line.

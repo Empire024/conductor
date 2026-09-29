@@ -63,6 +63,9 @@ test('parseProcessList reads one row or many and keeps a null command line empty
   assert.deepEqual(parseProcessList('{"ProcessId":4,"ParentProcessId":0,"Name":"System","CommandLine":null}'), [{ pid: 4, ppid: 0, name: 'System', commandLine: '', creationTime: null, executable: null }])
   assert.equal(parseProcessList('[{"ProcessId":1,"ParentProcessId":0,"Name":"a","CommandLine":"x"},{"ProcessId":2,"ParentProcessId":1,"Name":"b","CommandLine":"y"}]').length, 2)
   assert.deepEqual(parseProcessList(''), [])
+  // PowerShell 5.1 leaves a command line's raw control characters unescaped; they parse as themselves.
+  const raw = '[{"ProcessId":7,"ParentProcessId":1,"Name":"x","CommandLine":"a\u001b[0mb\u0007 \\"q\\" \\\\"},{"ProcessId":8,"ParentProcessId":1,"Name":"y","CommandLine":"line\nbreak"}]'
+  assert.deepEqual(parseProcessList(raw).map(row => row.commandLine), ['a\u001b[0mb\u0007 "q" \\', 'line\nbreak'])
 })
 
 test('parseProcessList keeps OS identity only when it is usable and refuses a broken inventory', () => {

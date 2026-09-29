@@ -31,7 +31,10 @@ then requests native `bypassPermissions` and counts it active only after provide
   the request is under stronger review with a class the review gate covers (never an owner ask rule
   or an owner-only boundary), where Conductor's in-memory class rule
   (`approval-review-rules.ts`) answers later requests of that class until the runtime ends (an app
-  restart, a reconnect that starts a new runtime, or a handoff); otherwise `once`. Unlike a
+  restart, a reconnect that starts a new runtime, or a handoff); otherwise `once`. `agents.approvals`
+  lists the same answer beforehand for each pending request (`sessionScope`, with the rule it would
+  record as `sessionClass`), computed by the same code, so a request under an owner ask rule never
+  advertises a class. Unlike a
   `permissions.decide` session grant, which is kept in `permission-grants.json` and applied again
   after a restart, neither of these outlives its runtime.
 - A representable grant is a narrow native allow rule for one conversation. A still-pending native

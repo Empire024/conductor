@@ -9,7 +9,7 @@ afterEach(() => sessionRules.clear())
 const approval = (id: string, input: Json, title: string, session?: string) => ({ id: 'item-' + id, runtimeId: 'runtime', nativeItemId: 'tool-' + id, sequence: 1, timestamp: '2026-09-26T00:00:00.000Z',
   data: { type: 'interaction' as const, interaction: { id, kind: 'approval' as const, status: 'pending' as const, title, input, choices: [{ id: 'allow', label: 'Allow once' }, { id: 'allow-session', label: 'Session', ...(session ? { description: session } : { disabled: true }) }, { id: 'deny', label: 'Deny' }] } } })
 
-function fixture({ reviewed = false, key }: { reviewed?: boolean; key?: string } = {}) {
+function fixture({ reviewed = false, key, classes }: { reviewed?: boolean; key?: string; classes?: Record<string, { reviewed: boolean; key?: string }> } = {}) {
   const settings = new Map<string, string>(), responses: InteractionResponse[] = []
   const state: SessionProjection = { sessionId: 'coworker', runtimeId: 'runtime', phase: 'waiting_approval', sequence: 3, items: [
     approval('run-tests', { command: 'npm test' }, 'Allow Bash?'),
@@ -26,7 +26,7 @@ function fixture({ reviewed = false, key }: { reviewed?: boolean; key?: string }
       if (item?.data.type === 'interaction') item.data.interaction.status = 'resolved'
     },
     persistence: { getSetting: key => settings.get(key) ?? null, setSetting: (key, value) => { settings.set(key, value) } },
-    reviewClass: () => ({ reviewed, ...(key ? { key } : {}) })
+    reviewClass: (_id, _runtime, requestId) => classes?.[requestId] ?? { reviewed, ...(key ? { key } : {}) }
   }
   const wizard: WizardApprovalScope = { agentSessionId: 'wizard', projectId: 'project', wizard: true }
   return { ports, responses, wizard, journal: () => new ApprovalReviews(ports.persistence) }
@@ -44,11 +44,11 @@ describe('a wizard answers its coworkers\' approvals (wizard-answers-approvals)'
   it('lists each pending approval with its exact action, and why a non-local one deserves attention', async () => {
     const f = fixture()
     const listed = await callWizardApprovals(f.ports, f.wizard, 'agents.approvals', {}) as { approvals: Array<Record<string, unknown>> }
-    expect(listed.approvals.map(entry => [entry.requestId, entry.tool, entry.class, entry.mayAllow, entry.sessionClass])).toEqual([
-      ['run-tests', 'Bash', 'local', true, 'Bash:npm test'],
-      ['push', 'Bash', 'external', true, null],
-      ['stray', 'Write', 'local', true, null],
-      ['lint', 'Bash', 'local', true, 'Bash:npm run lint']
+    expect(listed.approvals.map(entry => [entry.requestId, entry.tool, entry.class, entry.mayAllow, entry.sessionScope, entry.sessionClass])).toEqual([
+      ['run-tests', 'Bash', 'local', true, 'once', 'Bash:npm test'],
+      ['push', 'Bash', 'external', true, 'once', null],
+      ['stray', 'Write', 'local', true, 'once', null],
+      ['lint', 'Bash', 'local', true, 'native-session', null]
     ])
     expect(listed.approvals[0]).toMatchObject({ agentSessionId: 'coworker', runtimeId: 'runtime', input: '{"command":"npm test"}', choices: ['allow', 'deny'] })
     expect(listed.approvals[0]!.attention).toBeUndefined()
@@ -93,6 +93,20 @@ describe('a wizard answers its coworkers\' approvals (wizard-answers-approvals)'
     // A plain allow reports once.
     const f2 = fixture()
     await expect(callWizardApprovals(f2.ports, f2.wizard, 'agents.approve', { agentSessionId: 'coworker', requestId: 'run-tests', decision: 'allow', reason: 'tests' })).resolves.toMatchObject({ effectiveScope: 'once' })
+  })
+
+  it('lists the session scope agents.approve then reports: no class for an owner ask rule under review, the gate\'s class otherwise', async () => {
+    // run-tests: under review with the gate's class. push: under review, but the gate forms no class (an owner ask rule, as REQUIRED).
+    const f = fixture({ classes: { 'run-tests': { reviewed: true, key: 'Bash:npm test' }, push: { reviewed: true } } })
+    const listed = await callWizardApprovals(f.ports, f.wizard, 'agents.approvals', {}) as { approvals: Array<Record<string, unknown>> }
+    const byId = Object.fromEntries(listed.approvals.map(entry => [entry.requestId, [entry.sessionScope, entry.sessionClass]]))
+    expect(byId).toEqual({ 'run-tests': ['once+app-rule', 'Bash:npm test'], push: ['once', null], stray: ['once', null], lint: ['native-session', null] })
+    // What was listed is what the answer reports, for each kind.
+    for (const requestId of ['push', 'run-tests', 'lint']) {
+      const answer = await callWizardApprovals(f.ports, f.wizard, 'agents.approve', { agentSessionId: 'coworker', requestId, decision: 'allow', scope: 'session', reason: 'scope check' }) as Record<string, unknown>
+      expect([answer.effectiveScope, answer.effectiveScope === 'native-session' ? null : answer.sessionRule]).toEqual(byId[requestId])
+    }
+    expect(sessionRules.list({ workerId: 'coworker', runtimeId: 'runtime' }).map(rule => rule.key)).toEqual(['Bash:npm test'])
   })
 
   it('lets a wizard or the owner allow every class, as permissions.decide does, and still deny', async () => {

@@ -19,8 +19,8 @@ import { ownerOnlyEscalation } from './providers/codex'
  * answered, so no provider or managed restriction is lifted here.
  */
 export const WIZARD_APPROVAL_SIGNATURES: Record<string, string> = {
-  'agents.approvals': '({agentSessionId?}) — wizard tab or owner credential only: the approvals your coworkers are waiting on (or one coworker\'s), each with requestId, the exact tool and arguments, its class (local/shared/destructive/external), attention (why a non-local action deserves a careful look, if it does), whether its runtime offers an allow (mayAllow), its choices and the stronger review\'s phase and rationale if one ran',
-  'agents.approve': '({agentSessionId, requestId, decision:"allow"|"deny", scope?:"once"|"session", reason}) — wizard tab or owner credential only, the same authority as permissions.decide: the owner answers any conversation of this project, a wizard the coworkers it controls (and theirs), never its own request; any class, local, shared, destructive or external (production included), so review the exact action first. Answers one pending native approval with a choice its runtime offers. scope "session" uses the runtime\'s own for-this-session choice when it offers one; otherwise Conductor answers once and adds an app-side rule for the same class of action (the program and subcommand, workspace edits, one tool) that lasts while this runtime of the conversation runs (a restart, reconnect or handoff ends it). The response says which (effectiveScope). Recorded in the approval journal with your reason'
+  'agents.approvals': '({agentSessionId?}) — wizard tab or owner credential only: the approvals your coworkers are waiting on (or one coworker\'s), each with requestId, the exact tool and arguments, its class (local/shared/destructive/external), attention (why a non-local action deserves a careful look, if it does), whether its runtime offers an allow (mayAllow), its choices, what allowing it "for the session" would really cover (sessionScope: "native-session", "once+app-rule" or "once", exactly as agents.approve then reports effectiveScope) with the app-side rule it would record (sessionClass, else null), and the stronger review\'s phase and rationale if one ran',
+  'agents.approve': '({agentSessionId, requestId, decision:"allow"|"deny", scope?:"once"|"session", reason}) — wizard tab or owner credential only, the same authority as permissions.decide: the owner answers any conversation of this project, a wizard the coworkers it controls (and theirs), never its own request; any class, local, shared, destructive or external (production included), so review the exact action first. Answers one pending native approval with a choice its runtime offers. scope "session" uses the runtime\'s own for-this-session choice when it offers one (effectiveScope "native-session", lasting as the runtime states); otherwise Conductor answers once, and only when the request is under stronger review and its action forms a class the review gate covers (the program and subcommand, workspace edits, one tool; never an owner ask rule or owner-only boundary) does an in-memory rule answer later requests of that class while this runtime runs ("once+app-rule"; a restart, reconnect or handoff ends it); else only this request is allowed ("once"). agents.approvals shows which beforehand (sessionScope). Recorded in the approval journal with your reason'
 }
 export const WIZARD_APPROVAL_METHODS = Object.keys(WIZARD_APPROVAL_SIGNATURES)
 
@@ -79,6 +79,19 @@ function pendingOf(state: SessionProjection): Array<{ item: TimelineItem; intera
     ? [{ item, interaction: item.data.interaction }] : [])
 }
 
+/** What an allow "for the session" of this request would cover, before it is given: the runtime's
+ *  own session choice, or the app-side rule agents.approve would record and whether the review gate
+ *  would ever consult it. agents.approvals lists it; agents.approve acts on it. Read it before
+ *  answering: the review binding ends with the answer. */
+function sessionPlan(ports: WizardApprovalPorts, target: AnswerableConversation, runtimeId: string, interaction: PendingInteraction, tool: string, paths: string[]): { native: boolean; reviewed?: boolean; rule?: string; scope: 'native-session' | 'once+app-rule' | 'once' } {
+  if (pick(interaction, ALLOW_SESSION)) return { native: true, scope: 'native-session' }
+  const review = ports.reviewClass?.(target.agentSessionId, runtimeId, interaction.id) ?? { reviewed: false }
+  // Under review the rule is the gate's own class for this action (none for an owner ask rule or an
+  // owner-only boundary); otherwise it is kept for this runtime but not consulted.
+  const rule = review.reviewed ? review.key : commandClass({ tool, arguments: interaction.input, paths, boundary: 'workspace-write', cwd: target.cwd })
+  return { native: false, reviewed: review.reviewed, ...(rule ? { rule } : {}), scope: review.reviewed && rule ? 'once+app-rule' : 'once' }
+}
+
 /** What an allow actually covers, said truthfully: the runtime's own session choice (with the
  *  lifetime the runtime's adapter states), an app-side class rule, or only this one request. */
 function effectiveScope(asked: string, nativeSession: boolean, interaction: PendingInteraction, rule: string | undefined, reviewed: boolean, applies: boolean): Record<string, Json> {
@@ -113,13 +126,14 @@ export async function callWizardApprovals(ports: WizardApprovalPorts, scope: Wiz
       if (!state) return []
       return pendingOf(state).map(({ item, interaction }) => {
         const tool = toolOf(state, item, interaction), verdict = classify(tool, interaction.input, target.cwd)
+        const plan = sessionPlan(ports, target, state.runtimeId, interaction, tool, verdict.paths)
         const input = canonicalAction(interaction.input)
         let journaled: ReturnType<ApprovalReviews['forRequest']>
         try { journaled = journal.forRequest(target.projectId, target.agentSessionId, state.runtimeId, interaction.id) } catch { journaled = undefined }
         return {
           agentSessionId: target.agentSessionId, title: target.title ?? null, requestId: interaction.id, runtimeId: state.runtimeId, requestedAt: item.timestamp,
           tool, input: input.length > 4000 ? input.slice(0, 4000) + '…' : input, class: verdict.class, mayAllow: Boolean(pick(interaction, ALLOW_ONCE) ?? pick(interaction, ALLOW_SESSION)), ...(verdict.attention ? { attention: verdict.attention } : {}),
-          sessionClass: commandClass({ tool, arguments: interaction.input, paths: verdict.paths, boundary: 'workspace-write', cwd: target.cwd }) ?? null,
+          sessionScope: plan.scope, sessionClass: plan.rule ?? null,
           choices: interaction.choices.filter(choice => !choice.disabled).map(choice => choice.id),
           review: interaction.review ? { phase: interaction.review.phase, rationale: interaction.review.rationale, reviewerModel: interaction.review.reviewerModel ?? null } : journaled ? { phase: journaled.phase, rationale: journaled.rationale, reviewerModel: journaled.reviewerModel ?? null } : null
         }
@@ -144,7 +158,7 @@ export async function callWizardApprovals(ports: WizardApprovalPorts, scope: Wiz
     if (!choice) throw new Error(`The coworker's runtime does not offer a ${decision} answer for this request`)
     const response: InteractionResponse = { sessionId: target.agentSessionId, runtimeId: state.runtimeId, requestId, decision: choice }
     // Read before answering: the review binding ends with the answer.
-    const review = ports.reviewClass?.(target.agentSessionId, state.runtimeId, requestId) ?? { reviewed: false }
+    const plan = sessionPlan(ports, target, state.runtimeId, pending.interaction, tool, verdict.paths)
     const journaledByReview = attributeAnswer(response, `${by} (${decision} ${grant}: ${reason.slice(0, 300)})`)
     let bound: boolean
     try { await ports.respond(response) } finally { bound = journaledByReview() }
@@ -158,14 +172,12 @@ export async function callWizardApprovals(ports: WizardApprovalPorts, scope: Wiz
     let rule: string | undefined
     const nativeSession = ALLOW_SESSION.includes(choice)
     if (decision === 'allow' && grant === 'session' && !nativeSession) {
-      // Under review the rule is the gate's own class for this action (none for an owner ask rule or
-      // an owner-only boundary); otherwise it is kept for this runtime but not consulted.
-      rule = review.reviewed ? review.key : commandClass({ tool, arguments: pending.interaction.input, paths: verdict.paths, boundary: 'workspace-write', cwd: target.cwd })
+      rule = plan.rule
       if (rule) sessionRules.add({ workerId: target.agentSessionId, runtimeId: state.runtimeId }, { key: rule, source: 'wizard', recordId: record?.id, by, at: new Date().toISOString(), example: tool })
     }
     return {
       agentSessionId: target.agentSessionId, requestId, decision, scope: grant, answered: choice, journal: record ? { id: record.id, phase: record.phase } : null,
-      ...(decision === 'allow' ? effectiveScope(grant, nativeSession, pending.interaction, rule, review.reviewed, review.reviewed && rule !== undefined) : {})
+      ...(decision === 'allow' ? effectiveScope(grant, nativeSession, pending.interaction, rule, plan.reviewed === true, plan.scope === 'once+app-rule') : {})
     }
   }
   throw new Error(`Unknown approvals method: ${method}`)

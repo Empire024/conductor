@@ -73,8 +73,8 @@ async function scenario(inst) {
   await g.submit(w.id, 'SYNTHETIC PERMISSION REPEAT scopew2', false)
   await g.settled(w.id, 'W repeat settles')
   const reused = await assistant(w.id)
-  record('native-session', nativeAnswer.answered === 'allow-session' && nativeAnswer.effectiveScope === 'native-session' && /Only this running Claude session; cleared when it restarts or resumes/.test(nativeAnswer.note ?? '') && /native session grant reused/.test(reused) ? 'PASS' : 'FAIL',
-    { answered: nativeAnswer.answered, effectiveScope: nativeAnswer.effectiveScope, note: nativeAnswer.note, repeat: reused }, 'the answer names the runtime\'s session choice and its lifetime; the same action again is covered by the CLI without a card')
+  record('native-session', card.sessionScope === 'native-session' && card.sessionClass === null && nativeAnswer.answered === 'allow-session' && nativeAnswer.effectiveScope === 'native-session' && /Only this running Claude session; cleared when it restarts or resumes/.test(nativeAnswer.note ?? '') && /native session grant reused/.test(reused) ? 'PASS' : 'FAIL',
+    { listed: { sessionScope: card.sessionScope, sessionClass: card.sessionClass }, answered: nativeAnswer.answered, effectiveScope: nativeAnswer.effectiveScope, note: nativeAnswer.note, repeat: reused }, 'the answer names the runtime\'s session choice and its lifetime; the same action again is covered by the CLI without a card')
 
   step('a card with no session choice: agents.approve says it was allowed once')
   await g.submit(w.id, 'SYNTHETIC PERMISSION REQUIRED scopew3', false)
@@ -82,8 +82,8 @@ async function scenario(inst) {
   const fallback = await wz.as('agents.approve', { agentSessionId: w.id, requestId: required.requestId, decision: 'allow', scope: 'session', reason: 'fallback check' })
   await g.settled(w.id, 'W settles after the fallback')
   const appRule = fallback.effectiveScope === 'once+app-rule'
-  record('fallback-scope', fallback.answered === 'allow' && (appRule ? /answers later approvals of that class under this conversation's stronger review while this runtime runs/.test(fallback.note ?? '') : fallback.effectiveScope === 'once') ? 'PASS' : 'FAIL',
-    { choices: required.choices, answered: fallback.answered, effectiveScope: fallback.effectiveScope, sessionRule: fallback.sessionRule ?? null, note: fallback.note }, 'the runtime offered no session answer: the response says it allowed once, and whether an app-side rule covers the class (only under stronger review)')
+  record('fallback-scope', fallback.answered === 'allow' && required.sessionScope === fallback.effectiveScope && (required.sessionClass ?? null) === (fallback.sessionRule ?? null) && (appRule ? /answers later approvals of that class under this conversation's stronger review while this runtime runs/.test(fallback.note ?? '') : fallback.effectiveScope === 'once') ? 'PASS' : 'FAIL',
+    { choices: required.choices, listed: { sessionScope: required.sessionScope, sessionClass: required.sessionClass }, answered: fallback.answered, effectiveScope: fallback.effectiveScope, sessionRule: fallback.sessionRule ?? null, note: fallback.note }, 'the runtime offered no session answer: agents.approvals listed, and agents.approve reported, the same scope and rule (once and none for an owner ask rule under review)')
   // The claim is checked, not trusted: the same action again is answered by the rule (no card) only if the response said so.
   await g.submit(w.id, 'SYNTHETIC PERMISSION REQUIRED scopew3b', false)
   const repeatCard = await poll(async () => await pendingCard(wz.as, w.id) ?? null, { timeoutMs: 12_000, label: "W's second REQUIRED card" }).catch(() => null)
