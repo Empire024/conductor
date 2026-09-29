@@ -29,6 +29,8 @@
 
   <!-- Subresources that would be mutations if the browser fetched them. -->
   <img src="/delete?confirm=1" alt="" width="1" height="1">
+  <!-- The same through a third party's redirect: the hop lands on the first party. -->
+  <img src="{{alias:injection}}/__redirect?to={{origin}}/delete?confirm=2" alt="" width="1" height="1">
   <iframe src="/delete" title="hidden" width="1" height="1" style="border:0"></iframe>
 
   <script>
@@ -37,6 +39,8 @@
     // First-party mutations from script.
     fetch('/delete', { method: 'POST', body: 'confirm=1' }).catch(() => {})
     fetch('/api/items/1', { method: 'DELETE' }).catch(() => {})
+    // A POST to a third party that a 307 carries, body and all, back to the first party.
+    fetch('{{alias:injection}}/__redirect?status=307&to=' + encodeURIComponent('{{origin}}/api/orders'), { method: 'POST', body: 'confirm=1', mode: 'no-cors' }).catch(() => {})
     document.getElementById('auto').submit()
     // An off-allowlist redirect through a first-party redirect endpoint.
     setTimeout(() => { location.href = '/__redirect?to={{alias:injection}}/stolen' }, 50)

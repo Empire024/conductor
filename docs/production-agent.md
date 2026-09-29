@@ -83,8 +83,8 @@ ships the capability. Designation is a per-project owner setting and is never in
 - **ProductionProfile** (versioned; every mutation writes a new row `(project_id, version)`):
   designation (owner-set, separate from the gate), facts (`ProfileFact<T>` with
   `evidenced|assumed|unknown` and source), environments (each with `allowedOrigins`, accounts as
-  credential *references*, captured mail, commerce sandbox, storage config, build-info and smoke
-  commands), sandbox write authorizations, scope (route matrix with `full|sampled|excluded`,
+  credential *references* plus an optional owner-recorded login state referenced by path,
+  captured mail, commerce sandbox, storage config, build-info and smoke commands), sandbox write authorizations, scope (route matrix with `full|sampled|excluded`,
   journeys, devices, locales, region selection, auth and consent states, disabled controls with
   reasons), stack discovery, budget, drift settings, owner questions.
 - **ControlRegistry** (code, `registry.ts`, `version` bumped on any change): sixteen
@@ -130,6 +130,20 @@ the same project; `production.evidence` reads are bounded to 1 MiB and pass thro
    they are the evidence for C03/C05/C06; they are never navigated to. Private and loopback
    addresses are refused unless the environment kind is `local` (fixture servers). `file:`,
    `data:`, `javascript:` and `about:` navigations are refused (reuse `browserUrl` rules).
+   Playwright routes only the first URL of a redirect chain, so the handler follows redirects
+   itself, one hop at a time, and asks the gate about every hop before making it
+   (`walkRedirects` in `netpolicy.ts`). A top-level hop is served as a stub page that replaces
+   itself with the target, so it comes back through the handler. A subresource is fetched by the
+   handler and its final response handed to the page. Every hop meets the rules a first request
+   meets: a 307/308 keeps the method and body, so a POST to a third party that redirects to the
+   first party is a first-party POST, and a hop to a private address or a state-changing URL is
+   refused before anything is sent to it. Hops count against the budget and the rate.
+   Two limits follow from fetching subresources in the handler. First, media and event streams
+   (`media`, `eventsource` resource types) cannot be buffered, so they go to the network as the
+   browser makes them: their first URL is gated, but their redirect hops are only observed. Second,
+   the handler's requests carry the context's cookie jar without the browser's SameSite and
+   third-party filtering, so a cross-site subresource can receive a cookie the browser would have
+   withheld. Neither can make a first-party mutation: a stream is a GET, and a cookie grants no method.
 2. **Read-only production.** `NetworkPolicy.readOnly` is true for `production` environments and for
    any environment without a live `SandboxWriteAuthorization`. Under it the route handler aborts
    every non-GET/HEAD request to a first-party origin (recorded as `blocked-by-policy`), and
@@ -143,7 +157,10 @@ the same project; `production.evidence` reads are bounded to 1 MiB and pass thro
    act)` is the only way a check mutates: it checks the authorization, journals the operation as
    `intended`, runs `act`, settles `done|failed`. A restart with an `intended` operation blocks the
    run for the owner (no replay). Test accounts and sandbox endpoints do not imply permission for
-   any other mutation; each kind is named.
+   any other mutation; each kind is named. There is no `login` mutation kind: on a sandbox or
+   local environment a login step may submit the login form only under an authorization of the
+   existing kinds (for example `form-submit`), and on production the audit never logs in by
+   POST (see 6).
 4. **Budget and rate.** The route handler counts requests against `maxRequests` and throttles per
    origin at `requestsPerSecondPerOrigin`; the runner stops the run with `ledger.exhausted` set
    and the affected controls UNVERIFIED (a budget stop is never PASS).
@@ -168,6 +185,15 @@ the same project; `production.evidence` reads are bounded to 1 MiB and pass thro
    artefact to `MAX_EVIDENCE_TEXT_BYTES`. Screenshots are taken only after password/card fields are
    masked via CSS injection. Nothing leaves the machine except the interpretation excerpts to the
    routed model.
+   **Authenticated audits** use a login state the owner recorded by hand in a visible or sandbox
+   session: a Playwright `storageState` JSON file referenced by absolute path in
+   `TestAccountRef.storageState`. It is the only way into the authenticated state on production.
+   The file is a secret. The browser reads it when it opens the page and keeps only cookies and
+   storage for the environment's allowed origins. It never copies the file into run artifacts, and
+   it registers the kept cookie and storage values with the evidence sink (`addSecrets`), which masks
+   them, raw or URL-encoded, from evidence, descriptions and request excerpts. An authenticated open
+   refuses (`AuthUnavailable`) with a reason that names the fix: on production without a recorded
+   state, and elsewhere without either a recorded state or a login step.
 7. **Self-dealing.** Waivers, designation, write authorizations and drift settings are
    `PRODUCTION_SOVEREIGN_METHODS`. A run has no agent identity and cannot call control methods; a
    finding's status moves to `fixed` only through a `verify` run. `production.tasks.create` never
@@ -335,9 +361,11 @@ profile version bump on every mutation; queries on 10k synthetic findings stay u
 `netpolicy.ts`, `evidence.ts`, `synthetic.ts`, `discovery.ts`, `fixtures/server.ts`,
 `fixtures/sites/injection/*`, `fixtures/sites/baseline/*` and tests; adds `playwright-core` and
 `axe-core` to `dependencies` in `package.json` (the only package.json edit in the plan). Outputs:
-`createAuditBrowser(policy, {userDataDir, engine?}) → AuditBrowser` implementing every
+`createAuditBrowser(policy, {userDataDir, engine?, evidence?, login?}) → AuditBrowser` implementing every
 `AuditPage` method (fresh context per `open`, device presets, locale, consent state reached through
-common CMP selectors plus a `consent` fallback that records `applied:false`, `keyboard` returning
+common CMP selectors plus a `consent` fallback that records `applied:false` and is read back with
+`consentOutcome()`, `AuditBrowser.budget()` for the ledger's request count and exhaustion, the
+authenticated state from a recorded login state (section 4.6), `keyboard` returning
 focus traces, `axe` injecting axe-core, `submit`/mutating `click` refusing under `readOnly`),
 `resolveEngine()` for `BrowserAvailability`, `createEvidenceSink(dir, markers)` with redaction,
 `createFixtureServer({sites, record: true})` (static files, `Set-Cookie` and delayed-script
@@ -349,7 +377,10 @@ detection from `wp-content`, `style.css` headers, plugin folders, `functions.php
 with an empty mutation log; off-allowlist redirect stops with `off-allowlist`; first-party POST on
 production is `blocked-by-policy` while a third-party beacon is observed; rate limit and
 `maxRequests` enforced; private address refused for a `production` environment and allowed for
-`local`; screenshot masks a password field; evidence sink redacts a bearer token and a marker;
+`local`; a subresource redirect hop is gated like a first request (a 307 POST from a third party to
+the first party is refused under read-only); a recorded login state reaches the authenticated state
+on production with its values kept out of evidence, and an authenticated open without one is refused;
+screenshot masks a password field; evidence sink redacts a bearer token and a marker;
 `resolveEngine` finds the bundled Chromium on this machine. No test opens a visible window.
 
 **M3 Production panel and queue (renderer).** Owns `src/preload/production.ts`,

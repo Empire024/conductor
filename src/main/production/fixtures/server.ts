@@ -196,7 +196,7 @@ export async function createFixtureServer(options: FixtureServerOptions): Promis
 
 function isMutation(item: FixtureRequestRecord, site: SiteDirectives): boolean {
   const path = item.path.split('?')[0]!
-  if (path === '/__collect' || path === '/__mutations') return false
+  if (path === '/__collect' || path === '/__mutations' || path === '/__redirect') return false
   return MUTATING.has(item.method) || (site.mutationPaths?.includes(path) ?? false)
 }
 

@@ -1,13 +1,13 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { chromium } from 'playwright-core'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import {
   DEFAULT_AUDIT_BUDGET, MAX_INTERPRETATION_USER_CHARS, type InterpretationRequest, type Interpreter, type NetworkPolicy, type OpenPageOptions,
-  type ProductionEnvironment,
+  type AuditPage, type MutationKind, type ProductionEnvironment, type TestAccountRef,
 } from '../../shared/production'
-import { AuditPageImpl, createAuditBrowser, resolveEngine, type ProductionAuditBrowser } from './browser'
+import { AuthUnavailable, createAuditBrowser, resolveEngine, type ProductionAuditBrowser } from './browser'
 import { discoverStack } from './discovery'
 import { createEvidenceSink } from './evidence'
 import { createFixtureServer, type FixtureServer } from './fixtures/server'
@@ -96,7 +96,7 @@ describe.skipIf(!engine.available)('audit browser', { timeout: BROWSER_TIMEOUT }
     expect(server.mutations('injection')).toEqual([])
     expect(server.requests('injection').filter(item => item.path === '/stolen')).toEqual([])
     // The consent state asked for could not be reached through a link that navigates away.
-    expect((page as AuditPageImpl).consentOutcome()).toEqual({ state: 'accepted', applied: false, mechanism: null })
+    expect(page.consentOutcome()).toEqual({ state: 'accepted', applied: false, mechanism: null })
 
     const requests = page.requests()
     const blocked = (method: string, path: string) => requests.find(request => request.method === method && new URL(request.url).pathname + new URL(request.url).search === path && request.blocked)
@@ -109,6 +109,11 @@ describe.skipIf(!engine.available)('audit browser', { timeout: BROWSER_TIMEOUT }
     const kinds = (path: string) => requests.filter(request => new URL(request.url).pathname + new URL(request.url).search === path && request.blocked).map(request => `${request.method} ${request.resourceType}`)
     expect(kinds('/delete')).toEqual(expect.arrayContaining(['POST document', 'GET document', 'POST fetch']))
     expect(kinds('/delete?confirm=1')).toEqual(expect.arrayContaining(['GET image']))
+    // Hops through a third party's redirect meet the same rules: a 307 POST landing on the first
+    // party is a first-party POST, and a pixel redirected to /delete is a state-changing GET.
+    expect(requests.find(request => request.url === site.url('/api/orders'))).toMatchObject({ method: 'POST', blocked: expect.stringMatching(/redirect from .*read-only: POST/) })
+    expect(requests.find(request => request.url === site.url('/delete?confirm=2'))).toMatchObject({ method: 'GET', blocked: expect.stringMatching(/state-changing/) })
+    expect(server.requests('injection').filter(item => item.path === '/api/orders' || item.path === '/delete?confirm=2')).toEqual([])
     // The third-party beacon is observed, not blocked: it is evidence.
     const beacon = requests.find(request => request.url === `${site.aliasOrigin}/__collect`)
     expect(beacon).toMatchObject({ method: 'POST', party: 'third-party', blocked: null })
@@ -318,7 +323,7 @@ describe.skipIf(!engine.available)('audit browser', { timeout: BROWSER_TIMEOUT }
     const browser = newBrowser(localPolicy(site.origin), 'consent')
     const accepted = await browser.open(desktop({ consent: 'accepted' }))
     await accepted.goto(site.url('/'))
-    expect((accepted as AuditPageImpl).consentOutcome()).toEqual({ state: 'accepted', applied: true, mechanism: 'selector:[data-consent-action="accept"]' })
+    expect(accepted.consentOutcome()).toEqual({ state: 'accepted', applied: true, mechanism: 'selector:[data-consent-action="accept"]' })
     await accepted.waitFor(150)
     expect(server.collected('baseline')).toHaveLength(1)
     const cookies = await accepted.cookies()
@@ -331,10 +336,10 @@ describe.skipIf(!engine.available)('audit browser', { timeout: BROWSER_TIMEOUT }
     expect((await rejected.cookies()).find(cookie => cookie.name === 'consent')).toBeTruthy()
     const selected = await browser.open(desktop({ consent: 'selected' }))
     await selected.goto(site.url('/'))
-    expect((selected as AuditPageImpl).consentOutcome()).toMatchObject({ applied: true, mechanism: expect.stringContaining('save') })
+    expect(selected.consentOutcome()).toMatchObject({ applied: true, mechanism: expect.stringContaining('save') })
     const withdrawn = await browser.open(desktop({ consent: 'withdrawn' }))
     await withdrawn.goto(site.url('/'))
-    expect((withdrawn as AuditPageImpl).consentOutcome()).toMatchObject({ state: 'withdrawn', applied: true, mechanism: expect.stringContaining('open') })
+    expect(withdrawn.consentOutcome()).toMatchObject({ state: 'withdrawn', applied: true, mechanism: expect.stringContaining('open') })
     await withdrawn.waitFor(150)
     // Accept (one beacon) then withdraw: the stored choice is necessary-only.
     expect(await withdrawn.evaluate<string>('localStorage.getItem("consent")')).toBe('necessary')
@@ -381,6 +386,126 @@ describe.skipIf(!engine.available)('audit browser', { timeout: BROWSER_TIMEOUT }
     expect(await mobile.evaluate<number>('innerWidth')).toBe(412)
     expect(await mobile.evaluate<boolean>('navigator.userAgent.includes("Mobile")')).toBe(true)
     await Promise.all([page.close(), mobile.close()])
+  })
+
+  it('gates subresource redirect hops like first requests and follows the allowed ones', async () => {
+    const site = server.site('baseline')
+    server.reset()
+    const page = await newBrowser(localPolicy(site.origin), 'hops').open(desktop())
+    await page.goto(site.url('/'))
+    const loaded = await page.evaluate<number>(`new Promise(resolve => {
+      const image = new Image()
+      image.onload = () => resolve(image.naturalWidth)
+      image.onerror = () => resolve(-1)
+      image.src = '/__redirect?to=' + encodeURIComponent('/__redirect?to=/img/product.svg')
+    })`)
+    expect(loaded).toBe(40)
+    const hops = page.requests().filter(request => request.url === site.url('/img/product.svg') || request.url.includes('__redirect'))
+    expect(hops.map(request => [request.url.replace(site.origin, ''), request.status, request.blocked])).toEqual(expect.arrayContaining([
+      ['/__redirect?to=' + encodeURIComponent('/__redirect?to=/img/product.svg'), 302, null],
+      ['/__redirect?to=/img/product.svg', 302, null],
+      ['/img/product.svg', 200, null],
+    ]))
+    const posted = await page.evaluate<string>(`fetch(${JSON.stringify(`${site.aliasOrigin}/__redirect?status=307&to=${encodeURIComponent(site.url('/contact/send'))}`)}, { method: 'POST', body: 'x=1', mode: 'no-cors' }).then(() => 'ok', () => 'failed')`)
+    expect(posted).toBe('failed')
+    expect(page.requests().find(request => request.url === site.url('/contact/send'))).toMatchObject({ method: 'POST', party: 'first-party', blocked: expect.stringMatching(/read-only: POST/) })
+    expect(server.mutations('baseline')).toEqual([])
+    await page.close()
+  })
+
+  const account = (patch: Partial<TestAccountRef> = {}): TestAccountRef => ({
+    id: 'customer', label: 'Customer', role: 'customer',
+    usernameRef: { id: 'u', source: 'env', key: 'AUDIT_USER', purpose: 'login' }, passwordRef: { id: 'p', source: 'env', key: 'AUDIT_PASS', purpose: 'login' },
+    ...patch,
+  })
+
+  it('reaches the authenticated state on production from an owner-recorded login state, and keeps its values out of evidence', async () => {
+    const site = server.site('baseline')
+    server.reset()
+    const session = 'wpsess_9f3c2a7e1b5d4c6a8e0f'
+    const token = 'acct-token-7d1e5b3c9a2f'
+    const statePath = join(scratch, 'owner-secrets', 'customer-state.json')
+    mkdirSync(join(scratch, 'owner-secrets'), { recursive: true })
+    writeFileSync(statePath, JSON.stringify({
+      cookies: [
+        { name: 'wordpress_logged_in_abc', value: session, domain: '127.0.0.1', path: '/', expires: -1, httpOnly: true, secure: false, sameSite: 'Lax' },
+        { name: 'wp_account', value: 'Audit%20Customer', domain: '127.0.0.1', path: '/', expires: -1, httpOnly: false, secure: false, sameSite: 'Lax' },
+        { name: 'tracker_id', value: 'evil-cookie-value-123', domain: 'evil.example', path: '/', expires: -1, httpOnly: false, secure: false, sameSite: 'Lax' },
+      ],
+      origins: [
+        { origin: site.origin, localStorage: [{ name: 'account_token', value: token }] },
+        { origin: 'https://evil.example', localStorage: [{ name: 'x', value: 'evil-storage-value' }] },
+      ],
+    }))
+    const artifacts = join(scratch, 'login-state', 'artifacts')
+    const sink = createEvidenceSink(artifacts, [])
+    const login = vi.fn()
+    const browser = createAuditBrowser(productionPolicy(site.origin), { userDataDir: join(scratch, 'login-state'), evidence: sink, login })
+    browsers.push(browser)
+    const page = await browser.open(desktop({ auth: account({ storageState: { path: statePath, capturedAt: '2026-09-29T08:00:00.000Z', capturedBy: 'owner' } }) }))
+    expect(login).not.toHaveBeenCalled()
+    expect((await page.goto(site.url(`/my-account/?t=${token}`))).outcome).toBe('ok')
+    expect((await page.snapshot()).text).toContain('Logged in as Audit Customer')
+    expect((await page.cookies()).map(cookie => cookie.name).sort()).toEqual(['wordpress_logged_in_abc', 'wp_account'])
+    expect(server.requests('baseline').find(item => item.path.startsWith('/my-account/'))?.headers.cookie).toContain(`wordpress_logged_in_abc=${session}`)
+    expect(server.mutations('baseline')).toEqual([])
+    expect(page.requests().find(request => request.url.includes('/my-account/'))?.excerpt).toBe('?t=[REDACTED]')
+
+    await sink.writeJson('requests', `session ${session}`, { requests: page.requests(), leaked: { session, token } })
+    await sink.writeText('log', 'log', `cookie=${session}; token=${encodeURIComponent(token)}`)
+    await page.screenshot('account page')
+    const files = (dir: string): string[] => readdirSync(dir).flatMap(name => statSync(join(dir, name)).isDirectory() ? files(join(dir, name)) : [join(dir, name)])
+    const state = readFileSync(statePath, 'utf8')
+    for (const file of files(artifacts)) {
+      const content = readFileSync(file, 'latin1')
+      expect(content, file).not.toContain(session)
+      expect(content, file).not.toContain(token)
+      expect(content, file).not.toBe(state)
+    }
+    await page.close()
+  })
+
+  it('refuses an authenticated open without a usable recorded login state, and never runs a login step on production', async () => {
+    const site = server.site('baseline')
+    const login = vi.fn()
+    const production = createAuditBrowser(productionPolicy(site.origin), { userDataDir: join(scratch, 'no-state'), login })
+    browsers.push(production)
+    await expect(production.open(desktop({ auth: account() }))).rejects.toThrow(/on production needs a login state the owner recorded by hand/)
+    expect(login).not.toHaveBeenCalled()
+    await expect(production.open(desktop({ auth: account({ storageState: { path: 'relative/state.json', capturedAt: null, capturedBy: null } }) }))).rejects.toBeInstanceOf(AuthUnavailable)
+    const foreign = join(scratch, 'owner-secrets', 'foreign-state.json')
+    mkdirSync(join(scratch, 'owner-secrets'), { recursive: true })
+    writeFileSync(foreign, JSON.stringify({ cookies: [{ name: 'a', value: 'b', domain: 'evil.example', path: '/', expires: -1, httpOnly: false, secure: false, sameSite: 'Lax' }], origins: [] }))
+    await expect(production.open(desktop({ auth: account({ storageState: { path: foreign, capturedAt: null, capturedBy: null } }) }))).rejects.toThrow(/holds no cookies or storage/)
+    await expect(production.open(desktop({ auth: account({ storageState: { path: join(scratch, 'missing.json'), capturedAt: null, capturedBy: null } }) }))).rejects.toThrow(/could not be read/)
+    const local = createAuditBrowser(localPolicy(site.origin), { userDataDir: join(scratch, 'no-login') })
+    browsers.push(local)
+    await expect(local.open(desktop({ auth: account() }))).rejects.toThrow(/recorded login state \(storageState\), or a login step/)
+  })
+
+  it('logs in on a sandbox only through a submit that an authorization of an existing kind covers', async () => {
+    const site = server.site('baseline')
+    const sandbox = (mutations: MutationKind[]) => localPolicy(site.origin, {
+      environmentKind: 'sandbox', readOnly: false,
+      writeAuthorization: { id: 'a1', environmentId: 'env', mutations, grantedBy: { kind: 'owner', agentSessionId: null }, grantedAt: '2026-09-01T00:00:00.000Z', expiresAt: '2099-01-01T00:00:00.000Z', note: '' },
+    })
+    const synthetic = createSyntheticFactory()
+    const login = async (page: AuditPage) => {
+      await page.goto(site.url('/login/'))
+      await page.fill('#username', synthetic.next('email'))
+      await page.fill('#password', synthetic.next('password'))
+      await page.submit('#login', 'form-submit')
+    }
+    server.reset()
+    const refused = createAuditBrowser(sandbox(['checkout']), { userDataDir: join(scratch, 'sandbox-login-refused'), login })
+    browsers.push(refused)
+    await expect(refused.open(desktop({ auth: account() }))).rejects.toBeInstanceOf(MutationRefused)
+    expect(server.mutations('baseline')).toEqual([])
+    const allowed = createAuditBrowser(sandbox(['form-submit']), { userDataDir: join(scratch, 'sandbox-login'), login })
+    browsers.push(allowed)
+    const page = await allowed.open(desktop({ auth: account() }))
+    expect(server.mutations('baseline').map(item => `${item.method} ${item.path}`)).toEqual(['POST /login/submit'])
+    await page.close()
   })
 
   it('never launches a visible browser', () => {

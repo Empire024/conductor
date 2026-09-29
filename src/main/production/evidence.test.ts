@@ -50,6 +50,19 @@ describe('evidence redaction', () => {
     expect(redactHeaders({ 'Set-Cookie': 'x', Host: 'h' })).toEqual({ 'Set-Cookie': '[REDACTED]', Host: 'h' })
   })
 
+  it('masks registered secret values (a login state) in text, JSON and descriptions, raw or URL-encoded', async () => {
+    const dir = tempDir()
+    const sink = createEvidenceSink(dir, [])
+    const session = 'sess/ion+value==42abcdef'
+    sink.addSecrets([session, 'short'])
+    const text = await sink.writeText('log', `cookie ${session}`, `session=${session} url=?t=${encodeURIComponent(session)} short stays`)
+    const json = await sink.writeJson('storage', 'storage', { token: session, nested: [session] })
+    const written = readFileSync(join(dir, text.path), 'utf8') + readFileSync(join(dir, json.path), 'utf8') + text.description
+    expect(written).not.toContain(session)
+    expect(written).not.toContain(encodeURIComponent(session))
+    expect(written).toContain('short stays')
+  })
+
   it('bounds text to the byte limit and indexes every ref in evidence.json', async () => {
     const dir = tempDir()
     const sink = createEvidenceSink(dir, [], { maxTextBytes: 1024 })

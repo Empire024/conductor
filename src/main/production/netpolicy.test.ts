@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_AUDIT_BUDGET, type NetworkPolicy, type ProductionEnvironment, type SandboxWriteAuthorization } from '../../shared/production'
-import { MutationRefused, NetworkGate, assertMutationAllowed, isPrivateHost, isStateChangingUrl, liveAuthorization, originOf, policyForEnvironment } from './netpolicy'
+import { MutationRefused, NetworkGate, assertMutationAllowed, isPrivateHost, isStateChangingUrl, liveAuthorization, originOf, policyForEnvironment, redirectMethod, walkRedirects } from './netpolicy'
 
 const environment = (patch: Partial<ProductionEnvironment> = {}): ProductionEnvironment => ({
   id: 'prod', kind: 'production', label: 'Production', baseUrl: 'https://shop.example/', allowedOrigins: ['https://shop.example', 'https://www.shop.example'],
@@ -143,5 +143,79 @@ describe('NetworkGate', () => {
     expect((gate.decide(sub('https://cdn.example/a.js')) as { delayMs: number }).delayMs).toBe(0)
     clock += 5000
     expect((gate.decide(sub('https://shop.example/b.js')) as { delayMs: number }).delayMs).toBe(0)
+  })
+})
+
+describe('walkRedirects', () => {
+  const response = (status: number, location?: string) => ({ status: () => status, headers: () => (location ? { location } : {}) as Record<string, string> })
+  /** A fake server: a map from URL to the response it gives, recording what was fetched. */
+  const serve = (routes: Record<string, ReturnType<typeof response>>) => {
+    const fetched: string[] = []
+    return { fetched, fetchHop: async (hop: { url: string; method: string }) => { fetched.push(`${hop.method} ${hop.url}`); return routes[hop.url] ?? response(200) } }
+  }
+  const gateFor = (patch: Partial<NetworkPolicy> = {}) => {
+    const gate = new NetworkGate(policy({ requestsPerSecondPerOrigin: 0, ...patch }), { resolve: async host => host === 'intranet.example' ? ['10.0.0.9'] : ['93.184.216.34'] })
+    return async (url: string, method: string) => {
+      const decision = gate.decide({ url, method, resourceType: 'image', mainFrameNavigation: false, initiator: 'page' })
+      if (decision.action === 'allow' && await gate.refusesHost(new URL(url).hostname)) return { action: 'block' as const, party: decision.party, outcome: 'blocked-by-policy' as const, reason: 'private address' }
+      return decision
+    }
+  }
+
+  it('follows allowed hops and returns the final response', async () => {
+    const server = serve({ 'https://cdn.example/a': response(302, '/b'), 'https://cdn.example/b': response(301, 'https://img.example/c') })
+    const walk = await walkRedirects({ url: 'https://cdn.example/a', method: 'GET' }, server.fetchHop, gateFor())
+    expect(walk.blocked).toBeNull()
+    expect(walk.response?.status()).toBe(200)
+    expect(server.fetched).toEqual(['GET https://cdn.example/a', 'GET https://cdn.example/b', 'GET https://img.example/c'])
+    expect(walk.hops.map(hop => [hop.url, hop.status])).toEqual([['https://cdn.example/b', 301], ['https://img.example/c', 200]])
+  })
+
+  it('refuses a hop to a private address, literal or resolved, before fetching it', async () => {
+    for (const target of ['http://127.0.0.1:8080/admin', 'http://192.168.1.1/', 'https://intranet.example/']) {
+      const server = serve({ 'https://cdn.example/a': response(302, target) })
+      const walk = await walkRedirects({ url: 'https://cdn.example/a', method: 'GET' }, server.fetchHop, gateFor())
+      expect(walk.response, target).toBeNull()
+      expect(walk.blocked?.reason, target).toMatch(/private address/)
+      expect(server.fetched, target).toEqual(['GET https://cdn.example/a'])
+    }
+  })
+
+  it('treats a 307 that carries a third-party POST to the first party as a first-party POST under read-only', async () => {
+    const server = serve({ 'https://tracker.example/r': response(307, 'https://shop.example/api/orders') })
+    const walk = await walkRedirects({ url: 'https://tracker.example/r', method: 'POST' }, server.fetchHop, gateFor())
+    expect(walk.blocked).toMatchObject({ url: 'https://shop.example/api/orders', outcome: 'blocked-by-policy', reason: expect.stringMatching(/read-only: POST/) })
+    expect(walk.hops).toEqual([{ url: 'https://shop.example/api/orders', method: 'POST', blocked: expect.any(String), status: null }])
+    expect(server.fetched).toEqual(['POST https://tracker.example/r'])
+  })
+
+  it('turns POST into GET on 301/302/303, refuses a state-changing GET hop, and caps the chain', async () => {
+    expect(redirectMethod(303, 'PUT')).toBe('GET')
+    expect(redirectMethod(303, 'HEAD')).toBe('HEAD')
+    expect(redirectMethod(302, 'POST')).toBe('GET')
+    expect(redirectMethod(308, 'POST')).toBe('POST')
+    const converted = serve({ 'https://tracker.example/r': response(303, 'https://shop.example/thanks') })
+    expect((await walkRedirects({ url: 'https://tracker.example/r', method: 'POST' }, converted.fetchHop, gateFor())).blocked).toBeNull()
+    expect(converted.fetched).toEqual(['POST https://tracker.example/r', 'GET https://shop.example/thanks'])
+
+    const trap = serve({ 'https://img.example/pixel': response(302, 'https://shop.example/delete?confirm=1') })
+    expect((await walkRedirects({ url: 'https://img.example/pixel', method: 'GET' }, trap.fetchHop, gateFor())).blocked?.reason).toMatch(/state-changing/)
+
+    const loop = serve({ 'https://cdn.example/x': response(302, 'https://cdn.example/x') })
+    const walk = await walkRedirects({ url: 'https://cdn.example/x', method: 'GET' }, loop.fetchHop, gateFor(), { maxHops: 3 })
+    expect(walk.blocked?.reason).toMatch(/more than 3 redirects/)
+    expect(loop.fetched).toHaveLength(4)
+  })
+
+  it('spaces hops by the gate rate and counts them against the budget', async () => {
+    const waits: number[] = []
+    let clock = 0
+    const gate = new NetworkGate(policy({ requestsPerSecondPerOrigin: 2, maxRequests: 3 }), { clock: () => clock })
+    const decide = async (url: string, method: string) => gate.decide({ url, method, resourceType: 'image', mainFrameNavigation: false, initiator: 'page' })
+    gate.decide(sub('https://cdn.example/a'))
+    const server = serve({ 'https://cdn.example/a': response(302, '/b'), 'https://cdn.example/b': response(302, '/c'), 'https://cdn.example/c': response(302, '/d') })
+    const walk = await walkRedirects({ url: 'https://cdn.example/a', method: 'GET' }, server.fetchHop, decide, { sleep: async ms => { waits.push(ms) } })
+    expect(waits).toEqual([500, 1000])
+    expect(walk.blocked?.reason).toMatch(/budget of 3/)
   })
 })

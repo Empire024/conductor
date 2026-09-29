@@ -1,13 +1,14 @@
-import { existsSync, mkdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs'
+import { isAbsolute, join } from 'node:path'
 import type { Browser, BrowserContext, BrowserContextOptions, BrowserType, Frame, Page, Request, Route } from 'playwright-core'
 import type {
-  AuditBrowser, AuditPage, AxeResult, BrowserAvailability, ConsentAction, ConsentState, CookieRecord, DeviceClass, DomSnapshot,
+  AuditBrowser, AuditPage, AxeResult, BrowserAvailability, ConsentAction, ConsentOutcome, ConsentState, CookieRecord, DeviceClass, DomSnapshot,
   EvidenceRef, EvidenceSink, MutationKind, NavigationResult, NetworkPolicy, ObservedRequest, OpenPageOptions, StorageRecord,
-  SyntheticValue, TestAccountRef,
+  StoredLoginStateRef, SyntheticValue, TestAccountRef,
 } from '../../shared/production'
+import type { ProductionEvidenceSink } from './evidence'
 import { maskSecrets } from '../structured-store'
-import { MutationRefused, NetworkGate, assertMutationAllowed, originOf, type GateDecision, type NetworkGateOptions } from './netpolicy'
+import { MAX_REDIRECT_HOPS, MutationRefused, NetworkGate, assertMutationAllowed, originOf, walkRedirects, type GateDecision, type NetworkGateOptions } from './netpolicy'
 
 /**
  * The audit browser (docs/production-agent.md sections 1 and 4): Playwright over the bundled
@@ -21,8 +22,13 @@ import { MutationRefused, NetworkGate, assertMutationAllowed, originOf, type Gat
  * followed unseen. An allowed hop is served as a tiny document that replaces itself with the
  * target, which comes back through the handler and is checked like any other navigation. A blocked
  * top-level navigation is answered `204 No Content`, which leaves the page where it was instead of
- * committing an error page. Service workers are blocked so no request can bypass the handler, and
- * popups are closed on sight.
+ * committing an error page. Subresources are fetched by the handler the same way, hop by hop
+ * (`walkRedirects`), and the final response is handed to the page; only media and event streams,
+ * which cannot be buffered, go to the network as the browser makes them. Service workers are blocked
+ * so no request can bypass the handler, and popups are closed on sight.
+ *
+ * The authenticated state comes from a login state the owner recorded by hand (`storageState`),
+ * never from a login POST on production; see `loadLoginState`.
  */
 
 export type EngineName = NonNullable<BrowserAvailability['engine']>
@@ -76,8 +82,14 @@ export interface AuditBrowserOptions {
   engine?: EngineName
   /** Where `screenshot` writes; required for screenshots. */
   evidence?: EvidenceSink
-  /** Reaches the `authenticated` state for a test account; without it an authenticated open is refused. */
+  /**
+   * Logs a test account in on a sandbox or local environment, for an account without a recorded
+   * login state. Its `submit` needs a write authorization of an existing mutation kind; it is never
+   * used on production, where only `TestAccountRef.storageState` reaches the authenticated state.
+   */
   login?: (page: AuditPage, account: TestAccountRef) => Promise<void>
+  /** Receives the cookie and storage values of a loaded login state, for redaction. Default: the evidence sink's `addSecrets`. */
+  registerSecrets?: (values: string[]) => void
   navigationTimeoutMs?: number
   signal?: AbortSignal
   gate?: NetworkGateOptions
@@ -87,8 +99,54 @@ export interface AuditBrowserOptions {
 
 export interface ProductionAuditBrowser extends AuditBrowser {
   readonly gate: NetworkGate
-  /** Requests counted against the budget so far, and whether the budget stopped one. */
-  budget(): { requests: number; exhausted: boolean }
+}
+
+/** An authenticated open that cannot be served: no recorded login state, or one that is unusable. */
+export class AuthUnavailable extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'AuthUnavailable'
+  }
+}
+
+type LoginState = Exclude<NonNullable<BrowserContextOptions['storageState']>, string>
+export const MAX_LOGIN_STATE_BYTES = 1024 * 1024
+
+/**
+ * Reads an owner-recorded Playwright storage state. Only cookies whose domain matches an allowed
+ * origin and storage of allowed origins are kept; their values come back as secrets to redact. The
+ * file is read in place and never copied.
+ */
+export function loadLoginState(ref: StoredLoginStateRef, allowedOrigins: readonly string[], label: string): { state: LoginState; secrets: string[]; dropped: number } {
+  if (!ref.path || !isAbsolute(ref.path)) throw new AuthUnavailable(`The login state for ${label} must be an absolute path to a recorded storage-state file`)
+  let text: string
+  try {
+    const size = statSync(ref.path).size
+    if (size > MAX_LOGIN_STATE_BYTES) throw new AuthUnavailable(`The login state for ${label} is ${size} bytes, over the ${MAX_LOGIN_STATE_BYTES}-byte limit`)
+    text = readFileSync(ref.path, 'utf8')
+  } catch (error) {
+    if (error instanceof AuthUnavailable) throw error
+    throw new AuthUnavailable(`The login state for ${label} could not be read; record it again`)
+  }
+  let parsed: { cookies?: unknown; origins?: unknown }
+  try { parsed = JSON.parse(text) } catch { throw new AuthUnavailable(`The login state for ${label} is not a storage-state JSON file`) }
+  const hosts = allowedOrigins.map(origin => safeHost(origin)).filter((host): host is string => !!host)
+  const cookies = (Array.isArray(parsed.cookies) ? parsed.cookies : []) as LoginState['cookies']
+  const origins = (Array.isArray(parsed.origins) ? parsed.origins : []) as LoginState['origins']
+  const keptCookies = cookies.filter(cookie => {
+    const domain = String(cookie?.domain ?? '').replace(/^\./, '').toLowerCase()
+    return !!domain && typeof cookie.value === 'string' && hosts.some(host => host === domain || host.endsWith(`.${domain}`))
+  })
+  const keptOrigins = origins.filter(entry => allowedOrigins.includes(originOf(String(entry?.origin ?? '')) ?? '')).map(entry => ({
+    origin: entry.origin,
+    localStorage: (Array.isArray(entry.localStorage) ? entry.localStorage : []).filter(item => typeof item?.name === 'string' && typeof item.value === 'string'),
+  }))
+  if (!keptCookies.length && !keptOrigins.some(entry => entry.localStorage.length)) {
+    throw new AuthUnavailable(`The login state for ${label} holds no cookies or storage for ${allowedOrigins.join(', ')}`)
+  }
+  const secrets = [...keptCookies.map(cookie => cookie.value), ...keptOrigins.flatMap(entry => entry.localStorage.map(item => item.value))]
+    .filter(value => value.length >= 8)
+  return { state: { cookies: keptCookies, origins: keptOrigins }, secrets, dropped: cookies.length - keptCookies.length + origins.length - keptOrigins.length }
 }
 
 export const DEVICE_PRESETS: Readonly<Record<DeviceClass, { viewport: { width: number; height: number }; deviceScaleFactor: number; isMobile: boolean; hasTouch: boolean }>> = {
@@ -106,8 +164,11 @@ export const MASK_COLOR = '#000000'
 
 const EXCERPT_CHARS = 4096
 const DEFAULT_NAVIGATION_TIMEOUT = 20_000
-const MAX_REDIRECT_HOPS = 10
 const QUIET_MS = 500
+/** Streams cannot be buffered here; they go to the network as the browser makes them (see fetchThroughHops). */
+const STREAMING_TYPES = new Set(['media', 'eventsource'])
+const READ_ONLY_METHODS = new Set(['GET', 'HEAD'])
+const HOP_DROPPED_HEADERS = /^(host|content-length|cookie|connection|transfer-encoding)$/i
 
 export function createAuditBrowser(policy: NetworkPolicy, options: AuditBrowserOptions): ProductionAuditBrowser {
   const frozen = deepFreeze(structuredClone(policy))
@@ -147,7 +208,21 @@ export function createAuditBrowser(policy: NetworkPolicy, options: AuditBrowserO
     },
     async open(openOptions: OpenPageOptions) {
       if (closed || options.signal?.aborted) throw new Error('The audit browser is closed')
-      if (openOptions.auth && !options.login) throw new Error(`Authenticated state for ${openOptions.auth.label} needs a login step for this environment`)
+      const account = openOptions.auth
+      let loginState: LoginState | undefined
+      let secrets: string[] = []
+      if (account?.storageState) {
+        const loaded = loadLoginState(account.storageState, frozen.allowedOrigins, account.label)
+        loginState = loaded.state
+        secrets = loaded.secrets
+        const sink = options.evidence as Partial<ProductionEvidenceSink> | undefined
+        const register = options.registerSecrets ?? (sink?.addSecrets ? (values: string[]) => sink.addSecrets!(values) : null)
+        register?.(secrets)
+      } else if (account && frozen.environmentKind === 'production') {
+        throw new AuthUnavailable(`An authenticated audit of ${account.label} on production needs a login state the owner recorded by hand (storageState); the audit never logs in by POST`)
+      } else if (account && !options.login) {
+        throw new AuthUnavailable(`An authenticated audit of ${account.label} needs a recorded login state (storageState), or a login step whose submit a write authorization covers`)
+      }
       const browser = await launch()
       const preset = DEVICE_PRESETS[openOptions.device]
       const locale = openOptions.locale ?? undefined
@@ -164,14 +239,15 @@ export function createAuditBrowser(policy: NetworkPolicy, options: AuditBrowserO
         // network access checks would treat it as public and refuse its loopback subresources. The gate
         // already decides private addresses; a `local` environment grants them.
         permissions: frozen.allowPrivateAddresses ? ['local-network-access'] : [],
+        storageState: loginState,
       }
       // A system browser that does not know the permission refuses it; it has no such check to satisfy either.
       const context = await browser.newContext(contextOptions).catch(() => browser.newContext({ ...contextOptions, permissions: [] }))
-      const page = new AuditPageImpl(context, gate, frozen, openOptions, options)
+      const page = new AuditPageImpl(context, gate, frozen, openOptions, options, secrets)
       await page.attach()
       pages.add(page)
       page.onClose(() => pages.delete(page))
-      if (openOptions.auth && options.login) await options.login(page, openOptions.auth)
+      if (account && !account.storageState && options.login) await options.login(page, account)
       return page
     },
     close,
@@ -199,7 +275,7 @@ export class AuditPageImpl implements AuditPage {
   private readonly expected = new Map<string, ObservedRequest['initiator']>()
   private navigation: NavigationState | null = null
   private consentPending: ConsentState | null
-  private consentResult: { state: ConsentState; applied: boolean; mechanism: string | null } | null = null
+  private consentResult: ConsentOutcome | null = null
   private readonly closeListeners: Array<() => void> = []
   private readonly inflight = new Set<Request>()
   private lastActivity = Date.now()
@@ -212,6 +288,7 @@ export class AuditPageImpl implements AuditPage {
     private readonly policy: NetworkPolicy,
     readonly options: OpenPageOptions,
     private readonly browserOptions: AuditBrowserOptions,
+    private readonly secrets: readonly string[] = [],
   ) {
     this.timeout = browserOptions.navigationTimeoutMs ?? DEFAULT_NAVIGATION_TIMEOUT
     this.consentPending = ['rejected', 'accepted', 'selected', 'withdrawn'].includes(options.consent) ? options.consent : null
@@ -227,7 +304,7 @@ export class AuditPageImpl implements AuditPage {
       const httpUrl = url.replace(/^ws/, 'http')
       const decision = this.gate.decide({ url: httpUrl, method: 'GET', resourceType: 'websocket', mainFrameNavigation: false, initiator: 'page' })
       const refused = decision.action === 'block' ? decision.reason : decision.party === 'first-party' && this.policy.readOnly ? 'read-only: first-party websocket refused' : null
-      this.record({ url, method: 'GET', resourceType: 'websocket', party: decision.party, initiator: 'page', blocked: refused, status: null, excerpt: excerptOf(url, null), at: new Date().toISOString() })
+      this.record({ url, method: 'GET', resourceType: 'websocket', party: decision.party, initiator: 'page', blocked: refused, status: null, excerpt: excerptOf(url, null, this.secrets), at: new Date().toISOString() })
       if (refused) void ws.close({ code: 1008, reason: 'blocked by audit policy' }).catch(() => undefined)
       else ws.connectToServer()
     })
@@ -261,8 +338,7 @@ export class AuditPageImpl implements AuditPage {
 
   onClose(listener: () => void): void { this.closeListeners.push(listener) }
 
-  /** How the consent state requested in `open` was reached (`applied:false` when no CMP control was found). */
-  consentOutcome(): { state: ConsentState; applied: boolean; mechanism: string | null } | null { return this.consentResult }
+  consentOutcome(): ConsentOutcome | null { return this.consentResult ? { ...this.consentResult } : null }
 
   private describe(request: Request, initiator: ObservedRequest['initiator']): ObservedRequest {
     return {
@@ -273,7 +349,7 @@ export class AuditPageImpl implements AuditPage {
       initiator,
       blocked: null,
       status: null,
-      excerpt: excerptOf(request.url(), request.postData()),
+      excerpt: excerptOf(request.url(), request.postData(), this.secrets),
       at: new Date().toISOString(),
     }
   }
@@ -309,11 +385,46 @@ export class AuditPageImpl implements AuditPage {
       }
       this.track(request, entry, null)
       if (decision.delayMs) await sleep(decision.delayMs)
-      await route.continue()
+      if (STREAMING_TYPES.has(request.resourceType())) return await route.continue()
+      await this.fetchThroughHops(route, request, entry)
     } catch {
       // The context closed mid-request, or the request was already handled.
       await route.abort('failed').catch(() => undefined)
     }
+  }
+
+  /**
+   * Makes a subresource request here, one redirect hop at a time, so every hop meets the gate the
+   * way a first request does (Playwright routes only the first URL of a chain, and the browser would
+   * follow the rest unseen). Hops after the first go through the context's request client, which
+   * shares the browser's cookie jar; the final response is handed to the page as the answer to the
+   * original request.
+   */
+  private async fetchThroughHops(route: Route, request: Request, entry: ObservedRequest): Promise<void> {
+    const resourceType = request.resourceType()
+    const originalMethod = request.method().toUpperCase()
+    const body = request.postDataBuffer()
+    const walk = await walkRedirects(
+      { url: request.url(), method: originalMethod },
+      async ({ url, method, index }) => {
+        if (index === 0) {
+          const response = await route.fetch({ maxRedirects: 0, timeout: this.timeout })
+          entry.status = response.status()
+          return response
+        }
+        const headers = Object.fromEntries(Object.entries(request.headers()).filter(([name]) => !HOP_DROPPED_HEADERS.test(name) && !(method === 'GET' && /^content-type$/i.test(name))))
+        return this.context.request.fetch(url, {
+          method, headers, maxRedirects: 0, timeout: this.timeout, failOnStatusCode: false,
+          data: method === originalMethod && body && !READ_ONLY_METHODS.has(method) ? body : undefined,
+        })
+      },
+      (url, method) => this.decide(url, method, resourceType, false, 'page'),
+    )
+    for (const hop of walk.hops) {
+      this.record({ url: hop.url, method: hop.method, resourceType, party: this.gate.partyOf(hop.url), initiator: 'page', blocked: hop.blocked, status: hop.status, excerpt: excerptOf(hop.url, null, this.secrets), at: new Date().toISOString() })
+    }
+    if (!walk.response) return route.abort('blockedbyclient')
+    return route.fulfill({ response: walk.response })
   }
 
   private async decide(url: string, method: string, resourceType: string, mainFrameNavigation: boolean, initiator: ObservedRequest['initiator'], consume = true): Promise<GateDecision> {
@@ -358,7 +469,7 @@ export class AuditPageImpl implements AuditPage {
       const hop = await this.decide(target, 'GET', 'document', true, initiator, false)
       if (hop.action === 'block' || (ownsNavigation && ownsNavigation.hops >= MAX_REDIRECT_HOPS)) {
         const reason = hop.action === 'block' ? `redirect to ${target}: ${hop.reason}` : `more than ${MAX_REDIRECT_HOPS} redirects`
-        this.record({ url: target, method: 'GET', resourceType: 'document', party: hop.party, initiator, blocked: reason, status: null, excerpt: excerptOf(target, null), at: new Date().toISOString() })
+        this.record({ url: target, method: 'GET', resourceType: 'document', party: hop.party, initiator, blocked: reason, status: null, excerpt: excerptOf(target, null, this.secrets), at: new Date().toISOString() })
         if (ownsNavigation) { ownsNavigation.blocked = { outcome: hop.action === 'block' ? hop.outcome : 'blocked-by-policy', url: target, reason }; ownsNavigation.status = status; ownsNavigation.settle() }
         return route.fulfill({ status: 204, body: '' })
       }
@@ -397,7 +508,7 @@ export class AuditPageImpl implements AuditPage {
     // Schemes and origins the route handler would never see (file:, javascript:, data:) or would refuse anyway.
     const pre = await this.decide(target, 'GET', 'document', true, 'agent', false)
     if (pre.action === 'block') {
-      this.record({ url: target, method: 'GET', resourceType: 'document', party: pre.party, initiator: 'agent', blocked: pre.reason, status: null, excerpt: excerptOf(target, null), at: new Date().toISOString() })
+      this.record({ url: target, method: 'GET', resourceType: 'document', party: pre.party, initiator: 'agent', blocked: pre.reason, status: null, excerpt: excerptOf(target, null, this.secrets), at: new Date().toISOString() })
       return result(target, null, pre.outcome)
     }
     const state = this.beginNavigation(target)
@@ -628,11 +739,13 @@ function safeHost(url: string): string | null {
   try { return new URL(url).hostname } catch { return null }
 }
 
-export function excerptOf(url: string, postData: string | null): string {
+/** The query and body of a request, with secrets and a loaded login state's values masked; markers stay for leak searches. */
+export function excerptOf(url: string, postData: string | null, secrets: readonly string[] = []): string {
   let query = ''
   try { query = new URL(url).search } catch { /* not a URL */ }
-  const text = [query, postData ?? ''].filter(Boolean).join('\n')
-  return maskSecrets(text).slice(0, EXCERPT_CHARS)
+  let text = maskSecrets([query, postData ?? ''].filter(Boolean).join('\n'))
+  for (const secret of secrets) text = text.split(secret).join('[REDACTED]').split(encodeURIComponent(secret)).join('[REDACTED]')
+  return text.slice(0, EXCERPT_CHARS)
 }
 
 function deepFreeze<T>(value: T): T {

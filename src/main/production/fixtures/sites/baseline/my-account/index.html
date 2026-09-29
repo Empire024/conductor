@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>My account – Baseline Shop</title>
+</head>
+<body>
+  <h1>My account</h1>
+  <p id="state">Not logged in</p>
+  <a href="/my-account/customer-logout/?_wpnonce=abc">Log out</a>
+  <script>
+    // The session cookie itself is HttpOnly; the display name cookie and storage show the page is logged in.
+    const name = (document.cookie.match(/(?:^|; )wp_account=([^;]*)/) || [])[1]
+    const token = localStorage.getItem('account_token')
+    if (name && token) document.getElementById('state').textContent = 'Logged in as ' + decodeURIComponent(name)
+  </script>
+</body>
+</html>

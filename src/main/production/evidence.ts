@@ -27,14 +27,22 @@ export interface EvidenceSinkOptions {
 export interface ProductionEvidenceSink extends EvidenceSink {
   /** Every ref written so far, in order. */
   list(): EvidenceRef[]
+  /** Values that must never reach the disk (a loaded login state's cookies and storage); masked from here on. */
+  addSecrets(values: Iterable<string>): void
   readonly dir: string
 }
 
 const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
-/** Masks secrets, secret header lines and the run's synthetic markers (case-insensitive) in one string. */
-export function redactEvidenceText(text: string, markers: Iterable<string>): string {
+/** Masks secrets, secret header lines, known secret values and the run's synthetic markers (case-insensitive) in one string. */
+export function redactEvidenceText(text: string, markers: Iterable<string>, secrets: Iterable<string> = []): string {
   let result = maskSecrets(text).replace(SECRET_HEADER_LINE, '$1 [REDACTED]')
+  for (const secret of secrets) {
+    if (secret.length < 8) continue
+    result = result.split(secret).join('[REDACTED]')
+    const encoded = encodeURIComponent(secret)
+    if (encoded !== secret) result = result.split(encoded).join('[REDACTED]')
+  }
   const list = [...new Set([...markers].filter(marker => marker.length >= 6))].sort((a, b) => b.length - a.length)
   if (list.length) result = result.replace(new RegExp(list.map(escapeRegExp).join('|'), 'gi'), SYNTHETIC_PLACEHOLDER)
   return result
@@ -45,11 +53,11 @@ export function redactHeaders(headers: Record<string, string>): Record<string, s
   return Object.fromEntries(Object.entries(headers).map(([name, value]) => [name, SECRET_HEADERS.test(name) ? '[REDACTED]' : value]))
 }
 
-function redactValue(value: unknown, markers: readonly string[]): unknown {
-  if (typeof value === 'string') return redactEvidenceText(value, markers)
-  if (Array.isArray(value)) return value.map(item => redactValue(item, markers))
+function redactValue(value: unknown, markers: readonly string[], secrets: readonly string[]): unknown {
+  if (typeof value === 'string') return redactEvidenceText(value, markers, secrets)
+  if (Array.isArray(value)) return value.map(item => redactValue(item, markers, secrets))
   if (value && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, SECRET_HEADERS.test(key) ? '[REDACTED]' : redactValue(item, markers)]))
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, SECRET_HEADERS.test(key) ? '[REDACTED]' : redactValue(item, markers, secrets)]))
   }
   return value
 }
@@ -69,6 +77,7 @@ export function createEvidenceSink(dir: string, markers: Iterable<string> | (() 
   const maxTextBytes = options.maxTextBytes ?? MAX_EVIDENCE_TEXT_BYTES
   const currentMarkers = (): string[] => [...(typeof markers === 'function' ? markers() : markers)]
   const refs: EvidenceRef[] = []
+  const secrets = new Set<string>()
   let writes = Promise.resolve()
 
   const store = (kind: EvidenceKind, description: string, bytes: Uint8Array, ext: string, redacted: boolean): Promise<EvidenceRef> => {
@@ -84,7 +93,7 @@ export function createEvidenceSink(dir: string, markers: Iterable<string> | (() 
         kind,
         path,
         sha256,
-        description: boundText(redactEvidenceText(description, currentMarkers()), 500),
+        description: boundText(redactEvidenceText(description, currentMarkers(), secrets), 500),
         capturedAt: now().toISOString(),
         redacted,
       }
@@ -99,13 +108,14 @@ export function createEvidenceSink(dir: string, markers: Iterable<string> | (() 
   return {
     dir,
     list: () => [...refs],
+    addSecrets(values) { for (const value of values) if (value.length >= 8) secrets.add(value) },
     writeText(kind, description, text, ext = 'txt') {
-      const redactedText = redactEvidenceText(text, currentMarkers())
+      const redactedText = redactEvidenceText(text, currentMarkers(), secrets)
       const bounded = boundText(redactedText, maxTextBytes)
       return store(kind, description, Buffer.from(bounded), ext, bounded !== text)
     },
     writeJson(kind, description, value) {
-      const cleaned = redactValue(sanitizeDiagnostic(value), currentMarkers())
+      const cleaned = redactValue(sanitizeDiagnostic(value), currentMarkers(), [...secrets])
       let text = JSON.stringify(cleaned, null, 2) ?? 'null'
       if (Buffer.byteLength(text) > maxTextBytes) {
         // A cut JSON document would not parse; keep a parseable wrapper with the head of the text.

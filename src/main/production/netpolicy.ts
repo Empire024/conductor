@@ -245,3 +245,73 @@ export class NetworkGate {
     return Math.max(0, start - now)
   }
 }
+
+export const MAX_REDIRECT_HOPS = 10
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
+
+export interface RedirectHop {
+  url: string
+  method: string
+  /** The gate's reason when it refused this hop; null when the hop was fetched. */
+  blocked: string | null
+  status: number | null
+}
+
+export interface RedirectWalk<R> {
+  /** The first non-redirect response, or null when a hop was refused or the chain was too long. */
+  response: R | null
+  /** Every hop after the first request, in order, including the refused one. */
+  hops: RedirectHop[]
+  blocked: { url: string; outcome: 'off-allowlist' | 'blocked-by-policy'; reason: string } | null
+}
+
+/** The method a redirect hop is made with: 303 turns anything but HEAD into GET, 301/302 turn POST into GET, 307/308 keep it (and the body). */
+export function redirectMethod(status: number, method: string): string {
+  const upper = method.toUpperCase()
+  if (status === 303 && upper !== 'HEAD') return 'GET'
+  if ((status === 301 || status === 302) && upper === 'POST') return 'GET'
+  return upper
+}
+
+/**
+ * Follows a redirect chain one hop at a time, asking the gate about every hop before it is made, so
+ * a hop is held to exactly the rules a first request is: a 307 that carries a POST from a third party
+ * to the first party is a first-party POST, and a redirect to a private address or a state-changing
+ * URL is refused before anything is sent to it. `fetchHop` is called with redirects off.
+ */
+export async function walkRedirects<R extends { status(): number; headers(): Record<string, string> }>(
+  first: { url: string; method: string },
+  fetchHop: (hop: { url: string; method: string; index: number }) => Promise<R>,
+  decide: (url: string, method: string) => Promise<GateDecision>,
+  options: { maxHops?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<RedirectWalk<R>> {
+  const maxHops = options.maxHops ?? MAX_REDIRECT_HOPS
+  const wait = options.sleep ?? ((ms: number) => new Promise<void>(done => setTimeout(done, ms)))
+  const hops: RedirectHop[] = []
+  let url = first.url
+  let method = first.method.toUpperCase()
+  let response = await fetchHop({ url, method, index: 0 })
+  for (let index = 1; ; index++) {
+    const status = response.status()
+    const location = response.headers()['location']
+    if (!REDIRECT_STATUSES.has(status) || !location) return { response, hops, blocked: null }
+    let target: string
+    try { target = new URL(location, url).href } catch { return { response, hops, blocked: null } }
+    method = redirectMethod(status, method)
+    if (index > maxHops) {
+      const reason = `more than ${maxHops} redirects`
+      hops.push({ url: target, method, blocked: reason, status: null })
+      return { response: null, hops, blocked: { url: target, outcome: 'blocked-by-policy', reason } }
+    }
+    const decision = await decide(target, method)
+    if (decision.action === 'block') {
+      const reason = `redirect from ${url}: ${decision.reason}`
+      hops.push({ url: target, method, blocked: reason, status: null })
+      return { response: null, hops, blocked: { url: target, outcome: decision.outcome, reason } }
+    }
+    if (decision.delayMs) await wait(decision.delayMs)
+    url = target
+    response = await fetchHop({ url, method, index })
+    hops.push({ url, method, blocked: null, status: response.status() })
+  }
+}

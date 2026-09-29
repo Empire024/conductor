@@ -168,13 +168,32 @@ export interface CredentialRef {
   purpose: string
 }
 
-/** A synthetic test account in a non-production environment. */
+/**
+ * A login state the owner captured by hand (a Playwright `storageState` JSON file recorded in a visible or
+ * sandbox session), referenced by absolute path. The file is a secret: the audit browser reads it when it opens
+ * an authenticated page, drops cookies and storage for origins off the environment's allowlist, never copies it
+ * into run artifacts, and redacts its cookie and storage values from evidence and request excerpts. It is how an
+ * audit reaches the authenticated state on production, where a login POST is never made.
+ */
+export interface StoredLoginStateRef {
+  path: string
+  capturedAt: string | null
+  capturedBy: string | null
+  note?: string
+}
+
+/**
+ * A synthetic test account. On production the only way in is `storageState`; on sandbox or local environments a
+ * login step may instead submit the login form, and that submit needs a write authorization of an existing
+ * mutation kind (there is no `login` kind).
+ */
 export interface TestAccountRef {
   id: string
   label: string
   role: 'guest' | 'customer' | 'subscriber' | 'admin'
   usernameRef: CredentialRef
   passwordRef: CredentialRef
+  storageState?: StoredLoginStateRef | null
 }
 
 export interface CapturedMailConfig {
@@ -845,6 +864,13 @@ export interface ConsentAction {
   categories?: string[]
 }
 
+/** How the consent state requested in `OpenPageOptions.consent` was reached; `applied:false` when no CMP control was found. */
+export interface ConsentOutcome {
+  state: ConsentState
+  applied: boolean
+  mechanism: string | null
+}
+
 export interface OpenPageOptions {
   device: DeviceClass
   locale: string | null
@@ -869,6 +895,8 @@ export interface AuditPage {
   screenshot(description: string): Promise<EvidenceRef>
   evaluate<T>(expression: string): Promise<T>
   consent(action: ConsentAction): Promise<{ applied: boolean; mechanism: string | null }>
+  /** The requested consent state's outcome: set at open for `clean`/`no-interaction`, after the first successful navigation otherwise; null until then. */
+  consentOutcome(): ConsentOutcome | null
   fill(selector: string, value: SyntheticValue): Promise<void>
   click(selector: string, options?: { mutation?: MutationKind }): Promise<void>
   submit(formSelector: string, mutation: MutationKind): Promise<NavigationResult>
@@ -889,6 +917,8 @@ export interface BrowserAvailability {
 export interface AuditBrowser {
   availability(): Promise<BrowserAvailability>
   open(options: OpenPageOptions): Promise<AuditPage>
+  /** Requests counted against the run's `maxRequests` across every page, and whether the budget refused one (the ledger's `requests` and `exhausted`). */
+  budget(): { requests: number; exhausted: boolean }
   close(): Promise<void>
 }
 
