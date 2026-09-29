@@ -55,11 +55,13 @@ const credentialOf = async (marker, intervalMs = 250) => {
     return body.result
   }
 }
-const tabRow = title => view.locator('.workspace-tab-row').filter({ has: view.getByText(title, { exact: true }) }).first()
+// Rows show short labels ("…A (continued)") and a superseded tab sits under a collapsed Done, so tabs are
+// brought forward by id, as scripts/lib/grant-handoff.mjs show() does.
+const show = async tabId => { await call('tabs.focus', { tabId }); await sleep(700) }
 const article = requestId => view.locator(`article[data-native-item-id="${requestId}"]`)
 /** The owner's click: select the tab, then the button in the card. */
-const click = async (title, requestId, name) => {
-  await tabRow(title).click()
+const click = async (tabId, requestId, name) => {
+  await show(tabId)
   const button = article(requestId).getByRole('button', { name, exact: true })
   await button.waitFor({ timeout: 15_000 })
   await button.click()
@@ -111,13 +113,12 @@ async function gap1() {
   const held = await heldBy(denial, [a.id, b.id])
   record('G1-moved', b.result.permissions?.requests === 1 && listB[0]?.status === 'pending' && listB[0]?.holder?.agentSessionId === b.id && held?.agentSessionId === b.id ? 'PASS' : 'FAIL', { handoffPermissions: b.result.permissions ?? null, listB: listB.map(item => ({ status: item.status, holder: item.holder?.title })), ownerState: held ? (held.agentSessionId === b.id ? 'B' : 'A') : null }, 'the handoff moves the denial: B lists it pending with holder B, and so does the owner state')
 
-  await tabRow(a.title).click()
-  await sleep(500)
+  await show(a.tab.id)
   const aButtons = await article(denial).getByRole('button', { name: 'Approve once', exact: true }).count()
   const aText = (await article(denial).innerText().catch(() => '')).replace(/\s+/g, ' ')
   const aShot = await shot('g1-a-card')
   const aPayload = await deniedCard(a.id, denial)
-  await tabRow(b.title).click()
+  await show(b.tabId)
   await article(denial).getByRole('button', { name: 'Approve once', exact: true }).waitFor({ timeout: 15_000 }).catch(() => undefined)
   const bButtons = await article(denial).getByRole('button', { name: 'Approve once', exact: true }).count()
   const bText = (await article(denial).innerText().catch(() => '')).replace(/\s+/g, ' ')
@@ -125,7 +126,7 @@ async function gap1() {
   const holderLabel = b.title + ' · '
   record('G1-cards', aButtons === 0 && /Moved to/.test(aText) && aText.includes(holderLabel) && aPayload?.grantStatus === 'moved' && bButtons === 1 && /Holder/.test(bText) && bText.includes(holderLabel) ? 'PASS' : 'FAIL', { aButtons, aStatus: aPayload?.grantStatus ?? null, a: aText.slice(0, 260), bButtons, b: bText.slice(0, 260) }, `${aShot}, ${bShot}; A says Moved to <B title · id>, no buttons; B's card is live and names its holder`)
 
-  await click(b.title, denial, 'Approve once')
+  await click(b.tabId, denial, 'Approve once')
   await poll(async () => await ranAny(b.id) >= 1, { timeoutMs: 20_000, label: 'B ran it' }).catch(() => undefined)
   await sleep(4000)
   const who = { aTold: await told(a.id, '[Conductor] approved:'), bTold: await told(b.id, '[Conductor] approved:'), aRan: await ranAny(a.id), bRan: await ranAny(b.id) }
@@ -145,7 +146,7 @@ async function gap1Closed() {
   const list = (await b.as('permissions.list')).requests.filter(item => item.id === denial)
   const held = await heldBy(denial, [a.id, b.id])
   record('G2-survives-close', list.length === 1 && held?.agentSessionId === b.id && held.status === 'pending' ? 'PASS' : 'FAIL', { listB: list.length, ownerState: held ? `${held.agentSessionId === b.id ? 'B' : 'A'}:${held.status}` : null }, 'after A is closed (4 s = 4 sweeps) the request is still pending on B')
-  await click(b.title, denial, 'Approve once')
+  await click(b.tabId, denial, 'Approve once')
   await poll(async () => await ranAny(b.id) >= 1, { timeoutMs: 20_000, label: 'B2 ran it' }).catch(() => undefined)
   const shotB = await shot('g2-b-after')
   record('G2-approve-in-B', await ranAny(b.id) === 1 && await told(b.id, '[Conductor] approved:') === 1 ? 'PASS' : 'FAIL', { bTold: await told(b.id, '[Conductor] approved:'), bRan: await ranAny(b.id), status: (await heldBy(denial, [b.id]))?.status ?? null }, `${shotB}; the approval reaches B and B runs it once`)

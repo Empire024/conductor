@@ -1,11 +1,10 @@
-// H06 renderer half: an approved retry waits behind a turn that keeps running; once the waiting
-// notice is out the owner's grant card offers "Interrupt and retry", which stops that turn with the
-// queue expedited (sessions.interrupt(id, true), as a wizard approver's auto-interrupt does), and the
-// retry runs at once instead of after the busy turn.
+// H06 renderer half: an approval given while the conversation's turn keeps running interrupts that
+// turn at once (owner 2026-09-29: any approval, owner or wizard; the 2-min wait and its "Interrupt and
+// retry" card action only remain for an interrupt that fails), the tab says so, and the retry runs as
+// a turn of its own instead of after the busy turn.
 // Real Electron main/preload/renderer; only the Claude process is the synthetic fixture
 // (scripts/fixtures/fake-claude.mjs, CONDUCTOR_TEST_CLASSIFIER=approval-turn). The busy turn runs 90 s
-// (CONDUCTOR_TEST_BUSY_MS) and the notice comes after 3 s (CONDUCTOR_TEST_GRANT_NOTICE_MS, honoured
-// only with CONDUCTOR_TEST_USER_DATA), so a retry that ran within 30 s ran because of the button.
+// (CONDUCTOR_TEST_BUSY_MS), so a retry that ran within 30 s of the approval ran because of the interrupt.
 //   node scripts/smoke-lock.mjs -- node scripts/smoke-grant-interrupt.mjs
 // CONDUCTOR_SMOKE_MAIN points at another build's main entry (default out/main/index.js).
 import { _electron as electron, expect } from '@playwright/test'
@@ -19,7 +18,7 @@ const output = resolve('artifacts/h06/grant-interrupt')
 await mkdir(output, { recursive: true })
 const env = {
   ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_EMPTY_HISTORY: '1', CONDUCTOR_TEST_CLASSIFIER: 'approval-turn',
-  CONDUCTOR_TEST_BUSY_MS: '90000', CONDUCTOR_TEST_GRANT_NOTICE_MS: '3000',
+  CONDUCTOR_TEST_BUSY_MS: '90000',
   CONDUCTOR_TEST_NODE_EXECUTABLE: process.execPath, CONDUCTOR_TEST_USER_DATA: join(root, 'profile'), CONDUCTOR_PROJECTS_ROOT: join(root, 'projects')
 }
 delete env.ELECTRON_RUN_AS_NODE; delete env.CONDUCTOR_LIVE_TESTS; delete env.CONDUCTOR_BACKGROUND_WINDOWS
@@ -60,37 +59,33 @@ try {
   const [denial] = await denials(id)
   const rule = denial.data.payload.autoModeDenial.request.rule
   const grantCard = card(denial.nativeItemId)
-  await grantCard.getByRole('button', { name: 'Approve once' }).click()
-  await expect.poll(async () => (await snapshot(id)).queuedPrompts?.some(prompt => prompt.text.startsWith('[Conductor] approved: ' + rule))).toBe(true)
   assert.equal((await snapshot(id)).phase, 'running')
-  await expect(grantCard.getByRole('button', { name: 'Interrupt and retry' })).toHaveCount(0)
-  check('The approved retry is queued behind the running turn, and the card offers no interrupt before the waiting notice')
-
-  // 2. After the notice the card offers "Interrupt and retry".
-  const interrupt = grantCard.getByRole('button', { name: 'Interrupt and retry' })
-  await expect(interrupt).toBeVisible({ timeout: 15000 })
-  await expect(grantCard).toContainText('The retry is queued behind a turn that is still running.')
-  const waiting = (await grantsState()).waiting ?? []
-  assert.equal(waiting.length, 1)
-  assert.equal(waiting[0].agentSessionId, id)
-  assert.ok((await snapshot(id)).items.some(item => item.data.type === 'notice' && /Use "Interrupt and retry" on its approval card/.test(item.data.text ?? item.data.message ?? '')), 'The waiting notice names the card action')
-  await grantCard.scrollIntoViewIfNeeded()
-  await page.screenshot({ path: join(output, 'interrupt-and-retry-card.png') })
-  await grantCard.screenshot({ path: join(output, 'interrupt-and-retry-card-only.png') })
-  check('After the waiting notice the approval card shows "Interrupt and retry", and the grant state lists the waiting retry')
-
-  // 3. The button interrupts that turn with the queue expedited: the retry runs now, not in 90 s.
   const clicked = Date.now()
-  await interrupt.click()
+  await grantCard.getByRole('button', { name: 'Approve once' }).click()
+  check('The owner approves once while the turn that hit the refusal is still running')
+
+  // 2. Conductor interrupts that turn at once and says so in the tab; no card action is needed.
+  const interrupted = async () => (await snapshot(id)).items.find(item => item.data.type === 'notice' && /^The owner approved .*, so Conductor interrupted the running turn; the retry runs now as a message of its own.$/.test(item.data.text ?? item.data.message ?? ''))
+  await expect.poll(async () => Boolean(await interrupted()), { timeout: 15000 }).toBe(true)
+  const noticeMs = Date.now() - clicked
+  const notice = await interrupted()
+  assert.equal(notice.data.payload?.permissionGrantWaiting?.interrupted, true)
+  assert.ok(!(await snapshot(id)).items.some(item => item.data.type === 'notice' && /queued behind a running turn/.test(item.data.text ?? item.data.message ?? '')), 'no "queued behind" fallback notice')
+  await expect(grantCard.getByRole('button', { name: 'Interrupt and retry' })).toHaveCount(0)
+  await page.screenshot({ path: join(output, 'interrupted-notice.png') })
+  check(`The tab shows "${(notice.data.text ?? notice.data.message).slice(0, 60)}…" ${noticeMs} ms after the approval; no fallback notice, no "Interrupt and retry"`)
+
+  // 3. The retry runs now as a turn of its own, not after the 90 s busy turn.
   await expect.poll(() => ran(id, rule), { timeout: 30000 }).toBe(true)
   const tookMs = Date.now() - clicked
-  assert.ok(tookMs < 30000, `The retry ran ${tookMs} ms after the click`)
-  await expect(interrupt).toHaveCount(0)
-  assert.equal((await grantsState()).waiting, undefined)
+  assert.ok(tookMs < 30000, `The retry ran ${tookMs} ms after the approval`)
+  await expect.poll(async () => (await grantsState()).waiting, { timeout: 10000 }).toBe(undefined)
   await expect.poll(async () => (await snapshot(id)).phase, { timeout: 20000 }).toMatch(/^(completed|idle)$/)
-  await expect(grantCard).toContainText('Approved once, and used')
+  // Since the exact-execution cards (19ba9c9) a spent grant reads "Action succeeded".
+  await expect(grantCard).toHaveAttribute('data-grant-status', 'used')
+  await expect(grantCard).toContainText('Action succeeded')
   await page.screenshot({ path: join(output, 'after-interrupt.png') })
-  check(`"Interrupt and retry" stopped the busy turn and the approved call ran ${tookMs} ms later; the card no longer offers it`)
+  check(`The approved call ran ${tookMs} ms after the approval (the busy turn would have run 90 s), and the card is used: "Action succeeded"`)
 
   assert.deepEqual(errors, [])
   await writeFile(join(output, 'report.json'), JSON.stringify({ checks, errors, inference: 'none', providerBoundary: 'synthetic raw Claude process (approval-turn classifier)' }, null, 2))

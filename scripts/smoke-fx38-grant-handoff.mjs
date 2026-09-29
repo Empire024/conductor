@@ -53,11 +53,14 @@ async function scenario(inst) {
       return body.result
     }
   }
-  const tabRow = title => view.locator('.workspace-tab-row').filter({ has: view.getByText(title, { exact: true }) }).first()
+  // Rows show short labels ("…A (continued)") and a superseded tab sits under a collapsed Done, so tabs are
+  // brought forward by id, as scripts/lib/grant-handoff.mjs show() does.
+  const show = async tabId => { await call('tabs.focus', { tabId }); await new Promise(done => setTimeout(done, 700)) }
   const card = requestId => view.locator(`article[data-native-item-id="${requestId}"] .sa-grant-card`)
 
   step('wizard A files a permission request')
-  const a = (await openTab({ provider: 'claude', model: 'claude-fable-5-1', title: 'FX38 wizard A' })).resourceId
+  const aTab = await openTab({ provider: 'claude', model: 'claude-fable-5-1', title: 'FX38 wizard A' })
+  const a = aTab.resourceId
   await rm(capture, { force: true })
   await submit(a, 'SYNTHETIC CLASSIFIER LOCAL note before asking', true)
   const asA = await credentialOf('SYNTHETIC CLASSIFIER LOCAL')
@@ -87,13 +90,13 @@ async function scenario(inst) {
   record('B-no-duplicate', again.requestId === asked.requestId && (await grantsState()).requests.filter(entry => entry.status === 'pending' && entry.resource === moved?.resource).length === 1 ? 'PASS' : 'FAIL', { again: again.requestId }, 'the successor re-filing the same call gets the moved request, not a second card')
 
   step("the owner's card in B's tab shows the holder")
-  await tabRow(result.title).click()
+  await show(result.tabId)
   const liveCard = card(asked.requestId)
   await liveCard.waitFor({ timeout: 15_000 })
   const cardText = await liveCard.innerText()
   const cardShot = await shot('b-card-holder')
   record('card-holder', /Holder/.test(cardText) && cardText.includes(result.title) && await liveCard.getByRole('button', { name: 'Approve once' }).isEnabled() ? 'PASS' : 'FAIL', { cardText: cardText.slice(0, 600) }, cardShot)
-  await tabRow('FX38 wizard A').click()
+  await show(aTab.id)
   const aCard = card(asked.requestId)
   await aCard.waitFor({ timeout: 15_000 })
   const aText = await aCard.innerText()
@@ -101,7 +104,7 @@ async function scenario(inst) {
   record('old-card-moved', /Moved to/.test(aText) && aText.includes(result.title) && aButtons === 0 ? 'PASS' : 'FAIL', { aText: aText.slice(0, 600), aButtons }, await shot('a-card-moved'))
 
   step('the owner approves once in B\'s card')
-  await tabRow(result.title).click()
+  await show(result.tabId)
   await card(asked.requestId).getByRole('button', { name: 'Approve once' }).click()
   const rule = asked.rule
   await poll(async () => (await texts(b, 'user')).some(text => text.startsWith('[Conductor] approved: ' + rule)), { timeoutMs: 15_000, label: 'B told approved' })
