@@ -10,6 +10,7 @@ const bootSource = readFileSync(new URL('./boot.js', import.meta.url), 'utf8')
 const swSource = readFileSync(new URL('./sw.js', import.meta.url), 'utf8')
 const indexSource = readFileSync(new URL('./index.html', import.meta.url), 'utf8')
 const appSource = readFileSync(new URL('./app.js', import.meta.url), 'utf8')
+const markdownSource = readFileSync(new URL('./markdown.js', import.meta.url), 'utf8')
 
 const ORIGIN = 'https://phone.test:51841'
 const IPHONE_SAFARI = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1'
@@ -297,6 +298,10 @@ describe('index.html', () => {
     const app = indexSource.indexOf('<script src="/app.js" defer></script>')
     expect(boot).toBeGreaterThan(0)
     expect(app).toBeGreaterThan(boot)
+    /* Deferred scripts run in document order, so the renderer is loaded before app.js draws. */
+    const markdown = indexSource.indexOf('<script src="/markdown.js" defer></script>')
+    expect(markdown).toBeGreaterThan(boot)
+    expect(app).toBeGreaterThan(markdown)
     expect(indexSource).not.toMatch(/<script>(?!<\/script>)/)
   })
 })
@@ -353,7 +358,7 @@ describe('phone notification preferences', () => {
 interface AppCall { path: string; method: string; body: any; keepalive: boolean }
 
 /* A test that is not about the lock never sees its boot-time read: the computer has no code set. */
-const bootApp = (hash: string, respond: (call: AppCall) => unknown, options: { lock?: boolean } = {}) => {
+const bootApp = (hash: string, respond: (call: AppCall) => unknown, options: { lock?: boolean; markdown?: boolean; globals?: Record<string, unknown> } = {}) => {
   focusedNode = null
   const timers: Array<{ at: number; fn: () => void; id: number }> = []
   let now = 0
@@ -391,6 +396,7 @@ const bootApp = (hash: string, respond: (call: AppCall) => unknown, options: { l
     get activeElement() { return focusedNode },
     createElement: (tag: string) => new FakeNode(tag),
     createElementNS: (_ns: string, tag: string) => new FakeNode(tag),
+    createTextNode: (text: string) => { const node = new FakeNode('#text'); node.textContent = text; return node },
     getElementById: (id: string) => ({ app, pill, toasts } as Record<string, FakeNode>)[id] ?? null,
     addEventListener: (type: string, fn: Listener) => { (documentListeners[type] ??= []).push(fn) },
     removeEventListener: () => undefined
@@ -420,8 +426,11 @@ const bootApp = (hash: string, respond: (call: AppCall) => unknown, options: { l
     clearInterval: () => undefined,
     addEventListener: (type: string, fn: Listener) => { (windowListeners[type] ??= []).push(fn) },
     fetch,
-    AbortController
+    AbortController,
+    ...options.globals
   }
+  /* index.html loads markdown.js before app.js; without it app.js falls back to plain text. */
+  if (options.markdown) runInNewContext(markdownSource, { window })
   runInNewContext(appSource, {
     window, document, navigator: window.navigator, fetch, setTimeout: setTimer, clearTimeout: clearTimer,
     setInterval: () => 0, clearInterval: () => undefined, AbortController, TextDecoder, Response, URL
@@ -442,7 +451,7 @@ const bootApp = (hash: string, respond: (call: AppCall) => unknown, options: { l
   }
   const editor = () => app.find(node => node.tagName === 'TEXTAREA')
   const posts = () => calls.filter(call => call.method === 'POST')
-  return { window, document, app, calls, posts, streams, headersSent, advance, setVisibility, editor, fireWindow: (type: string) => fire(windowListeners, type), fireDocument: (type: string, event: any = {}) => fire(documentListeners, type, event) }
+  return { window, document, app, toasts, calls, posts, streams, headersSent, advance, setVisibility, editor, fireWindow: (type: string) => fire(windowListeners, type), fireDocument: (type: string, event: any = {}) => fire(documentListeners, type, event) }
 }
 
 const ideaDetail = (id: string, text: string) => ({
@@ -623,12 +632,13 @@ describe('sw.js', () => {
 
   it('precaches the boot guard with the rest of the shell under a new cache name', async () => {
     const sw = worker({}, unreachable)
-    expect(swSource).toContain("const CACHE = 'conductor-phone-v2'")
+    expect(swSource).toContain("const CACHE = 'conductor-phone-v3'")
     let done: Promise<unknown> = Promise.resolve()
     sw.listeners.install!({ waitUntil: (value: Promise<unknown>) => { done = value } })
     await done
     expect(sw.added).toContain('/boot.js')
     expect(sw.added).toContain('/app.js')
+    expect(sw.added).toContain('/markdown.js')
   })
 
   it('answers a failed navigation with no cached shell with a static page that explains itself', async () => {
@@ -730,5 +740,140 @@ describe('phone lock pad', () => {
   it('offers the terminal from the System screen', () => {
     expect(appSource).toContain("button('ghost terminal-open', 'Terminal', () => visit('#/terminal'))")
     expect(appSource).toContain("if (hash.indexOf('#/terminal') === 0) return { name: 'terminal', key: 'terminal' }")
+  })
+})
+
+/* One conversation at #/session/s1 whose timeline is the given items. */
+const conversationAnswer = (items: Array<{ role: string; text: string }>) => (call: AppCall) => {
+  if (call.path === '/api/sessions/s1') {
+    return {
+      summary: { id: 's1', title: 'Chat', phase: 'idle', state: 'idle', provider: 'claude', model: 'opus' },
+      items: items.map((item, index) => ({ id: 'i' + index, sequence: index, timestamp: '2026-09-30T10:00:00.000Z', data: { type: 'text', role: item.role, text: item.text } })),
+      pending: [],
+      queued: []
+    }
+  }
+  if (call.path === '/api/sessions/s1/message') return { ok: true }
+  return {}
+}
+
+describe('phone conversation markdown', () => {
+  it('renders agent replies as markdown and keeps what the owner typed as plain text', async () => {
+    const page = bootApp('#/session/s1', conversationAnswer([
+      { role: 'user', text: 'make it **bold**' },
+      { role: 'assistant', text: '# Done\n\n- one **two**\n- [site](https://example.com) and [bad](javascript:alert(1))\n\n<img src=x onerror=alert(1)>' }
+    ]), { markdown: true })
+    await settleAll()
+    const assistant = page.app.querySelector('assistant')!
+    expect(assistant.find(node => node.tagName === 'P' && node.className.includes('md-h1'))!.textContent).toBe('Done')
+    expect(assistant.find(node => node.tagName === 'STRONG')!.textContent).toBe('two')
+    const links = assistant.all().filter(node => node.tagName === 'A')
+    expect(links.map(node => node.getAttribute('href'))).toEqual(['https://example.com'])
+    /* Raw HTML is text, never an element. */
+    expect(assistant.find(node => node.tagName === 'IMG')).toBeUndefined()
+    expect(assistant.textContent).toContain('<img src=x onerror=alert(1)>')
+    const user = page.app.querySelector('user')!
+    expect(user.find(node => node.tagName === 'STRONG')).toBeUndefined()
+    expect(user.textContent).toContain('make it **bold**')
+  })
+
+  it('falls back to plain text blocks when markdown.js did not load', async () => {
+    const page = bootApp('#/session/s1', conversationAnswer([{ role: 'assistant', text: 'plain **text**' }]))
+    await settleAll()
+    const assistant = page.app.querySelector('assistant')!
+    expect(assistant.find(node => node.tagName === 'STRONG')).toBeUndefined()
+    expect(assistant.textContent).toContain('plain **text**')
+  })
+})
+
+/* A scripted SpeechRecognition: the test says what was heard and when the browser ends. */
+class FakeRecognition {
+  static last: FakeRecognition | null = null
+  lang = ''
+  continuous = false
+  interimResults = false
+  started = false
+  aborted = false
+  stopped = false
+  onresult: ((event: any) => void) | null = null
+  onerror: ((event: any) => void) | null = null
+  onend: (() => void) | null = null
+  constructor() { FakeRecognition.last = this }
+  start() { this.started = true }
+  stop() { this.stopped = true }
+  abort() { this.aborted = true }
+  hear(parts: Array<[string, boolean]>) {
+    const results = parts.map(([transcript, isFinal]) => Object.assign([{ transcript }], { isFinal }))
+    this.onresult?.({ resultIndex: 0, results })
+  }
+}
+
+describe('phone composer dictation', () => {
+  const composer = (page: ReturnType<typeof bootApp>) => page.app.find(node => node.tagName === 'TEXTAREA' && node.className.includes('composer-input'))!
+  const mic = (page: ReturnType<typeof bootApp>) => page.app.querySelector('composer-mic')!
+
+  it('writes what is heard into the composer after the typed text, then sends it', async () => {
+    FakeRecognition.last = null
+    const page = bootApp('#/session/s1', conversationAnswer([]), { globals: { webkitSpeechRecognition: FakeRecognition } })
+    await settleAll()
+    composer(page).typeText('Please')
+    expect(mic(page).getAttribute('aria-label')).toBe('Dictate')
+    mic(page).click()
+    const recognition = FakeRecognition.last!
+    expect(recognition.started).toBe(true)
+    expect(recognition.continuous).toBe(true)
+    expect(recognition.interimResults).toBe(true)
+    expect(mic(page).classList.contains('listening')).toBe(true)
+    expect(mic(page).getAttribute('aria-pressed')).toBe('true')
+    recognition.hear([['fix the', false]])
+    expect(composer(page).value).toBe('Please fix the')
+    /* Each event carries the whole utterance; nothing is appended twice. */
+    recognition.hear([['fix the', true], [' build', false]])
+    expect(composer(page).value).toBe('Please fix the build')
+    expect((page.app.querySelector('composer-send') as any).disabled).toBe(false)
+
+    page.app.querySelector('composer-send')!.click()
+    expect(recognition.aborted).toBe(true)
+    expect(mic(page).classList.contains('listening')).toBe(false)
+    /* A result that was already in flight does not refill the sent composer. */
+    recognition.hear([['fix the build please', true]])
+    await settleAll()
+    expect(page.posts().find(call => call.path === '/api/sessions/s1/message')!.body.text).toBe('Please fix the build')
+    expect(composer(page).value).toBe('')
+  })
+
+  it('stops on a second tap and keeps the last words', async () => {
+    const page = bootApp('#/session/s1', conversationAnswer([]), { globals: { SpeechRecognition: FakeRecognition } })
+    await settleAll()
+    mic(page).click()
+    const recognition = FakeRecognition.last!
+    mic(page).click()
+    expect(recognition.stopped).toBe(true)
+    recognition.hear([['last words', true]])
+    recognition.onend!()
+    expect(composer(page).value).toBe('last words')
+    expect(mic(page).getAttribute('aria-pressed')).toBe('false')
+  })
+
+  it('says the microphone is blocked instead of failing silently', async () => {
+    const page = bootApp('#/session/s1', conversationAnswer([]), { globals: { webkitSpeechRecognition: FakeRecognition } })
+    await settleAll()
+    mic(page).click()
+    FakeRecognition.last!.onerror!({ error: 'not-allowed' })
+    FakeRecognition.last!.onend!()
+    expect(page.toasts.textContent).toContain('Microphone is off for this page')
+  })
+
+  it('without speech recognition the button is dimmed and points at the keyboard microphone', async () => {
+    const page = bootApp('#/session/s1', conversationAnswer([]))
+    await settleAll()
+    expect(mic(page).classList.contains('unsupported')).toBe(true)
+    expect(mic(page).getAttribute('aria-label')).toBe('Dictation is not available in this browser')
+    mic(page).click()
+    expect(page.toasts.textContent).toContain('Dictation is not available here')
+    expect(page.toasts.textContent).toContain('microphone key')
+    /* The note is about this screen: tapping it does not navigate away. */
+    page.toasts.children[0]!.click()
+    expect(page.window.location.hash).toBe('#/session/s1')
   })
 })

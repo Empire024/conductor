@@ -578,7 +578,8 @@
     node.appendChild(el('strong', 'toast-title', notification.title || 'Conductor'))
     if (notification.body) node.appendChild(el('span', 'toast-body', oneLine(notification.body, 140)))
     const dismiss = () => { if (node.parentNode) node.parentNode.removeChild(node) }
-    node.addEventListener('click', () => { dismiss(); openUrl(notification.url || '#/') })
+    /* url: null is a note about this screen; tapping it only dismisses it. */
+    node.addEventListener('click', () => { dismiss(); if (notification.url !== null) openUrl(notification.url || '#/') })
     toastHost.appendChild(node)
     setTimeout(dismiss, 6000)
     while (toastHost.childNodes.length > 3) toastHost.removeChild(toastHost.firstChild)
@@ -650,6 +651,7 @@
       return
     }
     if (screen && screen.destroy) screen.destroy()
+    stopDictation()
     beginTicks()
     screen = buildScreen(route)
     clear(appRoot)
@@ -1529,9 +1531,15 @@
 
   // ------------------------------------------------------------------ conversation pieces
 
-  /* Text arrives as plain markdown-ish output. Only two things matter on a phone: newlines stay
-     newlines, and a fenced block reads as code instead of wrapping into soup. */
-  const appendRichText = (host, text) => {
+  /* Agent text is markdown: markdown.js renders it through createElement and textContent only.
+     Without that script (an old cached shell, or it failed to load) and for what the owner typed,
+     only two things matter: newlines stay newlines, and a fenced block reads as code. */
+  const appendRichText = (host, text, plain) => {
+    const markdown = window.ConductorMarkdown
+    if (!plain && markdown && typeof markdown.render === 'function') {
+      markdown.render(host, text, document)
+      return
+    }
     const lines = String(text === null || text === undefined ? '' : text).split('\n')
     let paragraph = []
     let code = null
@@ -1560,6 +1568,97 @@
     flushParagraph()
   }
 
+  /* Dictation through the browser's own speech recognition (the Web Speech API: Safari on iOS and
+     Chrome on Android have it). It uses whatever speech service that browser already uses;
+     Conductor adds none. Where it is missing the button stays, dimmed, and a tap says to use the
+     keyboard's own microphone key, which every phone keyboard has. One dictation runs at a time. */
+  let activeDictation = null
+  const stopDictation = () => { if (activeDictation) activeDictation() }
+  const speechRecognition = () => window.SpeechRecognition || window.webkitSpeechRecognition || null
+  const MIC_PATHS = ['M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z', 'M5.5 11a6.5 6.5 0 0 0 13 0', 'M12 17.5V21']
+
+  const dictationButton = (input, onChange) => {
+    const Recognition = speechRecognition()
+    const node = button('composer-mic' + (Recognition ? '' : ' unsupported'), null, () => toggle())
+    node.appendChild(icon(MIC_PATHS, 20))
+    let recognition = null
+    let before = ''
+    let after = ''
+    const paint = () => {
+      const listening = Boolean(recognition)
+      node.classList.toggle('listening', listening)
+      node.setAttribute('aria-pressed', listening ? 'true' : 'false')
+      node.setAttribute('aria-label', !Recognition ? 'Dictation is not available in this browser' : listening ? 'Stop dictation' : 'Dictate')
+    }
+    const note = (title, body) => showToast({ kind: 'failed', title: title, body: body, url: null })
+    /* Every result event carries the whole utterance so far; rebuilding from all of it avoids the
+       doubled words iOS produces when results are appended one at a time. */
+    const write = results => {
+      let spoken = ''
+      for (let index = 0; index < results.length; index++) spoken += results[index][0].transcript
+      spoken = spoken.replace(/\s+/g, ' ').trim()
+      const lead = before && spoken && !/\s$/.test(before) ? ' ' : ''
+      const tail = after && spoken && !/^\s/.test(after) ? ' ' : ''
+      input.value = before + lead + spoken + tail + after
+      const caret = (before + lead + spoken).length
+      try { input.setSelectionRange(caret, caret) } catch (error) { /* not focused; the value is what matters */ }
+      onChange()
+    }
+    /* The mic button stops and keeps the last words; sending, leaving or hiding the page drops
+       whatever is still in flight, so a late result cannot refill a composer that was just sent. */
+    const finish = () => {
+      if (!recognition) return
+      try { recognition.stop() } catch (error) { /* already ended */ }
+    }
+    const stop = () => {
+      const current = recognition
+      if (!current) return
+      ended()
+      try { current.abort() } catch (error) { /* already ended */ }
+    }
+    const ended = () => {
+      recognition = null
+      if (activeDictation === stop) activeDictation = null
+      paint()
+    }
+    const toggle = () => {
+      if (recognition) { finish(); return }
+      if (!Recognition) {
+        note('Dictation is not available here', 'This browser has no speech recognition. Use the microphone key on the keyboard instead.')
+        return
+      }
+      stopDictation()
+      const value = input.value
+      /* Tapping the mic blurs the field, but a textarea keeps its caret; dictation goes there. */
+      const caret = typeof input.selectionStart === 'number' ? input.selectionStart : value.length
+      before = value.slice(0, caret)
+      after = value.slice(caret)
+      const current = new Recognition()
+      current.lang = (window.navigator && window.navigator.language) || 'en-US'
+      current.continuous = true
+      current.interimResults = true
+      current.onresult = event => { if (recognition === current) write(event.results) }
+      current.onerror = event => {
+        const code = event && event.error
+        if (code === 'not-allowed' || code === 'service-not-allowed') note('Microphone is off for this page', 'Allow the microphone for this site in the browser settings, or use the keyboard microphone key.')
+        else if (code === 'audio-capture') note('No microphone', 'The phone did not give this page a microphone.')
+        else if (code && code !== 'no-speech' && code !== 'aborted') note('Dictation stopped', String(code))
+      }
+      current.onend = () => { if (recognition === current) ended() }
+      recognition = current
+      activeDictation = stop
+      paint()
+      try {
+        current.start()
+      } catch (error) {
+        ended()
+        note('Dictation could not start', errorMessage(error) || 'The browser refused to start speech recognition.')
+      }
+    }
+    paint()
+    return { node: node, stop: stop }
+  }
+
   const textItem = (item, data) => {
     const text = data.text || ''
     const attachments = data.attachments || []
@@ -1571,7 +1670,7 @@
     }
     const node = el('div', 'bubble ' + (data.role === 'user' ? 'user' : 'assistant'))
     const body = el('div', 'bubble-body')
-    appendRichText(body, text)
+    appendRichText(body, text, data.role === 'user')
     node.appendChild(body)
     if (attachments.length) {
       const chips = el('div', 'attachments')
@@ -1940,7 +2039,13 @@
     stop.appendChild(icon(['M8.5 8.5h7v7h-7z'], 20))
     stop.setAttribute('aria-label', 'Stop this turn')
     const primary = button('composer-send', 'Send', () => void sendPrimary())
+    const dictation = dictationButton(input, () => {
+      state.drafts[id] = input.value
+      grow()
+      paintComposer()
+    })
     composer.appendChild(input)
+    composer.appendChild(dictation.node)
     composer.appendChild(stop)
     composer.appendChild(primary)
     footer.appendChild(pendingHost)
@@ -1987,6 +2092,7 @@
       const conversation = state.conversation
       const resume = conversation && conversation.needsResume
       if (!resume && !text) return
+      dictation.stop()
       await run(async () => {
         if (resume) await api('/api/sessions/' + encodeURIComponent(id) + '/resume', { method: 'POST' })
         if (text) await api('/api/sessions/' + encodeURIComponent(id) + '/message', { method: 'POST', body: { text: text, mode: 'auto' } })
@@ -4317,6 +4423,7 @@
     document.addEventListener('visibilitychange', () => {
       const visible = document.visibilityState === 'visible'
       lockVisibility(visible)
+      if (!visible) stopDictation()
       if (screen && screen.onVisibility) screen.onVisibility(visible)
       if (visible) visibleSince = Date.now()
       if (!visible || !state.token) return

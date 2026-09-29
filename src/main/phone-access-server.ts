@@ -10,6 +10,7 @@ import { X509Certificate } from 'node:crypto'
 import indexHtml from '../phone/index.html?raw'
 import bootJs from '../phone/boot.js?raw'
 import appJs from '../phone/app.js?raw'
+import markdownJs from '../phone/markdown.js?raw'
 import appCss from '../phone/app.css?raw'
 import swJs from '../phone/sw.js?raw'
 import manifestJson from '../phone/manifest.webmanifest?raw'
@@ -93,7 +94,7 @@ export interface PhoneAccessServerDependencies {
   localAddresses?(): string[]
   hostname?(): string
   /** Test seam: the files served at /, /app.js and so on. */
-  assets?: Partial<Record<'index.html' | 'boot.js' | 'app.js' | 'app.css' | 'sw.js' | 'manifest.webmanifest' | 'icon.svg' | 'xterm.js' | 'xterm.css' | 'xterm-fit.js', string>>
+  assets?: Partial<Record<'index.html' | 'boot.js' | 'app.js' | 'markdown.js' | 'app.css' | 'sw.js' | 'manifest.webmanifest' | 'icon.svg' | 'xterm.js' | 'xterm.css' | 'xterm-fit.js', string>>
   log?(message: string, error?: unknown): void
 }
 
@@ -183,12 +184,13 @@ export class PhoneAccessServer {
       else this.terminals?.locked(deviceId, unlockId)
       this.closeStreams(deviceId, unlockId)
     })
-    const files = { 'index.html': indexHtml, 'boot.js': bootJs, 'app.js': appJs, 'app.css': appCss, 'sw.js': swJs, 'manifest.webmanifest': manifestJson, 'icon.svg': iconSvg, 'xterm.js': xtermJs, 'xterm.css': xtermCss, 'xterm-fit.js': xtermFitJs, ...deps.assets }
+    const files = { 'index.html': indexHtml, 'boot.js': bootJs, 'app.js': appJs, 'markdown.js': markdownJs, 'app.css': appCss, 'sw.js': swJs, 'manifest.webmanifest': manifestJson, 'icon.svg': iconSvg, 'xterm.js': xtermJs, 'xterm.css': xtermCss, 'xterm-fit.js': xtermFitJs, ...deps.assets }
     this.assets.set('/', asset(files['index.html'], 'text/html; charset=utf-8', { 'Content-Security-Policy': CSP, 'Cache-Control': 'no-cache' }))
     this.assets.set('/index.html', this.assets.get('/')!)
     // The boot guard is what shows an error when app.js cannot; it is small and cached like it.
     this.assets.set('/boot.js', asset(files['boot.js'], 'text/javascript; charset=utf-8', { 'Cache-Control': 'no-cache' }))
     this.assets.set('/app.js', asset(files['app.js'], 'text/javascript; charset=utf-8', { 'Cache-Control': 'no-cache' }))
+    this.assets.set('/markdown.js', asset(files['markdown.js'], 'text/javascript; charset=utf-8', { 'Cache-Control': 'no-cache' }))
     this.assets.set('/app.css', asset(files['app.css'], 'text/css; charset=utf-8', { 'Cache-Control': 'no-cache' }))
     this.assets.set('/sw.js', asset(files['sw.js'], 'text/javascript; charset=utf-8', { 'Cache-Control': 'no-cache', 'Service-Worker-Allowed': '/' }))
     this.assets.set('/manifest.webmanifest', asset(files['manifest.webmanifest'], 'application/manifest+json; charset=utf-8', { 'Cache-Control': 'no-cache' }))

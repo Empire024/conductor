@@ -108,11 +108,14 @@ try {
   assert.match(boot.headers['content-type'], /^text\/javascript/)
   assert.ok(boot.text.includes('ConductorBoot'), 'the real boot guard is served, not the placeholder')
   const worker = await call(origin, '/sw.js')
-  assert.ok(worker.text.includes("'conductor-phone-v2'") && worker.text.includes("'/boot.js'"))
+  assert.ok(worker.text.includes("'conductor-phone-v3'") && worker.text.includes("'/boot.js'") && worker.text.includes("'/markdown.js'"))
+  const markdown = await call(origin, '/markdown.js')
+  assert.equal(markdown.status, 200)
+  assert.ok(markdown.text.includes('ConductorMarkdown'), 'the markdown renderer is served')
   const health = await call(origin, '/api/health')
   assert.equal(health.status, 200)
   assert.equal(health.json.ok, true)
-  check('The listener serves the boot guard before app.js, the v2 worker precaching it, and an unauthenticated /api/health')
+  check('The listener serves the boot guard before app.js, markdown.js, the v3 worker precaching them, and an unauthenticated /api/health')
 
   // ------------------------------------------------------------------ the phone, unpaired
   const opened = await openPhone('phone-shell')

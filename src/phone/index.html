@@ -19,6 +19,8 @@
     <link rel="stylesheet" href="/app.css">
     <!-- Not deferred: the boot guard has to be listening before app.js can fail. -->
     <script src="/boot.js"></script>
+    <!-- Deferred scripts run in order: the markdown renderer is there before app.js draws. -->
+    <script src="/markdown.js" defer></script>
     <script src="/app.js" defer></script>
   </head>
   <body>

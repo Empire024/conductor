@@ -4,8 +4,9 @@
    so when neither the computer nor the cache can answer a navigation, the page below is the only
    thing the owner will see. It never caches or replays anything under /api. */
 
-/* v2: the shell gained /boot.js, and an old cache without it must not answer for the new shell. */
-const CACHE = 'conductor-phone-v2'
+/* v2: the shell gained /boot.js, and an old cache without it must not answer for the new shell.
+   v3: likewise /markdown.js. */
+const CACHE = 'conductor-phone-v3'
 /* The bearer token and VAPID key the page leaves behind, so a subscription the browser rotates
    can be re-registered without a window open. Same origin-scoped exposure as localStorage. */
 const AUTH_CACHE = 'conductor-phone-auth'
@@ -16,6 +17,7 @@ const SHELL = [
   '/index.html',
   '/boot.js',
   '/app.js',
+  '/markdown.js',
   '/app.css',
   '/manifest.webmanifest',
   '/icon.svg',
