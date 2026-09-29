@@ -1861,7 +1861,7 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 
 - [ ] add a Needs attention summary under all projects that shows active cards currently needing supervision <!-- conductor-task:eb5faab5-920e-4d92-8bf0-2438d6227cca -->
 
-- [ ] Full Auto authorization UI is just a wall of text (owner, 2026-09-29 after the genuine activation): redesign the Claude Full Auto control as a clear toggle/state card (authorized or not, since when, which tabs run Full Auto, disable) with the explanation collapsed <!-- conductor-task:full-auto-ui-redesign -->
+- [x] Full Auto authorization UI is just a wall of text (owner, 2026-09-29 after the genuine activation): redesign the Claude Full Auto control as a clear toggle/state card (authorized or not, since when, which tabs run Full Auto, disable) with the explanation collapsed <!-- conductor-task:full-auto-ui-redesign agent=agent_mumfmuhu_l5g37ti -->
 
 - [~] Codex credits vanish (owner, 2026-09-29): last 24 h Codex = 669 turns, 2,266 calls, 262M input tokens (98% cached, mean 116k context/call); a pure relay bridge tab alone used 12.2M. Fix: (1) cross-workspace send_message/report so no bridge tabs are needed, (2) per-tab token burn meter + alert when a tab exceeds a rate, (3) relay/coordinator roles default to medium effort and short-lived fresh sessions, (4) surface a limit-stopped coworker to its controller immediately (the overnight 7 h stall) <!-- conductor-task:codex-credit-burn agent=agent_mumfmv6m_dozpvi8 -->
 
