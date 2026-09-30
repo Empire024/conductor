@@ -485,9 +485,9 @@ describe('waivers', () => {
     return { f, store, run, finding: finding!, request }
   }
 
-  it('refuses the conversation whose run found it, a missing field and a past expiry', () => {
+  it('lets the wizard whose run found it waive it, and refuses a missing field and a past expiry', () => {
     const { f, store, request } = setup()
-    expect(() => store.createWaiver(f.projectId, request, { kind: 'wizard', agentSessionId: 'agent_wizard', title: 'Wizard' })).toThrow(/cannot waive what that run found/)
+    expect(store.createWaiver(f.projectId, request, { kind: 'wizard', agentSessionId: 'agent_wizard', title: 'Wizard' })).toMatchObject({ reason: request.reason, grantedBy: { kind: 'wizard', agentSessionId: 'agent_wizard' } })
     expect(() => store.createWaiver(f.projectId, { ...request, reason: ' ' }, { kind: 'owner', agentSessionId: null, title: null })).toThrow(/needs a reason/)
     expect(() => store.createWaiver(f.projectId, { ...request, expiresAt: clock().toISOString() }, { kind: 'owner', agentSessionId: null, title: null })).toThrow(/future/)
     expect(() => store.createWaiver(f.projectId, request, { kind: 'agent' as 'owner', agentSessionId: 'x', title: null })).toThrow(/owner or a wizard/)

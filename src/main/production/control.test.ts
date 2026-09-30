@@ -100,13 +100,13 @@ describe('audit, review answers, fix tasks, waivers (fake checks)', () => {
     const after = await productionCall(service, caller(), 'production.status', {}) as typeof status
     expect(after.results.find(result => result.controlId === 'C01')).toMatchObject({ status: 'PASS', humanReview: [{ answer: 'confirmed', note: 'read by counsel' }] })
 
-    // A wizard cannot waive a failure its own run found; the owner can.
+    // A wizard is the owner: it waives even a failure its own run found, and the waiver records who and why.
     const findingId = after.openFindings[0]!.id
     const mine = await audited(WIZARD)
     expect(mine).toBeTruthy()
-    await expect(productionCall(service, WIZARD, 'production.waive', { findingId, reason: 'accepted', scope: 'site', owner: 'ops', expiresAt: '2099-01-01T00:00:00Z' })).rejects.toThrow(/cannot waive its own failure/)
-    const waiver = await productionCall(service, OWNER, 'production.waive', { findingId, reason: 'accepted risk', scope: 'site', owner: 'ops', expiresAt: '2099-01-01T00:00:00Z' })
-    expect(waiver).toMatchObject({ findingId, grantedBy: { kind: 'owner' } })
+    await expect(productionCall(service, caller(), 'production.waive', { findingId, reason: 'accepted', scope: 'site', owner: 'ops', expiresAt: '2099-01-01T00:00:00Z' })).rejects.toThrow(/owner's decision/)
+    const waiver = await productionCall(service, WIZARD, 'production.waive', { findingId, reason: 'accepted risk', scope: 'site', owner: 'ops', expiresAt: '2099-01-01T00:00:00Z' })
+    expect(waiver).toMatchObject({ findingId, reason: 'accepted risk', grantedBy: { kind: 'wizard', agentSessionId: 'wizard-1', title: 'Wizard' } })
     // The waived FAIL no longer blocks; the open owner questions of the seeded profile still need review.
     const gate = service.gate('project-a')
     expect(gate).toMatchObject({ state: 'NEEDS_REVIEW', activeWaivers: 1, openCriticalOrHigh: 0, humanReviewPending: 0 })

@@ -1,7 +1,7 @@
 import { closeSync, existsSync, openSync, readSync, statSync } from 'node:fs'
 import {
   CONTROL_IDS, FINDING_STATUSES, MUTATION_KINDS, PRODUCTION_CONTROL_METHODS, PRODUCTION_LOCAL_METHODS, PRODUCTION_SOVEREIGN_METHODS, REVIEW_ANSWERS, SEVERITIES,
-  type AuditRun, type ControlId, type DriftSettings, type Finding, type FindingStatus, type MutationKind, type ProductionControlMethod, type ProfileUpdate,
+  type ControlId, type DriftSettings, type Finding, type FindingStatus, type MutationKind, type ProductionControlMethod, type ProfileUpdate,
   type ReviewAnswer, type Severity, type Waiver,
 } from '../../shared/production'
 import { maskSecrets } from '../structured-store'
@@ -10,7 +10,8 @@ import type { RunRequestOutcome } from './triggers'
 
 /**
  * production.* app-control methods (docs/production-agent.md sections 2, 4.7 and 11 M8). Every
- * method acts in the caller's own project. Who may call what is decided here from the caller facts
+ * method acts in the caller's own project, or for the owner or a wizard tab in the co-open project
+ * its projectId names (agent-control resolves it into caller.projectId). Who may call what is decided here from the caller facts
  * agent-control derives from the authorized scope, never from anything the caller sends:
  * - PRODUCTION_SOVEREIGN_METHODS (designation, owner answers, review answers, waivers, write
  *   authorizations, drift) need the owner's credential or a wizard tab;
@@ -21,7 +22,7 @@ import type { RunRequestOutcome } from './triggers'
  */
 
 export const productionSignatures: Readonly<Record<ProductionControlMethod, string>> = {
-  'production.status': '({environmentId?}) — the project\'s production audit: gate state with every reason (never a percentage), designation, active run with progress, recent runs, per-control results with human-review items, open findings (top 50), open owner questions, live waivers, browser availability',
+  'production.status': '({environmentId?}) — the project\'s production audit: gate state with every reason (never a percentage), designation, active run with progress, recent runs, per-control results with human-review items, open findings (top 50), open owner questions, live waivers, browser availability. Every production.* method also takes projectId? naming a co-open project (projects.list), for the owner or a wizard tab only',
   'production.queue': '() — one row per project designated production-ready: gate, open critical/high findings, open questions, active run, last completed audit',
   'production.registry': '({controlId?}) — the sixteen controls (C01-C16): sources, applicability predicate, provenance with dates, evidence requirements, checks',
   'production.runs': '({limit?}) — the project\'s audit runs, newest first, with progress and budget ledger',
@@ -41,7 +42,7 @@ export const productionSignatures: Readonly<Record<ProductionControlMethod, stri
   'production.resume': '({runId}) — resume a paused or blocked run from its checkpoint',
   'production.cancel': '({runId,reason}) — cancel a run',
   'production.tasks.create': '({findingIds}) — file or reopen one orchestration board task per finding (critical and high ones are filed by the audit itself); never changes a finding\'s status',
-  'production.waive': '({findingId,reason,scope,owner,expiresAt}) — owner or wizard: waive a finding until expiresAt; the finding stays, and a waiver never covers a failure the caller\'s own run found',
+  'production.waive': '({findingId,reason,scope,owner,expiresAt}) — owner or wizard: waive a finding until expiresAt; the finding stays, and the waiver records who granted it and why',
   'production.waivers.revoke': '({waiverId,reason}) — owner or wizard: revoke a waiver',
   'production.writes.authorize': '({environmentId,mutations,expiresAt,note}) — owner or wizard: allow the named mutations in one non-production environment until expiresAt (production is always refused)',
   'production.writes.revoke': '({authorizationId}) — owner or wizard: revoke a sandbox write authorization',
@@ -275,7 +276,6 @@ export async function productionCall(service: ProductionService, caller: Product
     case 'production.tasks.create': return service.createFixTasks(projectId, ids(args, 'findingIds'))
     case 'production.waive': {
       const findingId = text(args, 'findingId', 200)
-      if (!caller.owner) refuseSelfWaiver(service, projectId, findingId, caller)
       const grantedBy: Waiver['grantedBy'] = caller.owner ? { kind: 'owner', agentSessionId: null, title: 'Owner' } : { kind: 'wizard', agentSessionId: caller.agentSessionId, title: caller.title }
       return service.waive(projectId, { findingId, reason: text(args, 'reason', 2_000), scope: text(args, 'scope', 500), owner: text(args, 'owner', 200), expiresAt: isoDate(args, 'expiresAt') }, grantedBy)
     }
@@ -304,15 +304,5 @@ export async function productionCall(service: ProductionService, caller: Product
       const check = args.runNow === true ? await service.runDrift(projectId) : null
       return { drift: profile.drift, check }
     }
-  }
-}
-
-/** A wizard never waives a failure its own conversation's run found (section 4.7, self-dealing). */
-function refuseSelfWaiver(service: ProductionService, projectId: string, findingId: string, caller: ProductionCaller): void {
-  const [finding] = service.findingsByIds(projectId, [findingId])
-  if (!finding) throw new Error(`No finding ${findingId} in this project; production.findings lists them`)
-  const runs: AuditRun[] = [finding.firstSeenRunId, finding.lastSeenRunId].flatMap(id => { try { return [service.run(projectId, id)] } catch { return [] } })
-  if (runs.some(run => run.trigger.by.agentSessionId === caller.agentSessionId)) {
-    throw new Error(`Finding ${findingId} was found by a run this conversation started; it cannot waive its own failure. Ask the owner to decide from the Production panel.`)
   }
 }

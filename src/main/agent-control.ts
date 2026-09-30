@@ -1867,7 +1867,8 @@ export class AgentControl {
     }
     // Naming another project is only meaningful for the methods that were opened to a sibling;
     // everywhere else it is still an attempt to act outside the authorized scope.
-    if (args.projectId !== undefined && args.projectId !== scope.projectId && !crossProjectMethods.includes(method)) throw new Error('This method only runs in the authorized project. Use projects.list to see what else is open, and hand work to a sibling project with tabs.open({projectId}).')
+    // The owner or a wizard coordinating a co-open project also acts on its production audit.
+    if (args.projectId !== undefined && args.projectId !== scope.projectId && !crossProjectMethods.includes(method) && !(productionMethods.has(method) && sovereign(scope))) throw new Error('This method only runs in the authorized project. Use projects.list to see what else is open, and hand work to a sibling project with tabs.open({projectId}).')
     if (method === 'tools.list') return filterSignatures({ ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.cloud ? cloudSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(this.deps.ideaRuns ? ideaRunSignatures : {}), ...(this.deps.production ? productionSignatures : {}), ...(this.deps.modelIntelligence ? modelSignatures : {}), ...(this.deps.modelUpgrades ? Object.fromEntries(Object.entries(upgradeSignatures).filter(([name]) => upgradeOpenMethods.has(name) || sovereign(scope))) : {}), ...(sovereign(scope) ? { ...ownerSignatures, ...WIZARD_APPROVAL_SIGNATURES } : {}), ...(scope.owner ? supervisorSignatures : {}), ...(this.deps.permissionGrants ? { ...PERMISSION_METHOD_SIGNATURES, ...(sovereign(scope) ? PERMISSION_OWNER_SIGNATURES : {}) } : {}) }, args)
     if (PERMISSION_METHODS.includes(method)) {
       if (!this.deps.permissionGrants) throw new Error('Permission grants are not available in this Conductor')
@@ -2477,8 +2478,10 @@ export class AgentControl {
     const service = this.deps.production
     if (!service) throw new Error('Production audits are unavailable in this Conductor')
     const settings = scope.owner ? undefined : this.deps.database.structured.snapshot(scope.agentSessionId)?.settings
+    // invoke() lets only the owner or a wizard name another project here.
+    const projectId = args.projectId === undefined ? scope.projectId : this.sibling(scope, { projectId: args.projectId }).projectId
     return productionCall(service, {
-      projectId: scope.projectId, agentSessionId: scope.owner ? '' : scope.agentSessionId, title: source.title, owner: scope.owner === true, wizard: scope.wizard === true,
+      projectId, agentSessionId: scope.owner ? '' : scope.agentSessionId, title: source.title, owner: scope.owner === true, wizard: scope.wizard === true,
       sovereign: sovereign(scope), local: !scope.owner && source.provider === 'local', readOnly: !scope.owner && restricted(settings)
     }, method, args)
   }

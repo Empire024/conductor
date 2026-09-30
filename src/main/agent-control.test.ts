@@ -974,6 +974,18 @@ describe('projects open side by side in one window', () => {
     expect(readFileSync(join(other.path, 'style.css'), 'utf8')).toBe('body { color: teal }')
   })
 
+  it('lets the owner or a wizard act on a co-open project\'s production audit by projectId, and no one else', async () => {
+    const f = fixture(), other = sibling(f)
+    const profile = vi.fn((projectId: string) => ({ projectId }))
+    const control = new AgentControl({ ...f.deps, production: { profile } as never })
+    expect(await control.call({ ...f.scope, wizard: true }, 'production.profile.get', { projectId: other.project.id })).toEqual({ projectId: other.project.id })
+    expect(await control.call(control.ownerScope({ projectId: f.project.id }), 'production.profile.get', { projectId: other.project.id })).toEqual({ projectId: other.project.id })
+    expect(await control.call(f.scope, 'production.profile.get', { projectId: f.project.id })).toEqual({ projectId: f.project.id })
+    await expect(control.call(f.scope, 'production.profile.get', { projectId: other.project.id })).rejects.toThrow(/only runs in the authorized project/)
+    await expect(control.call({ ...f.scope, wizard: true }, 'production.profile.get', { projectId: 'project_nope' })).rejects.toThrow(/No project with that id/)
+    expect(profile.mock.calls.map(([projectId]) => projectId)).toEqual([other.project.id, other.project.id, f.project.id])
+  })
+
   it('hands work to a tab opened in the sibling project and keeps steering only that tab', async () => {
     const f = fixture(), other = sibling(f)
     const handed = await f.control.call(f.scope, 'tabs.open', { projectId: other.project.id, provider: 'claude', title: 'Theme worker' }) as AgentControlTab & { projectId: string; workspaceId: string }

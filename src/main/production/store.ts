@@ -913,8 +913,8 @@ export class ProductionStore {
 
   /**
    * A waiver preserves the finding and marks it waived. It needs a reason, scope, owner and an
-   * expiry in the future, and an owner or wizard grantor that is not the agent whose run found the
-   * finding (agents cannot waive their own failures). A fixed finding has nothing to waive; a
+   * expiry in the future, and an owner or wizard grantor, recorded on the waiver (a wizard is
+   * the owner, including for what its own run found). A fixed finding has nothing to waive; a
    * finding with a live waiver must have it revoked first.
    */
   createWaiver(projectId: string, request: WaiverRequest, grantedBy: Waiver['grantedBy']): Waiver {
@@ -928,12 +928,6 @@ export class ProductionStore {
       if (finding.status === 'fixed') throw new Error(`Finding ${finding.id} is verified fixed; there is nothing to waive`)
       const live = this.waivers(projectId, { active: true, findingId: finding.id, limit: 1 })[0]
       if (live) throw new Error(`Finding ${finding.id} already has waiver ${live.id} until ${live.expiresAt}; revoke it first`)
-      if (grantedBy.agentSessionId) {
-        for (const runId of new Set([finding.firstSeenRunId, finding.lastSeenRunId])) {
-          const run = this.findRun(runId)
-          if (run?.trigger.by.agentSessionId && run.trigger.by.agentSessionId === grantedBy.agentSessionId) throw new Error(`The conversation that triggered run ${run.id} cannot waive what that run found; the owner or another wizard decides`)
-        }
-      }
       const waiver: Waiver = {
         id: makeId('pwv'), projectId, findingId: finding.id, reason: text(request.reason, 2_000), scope: text(request.scope, 1_000), owner: text(request.owner, 200),
         grantedBy, grantedAt: this.now(), expiresAt: new Date(expires).toISOString(), revokedAt: null, revokedReason: null
