@@ -356,6 +356,27 @@ describe('permissions.* through app control', () => {
     await expect(callPermissions(h.grants, { agentSessionId: '', owner: true, answers: id => id === tab }, 'permissions.decide', { agentSessionId: tab, requestId: local.requestId, decision: 'approve-once' })).resolves.toMatchObject({ status: 'approved-once', grant: { decidedBy: 'owner' } })
     expect((await callPermissions(h.grants, { agentSessionId: tab }, 'permissions.list', {}) as { grants: unknown[] }).grants).toHaveLength(2)
   })
+
+  it('lets the asker, or the successor holding it, withdraw its own pending request; never another conversation\'s', async () => {
+    const heir = 'agent_other', h = harness({ title: id => id === heir ? 'Wizard (continued)' : 'Wizard' })
+    const first = await callPermissions(h.grants, { agentSessionId: tab }, 'permissions.request', { command: ssh, reason: 'pool fix' }) as { requestId: string }
+    await expect(callPermissions(h.grants, { agentSessionId: tab }, 'permissions.withdraw', { requestId: first.requestId })).rejects.toThrow('reason must be')
+    await expect(callPermissions(h.grants, { agentSessionId: tab }, 'permissions.withdraw', { requestId: first.requestId, reason: 'x', force: true })).rejects.toThrow('does not take force')
+    await expect(callPermissions(h.grants, { agentSessionId: 'agent_stranger' }, 'permissions.withdraw', { requestId: first.requestId, reason: 'mine now' })).rejects.toThrow('No such permission request')
+    await expect(callPermissions(h.grants, { agentSessionId: 'agent_stranger' }, 'permissions.withdraw', { agentSessionId: tab, requestId: first.requestId, reason: 'x' })).rejects.toThrow('Only the owner or a wizard')
+    await expect(callPermissions(h.grants, { agentSessionId: tab }, 'permissions.withdraw', { requestId: first.requestId, reason: 'Step already done by hand' })).resolves.toEqual({ withdrawn: true, requestId: first.requestId, status: 'expired' })
+    expect(h.grants.list(tab).requests[0]).toMatchObject({ id: first.requestId, status: 'expired' })
+    expect(h.notices.filter(entry => entry.id === tab).at(-1)).toMatchObject({ message: expect.stringContaining('Step already done by hand') })
+    await expect(h.grants.decide(tab, first.requestId, 'approve-once', 'owner')).rejects.toThrow('already answered')
+    await expect(callPermissions(h.grants, { agentSessionId: tab }, 'permissions.withdraw', { requestId: first.requestId, reason: 'again' })).resolves.toMatchObject({ withdrawn: false, status: 'expired' })
+    // Moved at handoff: the successor withdraws it, and so may the asker by its old id.
+    const second = h.grants.request(tab, { command: "bash scripts/fix-pool.sh", reason: "pool fix" })
+    const third = h.grants.request(tab, { command: 'npm run build', reason: 'build' })
+    await h.grants.transfer(tab, heir)
+    await expect(callPermissions(h.grants, { agentSessionId: heir }, 'permissions.withdraw', { requestId: second.id, reason: 'superseded' })).resolves.toMatchObject({ withdrawn: true })
+    await expect(callPermissions(h.grants, { agentSessionId: tab }, 'permissions.withdraw', { requestId: third.id, reason: 'not needed' })).resolves.toMatchObject({ withdrawn: true })
+    expect(h.grants.list(heir).requests.map(request => request.status)).toEqual(['expired', 'expired'])
+  })
 })
 
 describe('the conductor MCP server', () => {

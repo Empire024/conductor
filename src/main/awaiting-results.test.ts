@@ -14,6 +14,7 @@ function harness(settings = new Map<string, string>()) {
   const states = new Map<string, SessionProjection>()
   const open: Record<string, string> = { fixer: 'Fixer', other: 'Other fixer' }
   const superseded = new Set<string>()
+  const clock = { now: Date.parse('2026-09-30T00:00:00.000Z') }
   const state = (id: string, phase: SessionProjection['phase'] = 'completed', items: TimelineItem[] = []): SessionProjection => {
     const value = { sessionId: id, runtimeId: 'r', phase, sequence: items.reduce((max, item) => Math.max(max, item.sequence), 0), items, settings: { permission: 'default', plan: false }, title: id, archived: false, truncated: false } as SessionProjection
     states.set(id, value)
@@ -23,7 +24,7 @@ function harness(settings = new Map<string, string>()) {
     settings: { getSetting: key => settings.get(key) ?? null, setSetting: (key, value) => { settings.set(key, value) }, removeSetting: key => { settings.delete(key) } },
     snapshot: id => states.get(id) ?? null,
     journal: (id, from, to, limit) => (journal.get(id) ?? []).filter(event => event.sequence >= from && event.sequence < to && event.sequence >= (floors.get(id) ?? 0)).slice(0, limit),
-    open: id => open[id], successors: () => [], superseded: id => superseded.has(id)
+    open: id => open[id], successors: () => [], superseded: id => superseded.has(id), now: () => clock.now
   })
   const staged = new Map<string, TimelineItem[]>()
   const toEvent = (id: string, item: TimelineItem): AgentEvent => ({ sessionId: id, runtimeId: 'r', sequence: item.sequence, timestamp: item.timestamp, itemId: item.id, data: item.data }) as AgentEvent
@@ -40,7 +41,7 @@ function harness(settings = new Map<string, string>()) {
   }
   /** Events applied to the projection but not written to the journal yet (StructuredStore.stage). */
   const stage = (id: string, items: TimelineItem[]): SessionProjection => { staged.set(id, [...staged.get(id) ?? [], ...items]); return project(id, 2000) }
-  return { settings, state, ledger, open, superseded, emit, stage, floors, toEvent }
+  return { settings, state, ledger, open, superseded, emit, stage, floors, toEvent, clock }
 }
 
 describe('AwaitingResults', () => {
@@ -227,6 +228,62 @@ describe('AwaitingResults', () => {
     // The late broadcast of the reply at 2 still counts against the fixer's original baseline.
     h.ledger.noteEvents([h.toEvent('reviewer', reply)])
     expect(h.ledger.record('reviewer')).toMatchObject({ agents: ['other'] })
+  })
+
+  it('ends a wait at its deadline, the default one when none was named, and only for a waiter whose turn ended', () => {
+    const h = harness()
+    h.state('reviewer', 'completed', [text(1)])
+    h.state('fixer', 'running')
+    expect(h.ledger.declare('reviewer', ['fixer']).deadline).toBe('2026-09-30T01:00:00.000Z')
+    expect(h.ledger.waiters()).toEqual(['reviewer'])
+    const busy = () => false
+    h.clock.now += 59 * 60_000
+    expect(h.ledger.sweep(busy)).toEqual([])
+    h.clock.now += 2 * 60_000
+    // Mid-turn, or stopped by the owner, it is not woken; the wait stays.
+    h.state('reviewer', 'running', [text(1)])
+    expect(h.ledger.sweep(busy)).toEqual([])
+    h.state('reviewer', 'interrupted', [text(1)])
+    expect(h.ledger.sweep(busy)).toEqual([])
+    h.state('reviewer', 'completed', [text(1)])
+    expect(h.ledger.sweep(busy)).toMatchObject([{ waiter: 'reviewer', kind: 'deadline', agents: ['fixer'] }])
+    expect(h.ledger.record('reviewer')).toBeNull()
+    expect(h.ledger.waiters()).toEqual([])
+    expect(h.ledger.sweep(busy)).toEqual([])
+    // An explicit deadline, kept when awaitReply adds a recipient.
+    h.ledger.declare('reviewer', ['fixer'], undefined, undefined, {}, '2026-09-30T01:05:00.000Z')
+    expect(h.ledger.add('reviewer', 'other', 1).deadline).toBe('2026-09-30T01:05:00.000Z')
+  })
+
+  it('wakes the waiter once everyone it waits for stayed quiet for the grace period without messaging', () => {
+    const h = harness()
+    h.state('reviewer', 'completed', [text(1)])
+    h.ledger.declare('reviewer', ['fixer', 'other'])
+    const quiet = new Set<string>(['fixer'])
+    const isQuiet = (id: string) => quiet.has(id)
+    expect(h.ledger.sweep(isQuiet, 60_000)).toEqual([])
+    quiet.add('other')
+    expect(h.ledger.sweep(isQuiet, 60_000)).toEqual([])
+    h.clock.now += 30_000
+    // Work resumed in between: the grace period starts again.
+    quiet.delete('other')
+    expect(h.ledger.sweep(isQuiet, 60_000)).toEqual([])
+    quiet.add('other')
+    expect(h.ledger.sweep(isQuiet, 60_000)).toEqual([])
+    h.clock.now += 59_000
+    expect(h.ledger.sweep(isQuiet, 60_000)).toEqual([])
+    h.clock.now += 1_000
+    expect(h.ledger.sweep(isQuiet, 60_000)).toMatchObject([{ waiter: 'reviewer', kind: 'quiet', agents: ['fixer', 'other'] }])
+    expect(h.ledger.record('reviewer')).toBeNull()
+    // A closed tab counts as quiet; a reply that arrived resolves the wait before any sweep.
+    h.ledger.declare('reviewer', ['fixer'])
+    delete h.open.fixer
+    expect(h.ledger.sweep(() => false, 0)).toMatchObject([{ kind: 'quiet', agents: ['fixer'] }])
+    h.open.fixer = 'Fixer'
+    h.ledger.declare('reviewer', ['fixer'])
+    h.state('reviewer', 'completed', [text(1), text(2, 'fixer')])
+    expect(h.ledger.sweep(() => true, 0)).toEqual([])
+    expect(h.ledger.waiters()).toEqual([])
   })
 
   it('the archive refuses a waiting tab', () => {

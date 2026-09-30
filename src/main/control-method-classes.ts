@@ -23,7 +23,7 @@ export const MUTATION_FAMILIES = {
     'ideas.capture', 'ideas.link', 'ideas.note', 'ideas.explore', 'ideas.work',
     'ideas.run', 'ideas.run.approve', 'ideas.run.decide', 'ideas.run.pause', 'ideas.run.resume', 'ideas.run.stop'
   ],
-  permissions: ['permissions.request', 'permissions.decide', 'permissions.revoke'],
+  permissions: ['permissions.request', 'permissions.decide', 'permissions.revoke', 'permissions.withdraw'],
   models: ['models.refresh', 'models.outcome', 'models.evaluate', 'decisions.live', 'models.upgrades.check', 'models.upgrades.prepared', 'models.upgrades.accept', 'models.upgrades.decline', 'models.upgrades.retry', 'models.upgrades.configure'],
   production: [
     'production.profile.update', 'production.designate', 'production.answer', 'production.review.answer', 'production.audit', 'production.retest', 'production.verify',

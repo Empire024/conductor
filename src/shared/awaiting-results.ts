@@ -35,11 +35,22 @@ import type { SessionProjection } from './structured-agent'
  *   awaited coworker reopened by a message counts again.
  * - agents.await({clear:true}), agents.finish and any finish route (closeFinished) cancel it.
  * - While the waiter is stopped by the owner, handed off or superseded it is not waiting.
+ * - A wait never stalls silently (2026-09-30: a rejected cross-project reply left a wizard in
+ *   agents.await for 8.5 h). Every wait has a deadline (timeoutMinutes, DEFAULT_AWAIT_MINUTES when
+ *   omitted): once it passes, the waiter is woken with a "deadline passed" message. And when every
+ *   awaited conversation has gone quiet (idle, completed, failed or closed, with no background work
+ *   and no wait of its own) for AWAIT_QUIET_GRACE_MS without messaging, the waiter is woken with
+ *   that fact and each one's last answer. Either wake ends the wait (AgentControl.sweepAwaiting).
  */
 
 export const AWAITING_RESULTS_PREFIX = 'awaitingResults:'
 export const MAX_AWAITED = 20
 export const MAX_AWAIT_REASON = 300
+/** A wait's deadline when agents.await or awaitReply names none, and the longest one allowed. */
+export const DEFAULT_AWAIT_MINUTES = 60
+export const MAX_AWAIT_MINUTES = 24 * 60
+/** How long every awaited conversation must stay quiet before the waiter is told. */
+export const AWAIT_QUIET_GRACE_MS = 90_000
 
 export interface AwaitingRecord {
   /** Conversations whose results are still owed, in the order named; arrivals are removed. */
@@ -54,6 +65,8 @@ export interface AwaitingRecord {
    *  judged against it, not against the cursor, which a catch-up read may have moved past a trimmed
    *  gap. Absent in records written before it existed: sinceSequence stands in. */
   baselines?: Record<string, number>
+  /** When the waiter is woken regardless (ISO). Absent in records written before it existed. */
+  deadline?: string
 }
 
 export const baselineOf = (record: Pick<AwaitingRecord, 'sinceSequence' | 'baselines'>, agentSessionId: string): number => record.baselines?.[agentSessionId] ?? record.sinceSequence
@@ -71,7 +84,7 @@ export function parseAwaitingRecord(raw: string | null | undefined): AwaitingRec
     const value = JSON.parse(raw) as Partial<AwaitingRecord>
     if (!Array.isArray(value.agents) || !value.agents.every(id => typeof id === 'string' && id) || typeof value.since !== 'string' || typeof value.sinceSequence !== 'number') return null
     const baselines = value.baselines && typeof value.baselines === 'object' && !Array.isArray(value.baselines) ? Object.fromEntries(Object.entries(value.baselines).filter(([, sequence]) => typeof sequence === 'number')) as Record<string, number> : undefined
-    return { agents: value.agents, since: value.since, sinceSequence: value.sinceSequence, ...(typeof value.reason === 'string' && value.reason ? { reason: value.reason } : {}), ...(baselines ? { baselines } : {}) }
+    return { agents: value.agents, since: value.since, sinceSequence: value.sinceSequence, ...(typeof value.reason === 'string' && value.reason ? { reason: value.reason } : {}), ...(baselines ? { baselines } : {}), ...(typeof value.deadline === 'string' && value.deadline ? { deadline: value.deadline } : {}) }
   } catch { return null }
 }
 

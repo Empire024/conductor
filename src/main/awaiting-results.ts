@@ -1,5 +1,5 @@
 import type { AgentEvent, SessionProjection } from '../shared/structured-agent'
-import { AWAITING_RESULTS_PREFIX, MAX_AWAITED, MAX_AWAIT_REASON, arrivedFrom, baselineOf, evaluateAwaiting, parseAwaitingRecord, type AwaitedLookup, type Sequenced, type AwaitingFact, type AwaitingRecord } from '../shared/awaiting-results'
+import { AWAITING_RESULTS_PREFIX, AWAIT_QUIET_GRACE_MS, DEFAULT_AWAIT_MINUTES, MAX_AWAITED, MAX_AWAIT_REASON, arrivedFrom, baselineOf, evaluateAwaiting, parseAwaitingRecord, type AwaitedLookup, type Sequenced, type AwaitingFact, type AwaitingRecord } from '../shared/awaiting-results'
 import { handedOffIn } from '../shared/workspace-clarity'
 
 /**
@@ -19,6 +19,15 @@ function latestFrom(after: number, entries: Iterable<Sequenced>, into: Map<strin
     for (const id of from) into.set(id, Math.max(into.get(id) ?? -Infinity, entry.sequence))
   }
 }
+
+/** The settings key listing every conversation with a wait record. */
+const AWAITING_INDEX = 'awaitingResultsIndex'
+/** A waiter whose turn has ended: only such a tab is woken; one mid-turn is not waiting yet. */
+const SETTLED_WAITER = new Set<SessionProjection['phase']>(['idle', 'completed', 'failed', 'disconnected'])
+
+/** A wait the sweep ended: its deadline passed, or everyone it waited for went quiet. `agents` are
+ *  the conversations now carrying the awaited work (a successor in place of a handed-off one). */
+export interface AwaitWake { waiter: string; kind: 'deadline' | 'quiet'; record: AwaitingRecord; agents: string[] }
 
 type Settings = { getSetting(key: string): string | null; setSetting(key: string, value: string): void; removeSetting(key: string): void }
 
@@ -46,21 +55,73 @@ export class AwaitingResults {
     return parseAwaitingRecord(this.deps.settings.getSetting(this.key(waiter)))
   }
 
-  private save(waiter: string, record: AwaitingRecord): void { this.deps.settings.setSetting(this.key(waiter), JSON.stringify(record)) }
+  private save(waiter: string, record: AwaitingRecord): void {
+    this.deps.settings.setSetting(this.key(waiter), JSON.stringify(record))
+    const index = this.waiters()
+    if (!index.includes(waiter)) this.deps.settings.setSetting(AWAITING_INDEX, JSON.stringify([...index, waiter]))
+  }
+
+  /** The conversations with a wait record, for the deadline and quiet sweep (the settings table has
+   *  no prefix listing). Records written before the index existed are not swept until declared again. */
+  waiters(): string[] {
+    try {
+      const value: unknown = JSON.parse(this.deps.settings.getSetting(AWAITING_INDEX) ?? '[]')
+      return Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string') : []
+    } catch { return [] }
+  }
+
+  /** When each waiter's awaited conversations were first seen all quiet (in memory: a restart
+   *  only restarts the grace period). */
+  private readonly quietSince = new Map<string, number>()
+
+  /** The waits to end now: a passed deadline, or every awaited conversation quiet for the grace
+   *  period without messaging. Each returned wait is already cleared; the caller wakes its waiter.
+   *  A waiter mid-turn, stopped by the owner, handed off or superseded is left alone. */
+  sweep(quiet: (agentSessionId: string) => boolean, graceMs = AWAIT_QUIET_GRACE_MS): AwaitWake[] {
+    const now = this.deps.now?.() ?? Date.now(), wakes: AwaitWake[] = []
+    const index = this.waiters()
+    for (const waiter of index) {
+      const record = this.consume(waiter), state = this.deps.snapshot(waiter)
+      if (!record) { this.quietSince.delete(waiter); continue }
+      if (!state || !SETTLED_WAITER.has(state.phase) || handedOffIn(state.items) || this.deps.superseded?.(waiter)) { this.quietSince.delete(waiter); continue }
+      if (record.deadline && Date.parse(record.deadline) <= now) {
+        this.clear(waiter)
+        wakes.push({ waiter, kind: 'deadline', record, agents: record.agents.map(id => this.holder(id)) })
+        continue
+      }
+      const agents = record.agents.map(id => this.holder(id))
+      if (!agents.every(id => this.deps.open(id) === undefined || quiet(id))) { this.quietSince.delete(waiter); continue }
+      const first = this.quietSince.get(waiter) ?? now
+      this.quietSince.set(waiter, first)
+      if (now - first < graceMs) continue
+      this.clear(waiter)
+      wakes.push({ waiter, kind: 'quiet', record, agents })
+    }
+    return wakes
+  }
+
+  /** The conversation carrying an awaited one's work now: its newest open successor, else itself. */
+  private holder(id: string): string {
+    for (const candidate of [id, ...this.deps.successors(id)].reverse()) if (this.deps.open(candidate) !== undefined) return candidate
+    return id
+  }
 
   /** Replaces the waiter's wait with these conversations (order kept, duplicates dropped).
    *  `baseline` is the waiter's sequence before the message that asked for the results went out;
    *  by default its sequence now. */
-  declare(waiter: string, agents: readonly string[], reason?: string, baseline?: number, kept: Record<string, number> = {}): AwaitingRecord {
+  declare(waiter: string, agents: readonly string[], reason?: string, baseline?: number, kept: Record<string, number> = {}, deadline?: string): AwaitingRecord {
     const unique = [...new Set(agents.filter(id => id && id !== waiter))].slice(0, MAX_AWAITED)
     if (!unique.length) throw new Error('Name at least one other conversation to wait for')
     const from = baseline ?? this.deps.snapshot(waiter)?.sequence ?? 0
+    const now = this.deps.now?.() ?? Date.now()
     const record: AwaitingRecord = {
-      agents: unique, since: new Date(this.deps.now?.() ?? Date.now()).toISOString(), sinceSequence: from,
+      agents: unique, since: new Date(now).toISOString(), sinceSequence: from,
       // An agent still owed from an earlier wait keeps its own, earlier baseline.
       baselines: Object.fromEntries(unique.map(id => [id, kept[id] ?? from])),
-      ...(reason?.trim() ? { reason: reason.trim().slice(0, MAX_AWAIT_REASON) } : {})
+      ...(reason?.trim() ? { reason: reason.trim().slice(0, MAX_AWAIT_REASON) } : {}),
+      deadline: deadline ?? new Date(now + DEFAULT_AWAIT_MINUTES * 60_000).toISOString()
     }
+    this.quietSince.delete(waiter)
     this.save(waiter, record)
     // Whatever already arrived after the baseline (a reply faster than the send) counts at once.
     return this.consume(waiter) ?? { ...record, agents: [] }
@@ -76,12 +137,20 @@ export class AwaitingResults {
     // The shared cursor may start earlier, but the new recipient counts only from its own pre-send
     // baseline; one already owed keeps its earlier baseline.
     const kept = { ...current ? Object.fromEntries(current.agents.map(id => [id, baselineOf(current, id)])) : {}, ...current?.agents.includes(agentSessionId) ? {} : { [agentSessionId]: baseline } }
-    return this.declare(waiter, [...current?.agents ?? [], agentSessionId], reason ?? current?.reason, from, kept)
+    // An earlier deadline still stands; a first wait gets the default one.
+    return this.declare(waiter, [...current?.agents ?? [], agentSessionId], reason ?? current?.reason, from, kept, current?.deadline)
   }
 
   clear(waiter: string): boolean {
     const had = this.deps.settings.getSetting(this.key(waiter)) !== null
     if (had) this.deps.settings.removeSetting(this.key(waiter))
+    this.quietSince.delete(waiter)
+    const index = this.waiters()
+    if (index.includes(waiter)) {
+      const rest = index.filter(id => id !== waiter)
+      if (rest.length) this.deps.settings.setSetting(AWAITING_INDEX, JSON.stringify(rest))
+      else this.deps.settings.removeSetting(AWAITING_INDEX)
+    }
     return had
   }
 

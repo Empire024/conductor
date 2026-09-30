@@ -83,6 +83,9 @@ export interface ApprovalReviewShadow {
   reviewed(record: ReviewRecord): void
   answered(record: ReviewRecord): void
 }
+const DENIAL_FENCE = 'A durable approval denial protects this project target. This tool route cannot retry or bypass it.'
+/** Conductor's messaging tools: they reach another conversation, never a project target. */
+const MESSAGING_TOOLS = /^mcp__conductor__(?:send_message|report|handoff|request_permission|list_permissions)$/
 type Binding = { spec: AgentSpec; runtimeId: string; source: AdapterEvent; interaction: PendingInteraction; action?: ReviewAction; record?: ReviewRecord; settled?: 'owner' }
 const object = (value: unknown): Record<string, Json> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, Json> : {}
 /** Phases after which a record carries a response intent; an owner answer no longer changes them. */
@@ -97,17 +100,37 @@ export class ApprovalReviewGate {
     private publish: (id: string, runtimeId: string, source: AdapterEvent) => void,
     private respond: (response: InteractionResponse) => Promise<void>) { this.journal = new ApprovalReviews(persistence) }
   private key(id: string, runtime: string, request: string) { return canonicalAction([id, runtime, request]) }
+  /** The durable denial fence on every tool call (Claude PreToolUse). A denial fences what it
+   *  named: the exact paths of a file mutation, or the same pathless operation again. Until
+   *  2026-09-30 any denial in the project refused every non-read tool of every conversation there,
+   *  Conductor's own send_message and report included: one denied production card silenced the
+   *  Haftheme wizard's reply and its controller waited 8.5 h. Messaging never touches a project
+   *  target, so it always passes; any other tool is refused only when its paths or its exact
+   *  operation are the denied ones. */
   async guardTool(spec: AgentSpec, tool: string, input: Json): Promise<string | undefined> {
-    if (!this.journal.hasDenials(spec.projectId) || ['Read', 'Grep', 'Glob', 'LS', 'AskUserQuestion', 'TodoWrite'].includes(tool)) return undefined
-    if (['Write', 'Edit', 'MultiEdit', 'NotebookEdit'].includes(tool)) {
-      const args = object(input), requested = args.file_path ?? args.notebook_path
-      if (typeof requested === 'string') {
-        const path = await reviewTargetPath(spec.cwd, requested)
-        const action = { projectId: spec.projectId, machineId: 'local', paths: [process.platform === 'win32' ? path.toLowerCase() : path] } as ReviewAction
-        if (!this.journal.denied(action)) return undefined
-      }
+    if (!this.journal.hasDenials(spec.projectId) || ['Read', 'Grep', 'Glob', 'LS', 'AskUserQuestion', 'TodoWrite'].includes(tool) || MESSAGING_TOOLS.test(tool)) return undefined
+    const args = object(input), paths = new Set<string>()
+    const add = async (requested: string) => {
+      try { const path = await reviewTargetPath(spec.cwd, requested); paths.add(process.platform === 'win32' ? path.toLowerCase() : path) } catch { /* outside the workspace: no workspace denial names it */ }
     }
-    return 'A durable approval denial protects this project target. This tool route cannot retry or bypass it.'
+    const requested = args.file_path ?? args.notebook_path
+    if (['Write', 'Edit', 'MultiEdit', 'NotebookEdit'].includes(tool)) {
+      if (typeof requested !== 'string') return DENIAL_FENCE
+      await add(requested)
+    } else {
+      // A command or another tool's arguments name paths as words: each word that could be one is
+      // checked against the denied paths, so a shell cannot rewrite a denied file either.
+      // Every string argument counts, nested ones too (app control's files.write names its path inside args).
+      const strings: string[] = []
+      const walk = (value: Json | undefined): void => { if (typeof value === 'string') strings.push(value); else if (value && typeof value === 'object') for (const item of Object.values(value)) walk(item) }
+      walk(input)
+      const words = strings.join('\n').split(/[\s"'`;|&<>(){}[\],=]+/)
+      for (const word of [...new Set(words)].filter(word => word && /[\w.]/.test(word)).slice(0, 1000)) await add(word)
+    }
+    const base = { projectId: spec.projectId, machineId: 'local' } as ReviewAction
+    if (paths.size && this.journal.denied({ ...base, paths: [...paths] })) return DENIAL_FENCE
+    if (this.journal.denied({ ...base, tool, arguments: boundedArguments(input), paths: [] })) return DENIAL_FENCE
+    return undefined
   }
   /** What the owner sees while the review runs or after it stopped. The owner's own choices are
    *  never taken away: a reviewer may answer for the owner, but no review state, least of all a

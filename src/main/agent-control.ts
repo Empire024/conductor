@@ -42,7 +42,7 @@ import { ApprovalReviews } from './approval-review'
 import { sinceCursor, supervise } from './agent-supervision'
 import { CoworkerRecovery } from './coworker-recovery'
 import { AwaitingResults } from './awaiting-results'
-import { awaitingSentence, MAX_AWAITED, MAX_AWAIT_REASON, type AwaitingFact } from '../shared/awaiting-results'
+import { awaitingSentence, DEFAULT_AWAIT_MINUTES, MAX_AWAITED, MAX_AWAIT_MINUTES, MAX_AWAIT_REASON, type AwaitingFact } from '../shared/awaiting-results'
 import { displaySessionPhase } from '../shared/project-activity'
 import { claudeHookHealth } from './providers/claude'
 import { localStopOf } from '../shared/local-stop.ts'
@@ -78,6 +78,8 @@ import type { ModelUpgradeService } from './model-upgrades/service'
 import { freshestCatalog } from './model-upgrades/better'
 
 type Args = Record<string, unknown>
+/** Conductor's messaging tools whose refusal the recipient is told about (tellRefusedMessage). */
+const REFUSABLE_MESSAGE = /^(?:mcp__conductor__|conductor[./:])?(?:send_message|report)$/
 /** waitSeconds caps over HTTP; the conductor MCP control tool cuts any wait to
  *  CONTROL_WAIT_MAX_SECONDS first, inside its client's tool-call limit (control-mcp.ts). */
 const FINISH_WAIT_SECONDS = FINISH_WAIT_MAX_SECONDS
@@ -265,7 +267,7 @@ const toolSignatures = {
   'agents.fork': '({agentSessionId,title?}) — fork supported idle native history into a visible linked tab, opened in the workspace that holds the original; outside this workspace only a coworker this caller controls',
   'agents.release': '({agentSessionId}) — release this controller relationship, wherever the coworker lives',
   'agents.report': '({text}) — deliver a report to the conversation that opened this tab (its controller, whoever that is; a controller that handed itself on is reached through its successor), as agents.steer does: steered into a running turn where the provider can, else queued or starting one. Never refused for length: the first 2000 characters (cut at a line break) are delivered with a pointer, and the whole text is kept as an artifact the controller reads with agents.artifact; the result says {delivered,total,artifactId}. Takes no agentSessionId: it always reports to the caller\'s own controller, never any other target. For a local model this is the way to reach its controller directly instead of the controller polling agents.status',
-  'agents.await': '({agents,reason?}|{clear:true}) — declare that this conversation ends its turn waiting for results from the named conversations (agent ids, at most ' + MAX_AWAITED + '; reason up to ' + MAX_AWAIT_REASON + ' characters): its tab stays in the active group labelled "waiting for …" instead of Done, and no sweep closes it; it survives a restart. Their message (send_message, agents.report) wakes you as it always does, so end your turn and never poll. Each one drops out when its message arrives; once all have and your turn ends without declaring again, the tab is finished work. A conversation whose tab closed is no longer waited for. Calling it again replaces the list; clear:true cancels; agents.finish ends it. Your own live coworkers need no declaration',
+  'agents.await': '({agents,reason?,timeoutMinutes?}|{clear:true}) — declare that this conversation ends its turn waiting for results from the named conversations (agent ids, at most ' + MAX_AWAITED + '; reason up to ' + MAX_AWAIT_REASON + ' characters): its tab stays in the active group labelled "waiting for …" instead of Done, and no sweep closes it; it survives a restart. Their message (send_message, agents.report) wakes you as it always does, so end your turn and never poll. Each one drops out when its message arrives; once all have and your turn ends without declaring again, the tab is finished work. A conversation whose tab closed is no longer waited for. A wait never stalls silently: after timeoutMinutes (default ' + DEFAULT_AWAIT_MINUTES + ', at most ' + MAX_AWAIT_MINUTES + ') you are woken with "deadline passed", and once every awaited conversation has gone idle, completed, failed or closed without messaging you, you are woken with that fact and their last answers; either wake ends the wait. send_message awaitReply waits get the same default deadline. Calling it again replaces the list; clear:true cancels; agents.finish ends it. Your own live coworkers need no declaration',
   'agents.finish': '({agentSessionId?,waitSeconds?,force?}) — close a finished coworker: its tab closes with history kept (reopenable from the closed tabs) and its CLI process is released. With agentSessionId, a controller finishes a coworker it controls whose turn has settled with no background tasks, at once and without an owner dialog; waitSeconds (max ' + FINISH_WAIT_SECONDS + MCP_WAIT_NOTE + '; a longer wait is capped and the result says so in waitCapped) first waits that long for it to settle, so there is no agents.status loop; refused, naming the reason, while it is (still) running, has background tasks, waits on an approval, has an unsent draft, is a wizard tab or still controls open coworkers. With {} a coworker finishes itself as its last act: Conductor closes it once this turn settles, so call it after your work is delivered and reported, then end the turn; background tasks of your own are waited for with waitSeconds, or stopped with your CLI with force:true',
   'agents.handoff': `({handoff,title?,successor?,provider?,model?,effort?}) — hand your own remaining work to a fresh tab when this conversation's context has grown expensive. Takes no agentSessionId: it always hands off the caller. handoff is ${HANDOFF_MINIMUM}-${HANDOFF_MAXIMUM} characters holding the six sections of docs/token-thrift-policy.md on their own lines, in order (${handoffSections.join(', ')}); reference long output by repository path rather than pasting it. The new tab opens in this workspace with your provider, model, effort and mode, and receives the handoff as its first prompt; provider, model and effort from models.list continue you elsewhere (another provider must name its model; your mode is kept, never widened). Your tab stays open and steerable: finish the step you are in, report it, and stop. successor:true is for a main brain (a wizard tab, or a controller with live coworkers): the new tab is you continued, not your coworker. It opens as a root (under your own controller, if you have one), inherits wizard mode and limit continuation, takes over every coworker you control (their agents.report, approvals and steering go to it) and any pending restart that would bring you back (a wizard's successor must be a model that can hold the wand, else nothing opens); you lose wizard mode, are marked superseded, and your tab shows “Continued in <tab>”`,
   'files.list': '({query?,projectId?}) — indexed project search, at most 100 matches with stable URIs',
@@ -1445,6 +1447,78 @@ export class AgentControl {
    *  consumes its recipient's wait at once, even when it joins a running turn. */
   noteAwaitingEvents(events: Parameters<AwaitingResults['noteEvents']>[0]): void {
     try { this.awaiting().noteEvents(events) } catch (error) { console.warn('Waiting-for-results consume failed', error) }
+    for (const event of events) {
+      const data = event.data as { type: string; name?: string; status?: string; input?: unknown; output?: string }
+      if (data.type !== 'tool' || data.status !== 'rejected' || !REFUSABLE_MESSAGE.test(data.name ?? '')) continue
+      const key = `${event.sessionId}\n${(event as { itemId?: string }).itemId ?? event.sequence}`
+      if (this.refusedMessages.has(key)) continue
+      this.refusedMessages.add(key)
+      if (this.refusedMessages.size > 500) this.refusedMessages.delete(this.refusedMessages.values().next().value!)
+      void this.tellRefusedMessage(event.sessionId, data.name!, object(data.input), data.output).catch(error => console.warn('Refused-message notice failed', error))
+    }
+  }
+
+  /** Refused send_message/report calls already told to their recipient (item keys, bounded). */
+  private readonly refusedMessages = new Set<string>()
+
+  /** A send_message or report the sender's runtime refused (a hook, the classifier, a denied
+   *  approval) never reaches its recipient, who may be waiting on exactly that reply: tell the
+   *  recipient it was refused, with the reason the sender saw, so no wait stalls on it. The notice
+   *  carries the sender as its origin, so it also ends a wait on the sender. */
+  private async tellRefusedMessage(senderId: string, tool: string, input: Args, output?: string): Promise<void> {
+    const { database, sessions } = this.deps
+    const sender = database.structured.spec<AgentSpec>(senderId)
+    if (!sender) return
+    let recipient: string | undefined
+    if (tool.endsWith('report')) {
+      const link = this.reportLink(senderId)
+      recipient = link ? this.successorOf(link.controllerProjectId ?? link.projectId, link.controllerAgentSessionId) : undefined
+    } else if (typeof input.agentSessionId === 'string') recipient = input.agentSessionId
+    else if (typeof input.projectId === 'string') recipient = this.wizardsOf(input.projectId).find(wizard => !wizard.remote && wizard.agentSessionId !== senderId)?.agentSessionId
+    const state = recipient && recipient !== senderId ? database.structured.snapshot(recipient) : null
+    if (!recipient || !state) return
+    const title = this.describeTarget({ agentSessionId: senderId })?.title ?? database.structured.snapshot(senderId)?.title ?? sender.title ?? 'A conversation'
+    const project = sender.projectId === database.structured.spec<AgentSpec>(recipient)?.projectId ? '' : ` in project "${database.getProject(sender.projectId)?.name ?? sender.projectId}"`
+    const sealed = anonymousConversations.has(senderId) && !anonymousConversations.has(recipient)
+    const flat = (value: string, limit: number) => { const line = value.replace(/\s+/g, ' ').trim(); return line.length > limit ? line.slice(0, limit) + '…' : line }
+    const said = !sealed && typeof input.text === 'string' && input.text.trim() ? ` It began: "${flat(input.text, 600)}"` : ''
+    const reason = output?.trim() ? flat(output, 400) : 'its runtime refused the tool call before it ran'
+    const body = `[Conductor] "${title}" (${senderId})${project} tried to ${tool.endsWith('report') ? 'report' : 'send a message'} to you, and the call was refused, so it never arrived: ${reason}.${said} The sender saw the refusal. Read its tab with agents.status or agents.history, and reply to it or take its work over rather than waiting.`
+    await sessions.steerOrStart(recipient, body, state.settings, [], { agentSessionId: senderId, label: `${title} (refused message)` })
+  }
+
+  /** The deadline and quiet sweep (index.ts, on a timer): wakes each waiter whose agents.await
+   *  deadline passed, or whose awaited conversations all went quiet without messaging it, with a
+   *  message saying so and each one's state and last answer. On 2026-09-29 a wizard sat 8.5 h in
+   *  agents.await on a reply its sender's tool call never delivered. */
+  async sweepAwaiting(graceMs?: number): Promise<number> {
+    const { database, sessions } = this.deps
+    let wakes: ReturnType<AwaitingResults['sweep']>
+    try {
+      wakes = this.awaiting().sweep(id => {
+        const state = database.structured.snapshot(id)
+        return !state || (['idle', 'completed', 'failed', 'disconnected', 'interrupted'].includes(state.phase) && !state.backgroundTasks && !this.awaitingFact(id))
+      }, graceMs)
+    } catch (error) { console.warn('Waiting-for-results sweep failed', error); return 0 }
+    for (const wake of wakes) {
+      const state = database.structured.snapshot(wake.waiter)
+      if (!state) continue
+      const lines = wake.agents.map(id => {
+        const other = database.structured.snapshot(id)
+        const target = this.describeTarget({ agentSessionId: id }), open = target !== undefined
+        const title = target?.title ?? other?.title ?? 'a conversation'
+        const last = other?.items.filter(item => !item.parentId && item.data.type === 'text' && item.data.role === 'assistant').at(-1)
+        const said = last?.data.type === 'text' && !(anonymousConversations.has(id) && !anonymousConversations.has(wake.waiter)) ? last.data.text.replace(/\s+/g, ' ').trim() : ''
+        const excerpt = said ? `; last answer: "${said.length > 400 ? said.slice(0, 400) + '…' : said}"` : ''
+        return `- "${title}" (${id}): ${open ? other?.phase ?? 'unknown' : 'tab closed'}${other?.limitResumeAt ? `, usage limit until ${other.limitResumeAt}` : ''}${excerpt}`
+      }).join('\n')
+      const why = wake.record.reason ? ` (${wake.record.reason})` : ''
+      const body = wake.kind === 'deadline'
+        ? `[Conductor] Deadline passed: the wait you declared at ${wake.record.since}${why} ended at ${wake.record.deadline} with no message from:\n${lines}\nThe wait is over. Check agents.status or agents.history, message them again, take the work over, or declare a new agents.await.`
+        : `[Conductor] Everyone you were waiting for${why} has gone quiet without messaging you:\n${lines}\nThe wait is over. Read their result with agents.history, message them again (a refused reply shows as a rejected tool in agents.status), or take the work over.`
+      try { await sessions.steerOrStart(wake.waiter, body, state.settings) } catch (error) { console.warn('Waiting-for-results wake failed', error) }
+    }
+    return wakes.length
   }
 
   /** Whom this conversation waits for right now, for workspace clarity; undefined when nobody. */
@@ -1455,7 +1529,7 @@ export class AgentControl {
   /** agents.await: the caller declares (or cancels) the wait its turn ends on. */
   private declareAwait(scope: AgentControlScope, args: Args): unknown {
     if (scope.owner) throw new Error('agents.await is declared by the conversation that waits; the owner credential has none')
-    const input = validateArgs('agents.await', args, ['agents', 'reason', 'clear'], { aliases: { agentSessionIds: 'agents', agentIds: 'agents', agentSessionId: 'agents', agentId: 'agents', for: 'reason' } })
+    const input = validateArgs('agents.await', args, ['agents', 'reason', 'clear', 'timeoutMinutes'], { aliases: { agentSessionIds: 'agents', agentIds: 'agents', agentSessionId: 'agents', agentId: 'agents', for: 'reason', timeout: 'timeoutMinutes', deadlineMinutes: 'timeoutMinutes' } })
     const ledger = this.awaiting()
     if (input.clear !== undefined) {
       if (input.clear !== true || input.agents !== undefined) throw new ArgumentError('clear:true cancels the wait and takes nothing else')
@@ -1467,11 +1541,14 @@ export class AgentControl {
     if (agents.includes(scope.agentSessionId)) throw new ArgumentError('A conversation does not wait for itself')
     for (const id of agents) if (!this.deps.database.structured.spec<AgentSpec>(id)) throw new ArgumentError(`No conversation ${id} exists in this Conductor; agents.list gives the ids`)
     const reason = input.reason === undefined ? undefined : text(input, 'reason', MAX_AWAIT_REASON)
-    ledger.declare(scope.agentSessionId, agents, reason)
+    if (input.timeoutMinutes !== undefined && (typeof input.timeoutMinutes !== 'number' || !Number.isFinite(input.timeoutMinutes) || input.timeoutMinutes <= 0 || input.timeoutMinutes > MAX_AWAIT_MINUTES)) throw new ArgumentError(`timeoutMinutes is a number of minutes above 0 and at most ${MAX_AWAIT_MINUTES}; omitted, the wait ends after ${DEFAULT_AWAIT_MINUTES}`)
+    const minutes = typeof input.timeoutMinutes === 'number' ? input.timeoutMinutes : DEFAULT_AWAIT_MINUTES
+    const deadline = new Date(Date.now() + minutes * 60_000).toISOString()
+    ledger.declare(scope.agentSessionId, agents, reason, undefined, {}, deadline)
     const fact = ledger.fact(scope.agentSessionId)
     return {
-      awaiting: fact ?? null,
-      note: fact ? `${awaitingSentence(fact)} End your turn now; do not poll.` : 'None of those conversations has an open tab, so nothing is waited for; message them first, or finish your work.'
+      awaiting: fact ?? null, ...(fact ? { deadline } : {}),
+      note: fact ? `${awaitingSentence(fact)} Conductor wakes you at ${deadline} if nobody has answered, or once every one of them has gone quiet without messaging you. End your turn now; do not poll.` : 'None of those conversations has an open tab, so nothing is waited for; message them first, or finish your work.'
     }
   }
 

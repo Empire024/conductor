@@ -764,6 +764,32 @@ export class PermissionGrants {
     return true
   }
 
+  /** The conversation that asked, or the successor holding its card after a handoff, takes back
+   *  its own PENDING request (permissions.withdraw): the card stops asking the owner and reads
+   *  expired, with the reason. revoke() only ends live grants, so on 2026-09-29 four Haftheme cards
+   *  whose steps were already done kept asking. A pending native request is denied to its runtime,
+   *  so nothing waits on it. Returns the request's status when it was no longer pending. */
+  async withdrawRequest(agentSessionId: string, requestId: string, reason: string): Promise<{ withdrawn: boolean; requestId: string; status: GrantStatus }> {
+    requestId = this.aliases.get(agentSessionId)?.get(requestId) ?? requestId
+    const holder = this.holderOf(agentSessionId, requestId)
+    const request = this.requests.get(holder)?.get(requestId)
+    if (!request) {
+      const answered = this.settled.get(holder)?.get(requestId)
+      if (answered) return { withdrawn: false, requestId, status: answered }
+      throw new Error('No such permission request in this conversation or the one it took over; permissions.list gives your requests')
+    }
+    if (request.status !== 'pending') return { withdrawn: false, requestId, status: request.status }
+    if (request.source === 'native' && request.call && this.ports.respondNative) {
+      try { await this.ports.respondNative(holder, request.call, 'deny') }
+      catch { /* Withdrawn either way; a lost response cannot grant execution. */ }
+      request.execution = { status: 'cancelled', call: request.call, scope: 'once', updatedAt: this.now(), detail: 'The conversation withdrew this request.' }
+    }
+    this.settle(holder, request, { status: 'expired', decidedAt: this.now(), decidedBy: request.decidedBy })
+    this.settledAs(holder, requestId, 'expired')
+    this.ports.notice(holder, `Permission request withdrawn by the conversation: ${grantRequestSummary(request)}. Reason: ${reason.replace(/\s+/g, ' ').trim().slice(0, 400)}`, { permissionGrantWithdrawn: { requestId, reason: reason.slice(0, 400) } }, `grant-withdrawn:${requestId}`)
+    return { withdrawn: true, requestId, status: 'expired' }
+  }
+
   /** An approve-once grant's call ran: it is spent and taken back out of the live settings. */
   used(reporter: string, rule: string): void {
     let agentSessionId = reporter

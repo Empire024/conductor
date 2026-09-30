@@ -3521,6 +3521,49 @@ describe('waiting for results (src/shared/awaiting-results.ts)', () => {
     // ... and after a restart (a fresh AgentControl over the same database).
     expect(new AgentControl(f.deps).awaitingFact(f.scope.agentSessionId)!.agents.map(agent => agent.agentSessionId)).toEqual([other.agentSessionId])
   })
+
+  it('agents.await has a deadline (60 min by default) that wakes the waiter, and everyone going quiet wakes it too (2026-09-30 stall)', async () => {
+    const f = fixture()
+    const fixer = agentIn(f, f.project.id, f.workspace.id, 'fixer')
+    await expect(f.control.call(f.scope, 'agents.await', { agents: [fixer.agentSessionId], timeoutMinutes: 0 })).rejects.toThrow(/timeoutMinutes is a number/)
+    await expect(f.control.call(f.scope, 'agents.await', { agents: [fixer.agentSessionId], timeoutMinutes: 5000 })).rejects.toThrow(/at most 1440/)
+    const before = Date.now()
+    const declared = await f.control.call(f.scope, 'agents.await', { agents: [fixer.agentSessionId], reason: 'W5 results' }) as { deadline: string; note: string }
+    expect(Date.parse(declared.deadline) - before).toBeGreaterThanOrEqual(60 * 60_000 - 1000)
+    expect(declared.note).toMatch(/wakes you at .* gone quiet/)
+    // The fixer is still working: nothing wakes before the deadline.
+    const busy = f.database.structured.snapshot.bind(f.database.structured)
+    const running = vi.spyOn(f.database.structured, 'snapshot').mockImplementation(id => { const state = busy(id); return state && id === fixer.agentSessionId ? { ...state, phase: 'running' } : state })
+    expect(await f.control.sweepAwaiting(0)).toBe(0)
+    // A short deadline passes.
+    await f.control.call(f.scope, 'agents.await', { agents: [fixer.agentSessionId], reason: 'W5 results', timeoutMinutes: 0.0005 })
+    await new Promise(resolve => setTimeout(resolve, 60))
+    expect(await f.control.sweepAwaiting(0)).toBe(1)
+    expect(f.submissions.at(-1)).toMatchObject({ prompt: expect.stringMatching(/^\[Conductor\] Deadline passed: .*\(W5 results\)[\s\S]*"fixer" \(fixer\): running/) })
+    expect(f.control.awaitingFact(f.scope.agentSessionId)).toBeUndefined()
+    expect(await f.control.sweepAwaiting(0)).toBe(0)
+    // The fixer settles with an answer and never messages: the waiter is told, with its last answer.
+    running.mockRestore()
+    f.database.structured.append({ sessionId: fixer.agentSessionId, runtimeId: 'runtime', sequence: f.database.structured.snapshot(fixer.agentSessionId)!.sequence + 1, timestamp: new Date().toISOString(), itemId: 'answer', data: { type: 'text', role: 'assistant', text: 'All five browsers pass; see state.md', mode: 'snapshot' } } as never)
+    await f.control.call(f.scope, 'agents.await', { agents: [fixer.agentSessionId] })
+    expect(await f.control.sweepAwaiting(0)).toBe(1)
+    expect(f.submissions.at(-1)).toMatchObject({ prompt: expect.stringMatching(/^\[Conductor\] Everyone you were waiting for has gone quiet[\s\S]*last answer: "All five browsers pass; see state.md"/) })
+    expect(f.database.getSetting('awaitingResults:' + f.scope.agentSessionId)).toBeNull()
+  })
+
+  it('a refused send_message never strands its recipient: the recipient is told why, and its wait on the sender ends', async () => {
+    const f = fixture()
+    const sender = agentIn(f, f.project.id, f.workspace.id, 'haftheme-wizard')
+    await f.control.call(f.scope, 'agents.await', { agents: [sender.agentSessionId] })
+    const refused = { sessionId: sender.agentSessionId, runtimeId: 'runtime', sequence: 9, timestamp: new Date().toISOString(), itemId: 'toolu_reply',
+      data: { type: 'tool', name: 'mcp__conductor__send_message', status: 'rejected', input: { agentSessionId: f.scope.agentSessionId, text: 'Reply: W5 is done, 3 orders to cancel' }, output: 'PreToolUse:mcp__conductor__send_message hook error: A durable approval denial protects this project target.' } }
+    f.control.noteAwaitingEvents([refused] as never)
+    // The same item's later updates are not told twice.
+    f.control.noteAwaitingEvents([refused] as never)
+    await vi.waitFor(() => expect(f.submissions.filter(entry => String(entry.prompt).includes('was refused'))).toHaveLength(1))
+    expect(f.submissions.at(-1)).toMatchObject({ prompt: expect.stringMatching(/"haftheme-wizard" \(haftheme-wizard\) tried to send a message to you, and the call was refused, so it never arrived: PreToolUse.*durable approval denial.*It began: "Reply: W5 is done/) })
+    expect(f.control.awaitingFact(f.scope.agentSessionId)).toBeUndefined()
+  })
 })
 
 // conductor-task:codex-credit-burn (3): a relay or coordinator stays a short-lived session.

@@ -5,7 +5,8 @@ import type { AgentGrantRequest, PermissionGrants } from './service'
 export const PERMISSION_METHOD_SIGNATURES: Record<string, string> = {
   'permissions.request': '({command}|{path}|{url}, tool?, reason, rollback?) — ask the owner for exactly one call the classifier refused or would refuse: command for Bash (tool:"PowerShell" for PowerShell), path for Write (tool:"Edit" for Edit), url for WebFetch. The owner gets one card with Approve once / Approve for this session / Deny; you are then told "[Conductor] approved: <rule>; retry it now" (run exactly that call, unchanged) or that it was denied. Write a script and ask for running that script rather than one long command; never ask for edits to permission settings',
   'permissions.list': '({agentSessionId?}) — your own open requests and live grants; the owner or a wizard tab may name a conversation',
-  'permissions.revoke': '({grantId, agentSessionId?}) — withdraw a live grant at once; your own, or any for the owner or a wizard tab'
+  'permissions.revoke': '({grantId, agentSessionId?}) — withdraw a live grant at once; your own, or any for the owner or a wizard tab',
+  'permissions.withdraw': '({requestId, reason, agentSessionId?}) — take back your own PENDING request (one you asked, or one a handoff moved to you) that is no longer needed: its card stops asking the owner and reads expired with your reason; returns {withdrawn:false,status} when it was already answered. The owner or a wizard tab may name a conversation. permissions.revoke is for live grants'
 }
 /** Only the owner's credential or a wizard tab sees and may call this. The same authority as
  *  agents.approve (wizard-approvals.ts): the owner answers any conversation of the project, a
@@ -47,6 +48,11 @@ export async function callPermissions(grants: PermissionGrants, scope: Permissio
   }
   if (method === 'permissions.list') return grants.list(target())
   if (method === 'permissions.revoke') return { revoked: await grants.revoke(target(), text(args.grantId, 'grantId', true)!) }
+  if (method === 'permissions.withdraw') {
+    const unknown = Object.keys(args).filter(key => !['requestId', 'reason', 'agentSessionId'].includes(key))
+    if (unknown.length) throw new Error(`permissions.withdraw does not take ${unknown.join(', ')}; it takes {requestId, reason}`)
+    return grants.withdrawRequest(target(), text(args.requestId, 'requestId', true)!, text(args.reason, 'reason', true)!)
+  }
   if (method === 'permissions.decide') {
     if (!sovereign) throw new Error('permissions.decide answers only the owner\'s own control credential or a wizard tab')
     const agentSessionId = text(args.agentSessionId, 'agentSessionId', true)!

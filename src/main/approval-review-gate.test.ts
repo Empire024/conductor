@@ -118,6 +118,24 @@ describe('host approval response gate (synthetic reviewers, no inference)', () =
     expect(await f.gate.guardTool({ ...f.spec, id: 'replacement' }, 'Bash', { command: 'overwrite panel.txt' })).toContain('durable approval denial')
     expect(await f.gate.guardTool({ ...f.spec, id: 'replacement' }, 'Edit', { file_path: 'panel.txt' })).toContain('durable approval denial')
     expect(await f.gate.guardTool(f.spec, 'Read', { file_path: 'panel.txt' })).toBeUndefined()
+    // Nested arguments name the denied file too; what names another target passes.
+    expect(await f.gate.guardTool(f.spec, 'mcp__conductor__control', { method: 'files.write', args: { path: 'panel.txt', content: 'x' } })).toContain('durable approval denial')
+    expect(await f.gate.guardTool(f.spec, 'Bash', { command: 'git log --oneline -3' })).toBeUndefined()
+    expect(await f.gate.guardTool(f.spec, 'Write', { file_path: 'other.txt', content: 'x' })).toBeUndefined()
+  })
+  it('fences a denied command only, never the conversation\'s messages or unrelated tools (2026-09-30 Haftheme stall)', async () => {
+    const f = fixture()
+    f.setDecision(async (_action, digest) => ({ digest, decision: 'escalate', rationale: 'Production', reviewerId: 'reviewer', model: 'claude-opus-test', turnId: 'turn' }))
+    f.gate.intercept(f.spec, 'runtime', f.request('prod', { command: 'bash scripts/promote.sh production' }, 'Bash'))
+    await f.waitPhase('owner')
+    expect((await f.gate.reserve({ sessionId: 'worker', runtimeId: 'runtime', requestId: 'prod', decision: 'deny' }, false))?.denied).toBe(true)
+    f.restart()
+    const successor = { ...f.spec, id: 'successor' }
+    expect(await f.gate.guardTool(successor, 'mcp__conductor__send_message', { agentSessionId: 'wizard', text: 'Reply: W5 done' })).toBeUndefined()
+    expect(await f.gate.guardTool(successor, 'mcp__conductor__report', { text: 'Blocked on the promote' })).toBeUndefined()
+    expect(await f.gate.guardTool(successor, 'Bash', { command: 'git log --oneline -3' })).toBeUndefined()
+    expect(await f.gate.guardTool(successor, 'Write', { file_path: 'notes.md', content: 'x' })).toBeUndefined()
+    expect(await f.gate.guardTool(successor, 'Bash', { command: 'bash scripts/promote.sh production' })).toContain('durable approval denial')
   })
   it('invalidates a review when another writer changes target contents before the answer', async () => {
     const f = fixture()

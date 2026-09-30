@@ -3026,6 +3026,11 @@ app.whenReady().then(async () => {
   // A waiting tab consumes the replies it received on each of its status changes (awaiting-results.ts).
   onBroadcast((channel, payload) => { const id = channel === 'agent:status' ? (payload as { id?: unknown } | null)?.id : undefined; if (typeof id === 'string') control.noteAwaitingStatus(id) })
   onBroadcast((channel, payload) => { if (channel === 'structured:events' && Array.isArray(payload)) control.noteAwaitingEvents(payload) })
+  // A wait never stalls silently: its deadline, or everyone it waits for going quiet, wakes it.
+  const awaitTest = !app.isPackaged && process.env.CONDUCTOR_TEST_USER_DATA
+  const awaitSweepMs = (awaitTest && Number(process.env.CONDUCTOR_TEST_AWAIT_SWEEP_MS)) || 30_000
+  const awaitQuietMs = awaitTest && process.env.CONDUCTOR_TEST_AWAIT_QUIET_MS ? Number(process.env.CONDUCTOR_TEST_AWAIT_QUIET_MS) : undefined
+  setInterval(() => { void control.sweepAwaiting(awaitQuietMs) }, awaitSweepMs).unref()
   // Needs attention under the projects (src/main/needs-attention.ts).
   const needsAttention = needsAttentionService = createNeedsAttention({ database, permissionRequests: () => permissionGrants?.grants.state().requests ?? [], publish: snapshot => publish('attention:changed', snapshot) })
   onBroadcast(channel => { if (channel === 'agent:status') needsAttention.attention.changed() })
