@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { CheckContext, ControlCheck, TargetFingerprint } from '../../shared/production'
 import { AuthUnavailable } from './browser'
 import { createProductionService, type ProductionService } from './index'
@@ -254,6 +254,22 @@ describe('audit runs end to end (fake ports)', () => {
     expect(c16.calls).toBe(0)
     expect(Object.values(results).some(result => result.status === 'PASS')).toBe(false)
     expect(w.service.gate('project-a').state).toBe('NEEDS_REVIEW')
+  })
+
+  it('charges the requests of a long step while it runs, not only when it ends', async () => {
+    const gate = deferred()
+    const slow = scriptedCheck('C13', 'accessibility', async context => { spend(context, 7); await gate.promise; return outcome('accessibility', 'PASS') })
+    const w = world([slow])
+    const started = await w.service.audit('project-a', { controls: ['C13'] })
+    if (started.outcome === 'dropped') throw new Error(started.reason)
+    // The lease renews every ttl/3 (5 s / 3); the running step's requests are on the ledger by then.
+    await vi.waitFor(() => expect(temp.store.run(started.run.id).ledger.requests).toBe(7), { timeout: 4_000, interval: 100 })
+    expect(temp.store.run(started.run.id).steps.find(step => step.controlId === 'C13')!.status).toBe('running')
+    gate.resolve()
+    await w.service.runner.idle()
+    const run = temp.store.run(started.run.id)
+    expect(run.status).toBe('completed')
+    expect(run.ledger.requests).toBe(7)
   })
 
   it('blocks the run when the budget runs out before any control concluded', async () => {

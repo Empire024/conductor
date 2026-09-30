@@ -211,8 +211,13 @@ export class ProductionRunner {
     const lease = store.acquire(runId, this.deps.ownerId, this.leaseTtl)
     const guard: WriteGuard = { epoch: lease.epoch }
     const alive = (): void => { if (active.halted || signal.aborted) throw new RunStopped(signal.reason ? String(signal.reason) : 'stopped') }
+    // Requests and elapsed time of the running step, charged on every renewal as well as when the
+    // step ends: a long crawl (discovery throttled per origin takes ~20 min) shows its progress
+    // instead of reading as a hang with 0 requests.
+    let chargeStep: (() => void) | null = null
     const renew = setInterval(() => {
-      try { store.renew(runId, lease.epoch, this.leaseTtl) } catch { active.controller.abort('lease lost') }
+      try { store.renew(runId, lease.epoch, this.leaseTtl) } catch { active.controller.abort('lease lost'); return }
+      chargeStep?.()
     }, Math.max(1_000, Math.floor(this.leaseTtl / 3)))
     renew.unref?.()
     let browser: AuditBrowser | null = null
@@ -249,11 +254,22 @@ export class ProductionRunner {
       const interpreter = createRunInterpreter({ ports: this.deps.interpreter, store, run: initial, guard, clock: this.clock })
       const scope: StepScope = { runId, guard, profile, environment, policy, browser, source, adapters, evidence, synthetic, interpreter, state, signal, alive, run }
 
-      let requestsCharged = browser.budget().requests
+      const stepBrowser = browser
+      let requestsCharged = stepBrowser.budget().requests
+      let chargedAt = Date.now()
+      const charge = (): void => {
+        if (active.halted || signal.aborted) return
+        const used = stepBrowser.budget().requests
+        const now = Date.now()
+        try { store.charge(runId, guard, { requests: Math.max(0, used - requestsCharged), elapsedMs: now - chargedAt }) } catch { /* the run moved on (paused/cancelled) */ }
+        requestsCharged = used
+        chargedAt = now
+      }
       for (const step of store.steps(runId)) {
         if (step.status === 'done' || step.status === 'skipped') continue
         alive()
-        const started = Date.now()
+        chargedAt = Date.now()
+        chargeStep = charge
         store.startStep(runId, guard, step.id)
         try {
           await this.step(step, scope)
@@ -266,11 +282,8 @@ export class ProductionRunner {
           finished = store.transition(runId, 'failed', `Step ${step.index + 1} (${step.kind}${step.controlId ? ` ${step.controlId}` : ''}) failed: ${message}`, guard)
           return
         } finally {
-          if (!active.halted && !signal.aborted) {
-            const used = browser.budget().requests
-            try { store.charge(runId, guard, { requests: Math.max(0, used - requestsCharged), elapsedMs: Date.now() - started }) } catch { /* the run moved on (paused/cancelled) */ }
-            requestsCharged = used
-          }
+          chargeStep = null
+          charge()
         }
         const current = run()
         if (current.ledger.exhausted && !store.results(runId).some(result => result.status !== 'UNVERIFIED' && result.status !== 'NOT_APPLICABLE') && current.steps.some(entry => entry.kind === 'control' && entry.status === 'pending')) {
