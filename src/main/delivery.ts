@@ -4,6 +4,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync,
 import { tmpdir } from 'node:os'
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from 'node:path'
 import { lowerSpawned } from './background-priority'
+import { fullTestReason, relatedTestFiles } from './delivery-test-policy'
 import { DELIVERY_STAGES, type DeliveryRequester, type DeliveryRun, type DeliveryStage, type DeliveryStageId, type DeliveryTestProgress, type RepositoryFile, type RepositoryStatus } from '../shared/delivery'
 
 export interface DeliveryRunOptions {
@@ -317,6 +318,7 @@ interface Plan {
   github: { owner: string; repo: string } | null
   test: string[] | null
   defaultTest: boolean
+  scriptTests: boolean
   testSkip: string
   build: string[] | null
   defaultBuild: boolean
@@ -329,12 +331,6 @@ interface Plan {
 
 interface VerificationCommand { command: string; args: string[]; env?: NodeJS.ProcessEnv }
 interface DeliverySnapshot { path: string; blob: string | null; mode: string }
-
-const sharedCore = (path: string): boolean =>
-  path === 'package.json' || path === 'package-lock.json' || path === 'tsconfig.json'
-  || /^(?:vitest|electron\.vite)\.config\.[cm]?[jt]s$/.test(path)
-  || path.startsWith('src/shared/')
-  || ['src/main/database.ts', 'src/main/structured-store.ts', 'src/main/structured-sessions.ts', 'src/main/agent-control.ts'].includes(path)
 
 /** Whether a workflow file runs on push. A dispatch-only workflow (the shape this project uses,
  *  so that pushes never build a release by themselves) has to be started by the delivery. Read
@@ -595,7 +591,7 @@ export class DeliveryService {
       const verifyAt = worktree?.dir ?? plan.root
       const where = worktree ? ' in an isolated worktree holding the frozen delivery snapshot' : ' in the working tree'
       const verification = [
-        ['test', this.testCommands(plan), plan.testSkip],
+        ['test', plan.test ? [{ command: plan.test[0]!, args: plan.test.slice(1) } as VerificationCommand] : [], plan.testSkip],
         ['build', this.buildCommands(plan, verifyAt), plan.buildSkip]
       ] as const
       // Test and build run side by side, and the first failing command stops every other one: a
@@ -607,6 +603,7 @@ export class DeliveryService {
       for (const [id, commands, skip] of verification) {
         if (!commands.length) { this.skip(active, id, skip); continue }
         running.push({ id, done: this.stage(active, id, async stage => {
+          if (id === 'test' && plan.defaultTest) return this.verifyTests(active, stage, plan, verifyAt, verifying.signal, where)
           await Promise.all(commands.map(async ({ command, args, env }) => {
             const result = await this.command(active, stage, command, args, verifyAt, VERIFY_TIMEOUT_MS, { CI: '1', ...env }, verifying.signal)
             if (result.code === 0) return
@@ -659,13 +656,43 @@ export class DeliveryService {
     }
   }
 
-  private testCommands(plan: Plan): VerificationCommand[] {
-    if (!plan.test) return []
-    if (!plan.defaultTest) return [{ command: plan.test[0]!, args: plan.test.slice(1) }]
-    const full = plan.publish || !plan.scope || plan.changedPaths.some(sharedCore)
-    const commands: VerificationCommand[] = [{ command: 'npx', args: full ? ['vitest', 'run'] : ['vitest', 'related', ...plan.changedPaths, '--run', '--passWithNoTests'] }]
-    if (plan.changedPaths.some(path => path === 'scripts' || path.startsWith('scripts/'))) commands.push({ command: 'npm', args: ['run', 'test:scripts'] })
-    return commands
+  private async verifyTests(active: Active, stage: DeliveryStage, plan: Plan, cwd: string, signal: AbortSignal, where: string): Promise<string> {
+    let full = fullTestReason(plan.changedPaths, plan.publish)
+    let files: string[] = []
+    if (!full) {
+      try {
+        const script = join(cwd, 'scripts', 'delivery-related-tests.mjs')
+        const selected = await this.command(active, stage, 'node', [script, ...plan.changedPaths], cwd, VERIFY_TIMEOUT_MS, { CI: '1' }, signal)
+        if (selected.code !== 0) throw new Error(`Import graph exited ${selected.code ?? 'without a code'}.`)
+        files = relatedTestFiles(selected.stdout, plan.changedPaths)
+        if (files.some(file => plan.snapshots.some(snapshot => snapshot.path === file && snapshot.blob === null))) throw new Error('A touched test was deleted or renamed; verify the full suite.')
+      } catch (error) {
+        if (signal.aborted) throw new Cancelled('cancelled')
+        full = `Cannot compute related tests: ${error instanceof Error ? error.message : String(error)}`
+      }
+    }
+    if (full) this.log(active, stage, [`Full verification: ${full}`])
+    else this.log(active, stage, [`Related verification: ${files.length} test files (including touched tests).`])
+    const run = async (args: string[]): Promise<Awaited<ReturnType<DeliveryService['command']>>> => this.command(active, stage, 'npx', ['vitest', 'run', ...args], cwd, VERIFY_TIMEOUT_MS, { CI: '1' }, signal)
+    let failed: string[] | null = null
+    if (full || files.length) {
+      const result = await run(full ? [] : files)
+      if (result.code !== 0) {
+        failed = failureLines(result.lines)
+        if (!full && !signal.aborted) {
+          this.log(active, stage, ['Related tests failed; running the full suite for diagnosis. The original failure still blocks delivery.'])
+          const expanded = await run([])
+          failed.push(...failureLines(expanded.lines))
+          full = 'Expanded after related-test failure.'
+        }
+      }
+    }
+    if (plan.scriptTests && (full || plan.changedPaths.some(path => path.startsWith('scripts/'))) && !signal.aborted) {
+      const scripts = await this.command(active, stage, 'npm', ['run', 'test:scripts'], cwd, VERIFY_TIMEOUT_MS, { CI: '1' }, signal)
+      if (scripts.code !== 0) (failed ??= []).push(...failureLines(scripts.lines))
+    }
+    if (failed) throw new StageFailure(`Tests failed${where}. Nothing was committed or pushed.\n${failed.join('\n')}`)
+    return `${full ? 'Full Vitest and script suites' : `${files.length} related/touched test files${plan.changedPaths.some(path => path.startsWith('scripts/')) ? ' and script suite' : ''}`} passed${where}.`
   }
 
   private buildCommands(plan: Plan, verifyAt: string): VerificationCommand[] {
@@ -780,7 +807,7 @@ export class DeliveryService {
     if (behind) parts.push(`${behind} remote commit${behind === 1 ? '' : 's'} behind (the push will rebase onto them)`)
     if (publish && !remoteExists) parts.push(`${config.remote}/${config.branch} does not exist yet`)
     const changedPaths = [...new Set(inside.flatMap(entry => entry.from ? [entry.path, entry.from] : [entry.path]))]
-    const plan: Plan = { root, config, entries, changedPaths, snapshots, scope, commitNeeded: inside.length > 0, isolate: inside.length > 0, github, test: test.argv, defaultTest: test.default, testSkip: test.skip, build: build.argv, defaultBuild: build.default, buildSkip: build.skip, release, releaseSkip, publish }
+    const plan: Plan = { root, config, entries, changedPaths, snapshots, scope, commitNeeded: inside.length > 0, isolate: inside.length > 0, github, test: test.argv, defaultTest: test.default, scriptTests: typeof scripts['test:scripts'] === 'string', testSkip: test.skip, build: build.argv, defaultBuild: build.default, buildSkip: build.skip, release, releaseSkip, publish }
     return { plan, detail: `${parts.join('; ')}.` }
   }
 

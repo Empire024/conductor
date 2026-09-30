@@ -64,6 +64,22 @@ beforeEach(() => {
 })
 afterEach(() => { managers.splice(0).forEach(value => value.dispose()); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); vi.useRealTimers() })
 describe('installed updater source ownership — mocked transport, no installation', () => {
+  it('requires batch verification before local installation and prevents quiet auto-installs', async () => {
+    const directory = updateDir(), beforeInstall = vi.fn()
+    let blockers: Array<{ id: string; title: string }> = []
+    const m = new UpdateManager({ currentVersion: '0.1.4', isPackaged: true, localBuildDirectory: directory, beforeInstall, requireVerifiedLocal: true, installBlockers: () => blockers })
+    managers.push(m); m.configure(''); await m.check(); await m.download()
+    await expect(m.install()).rejects.toThrow('full batch verification')
+    expect(beforeInstall).not.toHaveBeenCalled()
+    writeLocalUpdateOffer(directory, { version: f.localVersion, builder: 'test', verified: true, offered: false })
+    m.getState(); expect(f.instances[1].autoInstallOnAppQuit).toBe(false)
+    writeLocalUpdateOffer(directory, { version: f.localVersion, builder: 'test', verified: true, offered: true })
+    m.getState(); expect(f.instances[1].autoInstallOnAppQuit).toBe(true)
+    blockers = [{ id: 'busy', title: 'Background work' }]
+    m.getState(); expect(f.instances[1].autoInstallOnAppQuit).toBe(false)
+    blockers = []
+    await m.install({ safe: true }); expect(beforeInstall).toHaveBeenCalledTimes(1)
+  })
   it('keeps a local build quiet until verified, offered and idle, without gating releases', async () => {
     const directory = updateDir()
     let blockers = [{ id: 'fake', title: 'Fake busy tab' }]
@@ -103,6 +119,19 @@ describe('installed updater source ownership — mocked transport, no installati
     await m.install({ safe: true })
     expect(beforeInstall).not.toHaveBeenCalled()
     expect(m.getState()).toMatchObject({ phase: 'ready', installBlockers: blockers })
+  })
+  it('cancels an idle install when a newer candidate replaces the downloaded version', async () => {
+    vi.useFakeTimers()
+    let blockers = [{ id: 'busy', title: 'Running work' }]
+    const beforeInstall = vi.fn()
+    const m = new UpdateManager({ currentVersion: '0.1.4', isPackaged: true, localBuildDirectory: updateDir(), beforeInstall, installBlockers: () => blockers })
+    managers.push(m); m.configure(''); await m.check(); await m.download(); await m.install({ safe: true, whenIdle: true })
+    f.localVersion = '0.1.5-local.2'
+    await m.check()
+    blockers = []
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(m.getState()).toMatchObject({ phase: 'available', availableVersion: f.localVersion, installWhenIdle: false })
+    expect(beforeInstall).not.toHaveBeenCalled()
   })
   it('discovers local builds automatically shortly after startup', async () => {
     vi.useFakeTimers()

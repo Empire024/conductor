@@ -3193,6 +3193,7 @@ app.whenReady().then(async () => {
     isPackaged: app.isPackaged,
     allowDevelopmentUpdates: process.env.CONDUCTOR_UPDATE_DEV === '1',
     localBuildDirectory: join(app.getPath('userData'), 'local-updates'),
+    requireVerifiedLocal: true,
     currentModels: () => (configuredModelCatalog() ?? []) as RestorePoint['models'],
     beforeInstall: prepareForUpdateInstall,
     installBlockers: (caller) => control.installBlockers(caller ? { agentSessionId: caller, projectId: '' } : undefined).map(tab => ({ id: tab.agentSessionId, title: tab.title }))

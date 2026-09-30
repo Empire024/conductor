@@ -1,0 +1,62 @@
+﻿{
+    "observedAt":  "2026-09-29T23:35:01.664Z",
+    "snapshotHead":  "bc58159478584856ec7e6e6e477f9a12be61473e",
+    "note":  "Recent commit change sets replayed on this fixed isolated snapshot, not historical revisions. tsc/build/tests overlap as in git.ship; baseline comes from the real full git.ship run reported separately.",
+    "results":  [
+                    {
+                        "commit":  "3f475a2",
+                        "paths":  [
+                                      "scripts/smoke-browser-close.mjs",
+                                      "src/renderer/src/components/Sidebar.tsx",
+                                      "src/renderer/src/components/WorkspaceSidebarPanel.tsx",
+                                      "src/renderer/src/panes/BrowserPane.tsx"
+                                  ],
+                        "files":  [
+                                      "src/renderer/src/components/Sidebar.test.ts",
+                                      "src/renderer/src/components/WorkspaceSidebarPanel.test.ts",
+                                      "src/renderer/src/panes/browser-partition.test.ts"
+                                  ],
+                        "graphSeconds":  6.0552307999999995,
+                        "testSeconds":  13.225686799999998,
+                        "typecheckSeconds":  22.6139708,
+                        "buildSeconds":  26.2662078,
+                        "verificationWallSeconds":  26.283973200000002
+                    },
+                    {
+                        "commit":  "31414df",
+                        "paths":  [
+                                      "scripts/smoke-phone-markdown-dictation.mjs",
+                                      "scripts/smoke-phone-shell.mjs",
+                                      "src/main/phone-access-server.ts",
+                                      "src/phone/app.css",
+                                      "src/phone/app.js",
+                                      "src/phone/index.html",
+                                      "src/phone/markdown.js",
+                                      "src/phone/markdown.test.ts",
+                                      "src/phone/phone-shell.test.ts",
+                                      "src/phone/sw.js"
+                                  ],
+                        "files":  [
+                                      "src/main/phone-access-server-lock.test.ts",
+                                      "src/main/phone-access-server.test.ts",
+                                      "src/phone/markdown.test.ts",
+                                      "src/phone/phone-shell.test.ts"
+                                  ],
+                        "graphSeconds":  5.858347600000001,
+                        "testSeconds":  15.809873500000002,
+                        "typecheckSeconds":  25.387729699999998,
+                        "buildSeconds":  28.891334100000005,
+                        "verificationWallSeconds":  28.9014217
+                    }
+                ],
+    "baseline":  {
+                     "verificationWallSeconds":  344.286,
+                     "deliveryId":  "delivery-4266d257-5ed3-46c7-a739-b6dabbca6a23",
+                     "runs":  1,
+                     "entireShipSeconds":  352.366,
+                     "fullTestsAndScriptsSeconds":  344.286,
+                     "typecheckAndBuildSeconds":  25.752,
+                     "note":  "Actual full git.ship verification on the host, measured once and reused for comparison with an unscoped narrow ship. Already-scoped narrow ships used related tests before this change. Replays use a fixed detached snapshot with first-task and test-policy overlays. Different snapshots and observed machine load; these are not controlled historical benchmarks.",
+                     "commit":  "680fb1c1a4a8d40396eab16697c5ffb522747982"
+                 }
+}

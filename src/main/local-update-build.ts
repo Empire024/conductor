@@ -7,7 +7,7 @@ import { readLocalUpdateOffer, writeLocalUpdateOffer } from './local-update-offe
 
 /** Where a candidate build is: making its worktree, copying node_modules into it, building,
  *  running its smokes, or done. Null for a build of the working tree itself. */
-export type LocalUpdateStage = 'worktree' | 'dependencies' | 'build' | 'smoke' | 'done'
+export type LocalUpdateStage = 'worktree' | 'dependencies' | 'test' | 'build' | 'smoke' | 'done'
 
 /** One smoke script run against a candidate build. `log` is the full output on disk; `tail` holds
  *  its last lines once it failed. */
@@ -42,6 +42,8 @@ export interface LocalUpdateBuildStatus {
   smokes: LocalUpdateSmoke[]
   /** True when every requested smoke passed, false when one failed or never ran, null when none were asked for. */
   verified: boolean | null
+  /** Full suite log for this batch, including errors that are no longer in the tail. */
+  verificationLog?: string
 }
 
 /** app.update({commit, smoke}): build that commit in a clean worktree instead of the working tree,
@@ -241,7 +243,7 @@ export class LocalUpdateBuilder implements LocalUpdateBuildService {
     try { commit = git(root, ['rev-parse', '--verify', '--quiet', `${request.commit}^{commit}`]) } catch { throw new Error(`No commit ${request.commit} in ${root}. Commit the work first (git.ship), then pass its sha.`) }
     const exists = (path: string): boolean => { try { git(root, ['cat-file', '-e', `${commit}:${path}`]); return true } catch { return false } }
     const smokes: string[] = []
-    for (const raw of request.smoke ?? []) {
+    for (const raw of ['smoke-background-windows', ...(request.smoke ?? [])]) {
       const name = raw.trim().replace(/^scripts[\\/]/, '').replace(/\.mjs$/, '')
       if (!SMOKE_PATTERN.test(name) || name === 'smoke-lock') throw new Error(`smoke names a scripts/smoke-*.mjs file, such as smoke-permission-grant; ${JSON.stringify(raw)} is not one.`)
       if (!exists(`scripts/${name}.mjs`)) throw new Error(`Commit ${commit.slice(0, 10)} has no scripts/${name}.mjs.`)
@@ -279,6 +281,21 @@ export class LocalUpdateBuilder implements LocalUpdateBuildService {
     if (linked.length) return this.finish(null, `node_modules in ${plan.worktree} still has junctions (${linked.slice(0, 3).join(', ')}); not building an app that would miss its dependencies.`)
     try { git(root, ['diff', '--quiet', plan.commit, '--', 'package-lock.json']) }
     catch { this.append(`Warning: package-lock.json at ${short} differs from the checkout's; node_modules was copied from the checkout.`) }
+    // One full acceptance run for the batch candidate, rather than for every narrow ship.
+    this.current.stage = 'test'
+    const logDirectory = join(plan.worktree, '.conductor-scratch', 'batch-verification')
+    mkdirSync(logDirectory, { recursive: true })
+    const logPath = join(logDirectory, `full-suite-${Date.now()}.log`), log = createWriteStream(logPath)
+    this.current.verificationLog = logPath
+    const tests = await this.run(node.executable, [npm, 'test'], plan.worktree, BUILD_TIMEOUT_MS, {
+      env: { ...smokeEnvironment(), CI: '1', ...(node.asNode ? { ELECTRON_RUN_AS_NODE: '1' } : {}) },
+      onText: text => { log.write(text); this.append(text) }
+    })
+    await new Promise<void>(done => log.end(done))
+    if (tests !== 0) {
+      this.current.verified = false
+      return this.finish(tests, `Full batch verification failed for commit ${short}; contact builder ${this.request.builder || 'the app.update caller'}. See ${logPath} and the log tail. No installable candidate was produced.`)
+    }
     this.current.stage = 'build'
     const code = await this.build(plan.worktree, node, npm)
     if (code !== 0) return this.built(code)
@@ -303,7 +320,7 @@ export class LocalUpdateBuilder implements LocalUpdateBuildService {
     this.current.verified = failed.length === 0
     this.current.stage = 'done'
     this.finish(0, failed.length
-      ? `Local update ${this.current.version ?? ''} built from ${short} and published, but NOT verified: ${failed.map(smoke => smoke.name).join(', ')} failed (smokes[].tail and smokes[].log say why). Do not install it before that is understood.`
+      ? `Local update ${this.current.version ?? ''} built from ${short} and published, but NOT verified: ${failed.map(smoke => smoke.name).join(', ')} failed (smokes[].tail and smokes[].log say why). Contact builder ${this.request.builder || 'the app.update caller'} for commit ${short}. Do not install it before that is understood.`
       : `Local update ${this.current.version ?? ''} built from ${short} (dirty=false) and verified: ${this.current.smokes.length} smoke${this.current.smokes.length === 1 ? '' : 's'} passed. Nothing was installed: app.update.install does that once no tab is mid-turn.`)
   }
 
@@ -328,8 +345,8 @@ export class LocalUpdateBuilder implements LocalUpdateBuildService {
     smoke.exitCode = code
     smoke.finishedAt = new Date().toISOString()
     // smoke-lock's 3 is "the command passed, but some process could not be accounted for".
-    smoke.state = code === 0 || code === 3 ? 'passed' : 'failed'
-    if (code === 3) smoke.note = 'Passed; smoke-lock could not account for every process it started (exit 3), see the log.'
+    smoke.state = code === 0 ? 'passed' : 'failed'
+    if (code === 3) smoke.note = 'Smoke passed but cleanup was not accounted for (exit 3); this candidate is not verified.'
     if (smoke.state === 'failed') smoke.tail = tail
   }
 

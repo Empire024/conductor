@@ -15,6 +15,11 @@ Conductor is a local desktop application for its owner. GitHub is used only as t
 - When you do publish, verify that the release workflow completed and that its GitHub release contains the installer, blockmap, and `latest.yml`. If publishing is blocked, say so; the local commit still stands as delivered.
 - Preserve unrelated work in the shared working tree. Only publish a coherent, tested state; coordinate rather than discarding another agent's changes.
 
+## Test policy
+
+- Every local ship freezes and verifies its own snapshot with typecheck, build, and the related Vitest import graph plus touched tests. Shared/core/configuration changes, publishing, an unavailable or empty application graph, and related-test failures expand to the full suite. A failed related test remains blocking even if a full rerun passes. Script changes also run `test:scripts`. Explicit project verification commands are honored. See `docs/delivery-test-policy.md` and its measured timings.
+- After the batch, the controller runs `app.update({commit, smoke:[...], offer:true})` once: full `npm test`, packaging, then the requested parked smokes plus the mandatory background-window guard. Only a verified candidate can install. Failed acceptance names the commit and builder to contact, and a smoke cleanup exit 3 is not a pass. Retry acceptance rather than reuse a stale verification cache.
+
 ## Automation must not take the desktop
 
 - Smoke scripts and probes drive a real window, but never over the owner's screen. A launch with

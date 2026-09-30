@@ -29,6 +29,7 @@ function harness(setup: { replies?: Record<string, Handler>; files?: Record<stri
   if (setup.workflow !== false) { mkdirSync(join(root, '.github', 'workflows'), { recursive: true }); writeFileSync(join(root, '.github', 'workflows', 'release.yml'), 'on: push') }
   for (const [path, content] of Object.entries(setup.files ?? {})) { mkdirSync(join(root, path, '..'), { recursive: true }); writeFileSync(join(root, path), content) }
   const replies: Record<string, Handler> = {
+    'node': { stdout: 'CONDUCTOR_RELATED_TESTS=["src/a.test.ts"]\n' },
     'git rev-parse --show-toplevel': { stdout: `${root}\n` },
     'git symbolic-ref --quiet --short HEAD': { stdout: 'main\n' },
     'git rev-parse --absolute-git-dir': { stdout: join(root, '.git') },
@@ -249,7 +250,7 @@ describe('DeliveryService pipeline', () => {
     expect(run).toMatchObject({ commit: SHA, releaseTag: 'v1.2.3', releaseUrl: 'https://github.com/owner/app/releases/tag/v1.2.3', workflowRunUrl: 'https://github.com/owner/app/actions/runs/7' })
     expect(h.ran('git fetch origin main')).toBe(true)
     expect(h.ran('npx vitest run')).toBe(true)
-    expect(h.ran('npm run test:scripts')).toBe(false)
+    expect(h.ran('npm run test:scripts')).toBe(true)
     expect(h.ran('npx tsc --noEmit --incremental')).toBe(true)
     expect(h.ran('npx electron-vite build')).toBe(true)
     expect(h.ran('git read-tree HEAD')).toBe(true)
@@ -305,7 +306,7 @@ describe('DeliveryService pipeline', () => {
     const h = harness({
       replies: {
         'git status --porcelain=v1 -z --untracked-files=all': { stdout: ' M src/a.ts\0 M other/agent.ts\0' },
-        'npx vitest related': () => new Promise<Reply>(resolve => { release = () => resolve({}) })
+        'npx vitest run src/a.test.ts': () => new Promise<Reply>(resolve => { release = () => resolve({}) })
       }
     })
     const started = h.service.ship('p1', h.root, { message: 'Snapshot', paths: ['src/a.ts'], publish: false }, { kind: 'owner' })
@@ -321,9 +322,9 @@ describe('DeliveryService pipeline', () => {
   })
 
   it('runs affected Vitest tests for scoped local changes and keeps script tests scoped to scripts', async () => {
-    const source = harness({ replies: { 'git status --porcelain=v1 -z --untracked-files=all': { stdout: ' M src/main/delivery.ts\0 M other/agent.ts\0' } } })
-    expect((await source.ship({ message: 'Source only', paths: ['src/main/delivery.ts'], publish: false })).state).toBe('delivered')
-    expect(source.ran('npx vitest related src/main/delivery.ts --run --passWithNoTests')).toBe(true)
+    const source = harness({ replies: { 'git status --porcelain=v1 -z --untracked-files=all': { stdout: ' M src/a.ts\0 M other/agent.ts\0' } } })
+    expect((await source.ship({ message: 'Source only', paths: ['src/a.ts'], publish: false })).state).toBe('delivered')
+    expect(source.ran('npx vitest run src/a.test.ts')).toBe(true)
     expect(source.ran('npm run test:scripts')).toBe(false)
 
     const scripts = harness({
@@ -331,7 +332,7 @@ describe('DeliveryService pipeline', () => {
       replies: { 'git status --porcelain=v1 -z --untracked-files=all': { stdout: ' M scripts/example.mjs\0 M other/agent.ts\0' } }
     })
     expect((await scripts.ship({ message: 'Script', paths: ['scripts/example.mjs'], publish: false })).state).toBe('delivered')
-    expect(scripts.ran('npx vitest related scripts/example.mjs --run --passWithNoTests')).toBe(true)
+    expect(scripts.ran('npx vitest run src/a.test.ts')).toBe(true)
     expect(scripts.ran('npm run test:scripts')).toBe(true)
   })
 
@@ -344,6 +345,32 @@ describe('DeliveryService pipeline', () => {
     const core = harness({ replies: { 'git status --porcelain=v1 -z --untracked-files=all': { stdout: ' M src/shared/orchestration.ts\0 M other/agent.ts\0' } } })
     expect((await core.ship({ message: 'Core', paths: ['src/shared/orchestration.ts'], publish: false })).state).toBe('delivered')
     expect(core.calls.find(call => call.command === 'npx' && call.args[0] === 'vitest')!.args).toEqual(['vitest', 'run'])
+  })
+  it('falls back to full verification when the import graph cannot be computed', async () => {
+    const h = harness({ replies: { 'node': { code: 1 }, 'git status --porcelain=v1 -z --untracked-files=all': { stdout: ' M src/a.ts\0' } } })
+    const run = await h.ship({ message: 'Fallback', paths: ['src/a.ts'], publish: false })
+    expect(run.state).toBe('delivered')
+    expect(h.calls.some(call => call.command === 'npx' && call.args.join(' ') === 'vitest run')).toBe(true)
+    expect(h.ran('npm run test:scripts')).toBe(true)
+  })
+  it('runs the full suite after related tests fail and never hides the original failure', async () => {
+    const h = harness({ replies: { 'npx vitest run src/a.test.ts': { code: 1, lines: ['FAIL src/a.test.ts original assertion'] }, 'git status --porcelain=v1 -z --untracked-files=all': { stdout: ' M src/a.ts\0' } } })
+    const run = await h.ship({ message: 'Failure diagnosis', paths: ['src/a.ts'], publish: false })
+    expect(run.state).toBe('failed')
+    expect(h.calls.some(call => call.command === 'npx' && call.args.join(' ') === 'vitest run')).toBe(true)
+    expect(h.ran('npm run test:scripts')).toBe(true)
+    expect(h.ran('git commit')).toBe(false)
+  })
+  it('runs touched tests even if the graph omitted them, and selects narrow tests without explicit paths', async () => {
+    const h = harness({ files: { 'src/b.test.ts': 'export {}' }, replies: { 'git status --porcelain=v1 -z --untracked-files=all': { stdout: ' M src/a.ts\0 M src/b.test.ts\0' } } })
+    expect((await h.ship({ message: 'Unscoped narrow', publish: false })).state).toBe('delivered')
+    expect(h.ran('npx vitest run src/a.test.ts src/b.test.ts')).toBe(true)
+    expect(h.ran('npm run test:scripts')).toBe(false)
+  })
+  it('uses the full suite for removed tests instead of treating a missing file as a failing test', async () => {
+    const h = harness({ replies: { 'git status --porcelain=v1 -z --untracked-files=all': { stdout: ' D src/removed.test.ts\0 M src/a.ts\0' } } })
+    expect((await h.ship({ message: 'Remove obsolete test', paths: ['src/removed.test.ts', 'src/a.ts'], publish: false })).state).toBe('delivered')
+    expect(h.calls.some(call => call.command === 'npx' && call.args.join(' ') === 'vitest run')).toBe(true)
   })
 
   it('runs tests, incremental typecheck and electron-vite concurrently', async () => {

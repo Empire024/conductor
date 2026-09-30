@@ -17,6 +17,8 @@ import { MacZipUpdater } from './mac-zip-updater'
 import { localUpdateGate, readLocalUpdateOffer } from './local-update-offer'
 
 interface UpdateManagerOptions {
+  /** Installed app accepts local packages only after the batch suite and smokes passed. */
+  requireVerifiedLocal?: boolean
   installBlockers?(caller?: string): Array<{ id: string; title: string }>
   currentVersion: string
   isPackaged: boolean
@@ -81,6 +83,7 @@ export class UpdateManager {
     this.currentVersion = this.seam.reportedVersion(options.currentVersion)
     this.state = { phase: 'disabled', currentVersion: this.currentVersion, configured: false, message: 'Connecting to update sources.' }
     this.idleTimer = setInterval(() => {
+      if (!this.queuedVersion && this.state.source !== 'local') return
       const state = this.getState(), gate = JSON.stringify([state.promptAllowed, state.quietReason, state.installBlockers, state.installWhenIdle])
       if (gate !== this.lastGate) { this.lastGate = gate; this.setState(this.state) }
       if (this.queuedVersion && this.queuedVersion !== state.availableVersion) this.queuedVersion = null
@@ -118,6 +121,7 @@ export class UpdateManager {
     const gate = this.state.source === 'local' ? localUpdateGate(
       this.options.localBuildDirectory && this.state.availableVersion ? readLocalUpdateOffer(this.options.localBuildDirectory, this.state.availableVersion) : null,
       installBlockers.length) : { promptAllowed: true }
+    if (this.options.requireVerifiedLocal && this.updater === this.localUpdater && this.localUpdater) this.localUpdater.autoInstallOnAppQuit = gate.promptAllowed
     return { ...this.state, ...gate, installBlockers, installWhenIdle: this.queuedVersion === this.state.availableVersion,
       ...(current ? { restartRequest: { title: request.title, reason: request.reason, at: request.at } } : {}) }
   }
@@ -305,6 +309,10 @@ export class UpdateManager {
   }
   async install(options: { force?: boolean; safe?: boolean; whenIdle?: boolean } = {}, initiator?: Omit<RestartInitiator, 'at'>): Promise<void> {
     if (!this.updater || this.state.phase !== 'ready') return
+    if (this.options.requireVerifiedLocal && this.installReason === 'update' && this.state.source === 'local'
+      && (!this.options.localBuildDirectory || !readLocalUpdateOffer(this.options.localBuildDirectory, this.state.availableVersion ?? '')?.verified)) {
+      throw new Error('This local update has not passed full batch verification. Ask its builder to run app.update with an exact commit and smokes before installing.')
+    }
     const blocked = (): boolean => Boolean(this.options.installBlockers?.(initiator?.agentSessionId).length)
     const defer = (): void => {
       if (options.whenIdle) this.queuedVersion = this.state.availableVersion ?? null
