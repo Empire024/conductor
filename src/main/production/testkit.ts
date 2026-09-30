@@ -87,7 +87,7 @@ export function fakeBrowserFactory(options: { available?: boolean } = {}): { fac
 }
 
 export interface RecordingPorts extends InterpreterPorts {
-  calls: Array<{ kind: 'route' | 'cloud' | 'local'; detail: string; projectId?: string }>
+  calls: Array<{ kind: 'route' | 'cloud' | 'local'; detail: string; projectId?: string; maxTokens?: number }>
 }
 
 export function recordingPorts(options: {
@@ -97,6 +97,10 @@ export function recordingPorts(options: {
   stop?: number | null
   used?: number | null
   routeError?: string
+  /** The cloud turn's fixed overhead the interpreter reserves (default 0, so small test budgets cover a call). */
+  cloudOverheadTokens?: number
+  /** The input a cloud turn reports (default 100). */
+  cloudInputTokens?: number
 } = {}): RecordingPorts {
   const calls: RecordingPorts['calls'] = []
   return {
@@ -106,9 +110,10 @@ export function recordingPorts(options: {
       if (options.routeError) throw new Error(options.routeError)
       return { decisionId: 'decision-1', key: options.key ?? { provider: 'anthropic', model: 'claude-test' } }
     },
-    async cloudTurn(key, prompt, _signal, _maxTokens, context) {
-      calls.push({ kind: 'cloud', detail: `${key.provider}/${key.model}`, projectId: context.projectId })
-      return { text: options.cloudText?.(prompt) ?? '{"rationale":"ok"}', inputTokens: 100, outputTokens: 20, costUsd: 0.001 }
+    cloudOverheadTokens: options.cloudOverheadTokens ?? 0,
+    async cloudTurn(key, prompt, _signal, maxTokens, context) {
+      calls.push({ kind: 'cloud', detail: `${key.provider}/${key.model}`, projectId: context.projectId, maxTokens })
+      return { text: options.cloudText?.(prompt) ?? '{"rationale":"ok"}', inputTokens: options.cloudInputTokens ?? 100, outputTokens: 20, costUsd: 0.001 }
     },
     async localAsk(request) {
       calls.push({ kind: 'local', detail: request.system.slice(0, 40) })

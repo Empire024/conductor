@@ -205,7 +205,13 @@ the same project; `production.evidence` reads are bounded to 1 MiB and pass thro
    (`maxConnectionsPerOrigin`, a browser's HTTP/1.1 limit): the handler fetches over HTTP/1.1 from
    Node, where every request in flight is its own connection, and a LiteSpeed host throttled the
    40-connection burst of one page so the next page's document never answered (20 s timeouts). A
-   top-level document never waits for a slot. The runner stops the run with `ledger.exhausted` set
+   top-level document never waits for a slot. A navigation that times out is retried once after
+   2 s (a single stalled answer used to leave a whole control UNVERIFIED), and `fill` refuses a
+   field that is not visible within 1.5 s instead of waiting out the navigation timeout.
+   A cloud interpretation is a whole native CLI turn, so its turn budget and ledger reservation
+   are the CLI's fixed prompt (about 40k tokens, learned from the run's turns) + the job's prompt
+   + the answer's `maxTokens`; the answer alone as the turn's budget stopped every cloud call.
+   The runner stops the run with `ledger.exhausted` set
    and the affected controls UNVERIFIED (a budget stop is never PASS).
 5. **Injection resistance.** Page text, DOM, uploads, source comments, logs and fetched legal pages
    are data. They reach a model only inside `InterpretationRequest.user`, bounded to

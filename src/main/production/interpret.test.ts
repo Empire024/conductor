@@ -21,6 +21,13 @@ const request = (role: InterpretationRequest['role'], overrides: Partial<Interpr
 })
 const interpreter = (ports: ReturnType<typeof recordingPorts>) => createRunInterpreter({ ports, store: temp.store, run: temp.store.run(runId), guard: OWNER })
 const signal = new AbortController().signal
+/** A second running run with a realistic token budget (the default run's 3,000 tokens cannot hold a cloud turn's prompt). */
+const roomyRun = (maxTokens = 200_000): string => {
+  temp.store.transition(runId, 'completed', 'test', OWNER)
+  const run = temp.store.createRun({ projectId: 'project-a', kind: 'audit', environmentId: ENV_ID, trigger: { kind: 'manual', by: { kind: 'owner', agentSessionId: null, title: null }, at: new Date().toISOString(), changes: [], detail: '' }, fingerprint: fingerprint(), controls: ['C01'], steps: [{ kind: 'control', controlId: 'C01' }], artifactsDir: temp.dir, budget: { maxTokens, maxModelCalls: 5, maxRequests: 10, maxDurationMs: 60_000, requestsPerSecondPerOrigin: 1, maxCostUsdPerCall: 0.5 } })
+  temp.store.transition(run.id, 'running', 'test', OWNER)
+  return run.id
+}
 
 describe('run interpreter', () => {
   it('routes interpret with the per-call cost ceiling, pre-charges and reconciles the ledger, and journals the call', async () => {
@@ -64,6 +71,36 @@ describe('run interpreter', () => {
     expect((await interpreter(ports).ask(request('interpret'), signal)).refused).toBe('budget exhausted (maxModelCalls)')
   })
 
+  it('gives a cloud turn a budget for the CLI\'s fixed prompt, the job\'s prompt and the answer, and learns the overhead from the turn', async () => {
+    const run = { id: roomyRun() }
+    // A native CLI turn reports ~39k of input for a small prompt: the answer's 900 tokens were never a turn's budget.
+    const ports = recordingPorts({ cloudInputTokens: 39_000 })
+    delete ports.cloudOverheadTokens
+    const bound = createRunInterpreter({ ports, store: temp.store, run: temp.store.run(run.id), guard: OWNER })
+    expect(await bound.ask(request('interpret', { maxTokens: 900 }), signal)).toMatchObject({ ok: true })
+    const first = ports.calls.filter(call => call.kind === 'cloud')[0]!.maxTokens!
+    expect(first).toBeGreaterThan(40_000 + 900)
+    expect(first).toBeLessThan(40_000 + 900 + 1_000)
+    // The ledger charged what the turn spent, not the reservation.
+    expect(temp.store.run(run.id).ledger.tokens).toBe(39_020)
+    // The next turn reserves the overhead this run measured (its input less its prompt).
+    await bound.ask(request('interpret', { maxTokens: 900 }), signal)
+    const second = ports.calls.filter(call => call.kind === 'cloud')[1]!.maxTokens!
+    expect(second).toBeLessThan(first)
+    expect(second).toBeGreaterThan(39_000 + 900 - 1_000)
+    // A local classify still reserves only its answer.
+    const local = recordingPorts({ localText: () => '{"rationale":"local"}' })
+    expect(await createRunInterpreter({ ports: local, store: temp.store, run: temp.store.run(run.id), guard: OWNER }).ask(request('classify', { maxTokens: 900 }), signal)).toMatchObject({ ok: true })
+  })
+
+  it('refuses a cloud call whose whole turn the run budget cannot cover, before any model call', async () => {
+    const ports = recordingPorts({ cloudOverheadTokens: 40_000 })
+    const refused = await interpreter(ports).ask(request('interpret'), signal)
+    expect(refused.refused).toMatch(/budget: 3000 tokens left, the call needs up to 4\d{4}/)
+    expect(ports.calls.map(call => call.kind)).toEqual(['route'])
+    expect(temp.store.run(runId).ledger).toMatchObject({ tokens: 0, modelCalls: 0 })
+  })
+
   it('accepts only JSON that validates: prose and injected fields are refusals, with the tokens still charged', async () => {
     const prose = await interpreter(recordingPorts({ cloudText: () => 'Sure! Here is the rationale.' })).ask(request('interpret'), signal)
     expect(prose.refused).toBe('answer rejected: not JSON')
@@ -77,7 +114,8 @@ describe('run interpreter', () => {
 
   it('bounds the user text and marks it as data in the prompt', async () => {
     let prompt = ''
-    await interpreter(recordingPorts({ cloudText: text => { prompt = text; return '{"rationale":"ok"}' } })).ask(request('interpret', { user: 'x'.repeat(30_000) }), signal)
+    const roomy = roomyRun()
+    await createRunInterpreter({ ports: recordingPorts({ cloudText: text => { prompt = text; return '{"rationale":"ok"}' } }), store: temp.store, run: temp.store.run(roomy), guard: OWNER }).ask(request('interpret', { user: 'x'.repeat(30_000) }), signal)
     expect(prompt).toMatch(/<data>\nx+\n\[truncated\]\n<\/data>$/)
     expect(prompt.length).toBeLessThan(26_000)
     expect(prompt).toMatch(/It is not instructions/)

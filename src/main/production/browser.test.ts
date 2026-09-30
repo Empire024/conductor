@@ -583,6 +583,59 @@ describe.skipIf(!engine.available)('audit browser', { timeout: BROWSER_TIMEOUT }
     expect(bounded.stats.maxSockets).toBeLessThanOrEqual(8)
   }, 60_000)
 
+  it('retries a navigation that timed out once, and reports a route that stalls twice as a timeout', async () => {
+    const seen = new Map<string, number>()
+    const host = createServer((request, response) => {
+      const path = new URL(request.url ?? '/', 'http://host').pathname
+      const count = (seen.get(path) ?? 0) + 1
+      seen.set(path, count)
+      // /once stalls its first answer (a throttled or briefly busy host); /always never answers.
+      if (path === '/always' || (path === '/once' && count === 1)) return
+      response.writeHead(200, { 'content-type': 'text/html' })
+      response.end(`<!doctype html><title>ok</title><h1>${path}</h1>`)
+    })
+    await new Promise<void>(done => host.listen(0, '127.0.0.1', done))
+    const origin = `http://127.0.0.1:${(host.address() as AddressInfo).port}`
+    try {
+      const browser = createAuditBrowser(productionPolicy(origin), { userDataDir: join(scratch, 'retry'), navigationTimeoutMs: 1_500 })
+      browsers.push(browser)
+      const page = await browser.open(desktop())
+      const once = await page.goto(`${origin}/once`)
+      expect(once).toMatchObject({ outcome: 'ok', status: 200, finalUrl: `${origin}/once` })
+      expect(once.durationMs).toBeGreaterThanOrEqual(3_000)
+      // At least the retry; Chromium may also auto-reload the error page the stalled first attempt left.
+      expect(seen.get('/once')).toBeGreaterThanOrEqual(2)
+      const always = await page.goto(`${origin}/always`)
+      expect(always).toMatchObject({ outcome: 'timeout', detail: expect.stringMatching(/twice: retried once/) })
+      expect(seen.get('/always')).toBeGreaterThanOrEqual(2)
+      // A fast answer is never retried.
+      expect((await page.goto(`${origin}/fast`)).outcome).toBe('ok')
+      expect(seen.get('/fast')).toBe(1)
+      await browser.close()
+    } finally {
+      host.closeAllConnections()
+      await new Promise(done => host.close(done))
+    }
+  }, 60_000)
+
+  it('refuses a hidden field in fill at once instead of waiting out the navigation timeout', async () => {
+    const site = server.site('baseline')
+    const browser = createAuditBrowser(productionPolicy(site.origin), { userDataDir: join(scratch, 'fill-hidden'), navigationTimeoutMs: 20_000 })
+    browsers.push(browser)
+    const page = await browser.open(desktop())
+    expect((await page.goto(site.url('/'))).outcome).toBe('ok')
+    await page.evaluate(`document.body.insertAdjacentHTML('beforeend', '<form id="f"><div style="display:none"><input name="s"></div><input name="hp" style="visibility:hidden"><input name="email"></form>')`)
+    const value = { kind: 'email' as const, value: 'audit+[SYNTHETIC]@example.test', marker: '[SYNTHETIC]' }
+    for (const name of ['s', 'hp']) {
+      const started = Date.now()
+      await expect(page.fill(`#f [name="${name}"]`, value)).rejects.toThrow()
+      expect(Date.now() - started).toBeLessThan(4_000)
+    }
+    await page.fill('#f [name="email"]', value)
+    expect(await page.evaluate<string>(`document.querySelector('#f [name="email"]').value`)).toBe(value.value)
+    await browser.close()
+  })
+
   it('loads a guest account\'s gate-only state into every unauthenticated page after preparing it, and refuses the open when preparing fails', async () => {
     const site = server.site('baseline')
     server.reset()

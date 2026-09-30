@@ -186,6 +186,11 @@ export const MASK_COLOR = '#000000'
 const EXCERPT_CHARS = 4096
 const DEFAULT_NAVIGATION_TIMEOUT = 20_000
 const QUIET_MS = 500
+/** Before the one retry of a navigation that timed out. */
+const RETRY_PAUSE_MS = 2_000
+/** How long a field may take to become visible before `fill` gives up on it (hidden, collapsed, a honeypot). */
+const FIELD_VISIBLE_MS = 1_500
+const FIELD_FILL_MS = 5_000
 const SETTLE_REASON_MS = 1_000
 /** Streams cannot be buffered here; they go to the network as the browser makes them (see fetchThroughHops). */
 const STREAMING_TYPES = new Set(['media', 'eventsource'])
@@ -649,8 +654,20 @@ export class AuditPageImpl implements AuditPage {
     await Promise.race([this.page.waitForLoadState('load', { timeout: this.timeout }).catch(() => undefined), quiet])
   }
 
-  goto(url: string, options: { waitMs?: number } = {}): Promise<NavigationResult> {
-    return this.navigate(url, () => this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: this.timeout }), options.waitMs)
+  /**
+   * A navigation that times out is retried once, after a short pause, as a visitor would reload: a
+   * host that throttles or briefly stalls one answer (haftheme's LiteSpeed, about one route in 30)
+   * otherwise left a whole control UNVERIFIED on a single 20 s stall.
+   */
+  async goto(url: string, options: { waitMs?: number } = {}): Promise<NavigationResult> {
+    const attempt = (): Promise<NavigationResult> => this.navigate(url, () => this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: this.timeout }), options.waitMs)
+    const first = await attempt()
+    if (first.outcome !== 'timeout' || this.closed) return first
+    await sleep(RETRY_PAUSE_MS)
+    if (this.closed) return first
+    const second = await attempt()
+    const durationMs = first.durationMs + RETRY_PAUSE_MS + second.durationMs
+    return second.outcome === 'timeout' ? { ...second, durationMs, detail: `${second.detail ?? 'timeout'} (twice: retried once)` } : { ...second, durationMs }
   }
 
   reload(): Promise<NavigationResult> {
@@ -767,8 +784,15 @@ export class AuditPageImpl implements AuditPage {
     await this.loaded(250)
   }
 
+  /**
+   * Types into the first matching field. A field that is not visible within FIELD_VISIBLE_MS is
+   * refused at once: `page.fill` waits out the whole navigation timeout for a hidden field (a
+   * collapsed search box, a honeypot), which made C04 take ~80 s a route and hit its 600 s cap.
+   */
   async fill(selector: string, value: SyntheticValue): Promise<void> {
-    await this.page.fill(selector, value.value)
+    const field = this.page.locator(selector).first()
+    await field.waitFor({ state: 'visible', timeout: FIELD_VISIBLE_MS })
+    await field.fill(value.value, { timeout: FIELD_FILL_MS })
   }
 
   async click(selector: string, options: { mutation?: MutationKind } = {}): Promise<void> {
