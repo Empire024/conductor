@@ -1,7 +1,7 @@
 import type { CheckContext, CheckOutcome, ControlCheck, FindingDraft, HumanReviewItem, ObservedRequest } from '../../../shared/production'
 import { factIsUnknown, jurisdictionsFor } from '../registry'
 import {
-  browserProblem, companyNames, documentDate, draft, entityName, entityProblem, footerLinks, LINK_PATTERNS, markTested, matchesLink,
+  browserProblem, companyNames, documentDate, documentLink, draft, entityName, entityProblem, footerLinks, LINK_PATTERNS, markTested,
   namesEntity, normalise, outcome, pathOf, placeholdersIn, planRoutes, review, throwIfAborted, trackerRequests, visit, withPage,
 } from './document-support'
 
@@ -71,7 +71,7 @@ async function runPolicies(context: CheckContext): Promise<CheckOutcome> {
       const { links, hasFooter } = await footerLinks(page)
       const row = { route: route.path, privacy: null as string | null, terms: null as string | null, footer: hasFooter }
       for (const kind of Object.keys(DOCUMENTS) as DocumentKind[]) {
-        const link = links.find(item => matchesLink(item, LINK_PATTERNS[kind]) && !(kind === 'terms' && matchesLink(item, LINK_PATTERNS.privacy)))
+        const link = documentLink(links, LINK_PATTERNS[kind], context.policy.allowedOrigins, kind === 'terms' ? LINK_PATTERNS.privacy : undefined)
         if (!link) {
           findings.push(draft(context, CHECK_ID, {
             key: `missing-link:${kind}`, route: route.path, severity: 'high', confidence: 'confirmed',

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { InterpretationRequest } from '../../shared/production'
-import { createRunInterpreter, parseJsonAnswer, validateSchema } from './interpret'
+import { createRunInterpreter, parseJsonAnswer, repairEnums, validateSchema } from './interpret'
 import { OWNER } from './store'
 import { ENV_ID, fingerprint, recordingPorts, seedProfile, tempStore, type TempStore } from './testkit'
 
@@ -101,6 +101,16 @@ describe('run interpreter', () => {
     expect(temp.store.run(runId).ledger).toMatchObject({ tokens: 0, modelCalls: 0 })
   })
 
+  it('gives the local model the answer schema to enforce, and accepts a classify answer that misses the enum only by spelling', async () => {
+    const schema = { type: 'object', properties: { kind: { type: 'string', enum: ['policy', 'placeholder', 'other'] } }, required: ['kind'], additionalProperties: false }
+    const seen: Array<Record<string, unknown> | undefined> = []
+    const answering = (text: string) => ({ ...recordingPorts(), localAsk: async (request: { schema?: Record<string, unknown> }) => { seen.push(request.schema); return { text, model: 'local/dolphin-x1-8b', inputTokens: 50, outputTokens: 5 } } })
+    const policy = await interpreter(answering('{"kind":"Policy"}')).ask(request('classify', { schema, maxTokens: 50 }), signal)
+    expect(policy).toMatchObject({ ok: true, json: { kind: 'policy' } })
+    expect(seen[0]).toEqual(schema)
+    expect((await interpreter(answering('{"kind":"terms of use"}')).ask(request('classify', { schema, maxTokens: 50 }), signal)).refused).toBe('answer rejected: $.kind is not one of policy, placeholder, other')
+  })
+
   it('accepts only JSON that validates: prose and injected fields are refusals, with the tokens still charged', async () => {
     const prose = await interpreter(recordingPorts({ cloudText: () => 'Sure! Here is the rationale.' })).ask(request('interpret'), signal)
     expect(prose.refused).toBe('answer rejected: not JSON')
@@ -123,6 +133,20 @@ describe('run interpreter', () => {
 })
 
 describe('schema validation', () => {
+  it('repairs an enum answer that misses only by spelling, and leaves ambiguous or unrelated ones for validation to refuse', () => {
+    const schema = { type: 'object', properties: { kind: { type: 'string', enum: ['policy', 'placeholder', 'other'] }, tags: { type: 'array', items: { enum: ['a-b', 'c'] } } } }
+    const repaired = (kind: unknown) => (repairEnums({ kind }, schema) as { kind: unknown }).kind
+    expect(repaired('Policy')).toBe('policy')
+    expect(repaired(' "POLICY." ')).toBe('policy')
+    expect(repaired('privacy policy')).toBe('policy')
+    expect(repaired('placeholder text')).toBe('placeholder')
+    expect(repaired('policy or placeholder')).toBe('policy or placeholder')
+    expect(repaired('terms')).toBe('terms')
+    expect(repaired(3)).toBe(3)
+    expect(repairEnums({ tags: ['A-B', 'C!'] }, schema)).toEqual({ tags: ['a-b', 'c'] })
+    expect(validateSchema(repairEnums({ kind: 'terms' }, schema), schema)).toEqual(['$.kind is not one of policy, placeholder, other'])
+  })
+
   it('checks types, required, enum, additionalProperties, items and bounds', () => {
     const schema = { type: 'object', additionalProperties: false, required: ['a'], properties: { a: { enum: ['x', 'y'] }, b: { type: 'array', maxItems: 1, items: { type: 'integer', minimum: 0 } }, c: { type: 'string', maxLength: 2 } } }
     expect(validateSchema({ a: 'x', b: [1], c: 'ok' }, schema)).toEqual([])

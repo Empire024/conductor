@@ -112,6 +112,9 @@ export interface CompletionRequest {
   /** Sent as llama.cpp `chat_template_kwargs` (see templates.ts). Dropped with the other optional
    *  parameters when the agent loop retries a refused request. */
   templateKwargs?: Record<string, unknown>
+  /** Constrains the reply to JSON matching this schema (llama.cpp `response_format` json_schema, a
+   *  grammar): a small model cannot answer outside an enum it was given. Not combined with tools. */
+  jsonSchema?: Record<string, unknown>
   /** Consulted after every streamed delta with what has accumulated so far. A returned string
    *  ends generation early with that word as the finish reason: the agent loop uses it to cut
    *  off a reply that is talking itself in circles rather than acting. */
@@ -258,7 +261,8 @@ async function streamCompletion(request: CompletionRequest): Promise<CompletionR
       max_tokens: request.maxTokens ?? 4096,
       ...(request.reasoningEffort ? { reasoning_effort: request.reasoningEffort } : {}),
       ...(request.templateKwargs ? { chat_template_kwargs: request.templateKwargs } : {}),
-      ...(request.tools?.length ? { tools: request.tools, tool_choice: request.toolChoice ?? 'auto' } : {})
+      ...(request.tools?.length ? { tools: request.tools, tool_choice: request.toolChoice ?? 'auto' } : {}),
+      ...(request.jsonSchema && !request.tools?.length ? { response_format: { type: 'json_schema', json_schema: { name: 'answer', strict: true, schema: request.jsonSchema } } } : {})
     })
   })
   if (response.status === 401 || response.status === 403) throw new Error('Local model rejected the API key; regenerate it with setup and restart the servers')

@@ -34,6 +34,8 @@ export interface LocalModelRequest {
   system: string
   user: string
   maxTokens: number
+  /** The answer must be JSON matching this schema; the server enforces it with a grammar. */
+  jsonSchema?: Record<string, unknown>
   /** Overrides MODEL_WAIT_BUDGET_MS (tests). */
   waitBudgetMs?: number
   /** Overrides GENERATION_TIMEOUT_MS for a request whose prompt alone takes longer to read. */

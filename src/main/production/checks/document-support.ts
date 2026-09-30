@@ -209,6 +209,18 @@ export async function footerLinks(page: AuditPage): Promise<{ links: Array<{ tex
 
 export const matchesLink = (link: { text: string; href: string }, pattern: RegExp): boolean => pattern.test(link.text) || pattern.test(decodeURIComponent(pathOf(link.href)))
 
+/**
+ * The link to a site document: the first matching link on an allowed origin, else the first match
+ * anywhere. A reCAPTCHA notice ("Google Privacy Policy and Terms of Service apply") often precedes the
+ * site's own legal links in the footer; taking the first match read haftheme's terms as
+ * policies.google.com/terms instead of its /terms-of-use/.
+ */
+export function documentLink<L extends { text: string; href: string }>(links: readonly L[], pattern: RegExp, allowedOrigins: readonly string[], exclude?: RegExp): L | null {
+  const matches = links.filter(link => matchesLink(link, pattern) && !(exclude && matchesLink(link, exclude)))
+  const own = matches.find(link => { try { return allowedOrigins.includes(new URL(link.href).origin) } catch { return false } })
+  return own ?? matches[0] ?? null
+}
+
 // ---------------------------------------------------------------------------------------------
 // Observed data flows
 // ---------------------------------------------------------------------------------------------

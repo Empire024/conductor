@@ -138,7 +138,8 @@ export function createLocalModelRunner(ports: LocalModelRunnerPorts, options: Lo
       const result = await ports.complete({
         endpoint, apiKey, model,
         messages: [{ role: 'system', content: request.system }, { role: 'user', content: request.user }],
-        maxTokens: request.maxTokens, temperature: 0.2, reasoningEffort: 'none', signal: controller.signal
+        maxTokens: request.maxTokens, temperature: 0.2, reasoningEffort: 'none', signal: controller.signal,
+        ...(request.jsonSchema ? { jsonSchema: request.jsonSchema } : {}),
       })
       if (timedOut) throw new Fallback(`the local model did not answer within ${seconds(timeoutMs)} s`)
       cancelled(request.signal)

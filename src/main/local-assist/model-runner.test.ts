@@ -39,6 +39,15 @@ function harness(overrides: Partial<LocalModelRunnerPorts> = {}) {
 }
 
 describe('local model runner', () => {
+  it('passes a JSON schema through to the completion, so the server can enforce it as a grammar', async () => {
+    const h = harness({ servers: () => [entry('local/other-model', 6001)] })
+    const jsonSchema = { type: 'object', properties: { kind: { type: 'string', enum: ['policy', 'other'] } } }
+    await createLocalModelRunner(h.ports).ask({ ...request, jsonSchema })
+    expect(h.log.completes[0]).toMatchObject({ jsonSchema })
+    await createLocalModelRunner(h.ports).ask(request)
+    expect(h.log.completes[1]).not.toHaveProperty('jsonSchema')
+  })
+
   it('uses the running server, whatever its model, and waits while it loads', async () => {
     let probes = 0
     const h = harness({ servers: () => [entry('local/other-model', 6001)], healthy: async () => ++probes > 2 })

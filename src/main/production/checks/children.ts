@@ -1,7 +1,7 @@
 import type { CheckContext, CheckOutcome, ControlCheck, FindingDraft, HumanReviewItem, ObservedRequest } from '../../../shared/production'
 import { decideApplicability } from '../registry'
 import {
-  browserProblem, draft, footerLinks, LINK_PATTERNS, markTested, matchesLink, notRun, outcome, pathOf, planRoutes, review, throwIfAborted,
+  browserProblem, documentLink, draft, footerLinks, LINK_PATTERNS, markTested, notRun, outcome, pathOf, planRoutes, review, throwIfAborted,
   trackerRequests, visit, withPage,
 } from './document-support'
 
@@ -58,7 +58,7 @@ async function runChildren(context: CheckContext): Promise<CheckOutcome> {
       if (!loaded.ok) { unconcluded.push(`route ${route.path} could not be read (${loaded.problem})`); return }
       markTested(coverage, route.path, 'desktop')
       const snapshot = await page.snapshot()
-      if (!privacyUrl) privacyUrl = (await footerLinks(page)).links.find(link => matchesLink(link, LINK_PATTERNS.privacy))?.href.split('#')[0] ?? null
+      if (!privacyUrl) privacyUrl = documentLink((await footerLinks(page)).links, LINK_PATTERNS.privacy, context.policy.allowedOrigins)?.href.split('#')[0] ?? null
       const personalForms = snapshot.forms.filter(form => form.fields.some(field => field.type !== 'hidden' && field.type !== 'submit' && PERSONAL_FIELD.test(`${field.name} ${field.label ?? ''} ${field.autocomplete ?? ''}`)))
         .map(form => `${form.selector} (${form.fields.map(field => field.label ?? field.name).filter(Boolean).join(', ')})`)
       const hasAgeGate = AGE_GATE.test(snapshot.text) || /\bage\b/i.test(snapshot.accessibilityTree.match(/dialog[^\n]*/g)?.join(' ') ?? '')

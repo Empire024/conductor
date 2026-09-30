@@ -76,7 +76,7 @@ export function createProductionApp(deps: ProductionAppDeps): ProductionApp {
     localAsk: async request => {
       const runner = deps.offline ? null : deps.localRunner()
       if (!runner) return null
-      const outcome = await runner.ask({ system: request.system, user: request.user, maxTokens: request.maxTokens, signal: request.signal, noStart: deps.localTurnsInFlight() })
+      const outcome = await runner.ask({ system: request.system, user: request.user, maxTokens: request.maxTokens, jsonSchema: request.schema, signal: request.signal, noStart: deps.localTurnsInFlight() })
       if (!outcome.ok) { log(`local model not used: ${outcome.reason}`); return null }
       return { text: outcome.answer.text, model: outcome.answer.model, inputTokens: outcome.answer.inputTokens, outputTokens: outcome.answer.outputTokens }
     },

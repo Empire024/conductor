@@ -34,7 +34,8 @@ export interface InterpreterPorts {
   /** One cloud turn; `context.projectId` is the audited project, where the turn's background tab opens. */
   cloudTurn(key: ModelKey, prompt: string, signal: AbortSignal, maxTokens: number, context: { projectId: string }): Promise<{ text: string; inputTokens: number; outputTokens: number; costUsd: number | null }>
   /** The local model; null when none is available right now (or starting one would disturb an interactive local turn). */
-  localAsk(request: { system: string; user: string; maxTokens: number; signal: AbortSignal }): Promise<{ text: string; model: string; inputTokens: number; outputTokens: number } | null>
+  /** `schema` is the answer's JSON schema, enforced by the local server as a grammar where it can. */
+  localAsk(request: { system: string; user: string; maxTokens: number; schema?: Record<string, unknown>; signal: AbortSignal }): Promise<{ text: string; model: string; inputTokens: number; outputTokens: number } | null>
   /** A cloud turn's fixed input before the job's prompt; default DEFAULT_FIXED_OVERHEAD_TOKENS until a turn is measured. */
   cloudOverheadTokens?: number
   /** The owner's weekly stop for a provider, in percent of its weekly window; null when none applies. */
@@ -110,7 +111,7 @@ export function createRunInterpreter(options: RunInterpreterOptions): Interprete
       let answer: { text: string; inputTokens: number; outputTokens: number; costUsd: number | null } | null
       try {
         if (!key || provider === 'local') {
-          const local = await ports.localAsk({ system: `${request.system}\nAnswer with JSON only.`, user: prompt, maxTokens, signal })
+          const local = await ports.localAsk({ system: `${request.system}\nAnswer with JSON only.`, user: prompt, maxTokens, schema: request.schema, signal })
           answer = local && { text: local.text, inputTokens: local.inputTokens, outputTokens: local.outputTokens, costUsd: 0 }
           if (local) model = local.model
         } else {
@@ -131,11 +132,41 @@ export function createRunInterpreter(options: RunInterpreterOptions): Interprete
       const fields = { provider, model, decisionId, inputTokens: answer.inputTokens, outputTokens: answer.outputTokens, costUsd: answer.costUsd, durationMs: Date.now() - started }
       const parsed = parseJsonAnswer(answer.text)
       if (!parsed.ok) return refuse(request, `answer rejected: ${parsed.error}`, fields)
-      const problems = validateSchema(parsed.value, request.schema)
+      const problems = validateSchema(repairEnums(parsed.value, request.schema), request.schema)
       if (problems.length) return refuse(request, `answer rejected: ${problems.slice(0, 3).join('; ')}`, fields)
       return { ok: true, json: parsed.value, refused: null, record: record(request, { ...fields, refused: null }) }
     },
   }
+}
+
+/**
+ * Maps a string that misses its enum only by spelling onto the one member it means: case, spacing,
+ * quotes and punctuation (`"Policy."` → `policy`), or a phrase naming exactly one member
+ * (`"privacy policy"` → `policy`). A local 8B model answered C01's classify outside
+ * `policy|placeholder|other` and the whole answer was refused. Anything ambiguous or unrelated is
+ * left as it is, for validation to refuse. Mutates and returns `value`.
+ */
+const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, match => `\\${match}`)
+
+export function repairEnums(value: unknown, schema: Record<string, unknown>): unknown {
+  const members = Array.isArray(schema.enum) ? schema.enum.filter((item): item is string => typeof item === 'string') : null
+  if (members && typeof value === 'string' && !members.includes(value)) {
+    const plain = value.toLowerCase().replace(/[^\p{L}\p{N}\s_-]/gu, ' ').replace(/\s+/g, ' ').trim()
+    const exact = members.filter(member => member.toLowerCase() === plain)
+    if (exact.length === 1) return exact[0]
+    const named = members.filter(member => new RegExp(`(^|[\\s_-])${escapeRegExp(member.toLowerCase())}($|[\\s_-])`).test(plain))
+    return named.length === 1 ? named[0] : value
+  }
+  if (Array.isArray(value) && schema.items && typeof schema.items === 'object') {
+    for (let index = 0; index < value.length; index++) value[index] = repairEnums(value[index], schema.items as Record<string, unknown>)
+    return value
+  }
+  if (value && typeof value === 'object' && !Array.isArray(value) && schema.properties && typeof schema.properties === 'object') {
+    const properties = schema.properties as Record<string, Record<string, unknown>>
+    const object = value as Record<string, unknown>
+    for (const key of Object.keys(object)) if (properties[key]) object[key] = repairEnums(object[key], properties[key])
+  }
+  return value
 }
 
 /** The answer's JSON: the whole text, or one fenced ```json block; nothing else is accepted. */
