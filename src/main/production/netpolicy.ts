@@ -16,8 +16,8 @@ import type { AuditBudget, MutationKind, NetworkPolicy, ObservedRequest, Product
  *   browser has armed an authorized mutation kind for a `submit` or `click({mutation})`.
  * - A GET that looks state-changing (a `/delete` or `/logout` path segment, `?action=delete`,
  *   `add-to-cart`, a WordPress nonce) is a mutation in disguise: refused under read-only.
- * - Every request counts against `maxRequests`, and requests are spaced per origin to
- *   `requestsPerSecondPerOrigin`.
+ * - Every request counts against `maxRequests`. Top-level navigations and the audit's own requests
+ *   are spaced per origin to `requestsPerSecondPerOrigin`; a page's own subresources are not.
  */
 
 export class MutationRefused extends Error {
@@ -241,7 +241,11 @@ export class NetworkGate {
       return { action: 'block', party, outcome: 'blocked-by-policy', reason: `request budget of ${this.policy.maxRequests} reached` }
     }
     this.count++
-    return { action: 'allow', party, delayMs: this.slot(parsed.origin) }
+    // Only navigations and the audit's own requests are spaced: they are what the crawl adds. A
+    // page's subresources load as they would for one visitor; spacing them at a few per second made
+    // an asset-heavy page miss its navigation timeout.
+    const paced = request.mainFrameNavigation || request.initiator !== 'page'
+    return { action: 'allow', party, delayMs: paced ? this.slot(parsed.origin) : 0 }
   }
 
   /** Reserves the next request slot for an origin and returns how long to wait for it. */

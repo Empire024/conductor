@@ -134,15 +134,26 @@ describe('NetworkGate', () => {
     expect(new NetworkGate(policy({ maxRequests: 1 })).decide(nav('https://shop.example/'), false)).toMatchObject({ action: 'allow' })
   })
 
-  it('spaces requests per origin to the configured rate', () => {
+  it('spaces navigations and the audit\'s own requests per origin to the configured rate', () => {
     let clock = 1000
     const gate = new NetworkGate(policy({ requestsPerSecondPerOrigin: 4 }), { clock: () => clock })
-    const delays = Array.from({ length: 5 }, () => (gate.decide(sub('https://shop.example/a.js')) as { delayMs: number }).delayMs)
+    const delays = Array.from({ length: 5 }, (_, index) => (gate.decide(nav(`https://shop.example/${index}`)) as { delayMs: number }).delayMs)
     expect(delays).toEqual([0, 250, 500, 750, 1000])
-    // Another origin has its own schedule.
-    expect((gate.decide(sub('https://cdn.example/a.js')) as { delayMs: number }).delayMs).toBe(0)
+    // An agent fetch shares the origin's schedule; another origin has its own.
+    expect((gate.decide({ ...sub('https://shop.example/robots.txt'), initiator: 'agent' }) as { delayMs: number }).delayMs).toBe(1250)
+    expect((gate.decide({ ...sub('https://cdn.example/a.js'), initiator: 'agent' }) as { delayMs: number }).delayMs).toBe(0)
     clock += 5000
-    expect((gate.decide(sub('https://shop.example/b.js')) as { delayMs: number }).delayMs).toBe(0)
+    expect((gate.decide(nav('https://shop.example/b')) as { delayMs: number }).delayMs).toBe(0)
+  })
+
+  it('counts a page\'s own subresources against the budget without spacing them', () => {
+    const gate = new NetworkGate(policy({ requestsPerSecondPerOrigin: 1 }), { clock: () => 1000 })
+    gate.decide(nav('https://shop.example/'))
+    const delays = Array.from({ length: 20 }, (_, index) => (gate.decide(sub(`https://shop.example/${index}.js`)) as { delayMs: number }).delayMs)
+    expect(delays.every(delay => delay === 0)).toBe(true)
+    expect(gate.requestCount).toBe(21)
+    // The next navigation still waits for its slot.
+    expect((gate.decide(nav('https://shop.example/next')) as { delayMs: number }).delayMs).toBe(1000)
   })
 })
 
@@ -211,8 +222,8 @@ describe('walkRedirects', () => {
     const waits: number[] = []
     let clock = 0
     const gate = new NetworkGate(policy({ requestsPerSecondPerOrigin: 2, maxRequests: 3 }), { clock: () => clock })
-    const decide = async (url: string, method: string) => gate.decide({ url, method, resourceType: 'image', mainFrameNavigation: false, initiator: 'page' })
-    gate.decide(sub('https://cdn.example/a'))
+    const decide = async (url: string, method: string) => gate.decide({ url, method, resourceType: 'image', mainFrameNavigation: false, initiator: 'agent' })
+    gate.decide({ ...sub('https://cdn.example/a'), initiator: 'agent' })
     const server = serve({ 'https://cdn.example/a': response(302, '/b'), 'https://cdn.example/b': response(302, '/c'), 'https://cdn.example/c': response(302, '/d') })
     const walk = await walkRedirects({ url: 'https://cdn.example/a', method: 'GET' }, server.fetchHop, decide, { sleep: async ms => { waits.push(ms) } })
     expect(waits).toEqual([500, 1000])

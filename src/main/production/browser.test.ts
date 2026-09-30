@@ -225,18 +225,22 @@ describe.skipIf(!engine.available)('audit browser', { timeout: BROWSER_TIMEOUT }
     await page.close()
   })
 
-  it('spaces requests per origin to the configured rate', async () => {
+  it('spaces navigations per origin to the configured rate, but not a page\'s own subresources', async () => {
     const site = server.site('baseline')
     server.reset()
-    const page = await newBrowser(localPolicy(site.origin, { requestsPerSecondPerOrigin: 10 }), 'rate').open(desktop())
+    const page = await newBrowser(localPolicy(site.origin, { requestsPerSecondPerOrigin: 2 }), 'rate').open(desktop())
+    const started = Date.now()
     expect((await page.goto(site.url('/gallery.html'))).outcome).toBe('ok')
-    const times = server.requests('baseline').map(item => item.at)
-    expect(times.length).toBeGreaterThanOrEqual(12)
-    const gaps = times.slice(1).map((time, index) => time - times[index]!).sort((a, b) => a - b)
-    // 10 per second: requests arrive about 100 ms apart. Slots are reserved in order, so the whole
-    // span is bounded below even when one request is late off the event loop.
-    expect(gaps[Math.floor(gaps.length / 2)]!).toBeGreaterThanOrEqual(80)
-    expect(times[times.length - 1]! - times[0]!).toBeGreaterThanOrEqual((times.length - 2) * 100)
+    await page.waitFor(300)
+    const gallery = server.requests('baseline').map(item => item.at)
+    // At 2 per second a dozen spaced subresources would take over 5 s; unspaced they arrive at once.
+    expect(gallery.length).toBeGreaterThanOrEqual(12)
+    expect(gallery[gallery.length - 1]! - gallery[0]!).toBeLessThan(2_000)
+    // The next navigation waits for the origin's next slot (500 ms after the last one it was given).
+    expect((await page.goto(site.url('/'))).outcome).toBe('ok')
+    const index = server.requests('baseline').find(item => item.at >= gallery[gallery.length - 1]! && item.path === '/')
+    expect(index).toBeTruthy()
+    expect(index!.at - started).toBeGreaterThanOrEqual(450)
     await page.close()
   })
 

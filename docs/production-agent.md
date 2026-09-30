@@ -111,7 +111,11 @@ ships the capability. Designation is a per-project owner setting and is never in
   with `RUN_TRANSITIONS`, steps (`discovery, fingerprint, legal-sources, control×N,
   engineering-smokes, interpretation, report`), `RunCheckpoint` (next step index, done step ids),
   `RunOperation` ledger, budget + `BudgetLedger`, `RouteCoverage`, artifacts dir, report paths,
-  `rerunRequested`.
+  `rerunRequested`. The discovery step reuses the profile's stack and routes, and notes which run's
+  crawl it reused, when a crawl of the same target (`sameTarget` of that run's recorded fingerprint
+  and this run's) finished within `DISCOVERY_REUSE_MS` (24 h). A real shop takes about 20 minutes
+  to crawl, so targeted re-audits skip it. The ledger charges the running step's requests on every
+  lease renewal, so a long step shows progress.
 - **ControlResult** per run and control: status, applicability decision, rationale, evidence ids,
   finding ids, human-review items, per-check summaries with the reason a check did not conclude,
   coverage, provenance that applied.
@@ -194,8 +198,10 @@ the same project; `production.evidence` reads are bounded to 1 MiB and pass thro
    local environment a login step may submit the login form only under an authorization of the
    existing kinds (for example `form-submit`), and on production the audit never logs in by
    POST (see 6).
-4. **Budget and rate.** The route handler counts requests against `maxRequests` and throttles per
-   origin at `requestsPerSecondPerOrigin`; the runner stops the run with `ledger.exhausted` set
+4. **Budget and rate.** The route handler counts requests against `maxRequests` and throttles
+   top-level navigations and the audit's own requests per origin at `requestsPerSecondPerOrigin`.
+   A page's own subresources are counted but not spaced, since spacing them made asset-heavy pages
+   miss the navigation timeout. The runner stops the run with `ledger.exhausted` set
    and the affected controls UNVERIFIED (a budget stop is never PASS).
 5. **Injection resistance.** Page text, DOM, uploads, source comments, logs and fetched legal pages
    are data. They reach a model only inside `InterpretationRequest.user`, bounded to

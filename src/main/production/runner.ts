@@ -7,6 +7,7 @@ import {
   type HumanReviewItem, type MutationKind, type ProductionProfile, type RouteCoverage, type TestAccountRef, type RouteEntry, type RunStep, type SourceTree, type TargetFingerprint, type VerificationRecord,
 } from '../../shared/production'
 import { discoverStack } from './discovery'
+import { sameTarget } from './fingerprint'
 import { createEvidenceSink } from './evidence'
 import { controlStatus } from './gate'
 import { createRunInterpreter, type InterpreterPorts } from './interpret'
@@ -43,6 +44,8 @@ import { createLoginStatePreparer } from './login-refresh'
 
 export const DEFAULT_LEASE_TTL_MS = 60_000
 export const DEFAULT_CHECK_TIMEOUT_MS = 10 * 60_000
+/** A crawl of the same target this recent is reused instead of repeated (a real shop takes ~20 min). */
+export const DISCOVERY_REUSE_MS = 24 * 3_600_000
 /** Controls the interpretation step explains per run at most (each is one model call). */
 export const MAX_INTERPRETED_CONTROLS = 12
 
@@ -348,6 +351,12 @@ export class ProductionRunner {
       scope.state.write('discovery', { skipped: this.deps.discovery === false ? 'discovery disabled' : 'the owner lists every route' })
       return
     }
+    const reused = this.recentDiscovery(scope)
+    if (reused) {
+      try { this.deps.store.event(scope.runId, scope.guard, 'note', `Discovery reused from run ${reused.id} (same target, crawled ${reused.at}); the profile's stack and routes stand`) } catch { /* superseded */ }
+      scope.state.write('discovery', { reused: reused.id, routes: scope.profile.scope.routes.length, profileVersion: scope.profile.version })
+      return
+    }
     let page
     try { page = await scope.browser.open({ device: 'desktop', locale: scope.profile.scope.locales[0] ?? null, auth: null, consent: 'clean', regionSelection: scope.profile.scope.regionSelection }) } catch (error) {
       if (!(error instanceof AuthUnavailable)) throw error
@@ -366,6 +375,31 @@ export class ProductionRunner {
       scope.profile = this.deps.store.mutateProfile(scope.profile.projectId, 'discovery', current => ({ ...current, stack: found.stack, scope: { ...current.scope, routes } }))
     }
     scope.state.write('discovery', { routes: routes.length, visited: found.visited.length, profileVersion: scope.profile.version })
+  }
+
+  /**
+   * The newest run of this environment whose crawl finished within DISCOVERY_REUSE_MS on the same
+   * target (sameTarget of its fingerprint and this run's): commit, config, policy, dependencies,
+   * routes, profile and registry versions unchanged. Only a crawl that actually ran counts (not a
+   * skipped, not-audited or itself reused one), and its fingerprint step must have recorded the
+   * target it saw.
+   */
+  private recentDiscovery(scope: StepScope): { id: string; at: string } | null {
+    if (!scope.profile.stack) return null
+    const current = scope.run()
+    const since = this.clock().getTime() - DISCOVERY_REUSE_MS
+    for (const prior of this.deps.store.runs(current.projectId, { environmentId: current.environmentId, limit: 20 })) {
+      if (prior.id === current.id) continue
+      const crawl = prior.steps.find(step => step.kind === 'discovery')
+      if (crawl?.status !== 'done' || !crawl.finishedAt || Date.parse(crawl.finishedAt) < since) continue
+      if (prior.steps.find(step => step.kind === 'fingerprint')?.status !== 'done') continue
+      if (!sameTarget(prior.fingerprint, current.fingerprint)) continue
+      const state = prior.artifactsDir ? new RunState(prior.artifactsDir).read<{ routes?: unknown; reused?: unknown }>('discovery') : null
+      // A run that itself reused a crawl does not renew it: the window counts from the real crawl.
+      if (typeof state?.routes !== 'number' || state.reused !== undefined) continue
+      return { id: prior.id, at: crawl.finishedAt }
+    }
+    return null
   }
 
   private async fingerprintStep(scope: StepScope): Promise<void> {
