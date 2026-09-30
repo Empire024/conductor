@@ -9,7 +9,7 @@ export const MUTATION_FAMILIES = {
   delivery: ['git.ship'],
   tabs: ['tabs.open', 'tabs.focus', 'tabs.rename', 'tabs.split', 'tabs.detach', 'tabs.close', 'tabs.archive', 'router.start', 'router.dispatch', 'workspace.rename'],
   agents: ['agents.compact', 'agents.configure', 'agents.grant', 'agents.submit', 'agents.steer', 'agents.interrupt', 'agents.resume', 'agents.fork', 'agents.release', 'agents.handoff', 'agents.supersede', 'agents.report', 'agents.finish', 'agents.await', 'agents.approve'],
-  app: ['projects.open', 'app.update', 'app.update.offer', 'app.update.authorize', 'app.update.check', 'app.update.download', 'app.update.install', 'app.restart', 'app.restart.request', 'app.quit.confirm', 'local.stop'],
+  app: ['projects.open', 'app.update', 'app.update.offer', 'app.update.authorize', 'app.update.check', 'app.update.download', 'app.update.install', 'app.restart', 'app.restart.request', 'app.quit.confirm', 'local.stop', 'supervisor.alert'],
   files: ['files.write', 'files.open', 'tasks.update', 'memory.remember', 'memory.forget'],
   schedules: [
     'jobs.create', 'jobs.pause', 'jobs.resume', 'jobs.cancel', 'jobs.report',
@@ -44,7 +44,7 @@ export const CONTROL_METHOD_CLASSES = new Set<`${ControlMethodClass}:${string}`>
     'tools.list', 'app.state', 'projects.list', 'machines.list', 'models.list', 'tabs.list',
     'agents.list', 'agents.snapshot', 'agents.history', 'agents.artifact', 'agents.status', 'agents.approvals',
     'files.list', 'files.read', 'tasks.list', 'memory.recall', 'orchestration.snapshot',
-    'app.update.status', 'git.status', 'git.ship.status', 'local.servers', 'usage.limits',
+    'app.update.status', 'supervisor.overview', 'git.status', 'git.ship.status', 'local.servers', 'usage.limits',
     'jobs.list', 'jobs.status', 'jobs.events', 'schedules.list', 'schedules.get',
     'loops.list', 'loops.get', 'loops.history', 'loops.proposals', 'ideas.list', 'ideas.get', 'ideas.runs',
     'nodes.list', 'nodes.jobs', 'nodes.job', 'nodes.log', 'cloud.list', 'cloud.status', 'cloud.transcript', 'permissions.list',

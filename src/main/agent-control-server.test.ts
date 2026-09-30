@@ -185,7 +185,7 @@ describe('control method classes', () => {
       'loops.list', 'loops.get', 'loops.history', 'loops.run', 'loops.record', 'loops.propose', 'loops.apply', 'loops.reject', 'loops.proposals',
       'router.start', 'router.dispatch', 'jobs.create', 'jobs.list', 'jobs.status', 'jobs.events', 'jobs.pause', 'jobs.resume', 'jobs.cancel', 'jobs.report',
       'schedules.list', 'schedules.get', 'schedules.create', 'schedules.update', 'schedules.pause', 'schedules.resume', 'schedules.runNow', 'schedules.delete', 'schedules.scripts.save', 'schedules.scripts.delete',
-      'projects.open', 'app.update.check', 'app.update.download', 'app.update.install', 'app.restart', 'app.restart.request', 'app.quit.confirm',
+      'projects.open', 'app.update.check', 'app.update.download', 'app.update.install', 'app.restart', 'app.restart.request', 'app.quit.confirm', 'supervisor.overview', 'supervisor.alert',
       'ideas.list', 'ideas.get', 'ideas.capture', 'ideas.link', 'ideas.note', 'ideas.explore', 'ideas.work',
       'ideas.run', 'ideas.runs', 'ideas.run.approve', 'ideas.run.decide', 'ideas.run.pause', 'ideas.run.resume', 'ideas.run.stop',
       'nodes.list', 'nodes.jobs', 'nodes.job', 'nodes.log', 'nodes.probe', 'nodes.run', 'nodes.cancel', 'nodes.register', 'nodes.remove',

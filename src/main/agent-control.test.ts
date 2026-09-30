@@ -24,6 +24,7 @@ import { SUCCESSION_NUDGE, SUCCESSION_TURNS, TurnBriefings } from './turn-briefi
 import { COWORKER_OPENED_PREFIX, CoworkerAutoClose } from './coworker-autoclose'
 import { CoworkerRecovery } from './coworker-recovery'
 import { encodeRestartInitiator, encodeRestartRequest, parseRestartRequest, RESTART_INITIATOR_KEY, RESTART_REQUEST_KEY, takeRestartInitiator } from './restart-initiator'
+import type { SupervisorOverview } from './supervisor-overview'
 
 const dispose: Array<() => void> = []
 afterEach(() => { for (const close of dispose.splice(0).reverse()) close(); vi.unstubAllEnvs(); vi.useRealTimers() })
@@ -1839,6 +1840,28 @@ describe('the owner control credential', () => {
     expect(await f.control.call(owner, 'memory.forget', { id: memory.id })).toEqual({ removed: true })
     expect(f.confirm).not.toHaveBeenCalled()
     await expect(f.control.call(owner, 'agents.handoff', { handoff: 'x' })).rejects.toThrow(/no conversation to hand off/)
+  })
+
+  it('answers the meta-wizard its overview and alerts on the owner credential only (docs/meta-wizard.md)', async () => {
+    const f = fixture()
+    const worker: AgentSpec = { ...f.spec, id: 'worker', title: 'Worker' }
+    f.sessions.ensure(worker)
+    openAgentTab(f, worker.id, 'worker-tab')
+    const alertOwner = vi.fn(async () => 'pushed to 1 phone; 0 open phone streams')
+    const control = new AgentControl({ ...f.deps, host: { version: '1.0.0', pid: 4242, relaunch: vi.fn(async () => {}), alertOwner } })
+    control.awaiting().declare(f.scope.agentSessionId, [worker.id], 'wait for the worker', undefined, {}, '2026-09-30T01:00:00.000Z')
+    const owner = control.ownerScope({ projectId: f.project.id })
+    expect(Object.keys(await control.call(owner, 'tools.list', {}) as object)).toEqual(expect.arrayContaining(['supervisor.overview', 'supervisor.alert']))
+    expect(Object.keys(await control.call(f.scope, 'tools.list', {}) as object)).not.toContain('supervisor.overview')
+    const overview = await control.call(owner, 'supervisor.overview', {}) as SupervisorOverview
+    expect(overview).toMatchObject({ pid: 4242, version: '1.0.0', localBuild: null })
+    expect(overview.tabs.map(tab => tab.agentSessionId)).toEqual(['controller', 'worker'])
+    expect(overview.tabs[0]).toMatchObject({ title: 'Controller', projectId: f.project.id, project: 'Control project', workspaceId: f.workspace.id, wizard: false, controller: null, awaiting: { agents: ['worker'], deadline: '2026-09-30T01:00:00.000Z', reason: 'wait for the worker' }, pending: { owner: 0, reviewer: 0 } })
+    expect(await control.call(owner, 'supervisor.alert', { title: 'Conductor is down', body: 'details' })).toEqual({ delivered: 'pushed to 1 phone; 0 open phone streams' })
+    expect(alertOwner).toHaveBeenCalledWith({ title: 'Conductor is down', body: 'details' })
+    await expect(control.call(f.scope, 'supervisor.overview', {})).rejects.toThrow(/only the owner's own control credential/)
+    await expect(control.call(f.scope, 'supervisor.alert', { title: 't', body: 'b' })).rejects.toThrow(/only the owner's own control credential/)
+    await expect(control.call(owner, 'supervisor.alert', { title: 't' })).rejects.toThrow()
   })
 
   it('answers the owner-only app methods through the host hooks, and refuses them to conversations', async () => {

@@ -110,6 +110,14 @@ reattach continues from (only `detachForRestart` on a clean restart does), so th
 resumes from its native transcript in a new host runtime. Smoke:
 `node scripts/smoke-lock.mjs -- node scripts/smoke-verify-vr6-recovery.mjs --group crash [--host]`.
 
+## Above the watchdog: the meta-wizard
+
+The watchdog lives and dies with one Conductor launch. The meta-wizard (docs/meta-wizard.md) is a
+per-user scheduled task that outlives all of them: it leaves a restart or install to the watchdog
+while `armed.json` says one is in progress, starts Conductor itself when nobody brought it back or
+when it hangs, resumes every tab a restart cut (not only wizards and coworkers), and steers stalled
+waits.
+
 ## The recovery agent
 
 `claude -p` (Claude Code, found on PATH or `%USERPROFILE%\.local\bin\claude.exe`), in the Conductor

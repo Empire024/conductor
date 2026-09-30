@@ -2917,7 +2917,9 @@ app.whenReady().then(async () => {
       relaunch: relaunchConductor,
       requestRestart: recordRestartRequest,
       restartRequest: readRestartRequest,
-      stopConfirmation: { pending: () => stopConfirmations.pending(), answer: stopWork => stopConfirmations.answer(stopWork), wouldAsk: stopQuestion }
+      stopConfirmation: { pending: () => stopConfirmations.pending(), answer: stopWork => stopConfirmations.answer(stopWork), wouldAsk: stopQuestion },
+      // The meta-wizard's owner alerts (docs/meta-wizard.md) reach the paired phones.
+      alertOwner: async ({ title, body }) => phoneAccess ? phoneAccess.announce({ id: randomUUID(), kind: 'attention', sessionId: null, title, body, at: new Date().toISOString(), url: '/#/' }) : 'Phone access is not running.'
     },
     delivery,
     localModels: { availability: localModelAvailability, servers: localServersWithDecider, stop: stopRunningLocalServer, vramTotalGb: () => vramTotalGb() },

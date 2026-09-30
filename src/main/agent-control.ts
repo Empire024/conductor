@@ -34,6 +34,8 @@ import { readTextFile } from './text-files'
 import { invalidateProjectFiles, searchProjectFiles } from './project-file-search'
 import { inheritMachineId, machineRunsProject, tabMachineId } from './machines'
 import type { LocalUpdateBuildService } from './local-update-build'
+import { readLocalUpdateOffer } from './local-update-offer'
+import { supervisorTab, type SupervisorOverview } from './supervisor-overview'
 import type { SavingsSummary } from './local-assist/contract'
 import type { DeliveryRequester, DeliveryRun, RepositoryStatus } from '../shared/delivery'
 import { LOCAL_CONNECTION, LOCAL_MACHINE_ID, type MachineDescriptor } from '../shared/remote-control'
@@ -342,6 +344,8 @@ export interface AgentControlHost {
   /** The open "Work is still running" dialog, which app.quit.confirm answers. `wouldAsk` names
    *  the work a quit or restart would ask the owner about now, or null when it would go ahead. */
   stopConfirmation?: { pending(): PendingStopConfirmation | null; answer(stopWork: boolean): PendingStopConfirmation | null; wouldAsk?(): PendingStopConfirmation['running'] | null }
+  /** supervisor.alert: push one owner alert to the paired phones; says what happened. */
+  alertOwner?(alert: { title: string; body: string }): Promise<string>
 }
 
 /** The agentSessionId an owner-credential call carries. No conversation has this id. */
@@ -359,6 +363,12 @@ const ownerSignatures: Record<string, string> = {
   'tabs.archive': '({tabIds,projectId?,workspaceId?}) — owner credential or wizard tab only: close these tabs into their workspace archive (history kept; reopened from the Archive or Ctrl+K). A tab that is busy (a running turn, an approval or question, a limit wait, queued or steered messages, background tasks, a git.ship it started) or protected (the live wizard, a controller with open coworkers, a remote tab) is refused and named with its reason; nothing can start in a tab between its check and its close. Returns {archived:[{tabId,title}], refused:[{tabId,title,reason,message}]}'
 }
 const ownerMethods = new Set(Object.keys(ownerSignatures))
+/** The meta-wizard's methods (docs/meta-wizard.md): the owner credential only, never a wizard tab. */
+const supervisorSignatures: Record<string, string> = {
+  'supervisor.overview': '() — owner credential only: every agent tab of every project in one read (phase, wizard, controller, declared wait with its deadline, last tool with a refusal text, last answer, usage-limit reset, pending cards) plus the app update state and the newest local build with its builder',
+  'supervisor.alert': '({title,body}) — owner credential only: push an alert to the owner\'s paired phones; returns what was delivered'
+}
+const supervisorMethods = new Set(Object.keys(supervisorSignatures))
 /** The owner's authority, from either source: the credential file, or a wizard conversation. */
 const sovereign = (scope: AgentControlScope): boolean => scope.owner === true || scope.wizard === true
 
@@ -403,7 +413,7 @@ const upgradeMethods = new Set(Object.keys(upgradeSignatures))
 const upgradeOpenMethods = new Set(['models.upgrades.status', 'models.upgrades.check', 'models.upgrades.prepared'])
 /** Every method some caller of this build can reach, for the unknown-method refusal: a method
  *  that is merely unavailable here (no job controller, not the owner) keeps its own refusal. */
-const KNOWN_METHODS = new Set<string>([...Object.keys(toolSignatures), ...Object.keys(ownerSignatures), ...Object.keys(jobSignatures), ...Object.keys(nodeSignatures), ...Object.keys(cloudSignatures), ...Object.keys(scheduleSignatures), ...Object.keys(ideaSignatures), ...Object.keys(ideaRunSignatures), ...Object.keys(productionSignatures), ...Object.keys(modelSignatures), ...modelMethods, ...upgradeMethods, ...PERMISSION_METHODS, ...WIZARD_APPROVAL_METHODS])
+const KNOWN_METHODS = new Set<string>([...Object.keys(toolSignatures), ...Object.keys(ownerSignatures), ...Object.keys(supervisorSignatures), ...Object.keys(jobSignatures), ...Object.keys(nodeSignatures), ...Object.keys(cloudSignatures), ...Object.keys(scheduleSignatures), ...Object.keys(ideaSignatures), ...Object.keys(ideaRunSignatures), ...Object.keys(productionSignatures), ...Object.keys(modelSignatures), ...modelMethods, ...upgradeMethods, ...PERMISSION_METHODS, ...WIZARD_APPROVAL_METHODS])
 const strings = (value: unknown, key: string, count: number, length: number): string[] => {
   if (!Array.isArray(value) || value.length > count || value.some(item => typeof item !== 'string' || !item.trim() || item.length > length || item.includes('\0'))) throw new Error(`${key} must be a list of at most ${count} non-empty strings of up to ${length} characters`)
   return value as string[]
@@ -1858,7 +1868,7 @@ export class AgentControl {
     // Naming another project is only meaningful for the methods that were opened to a sibling;
     // everywhere else it is still an attempt to act outside the authorized scope.
     if (args.projectId !== undefined && args.projectId !== scope.projectId && !crossProjectMethods.includes(method)) throw new Error('This method only runs in the authorized project. Use projects.list to see what else is open, and hand work to a sibling project with tabs.open({projectId}).')
-    if (method === 'tools.list') return filterSignatures({ ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.cloud ? cloudSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(this.deps.ideaRuns ? ideaRunSignatures : {}), ...(this.deps.production ? productionSignatures : {}), ...(this.deps.modelIntelligence ? modelSignatures : {}), ...(this.deps.modelUpgrades ? Object.fromEntries(Object.entries(upgradeSignatures).filter(([name]) => upgradeOpenMethods.has(name) || sovereign(scope))) : {}), ...(sovereign(scope) ? { ...ownerSignatures, ...WIZARD_APPROVAL_SIGNATURES } : {}), ...(this.deps.permissionGrants ? { ...PERMISSION_METHOD_SIGNATURES, ...(sovereign(scope) ? PERMISSION_OWNER_SIGNATURES : {}) } : {}) }, args)
+    if (method === 'tools.list') return filterSignatures({ ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.cloud ? cloudSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(this.deps.ideaRuns ? ideaRunSignatures : {}), ...(this.deps.production ? productionSignatures : {}), ...(this.deps.modelIntelligence ? modelSignatures : {}), ...(this.deps.modelUpgrades ? Object.fromEntries(Object.entries(upgradeSignatures).filter(([name]) => upgradeOpenMethods.has(name) || sovereign(scope))) : {}), ...(sovereign(scope) ? { ...ownerSignatures, ...WIZARD_APPROVAL_SIGNATURES } : {}), ...(scope.owner ? supervisorSignatures : {}), ...(this.deps.permissionGrants ? { ...PERMISSION_METHOD_SIGNATURES, ...(sovereign(scope) ? PERMISSION_OWNER_SIGNATURES : {}) } : {}) }, args)
     if (PERMISSION_METHODS.includes(method)) {
       if (!this.deps.permissionGrants) throw new Error('Permission grants are not available in this Conductor')
       const approver = { agentSessionId: scope.agentSessionId, projectId: scope.projectId, owner: scope.owner === true, wizard: scope.wizard === true }
@@ -1866,6 +1876,10 @@ export class AgentControl {
     }
     if (WIZARD_APPROVAL_METHODS.includes(method)) return callWizardApprovals({ answerable: current => this.answerable(current), snapshot: id => database.structured.snapshot(id), respond: response => sessions.respond(response), persistence: database, reviewClass: (id, runtimeId, requestId) => sessions.approvalReviewClass?.(id, runtimeId, requestId) ?? { reviewed: false } }, { agentSessionId: scope.agentSessionId, projectId: scope.projectId, owner: scope.owner === true, wizard: scope.wizard === true }, method, args)
     if (upgradeMethods.has(method)) return this.modelUpgradesMethod(scope, method, args)
+    if (supervisorMethods.has(method)) {
+      if (!scope.owner) throw new Error(`${method} answers only the owner's own control credential (control-owner.json), which the meta-wizard uses`)
+      return this.supervisor(method, args)
+    }
     if (ownerMethods.has(method)) {
       if (!sovereign(scope)) throw new Error(`${method} answers only the owner's own control credential (control-owner.json) or a wizard tab (the wand toggle, frontier models only), not an ordinary conversation`)
       return this.ownerCall(scope, method, args)
@@ -2845,6 +2859,45 @@ export class AgentControl {
       return { installing: true, version: state.availableVersion ?? null, force, ...(resume ? { resume } : {}), note: 'Conductor quits, installs and relaunches. Wait for a new control-owner.json (new pid) before calling again.' }
     }
     throw new Error(this.unknownMethod(method))
+  }
+
+  /** supervisor.overview and supervisor.alert, for the meta-wizard outside the app. */
+  private async supervisor(method: string, args: Args): Promise<unknown> {
+    const { database, host, localUpdates } = this.deps
+    if (method === 'supervisor.alert') {
+      validateArgs(method, args, ['title', 'body'])
+      if (!host?.alertOwner) throw new Error('Phone alerts are unavailable in this Conductor')
+      return { delivered: await host.alertOwner({ title: text(args, 'title', 120), body: text(args, 'body', 1000) }) }
+    }
+    validateArgs(method, args, [])
+    const tabs: SupervisorOverview['tabs'] = []
+    let ledger: AwaitingResults | undefined
+    try { ledger = this.awaiting() } catch { /* no waits known */ }
+    for (const project of database.listProjects()) for (const workspace of database.listSessions(project.id)) {
+      let open: AgentControlTab[]
+      try { open = this.tabs({ projectId: project.id, sessionId: workspace.id, agentSessionId: '' }) } catch { continue }
+      for (const tab of open) {
+        if (tab.kind !== 'agent' || !tab.resourceId) continue
+        const id = tab.resourceId, state = database.structured.snapshot(id)
+        const provider = typeof tab.state?.provider === 'string' ? tab.state.provider : null
+        const lastEvent = state?.sequence ? database.structured.events(id, state.sequence - 1)[0] : undefined
+        const { phase, backgroundTasks } = this.background(id, state)
+        let awaiting = null
+        try { awaiting = ledger?.record(id) ?? null } catch { /* unreadable wait record */ }
+        tabs.push(supervisorTab({
+          agentSessionId: id, tabId: tab.id, title: tab.title, projectId: project.id, project: project.name, workspaceId: workspace.id, provider, phase, backgroundTasks,
+          wizard: wizardActive(state?.settings, provider ?? undefined), controller: this.linkFor(id)?.controllerAgentSessionId ?? null,
+          lastActivityAt: lastEvent?.timestamp ?? null
+        }, state, awaiting))
+      }
+    }
+    const build = localUpdates?.status()
+    const offer = build?.feedDirectory && build.version ? readLocalUpdateOffer(build.feedDirectory, build.version) : null
+    return {
+      observedAt: new Date().toISOString(), pid: host?.pid ?? null, version: host?.version ?? null, updates: host?.updates?.state() ?? null,
+      localBuild: build && build.state !== 'idle' ? { state: build.state, version: build.version, commit: build.commit, verified: build.verified, finishedAt: build.finishedAt, builder: offer?.builder || null, offered: offer?.offered ?? null } : null,
+      tabs
+    } satisfies SupervisorOverview
   }
 
   /** The conversations an unforced app.update.install waits for, across every project: a live
