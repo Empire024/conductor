@@ -14,8 +14,10 @@ const descriptions: Record<string, string> = {
   plan: 'Explore and plan before implementing changes.'
 }
 const modeIcons: Record<string, typeof ShieldCheck> = { default: Hand, auto: Zap, 'accept-edits': PencilLine, 'read-only': Eye, edit: PencilLine, plan: ListTree }
-export function ConversationModeControl({ modes, value, disabled, onChange }: {
+export function ConversationModeControl({ modes, value, status, attention, disabled, onChange }: {
   modes: ReturnType<typeof conversationModes>; value: string; disabled: boolean
+  /** The runtime's confirmed mode, shown as the trigger's tooltip; attention adds a small dot. */
+  status?: string; attention?: boolean
   onChange(change: Partial<SessionSettings>): void
 }): React.JSX.Element {
   const [open, setOpen] = useState(false)
@@ -35,7 +37,7 @@ export function ConversationModeControl({ modes, value, disabled, onChange }: {
   }, [open])
   useEffect(() => { if (disabled) setOpen(false) }, [disabled])
   return <div className="sa-mode-picker" ref={host} onBlur={event => { if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false) }}>
-    <button ref={trigger} type="button" className="sa-mode-trigger" aria-label="Conversation mode" aria-haspopup="menu" aria-controls={id} aria-expanded={open} disabled={disabled} title={describe(selected) ?? descriptions[value]} onClick={() => setOpen(!open)} onKeyDown={event => { if (event.key === 'ArrowDown') { event.preventDefault(); setOpen(true) } }}><SelectedIcon size={14} aria-hidden="true" /><span>{selected?.label ?? 'Choose mode'}</span><ChevronDown size={11} /></button>
+    <button ref={trigger} type="button" className="sa-mode-trigger" data-attention={attention ? 'true' : undefined} aria-label="Conversation mode" aria-description={status} aria-haspopup="menu" aria-controls={id} aria-expanded={open} disabled={disabled} title={status ?? describe(selected) ?? descriptions[value]} onClick={() => setOpen(!open)} onKeyDown={event => { if (event.key === 'ArrowDown') { event.preventDefault(); setOpen(true) } }}><SelectedIcon size={14} aria-hidden="true" /><span>{selected?.label ?? 'Choose mode'}</span><ChevronDown size={11} /></button>
     {open && <div className="sa-mode-menu" id={id} role="menu" aria-label="Conversation mode" onKeyDown={event => {
       if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close() }
       if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {

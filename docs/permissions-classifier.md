@@ -17,14 +17,13 @@ then requests native `bypassPermissions` and counts it active only after provide
 - Sensitive steps (production, shared, destructive, credentialed, external) need an approval when
   the owner has not enabled Full Auto. The native provider may still require an individual,
   request-specific approval where its policy mandates one.
-- The owner answers in the card or with the owner's own control credential. A wizard tab holds
-  the owner's authority (AGENTS.md) and answers **every** class, production included (owner
-  decision 2026-09-28, gap H13). Both app-control paths hold the same line: `permissions.decide`
-  (Conductor's permission requests and denial cards) and `agents.approve` (a coworker's native
-  approval card). The owner credential answers any conversation of its project, a wizard the
-  coworkers it controls (and theirs); nobody answers their own request, and an ordinary conversation
-  answers nothing. `agents.approve` only sends a choice the coworker's runtime offers, so no
-  provider or managed restriction is lifted by it.
+- The owner answers in the card or with the owner's own control credential; a wizard tab is the
+  owner (AGENTS.md) and answers **every** class itself, production included. Both app-control paths
+  (`permissions.decide` for permission requests and denial cards, `agents.approve` for native
+  approval cards) cover any conversation of the project, and for a wizard also its own requests
+  (a predecessor's too) and its coworkers in other projects. An ordinary conversation answers
+  nothing. Each answer records who gave it. `agents.approve` only sends a choice the runtime
+  offers, so no provider or managed restriction is lifted by it.
 - `agents.approve` with `scope:"session"` reports what it actually covered (`effectiveScope`):
   `native-session` when the runtime offered its own for-this-session choice (for Claude, "Only this
   running Claude session; cleared when it restarts or resumes"); `once+app-rule` when it did not and

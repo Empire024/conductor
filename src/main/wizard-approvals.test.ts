@@ -37,7 +37,7 @@ describe('a wizard answers its coworkers\' approvals (wizard-answers-approvals)'
     const f = fixture()
     await expect(callWizardApprovals(f.ports, { agentSessionId: 'worker', projectId: 'project' }, 'agents.approvals', {})).rejects.toThrow('only a wizard tab')
     await expect(callWizardApprovals(f.ports, { agentSessionId: 'worker', projectId: 'project' }, 'agents.approve', { agentSessionId: 'coworker', requestId: 'run-tests', decision: 'allow', reason: 'x' })).rejects.toThrow('only a wizard tab')
-    await expect(callWizardApprovals(f.ports, { agentSessionId: 'other-wizard', projectId: 'project', wizard: true }, 'agents.approve', { agentSessionId: 'coworker', requestId: 'run-tests', decision: 'allow', reason: 'x' })).rejects.toThrow('not one of your coworkers')
+    await expect(callWizardApprovals(f.ports, { agentSessionId: 'other-wizard', projectId: 'project', wizard: true }, 'agents.approve', { agentSessionId: 'coworker', requestId: 'run-tests', decision: 'allow', reason: 'x' })).rejects.toThrow('neither in this project nor one of your coworkers')
     expect(f.responses).toHaveLength(0)
   })
 
@@ -119,10 +119,11 @@ describe('a wizard answers its coworkers\' approvals (wizard-answers-approvals)'
     expect(sessionRules.list({ workerId: 'coworker', runtimeId: 'runtime' })).toEqual([])
   })
 
-  it('refuses a wizard answering its own request, and a choice its runtime does not offer', async () => {
+  it('lets a wizard answer its own request, and refuses a choice its runtime does not offer', async () => {
     const f = fixture()
-    const self = { ...f.ports, answerable: () => [{ agentSessionId: 'wizard', cwd: 'C:/work', projectId: 'project' }] }
-    await expect(callWizardApprovals(self, f.wizard, 'agents.approve', { agentSessionId: 'wizard', requestId: 'push', decision: 'allow', reason: 'x' })).rejects.toThrow('not one of your coworkers')
+    const self = { ...f.ports, answerable: () => [{ agentSessionId: 'wizard', cwd: 'C:/work', projectId: 'project' }], snapshot: (id: string) => f.ports.snapshot(id === 'wizard' ? 'coworker' : id) }
+    await expect(callWizardApprovals(self, f.wizard, 'agents.approve', { agentSessionId: 'wizard', requestId: 'lint', decision: 'allow', reason: 'mine' })).resolves.toMatchObject({ answered: 'allow' })
+    f.responses.length = 0
     const state = f.ports.snapshot('coworker')!
     for (const item of state.items) if (item.data.type === 'interaction') item.data.interaction.choices = item.data.interaction.choices.map(choice => choice.id === 'allow' ? { ...choice, disabled: true } : choice)
     await expect(callWizardApprovals(f.ports, f.wizard, 'agents.approve', { agentSessionId: 'coworker', requestId: 'push', decision: 'allow', reason: 'x' })).rejects.toThrow('does not offer a allow answer')

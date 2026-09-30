@@ -81,18 +81,14 @@ try {
   await shot(card, '3-on-explained')
   check('Explanation opens behind the disclosure')
 
-  await page.keyboard.press('Escape')
-  await expect(panel).toBeHidden()
-  const detail = page.locator('.structured-agent-pane .sa-full-auto-details')
-  await detail.locator(':scope > summary').click()
-  await expect(detail.locator('.sa-full-auto-control')).toHaveAttribute('data-state', 'on')
-  await shot(detail, '4-pane')
-  check('Conversation disclosure shows the same card')
+  // The composer carries no Full Auto disclosure (wizard-means-wizard): the card is here only.
+  assert.equal(await page.locator('.structured-agent-pane .sa-full-auto-control').count(), 0)
+  check('No Full Auto card in the conversation composer')
 
-  await detail.getByRole('button', { name: DISABLE, exact: true }).click()
+  await card.getByRole('button', { name: DISABLE, exact: true }).click()
   await expect.poll(async () => { const s = await policy(); return !s.enabled && !s.applying }, { timeout: 60000 }).toBe(true)
-  await expect(detail.locator('.sa-full-auto-control')).toHaveAttribute('data-state', 'off')
-  await shot(detail, '5-pane-off')
+  await expect(card).toHaveAttribute('data-state', 'off')
+  await shot(card, '5-off-again')
   check('Disable returns the card to Off')
   assert.deepEqual(errors, [])
 } catch (error) {

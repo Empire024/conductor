@@ -28,8 +28,8 @@ export function ClaudeFullAutoControl(): React.JSX.Element {
   useEffect(() => {
     if (!enabled) { setTabs(undefined); return }
     let alive = true
-    // Read-only listing, refreshed only while the card is actually on screen (a collapsed
-    // conversation disclosure or a hidden window does not poll).
+    // Read-only listing, refreshed only while the card is actually on screen (a hidden window
+    // does not poll).
     const refresh = (): void => {
       if (document.hidden || !root.current?.offsetParent) return
       void window.conductor.claudeFullAuto.tabs().then(value => { if (alive) setTabs(value) }).catch(() => {})

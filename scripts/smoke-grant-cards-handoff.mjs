@@ -8,8 +8,10 @@
 //   conductor:// link to its own tab -> app.restart -> in S's tab the cards are out of the timeline
 //   window, yet the dock above the composer shows both with their buttons -> Needs attention lists S
 //   as permission with the call -> the link, clicked with the timeline scrolled up, brings the live end
-//   and the dock into view -> S may not answer its own request (permissions.decide) -> the owner's
-//   "Approve once" in the dock tells S to retry, and the dock drops that card.
+//   and the dock into view (S's wand switched off: the dock is for tabs that are not wizards) -> with
+//   the wand back on the dock is gone, and S, a wizard, answers both cards itself (permissions.decide,
+//   by its own id and by its predecessor's), each recorded as answered by a wizard tab, and is told
+//   to retry (wizard-means-wizard, owner 2026-09-30).
 // Real Electron main/preload/renderer; only the Claude process is the synthetic fixture
 // (scripts/fixtures/fake-claude.mjs, SYNTHETIC CLASSIFIER / LONG / FILELINKS), so nothing is executed
 // and no inference happens. CONDUCTOR_TEST_USER_DATA parks the window; spawn mode survives the restart.
@@ -60,7 +62,11 @@ async function scenario(inst) {
   await rebind()
   await g.show({ tabId: s.tabId }, 1500)
 
-  step("S's tab: the cards are out of the timeline window, and the dock shows them live")
+  step("S's tab, wand off: the cards are out of the timeline window, and the dock shows them live")
+  const wand = view.locator('.structured-agent-pane .wizard-toggle')
+  const setWand = async on => { if ((await wand.getAttribute('aria-pressed')) !== String(on)) await wand.click(); await poll(async () => (await wand.getAttribute('aria-pressed')) === String(on), { timeoutMs: 5000, label: `wand ${on ? 'on' : 'off'}` }) }
+  const wizardDock = await view.locator('[data-grant-dock]').count()
+  await setWand(false)
   const inTimeline = await view.locator(`.sa-timeline article[data-native-item-id="${first.requestId}"]`).count()
   const dock = view.locator('[data-grant-dock]')
   await dock.waitFor({ timeout: 10_000 }).catch(() => undefined)
@@ -85,19 +91,15 @@ async function scenario(inst) {
   const atEnd = await poll(() => timeline.evaluate(element => element.scrollHeight - element.scrollTop - element.clientHeight < 40), { timeoutMs: 3000, label: 'timeline at its live end' }).then(() => true, () => false)
   record('link-reveals', pulsed && atEnd ? 'PASS' : 'FAIL', { href: await link.getAttribute('href'), pulsed, atEnd }, await shot('link-reveals'))
 
-  step('S, the wizard now, may not answer its own request')
-  let own
-  try { own = await s.as('permissions.decide', { agentSessionId: s.id, requestId: first.requestId, decision: 'approve-once' }) } catch (error) { own = { error: errorText(error) } }
-  let viaPredecessor
-  try { viaPredecessor = await s.as('permissions.decide', { agentSessionId: w.id, requestId: first.requestId, decision: 'approve-once' }) } catch (error) { viaPredecessor = { error: errorText(error) } }
-  const stillPending = (await g.grantsState()).requests.find(entry => entry.id === first.requestId)?.status === 'pending'
-  record('wizard-not-own', /cannot answer its own/.test(own.error ?? '') && /cannot answer its own|not one of your coworkers/.test(viaPredecessor.error ?? '') && stillPending ? 'PASS' : 'FAIL', { own: own.error ?? own, viaPredecessor: viaPredecessor.error ?? viaPredecessor, stillPending }, 'refused by its own id and through its predecessor; the card still waits for the owner')
-
-  step("the owner's Approve once in the dock")
-  await dock.locator('.sa-grant-card').first().getByRole('button', { name: 'Approve once', exact: true }).click()
-  await poll(async () => await g.told(s.id) === 1, { timeoutMs: 15_000, label: 'S told approved' })
-  const after = await g.grantsState()
-  const answered = after.requests.find(entry => entry.id === first.requestId)
-  const left = await poll(async () => (await dock.locator('.sa-grant-card').count()) === 1 ? 1 : null, { timeoutMs: 5000, label: 'dock drops the answered card' }).catch(() => null)
-  record('owner-approves', answered && answered.status !== 'pending' && answered.decidedBy === 'owner' && left === 1 ? 'PASS' : 'FAIL', { status: answered?.status, decidedBy: answered?.decidedBy, told: await g.told(s.id), dockCards: await dock.locator('.sa-grant-card').count() }, await shot('after-approve'))
+  step("wand back on: no dock in the wizard tab, and S answers its own and its predecessor's card itself")
+  await setWand(true)
+  const dockWithWand = await poll(async () => await view.locator('[data-grant-dock]').count() === 0 ? 'hidden' : null, { timeoutMs: 5000, label: 'dock hidden in the wizard tab' }).catch(() => 'shown')
+  record('wizard-no-dock', wizardDock === 0 && dockWithWand === 'hidden' ? 'PASS' : 'FAIL', { beforeWandOff: wizardDock, afterWandOn: dockWithWand }, await shot('wizard-no-dock'))
+  const answer = async (agentSessionId, requestId) => { try { return await s.as('permissions.decide', { agentSessionId, requestId, decision: 'approve-once' }) } catch (error) { return { error: errorText(error) } } }
+  const own = await answer(s.id, first.requestId)
+  await poll(async () => await g.told(s.id) >= 1, { timeoutMs: 15_000, label: 'S told approved' }).catch(() => undefined)
+  const viaPredecessor = await answer(w.id, second.requestId)
+  const after = (await g.grantsState()).requests
+  const decided = [first, second].map(entry => after.find(request => request.id === entry.requestId))
+  record('wizard-answers-own', decided.every(entry => entry && ['approved-once', 'used'].includes(entry.status) && entry.decidedBy === 'wizard') && !own.error && !viaPredecessor.error ? 'PASS' : 'FAIL', { own: own.error ?? own.status, viaPredecessor: viaPredecessor.error ?? viaPredecessor.status, decided: decided.map(entry => ({ status: entry?.status, decidedBy: entry?.decidedBy })), told: await g.told(s.id) }, await shot('after-wizard-approves'))
 }

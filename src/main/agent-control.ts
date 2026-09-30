@@ -1872,7 +1872,7 @@ export class AgentControl {
     if (PERMISSION_METHODS.includes(method)) {
       if (!this.deps.permissionGrants) throw new Error('Permission grants are not available in this Conductor')
       const approver = { agentSessionId: scope.agentSessionId, projectId: scope.projectId, owner: scope.owner === true, wizard: scope.wizard === true }
-      return callPermissions(this.deps.permissionGrants, { ...approver, answers: id => id !== scope.agentSessionId && this.answerable(approver).some(entry => entry.agentSessionId === id) }, method, args)
+      return callPermissions(this.deps.permissionGrants, { ...approver, answers: id => this.answerable(approver).some(entry => entry.agentSessionId === id) }, method, args)
     }
     if (WIZARD_APPROVAL_METHODS.includes(method)) return callWizardApprovals({ answerable: current => this.answerable(current), snapshot: id => database.structured.snapshot(id), respond: response => sessions.respond(response), persistence: database, reviewClass: (id, runtimeId, requestId) => sessions.approvalReviewClass?.(id, runtimeId, requestId) ?? { reviewed: false } }, { agentSessionId: scope.agentSessionId, projectId: scope.projectId, owner: scope.owner === true, wizard: scope.wizard === true }, method, args)
     if (upgradeMethods.has(method)) return this.modelUpgradesMethod(scope, method, args)
@@ -3395,16 +3395,18 @@ export class AgentControl {
     return [...links.values()]
   }
 
-  /** Whose approvals agents.approve may answer (wizard-approvals.ts): the owner credential, every
-   *  agent conversation of its project; a wizard, the coworkers it controls and theirs. */
+  /** Whose approvals agents.approve and permissions.decide may answer (wizard-approvals.ts): the
+   *  owner credential, every agent conversation of its project; a wizard, the same (itself and a
+   *  predecessor included) plus the coworkers it controls in other projects, and theirs. */
   private answerable(scope: WizardApprovalScope): AnswerableConversation[] {
     const describe = (id: string, title?: string): AnswerableConversation[] => {
       const spec = this.deps.database.structured.spec<AgentSpec>(id)
       return spec ? [{ agentSessionId: id, title, cwd: spec.cwd, projectId: spec.projectId, provider: spec.provider }] : []
     }
-    if (scope.owner) return this.deps.database.listSessions(scope.projectId).flatMap(workspace => this.tabs({ projectId: scope.projectId, sessionId: workspace.id, agentSessionId: '' }))
+    const project = this.deps.database.listSessions(scope.projectId).flatMap(workspace => this.tabs({ projectId: scope.projectId, sessionId: workspace.id, agentSessionId: '' }))
       .flatMap(tab => tab.kind === 'agent' && tab.resourceId ? describe(tab.resourceId, tab.title) : [])
-    const found = new Map<string, AnswerableConversation>()
+    if (scope.owner) return project
+    const found = new Map<string, AnswerableConversation>(project.map(entry => [entry.agentSessionId, entry]))
     let frontier = [scope.agentSessionId]
     for (let depth = 0; depth < 4 && frontier.length; depth++) {
       frontier = frontier.flatMap(controller => this.controlledBy(controller).map(link => link.targetAgentSessionId)).filter(id => id !== scope.agentSessionId && !found.has(id))

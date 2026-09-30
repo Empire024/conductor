@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { SessionSettings } from './structured-agent'
-import { permissionParity } from './permission-parity'
+import { permissionParity, permissionParityNeedsAttention } from './permission-parity'
 
 const settings: SessionSettings = { permission: 'auto', plan: false }
 const capabilities = (mode: string) => ({ provider: 'claude' as const, effectiveSettings: { permissionMode: mode } })
@@ -10,6 +10,11 @@ describe('visible configured/native permission parity', () => {
   it('normalizes equivalent native ask names', () => expect(permissionParity({ ...settings, permission: 'default' }, capabilities('default'))).toBeUndefined())
   it('identifies Guarded Auto with stronger review routing too', () => expect(permissionParity(settings, { ...capabilities('auto'), approvalRouting: 'stronger-review' })).toContain('Guarded Auto'))
   it('still reports a reviewed worker whose native mode is not the configured one', () => expect(permissionParity(settings, { ...capabilities('manual'), approvalRouting: 'stronger-review' })).toContain('configured auto; native manual'))
+  it('marks only an unconfirmed or mismatched mode for attention', () => {
+    expect(permissionParityNeedsAttention(permissionParity(settings, capabilities('default')))).toBe(true)
+    expect(permissionParityNeedsAttention(permissionParity(settings, capabilities('auto')))).toBe(false)
+    expect(permissionParityNeedsAttention(undefined)).toBe(false)
+  })
   it('does not invent an unreported native permission', () => expect(permissionParity(settings, { provider: 'claude' })).toBeUndefined())
   it('only reports Full Auto active after runtime confirmation', () => {
     const effective = { claudeFullAutoAuthorized: true, requestedPermissionMode: 'bypassPermissions', permissionMode: 'bypassPermissions' }

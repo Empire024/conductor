@@ -30,7 +30,8 @@ export function dockedGrantRequests(state: PermissionGrantsState, agentSessionId
 }
 
 /** Pinned above the composer: every waiting request this conversation holds that the visible
- *  timeline does not already show, each as the same live card with its buttons. */
+ *  timeline does not already show, each as the same live card with its buttons. Not in a wizard
+ *  tab, which answers its own requests. */
 export function PendingGrantDock({ agentSessionId, rendered }: { agentSessionId: string; rendered: ReadonlySet<string> }): React.JSX.Element | null {
   const state = usePermissionGrants()
   const waiting = dockedGrantRequests(state, agentSessionId, rendered)
@@ -54,7 +55,7 @@ export function PendingGrantDock({ agentSessionId, rendered }: { agentSessionId:
   if (!waiting.length) return null
   return <section ref={dock} className={'sa-grant-dock' + (pulse ? ' sa-grant-dock-pulse' : '')} aria-label={`${waiting.length} permission request${waiting.length === 1 ? '' : 's'} waiting for you`} data-grant-dock={waiting.length}>
     <button type="button" className="sa-grant-dock-head" aria-expanded={open} onClick={() => setOpen(value => !value)}>
-      <strong>{waiting.length === 1 ? 'A permission request is waiting for you' : `${waiting.length} permission requests are waiting for you`}</strong>
+      <strong>{waiting.length === 1 ? 'Permission request waiting' : `${waiting.length} permission requests waiting`}</strong>
       <span className="sa-muted">{open ? 'Hide' : 'Show'}</span>
     </button>
     {open && <div className="sa-grant-dock-cards">

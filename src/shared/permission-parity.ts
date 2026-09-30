@@ -1,5 +1,10 @@
 import type { ProviderCapabilities, SessionSettings } from './structured-agent'
 
+/** Whether a parity text reports a mode the runtime has not (yet) confirmed, rather than plain status. */
+export function permissionParityNeedsAttention(text: string | undefined): boolean {
+  return Boolean(text && /^(Permission transition|Permission mismatch|Full Auto requested)/.test(text))
+}
+
 /** Native-reported values remain distinct from the owner's requested mode. */
 export function permissionParity(settings: SessionSettings, capabilities?: Pick<ProviderCapabilities, 'provider' | 'effectiveSettings' | 'approvalRouting'>): string | undefined {
   if (capabilities?.provider !== 'claude') return undefined

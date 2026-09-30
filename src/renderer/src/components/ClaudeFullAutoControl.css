@@ -25,6 +25,4 @@
 .sa-full-auto-explain { font-size: 12px; }
 .sa-full-auto-explain summary { cursor: pointer; color: var(--text-2, #9aa1ab); font-size: 11px; }
 .sa-full-auto-explain p { margin-top: 6px; color: var(--text-2, #9aa1ab); }
-.sa-full-auto-details { margin: 6px 0; font-size: 12px; }
-.sa-full-auto-details > summary { cursor: pointer; padding: 4px 0; }
 .settings-page > .sa-full-auto-control { padding: 10px 12px; margin-bottom: 21px; border: 1px solid var(--border); }

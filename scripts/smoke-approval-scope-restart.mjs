@@ -1,7 +1,7 @@
 // One authority on both approval paths, and what a session answer really outlives (reviewer findings
 // H13 and scope/lifetime, 2026-09-29). A wizard Wz controls a coworker W on ask mode:
 //   both APIs (agents.approve for W's native card, permissions.decide for W's permission request)
-//   refuse an ordinary tab P and an uncontrolled wizard Z, and a wizard its own request; Wz answers
+//   refuse an ordinary tab P and the (non-wizard) coworker itself; Wz answers
 //   W's native "SYNTHETIC PERMISSION SCOPED" card for the session -> effectiveScope native-session with
 //   the runtime's stated lifetime, and W's REPEAT is covered without a card; a REQUIRED card offers
 //   no session choice -> effectiveScope once, truthfully; W's external permissions.request approved
@@ -37,19 +37,18 @@ async function scenario(inst) {
   const assistant = async id => (await g.texts(id, 'assistant')).at(-1) ?? ''
   const pendingCard = async (as, id) => (await as('agents.approvals', { agentSessionId: id })).approvals[0]
 
-  step('wizard Wz opens coworker W on ask mode; an ordinary tab P and a second wizard Z look on')
+  step('wizard Wz opens coworker W on ask mode; an ordinary tab P looks on')
   const wz = await g.wizard('Scope wizard Wz', 'SYNTHETIC CLASSIFIER LOCAL scopewz')
   const opened = await wz.as('tabs.open', { kind: 'agent', provider: 'claude', model: 'claude-fable-5-1', title: 'Scope coworker W', permission: 'default', exactPermission: true })
   const w = { id: opened.resourceId, tabId: opened.id, title: 'Scope coworker W' }
   await poll(() => call('agents.status', { agentSessionId: w.id }), { timeoutMs: 30_000, label: 'W mounted' })
-  const z = await g.wizard('Scope wizard Z', 'SYNTHETIC CLASSIFIER LOCAL scopez')
   const pTab = await openTab({ provider: 'claude', model: 'claude-fable-5-1', title: 'Scope plain P' })
   await rm(capture, { force: true })
   await g.submit(pTab.resourceId, 'SYNTHETIC CLASSIFIER LOCAL scopep', false)
   const p = { id: pTab.resourceId, as: await g.credentialOf('scopep') }
   await g.settled(p.id, 'P settles')
 
-  step("W's native card: both APIs refuse the ordinary, the uncontrolled and the self answer")
+  step("W's native card: both APIs refuse the ordinary and the self answer")
   await rm(capture, { force: true })
   await g.submit(w.id, 'SYNTHETIC PERMISSION SCOPED scopew', false)
   w.as = await g.credentialOf('scopew')
@@ -59,12 +58,11 @@ async function scenario(inst) {
   const decide = as => as('permissions.decide', { agentSessionId: w.id, requestId: asked.requestId, decision: 'approve-session' })
   const refused = {
     ordinary: { approve: await refusal(() => approve(p.as)), decide: await refusal(() => decide(p.as)) },
-    uncontrolled: { approve: await refusal(() => approve(z.as)), decide: await refusal(() => decide(z.as)) },
     self: { approve: await refusal(() => w.as('agents.approve', { agentSessionId: w.id, requestId: card.requestId, decision: 'allow', reason: 'self' })), decide: await refusal(() => w.as('permissions.decide', { agentSessionId: w.id, requestId: asked.requestId, decision: 'approve-once' })) }
   }
   const still = await pendingCard(wz.as, w.id)
-  record('parity-refusals', Object.values(refused).every(pair => pair.approve !== 'ALLOWED' && pair.decide !== 'ALLOWED') && /not one of your coworkers/.test(refused.uncontrolled.approve) && /not one of your coworkers/.test(refused.uncontrolled.decide) && still?.requestId === card.requestId ? 'PASS' : 'FAIL',
-    refused, 'the ordinary tab, the uncontrolled wizard and W itself are refused on agents.approve and permissions.decide alike; the card is still pending')
+  record('parity-refusals', Object.values(refused).every(pair => pair.approve !== 'ALLOWED' && pair.decide !== 'ALLOWED') && still?.requestId === card.requestId ? 'PASS' : 'FAIL',
+    refused, 'the ordinary tab and W itself (not a wizard) are refused on agents.approve and permissions.decide alike; the card is still pending')
 
   step('Wz allows the native card for the session: the runtime\'s own session choice, and W\'s repeat needs no card')
   const nativeAnswer = await approve(wz.as)

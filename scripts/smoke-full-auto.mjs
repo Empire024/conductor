@@ -49,15 +49,21 @@ const settled = (id, initialSequence) => poll(async () => {
   const providerReplied = state?.items?.some(item => item.sequence > initialSequence && item.data?.type === 'text' && item.data.role === 'assistant')
   return ended && (providerReplied || ['failed', 'disconnected', 'interrupted'].includes(state?.phase)) ? state : null
 }, { timeoutMs: 420_000, label: `${id} terminal turn phase` })
+// The Full Auto control lives in Settings → Runtimes only (not in the composer since wizard-means-wizard).
+const withRuntimesCard = async act => {
+  await view.getByRole('button', { name: 'Settings', exact: true }).click()
+  const panel = view.getByRole('dialog', { name: 'Settings', exact: true })
+  await panel.getByRole('navigation', { name: 'Settings sections' }).getByRole('button', { name: 'Runtimes', exact: true }).click()
+  try { return await act(panel.locator('.sa-full-auto-control')) } finally { await panel.getByRole('button', { name: 'Close settings', exact: true }).click() }
+}
 const ownerButton = async label => {
   await call('tabs.focus', { tabId: worker.id })
   await workerPane().waitFor({ state: 'visible' })
-  const detail = workerPane().locator('.sa-full-auto-details')
-  if (!await detail.evaluate(element => element.open)) await detail.locator(':scope > summary').click()
-  await detail.getByRole('button', { name: label, exact: true }).click()
+  await withRuntimesCard(card => card.getByRole('button', { name: label, exact: true }).click())
 }
 const modeLabel = () => workerPane().locator('.sa-mode-trigger').textContent()
-const parityText = () => workerPane().locator('.sa-request-summary').textContent()
+// The confirmed mode is the mode picker's tooltip.
+const parityText = async () => await workerPane().locator('.sa-mode-trigger').getAttribute('title') ?? ''
 const foreignBrowserPage = async () => {
   browserServer = createServer(async (request, response) => {
     if (request.method === 'POST' && request.url === '/receipt') {
@@ -181,13 +187,11 @@ try {
   step('synthetic DOM replay cannot activate the owner control')
   await call('tabs.focus', { tabId: worker.id })
   await workerPane().waitFor({ state: 'visible' })
-  await view.evaluate(() => {
-    const detail = document.querySelector('.structured-agent-pane .sa-full-auto-details')
-    if (detail) detail.open = true
-    const button = detail?.querySelector('button')
+  await withRuntimesCard(card => card.evaluate(element => {
+    const button = element.querySelector('button')
     if (!button) throw new Error('Full Auto owner control is absent')
     button.click() // isTrusted=false; no policy write should follow.
-  })
+  }))
   assert.equal((await view.evaluate(() => window.conductor.claudeFullAuto.state())).enabled, false)
   record('J-replay', 'PASS', {}, 'Synthetic DOM click did not authorize Full Auto')
 

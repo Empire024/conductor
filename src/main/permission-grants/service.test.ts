@@ -345,16 +345,23 @@ describe('permissions.* through app control', () => {
     // The same authority as agents.approve: answers(id) is the caller's answerable set (agent-control.ts).
     const coworkerOf = (controller: string) => (id: string) => controller === 'agent_wizard' && id === tab
     await expect(callPermissions(h.grants, { agentSessionId: tab, answers: () => true }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow('answers only')
-    // A wizard cannot answer its own request, nor a conversation it does not control.
-    await expect(callPermissions(h.grants, { agentSessionId: tab, wizard: true, answers: () => true }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow('cannot answer its own')
-    await expect(callPermissions(h.grants, { agentSessionId: 'agent_stranger', wizard: true, answers: coworkerOf('agent_stranger') }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow('not one of your coworkers')
-    await expect(callPermissions(h.grants, { agentSessionId: 'agent_stranger', wizard: true }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow('not one of your coworkers')
+    // A wizard answers only inside its answerable set (its project and the coworkers it controls).
+    await expect(callPermissions(h.grants, { agentSessionId: 'agent_stranger', wizard: true, answers: coworkerOf('agent_stranger') }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow('neither in this project nor one of your coworkers')
+    await expect(callPermissions(h.grants, { agentSessionId: 'agent_stranger', wizard: true }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow('neither in this project nor one of your coworkers')
     // Its controlling wizard answers even an external one (H13), attributed to a wizard tab.
     await expect(callPermissions(h.grants, { agentSessionId: 'agent_wizard', wizard: true, answers: coworkerOf('agent_wizard') }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).resolves.toMatchObject({ status: 'approved-once', grant: { decidedBy: 'wizard' } })
     const local = await callPermissions(h.grants, { agentSessionId: tab }, 'permissions.request', { command: 'npm run build', reason: 'build' }) as { requestId: string }
     await expect(callPermissions(h.grants, { agentSessionId: '', owner: true, answers: () => false }, 'permissions.decide', { agentSessionId: tab, requestId: local.requestId, decision: 'approve-once' })).rejects.toThrow('No such agent conversation')
     await expect(callPermissions(h.grants, { agentSessionId: '', owner: true, answers: id => id === tab }, 'permissions.decide', { agentSessionId: tab, requestId: local.requestId, decision: 'approve-once' })).resolves.toMatchObject({ status: 'approved-once', grant: { decidedBy: 'owner' } })
     expect((await callPermissions(h.grants, { agentSessionId: tab }, 'permissions.list', {}) as { grants: unknown[] }).grants).toHaveLength(2)
+  })
+
+  it('lets a wizard answer its own request, recorded as answered by a wizard tab', async () => {
+    const h = harness()
+    const asked = await callPermissions(h.grants, { agentSessionId: tab, wizard: true }, 'permissions.request', { command: ssh, reason: 'pool fix' }) as { requestId: string; next: string }
+    expect(asked.next).toContain('answer it yourself with permissions.decide')
+    await expect(callPermissions(h.grants, { agentSessionId: tab, wizard: true, answers: id => id === tab }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).resolves.toMatchObject({ status: 'approved-once', grant: { decidedBy: 'wizard', agentSessionId: tab } })
+    expect(h.grants.list(tab).requests[0]).toMatchObject({ id: asked.requestId, status: 'approved-once', decidedBy: 'wizard' })
   })
 
   it('lets the asker, or the successor holding it, withdraw its own pending request; never another conversation\'s', async () => {
@@ -472,8 +479,8 @@ describe('a pending owner approval survives a handoff (grant-survives-handoff)',
 
   // Haftheme 2026-09-29 (grant-cards-lost-at-handoff): a wizard filed four cards, handed itself on
   // and the app restarted. The requests must stay the successor's pending ones in state (what the
-  // pane's dock and Needs attention read), and the successor wizard may not answer them itself.
-  it('keeps a moved request pending for the successor across a restart, answerable by the owner and never by the successor wizard', async () => {
+  // pane's dock and Needs attention read), and the successor wizard answers them itself.
+  it('keeps a moved request pending for the successor across a restart, answerable by the successor wizard by either id', async () => {
     const saved: { value?: SavedPermissionGrants } = {}
     const h = harness({ persist: value => { saved.value = value } })
     const asked = h.grants.request(tab, { command: `bash ${script}`, reason: 'launch step 1, the owner said go' })
@@ -483,11 +490,11 @@ describe('a pending owner approval survives a handoff (grant-survives-handoff)',
     const restarted = harness({ notice: () => false })
     restarted.grants.restore(JSON.parse(JSON.stringify(saved.value)), () => true)
     expect(restarted.grants.state().requests).toEqual([expect.objectContaining({ id: asked.id, agentSessionId: successor, status: 'pending', resource: `bash ${script}` })])
-    const wizard = { agentSessionId: successor, wizard: true, answers: () => true }
-    // Neither by its own id nor through the predecessor's, whose handoff chain ends at the caller.
-    for (const agentSessionId of [successor, tab]) await expect(callPermissions(restarted.grants, wizard, 'permissions.decide', { agentSessionId, requestId: asked.id, decision: 'approve-once' })).rejects.toThrow(/cannot answer its own.*do not run the call another way/)
-    expect(restarted.grants.state().requests[0]!.status).toBe('pending')
-    await expect(callPermissions(restarted.grants, { agentSessionId: '', owner: true, answers: () => true }, 'permissions.decide', { agentSessionId: successor, requestId: asked.id, decision: 'approve-once' })).resolves.toMatchObject({ status: 'approved-once', grant: { decidedBy: 'owner', agentSessionId: successor } })
+    // Through the predecessor's id, whose handoff chain ends at the caller, even when the
+    // predecessor is outside its answerable set (answers is false).
+    const wizard = { agentSessionId: successor, wizard: true, answers: () => false }
+    await expect(callPermissions(restarted.grants, wizard, 'permissions.decide', { agentSessionId: tab, requestId: asked.id, decision: 'approve-once' })).resolves.toMatchObject({ status: 'approved-once', grant: { decidedBy: 'wizard', agentSessionId: successor } })
+    expect(restarted.grants.state().requests[0]!.status).toBe('approved-once')
   })
 
   it('moves a pending request to the successor: its list and card show it with the holder, the approval tells the successor, and it consumes it exactly once', async () => {

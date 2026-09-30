@@ -24,7 +24,8 @@ import { grantCallIdentity, grantWorkKey, sameNativeCall, sameToolAttempt, type 
  * the owner revokes them, or (approve once) when their call has run.
  * A tab that hands itself on (agents.handoff successor) hands its waiting requests and unspent
  * grants to the successor (transfer), which is the same brain continued; a tab closed without one
- * withdraws its waiting cards. Nothing here lets an agent approve its own request.
+ * withdraws its waiting cards. Who may answer is decided in control.ts (the owner, or a wizard tab
+ * holding the owner's authority, its own requests included); a request records who answered it.
  */
 export interface PermissionGrantPorts {
   now?(): string

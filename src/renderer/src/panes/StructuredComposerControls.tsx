@@ -6,6 +6,7 @@ import { Check, ChevronDown, LoaderCircle, Search } from 'lucide-react'
 import type { ProviderCapabilities, SessionSettings } from '../../../shared/structured-agent'
 import './AgentPrompt.css'
 import { ConversationModeControl } from './ConversationModeControl'
+import { permissionParity, permissionParityNeedsAttention } from '../../../shared/permission-parity'
 
 export function StructuredComposerControls({ settings, capabilities, disabled, onChange, onDiscover }: {
   settings: SessionSettings
@@ -27,6 +28,8 @@ export function StructuredComposerControls({ settings, capabilities, disabled, o
   const choices = models.filter(option => option.id !== 'default').map(option => ({ ...option, label: modelDisplayName(option.label) }))
     .filter(option => (option.label + ' ' + option.id).toLowerCase().includes(query.toLowerCase()))
   const modes = conversationModes(capabilities)
+  // The runtime's confirmed permission mode lives in the mode picker's tooltip, not above the textbox.
+  const parity = permissionParity(settings, capabilities)
   const mode = settings.plan ? 'plan' : capabilities?.provider === 'claude' && settings.permission === 'auto' && settings.claudeGuardedAuto ? 'guarded-auto' : settings.permission
   const supportedEfforts = modelEfforts(capabilities, settings.model)
   const efforts = supportedEffortChoices(capabilities, settings.model)
@@ -75,7 +78,7 @@ export function StructuredComposerControls({ settings, capabilities, disabled, o
   }
 
   return <>
-    {modes.length > 1 && <ConversationModeControl modes={modes} value={mode} disabled={disabled} onChange={onChange} />}
+    {modes.length > 1 && <ConversationModeControl modes={modes} value={mode} status={parity} attention={permissionParityNeedsAttention(parity)} disabled={disabled} onChange={onChange} />}
     <div className="sa-model-control" ref={host}>
       <button ref={trigger} type="button" role="combobox" aria-label="Model" aria-controls={listId} aria-haspopup="listbox" aria-expanded={open} disabled={disabled} className="sa-model-trigger" title={modelTitle} onClick={() => void show()} onKeyDown={event => { if (event.key === 'ArrowDown' && !open) { event.preventDefault(); void show() } }}><ProviderIcon provider={capabilities?.provider} model={model} size={14} /><span>{label}</span><ChevronDown size={12} /></button>
       {open && <div className="sa-model-menu" onKeyDown={event => {

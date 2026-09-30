@@ -36,11 +36,14 @@ const nativePending = id => poll(async () => {
   const state = await grantsState()
   return state.requests.find(request => request.agentSessionId === id && request.source === 'native' && request.status === 'pending' && request.execution?.status === 'pending') ?? null
 }, { timeoutMs: 90_000, label: `${id} native pending grant` })
-const ownerButton = async (id, label) => {
-  const detail = pane(id).locator('.sa-full-auto-details')
-  if (!await detail.evaluate(element => element.open)) await detail.locator(':scope > summary').click()
-  await detail.getByRole('button', { name: label, exact: true }).click()
+// The Full Auto control lives in Settings → Runtimes only (not in the composer since wizard-means-wizard).
+const withRuntimesCard = async act => {
+  await view.getByRole('button', { name: 'Settings', exact: true }).click()
+  const panel = view.getByRole('dialog', { name: 'Settings', exact: true })
+  await panel.getByRole('navigation', { name: 'Settings sections' }).getByRole('button', { name: 'Runtimes', exact: true }).click()
+  try { return await act(panel.locator('.sa-full-auto-control')) } finally { await panel.getByRole('button', { name: 'Close settings', exact: true }).click() }
 }
+const ownerButton = async (_id, label) => withRuntimesCard(card => card.getByRole('button', { name: label, exact: true }).click())
 
 try {
   step('host process inventory and parked real Claude launch')
@@ -156,7 +159,9 @@ try {
   assert.equal(effective(blocked).requestedPermissionMode, 'bypassPermissions')
   assert.equal(effective(blocked).claudeFullAutoAuthorized, true)
   assert.ok(typeof reason === 'string' && reason.length > 0)
-  const blockedSummary = await pane(limited.resourceId).locator('.sa-request-summary').textContent()
+  // The confirmed mode is the mode picker's tooltip, marked for attention when blocked.
+  const blockedSummary = await pane(limited.resourceId).locator('.sa-mode-trigger').getAttribute('title') ?? ''
+  assert.equal(await pane(limited.resourceId).locator('.sa-mode-trigger').getAttribute('data-attention'), 'true')
   assert.match(blockedSummary, /Permission transition blocked/)
   assert.ok(blockedSummary.includes(reason), 'UI must show the same exact native reason')
   assert.equal(await pane(limited.resourceId).getByText('Full Auto active', { exact: false }).count(), 0)
