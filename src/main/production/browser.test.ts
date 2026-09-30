@@ -1,4 +1,6 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createServer } from 'node:http'
+import { connect, createServer as createTcpServer, type AddressInfo, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { chromium } from 'playwright-core'
@@ -7,7 +9,7 @@ import {
   DEFAULT_AUDIT_BUDGET, MAX_INTERPRETATION_USER_CHARS, type InterpretationRequest, type Interpreter, type NetworkPolicy, type OpenPageOptions,
   type AuditPage, type MutationKind, type ProductionEnvironment, type TestAccountRef,
 } from '../../shared/production'
-import { AuthUnavailable, createAuditBrowser, resolveEngine, type ProductionAuditBrowser } from './browser'
+import { AuthUnavailable, MAX_CONNECTIONS_PER_ORIGIN, OriginLimiter, createAuditBrowser, resolveEngine, type ProductionAuditBrowser } from './browser'
 import { discoverStack } from './discovery'
 import { createEvidenceSink } from './evidence'
 import { createFixtureServer, type FixtureServer } from './fixtures/server'
@@ -17,6 +19,50 @@ import { createSyntheticFactory } from './synthetic'
 const launchSpy = vi.spyOn(chromium, 'launch')
 const engine = await resolveEngine()
 const BROWSER_TIMEOUT = 30_000
+
+/**
+ * A password-gated shop on a host that throttles a client the way LiteSpeed's per-client throttling
+ * does: once one client holds more than `limit` connections, every new connection it opens is held
+ * unanswered for `banMs`. `/` and `/gallery` answer 302 to `/gate` without the gate cookie.
+ */
+async function throttlingGatedHost(limit: number, banMs: number) {
+  const backend = createServer((request, response) => {
+    const url = new URL(request.url ?? '/', 'http://host')
+    if (url.pathname === '/gate') { response.writeHead(200, { 'content-type': 'text/html' }); response.end('<form method="post"><input type="password" name="pw"></form>'); return }
+    if (url.pathname.startsWith('/img/')) { setTimeout(() => { response.writeHead(200, { 'content-type': 'image/svg+xml' }); response.end('<svg xmlns="http://www.w3.org/2000/svg"/>') }, 150); return }
+    if (!/(^|; )pp_gate=gate-cookie-7f3a91c2(;|$)/.test(request.headers.cookie ?? '')) { response.writeHead(302, { location: `/gate?redirect_to=${encodeURIComponent(url.pathname)}` }); response.end(); return }
+    const images = url.pathname === '/gallery' ? Array.from({ length: 24 }, (_, index) => `<img src="/img/${index}.svg">`).join('') : ''
+    response.writeHead(200, { 'content-type': 'text/html' })
+    response.end(`<!doctype html><title>Shop</title><h1>Shop ${url.pathname}</h1>${images}`)
+  })
+  await new Promise<void>(done => backend.listen(0, '127.0.0.1', done))
+  const clients = new Set<Socket>()
+  const stats = { sockets: 0, maxSockets: 0, bans: 0 }
+  let bannedUntil = 0
+  const front = createTcpServer(client => {
+    stats.sockets++
+    stats.maxSockets = Math.max(stats.maxSockets, stats.sockets)
+    clients.add(client)
+    client.on('close', () => { stats.sockets--; clients.delete(client) })
+    client.on('error', () => undefined)
+    if (stats.sockets > limit) { bannedUntil = Date.now() + banMs; stats.bans++ }
+    if (Date.now() < bannedUntil) return
+    const upstream = connect((backend.address() as AddressInfo).port, '127.0.0.1')
+    upstream.on('error', () => client.destroy())
+    client.pipe(upstream).pipe(client)
+    client.on('close', () => upstream.destroy())
+  })
+  await new Promise<void>(done => front.listen(0, '127.0.0.1', done))
+  return {
+    origin: `http://127.0.0.1:${(front.address() as AddressInfo).port}`,
+    stats,
+    close: async () => {
+      for (const socket of clients) socket.destroy()
+      backend.closeAllConnections()
+      await Promise.all([new Promise(done => front.close(done)), new Promise(done => backend.close(done))])
+    },
+  }
+}
 
 const desktop = (patch: Partial<OpenPageOptions> = {}): OpenPageOptions => ({ device: 'desktop', locale: 'en-US', auth: null, consent: 'clean', regionSelection: 'none', ...patch })
 const environmentFor = (origin: string, patch: Partial<ProductionEnvironment> = {}): ProductionEnvironment => ({
@@ -50,6 +96,37 @@ afterAll(async () => {
   await Promise.all(browsers.map(browser => browser.close()))
   await server?.close()
   rmSync(scratch, { recursive: true, force: true })
+})
+
+describe('OriginLimiter', () => {
+  it('lets a limit of fetches per origin run, queues the rest in order, and keeps origins apart', async () => {
+    const limiter = new OriginLimiter(2)
+    expect(MAX_CONNECTIONS_PER_ORIGIN).toBe(6)
+    const first = await limiter.acquire('https://a')
+    const second = await limiter.acquire('https://a')
+    const other = await limiter.acquire('https://b')
+    const order: string[] = []
+    const third = limiter.acquire('https://a').then(release => { order.push('third'); return release })
+    const fourth = limiter.acquire('https://a').then(release => { order.push('fourth'); return release })
+    await Promise.resolve()
+    expect(order).toEqual([])
+    expect(limiter.inFlight('https://a')).toBe(2)
+    first()
+    first()
+    const releaseThird = await third
+    expect(order).toEqual(['third'])
+    expect(limiter.inFlight('https://a')).toBe(2)
+    second()
+    ;(await fourth)()
+    releaseThird()
+    other()
+    expect(limiter.inFlight('https://a')).toBe(0)
+    expect(limiter.inFlight('https://b')).toBe(0)
+    // A limit of 0 is no limit.
+    const open = new OriginLimiter(0)
+    await Promise.all(Array.from({ length: 20 }, () => open.acquire('https://a')))
+    expect(open.inFlight('https://a')).toBe(20)
+  })
 })
 
 describe('resolveEngine', () => {
@@ -468,6 +545,43 @@ describe.skipIf(!engine.available)('audit browser', { timeout: BROWSER_TIMEOUT }
     }
     await page.close()
   })
+
+  it('keeps a page\'s fetches to a browser\'s connections per origin, so a throttling host behind a password gate keeps answering the next page', async () => {
+    const statePath = join(scratch, 'owner-secrets', 'throttle-gate-state.json')
+    mkdirSync(join(scratch, 'owner-secrets'), { recursive: true })
+    writeFileSync(statePath, JSON.stringify({ cookies: [{ name: 'pp_gate', value: 'gate-cookie-7f3a91c2', domain: '127.0.0.1', path: '/', expires: -1, httpOnly: true, secure: false, sameSite: 'Lax' }], origins: [] }))
+    const guest: TestAccountRef = { id: 'gate', label: 'Site gate', role: 'guest', usernameRef: null, passwordRef: null, storageState: { path: statePath, capturedAt: null, capturedBy: null } }
+    const audit = async (name: string, maxConnectionsPerOrigin?: number) => {
+      const host = await throttlingGatedHost(8, 10_000)
+      try {
+        const browser = createAuditBrowser(productionPolicy(host.origin), { userDataDir: join(scratch, name), guest, navigationTimeoutMs: 3_000, maxConnectionsPerOrigin })
+        browsers.push(browser)
+        const gallery = await browser.open(desktop())
+        const first = await gallery.goto(`${host.origin}/gallery`)
+        const images = gallery.requests().filter(request => request.url.includes('/img/'))
+        await gallery.close()
+        const next = await (await browser.open(desktop())).goto(`${host.origin}/`)
+        await browser.close()
+        return { first, images, next, stats: { ...host.stats } }
+      } finally {
+        await host.close()
+      }
+    }
+
+    // One connection per request in flight (the old handler): the gallery's burst gets the client
+    // throttled, and the next page's document is never answered.
+    const unbounded = await audit('throttle-unbounded', 0)
+    expect(unbounded.stats.bans).toBeGreaterThan(0)
+    expect(unbounded.next).toMatchObject({ outcome: 'timeout' })
+
+    const bounded = await audit('throttle-bounded')
+    expect(bounded.first).toMatchObject({ outcome: 'ok', status: 200 })
+    expect(bounded.images).toHaveLength(24)
+    expect(bounded.images.every(request => request.status === 200)).toBe(true)
+    expect(bounded.next).toMatchObject({ outcome: 'ok', status: 200, finalUrl: expect.stringMatching(/\/$/) })
+    expect(bounded.stats.bans).toBe(0)
+    expect(bounded.stats.maxSockets).toBeLessThanOrEqual(8)
+  }, 60_000)
 
   it('loads a guest account\'s gate-only state into every unauthenticated page after preparing it, and refuses the open when preparing fails', async () => {
     const site = server.site('baseline')

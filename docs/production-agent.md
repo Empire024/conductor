@@ -201,7 +201,11 @@ the same project; `production.evidence` reads are bounded to 1 MiB and pass thro
 4. **Budget and rate.** The route handler counts requests against `maxRequests` and throttles
    top-level navigations and the audit's own requests per origin at `requestsPerSecondPerOrigin`.
    A page's own subresources are counted but not spaced, since spacing them made asset-heavy pages
-   miss the navigation timeout. The runner stops the run with `ledger.exhausted` set
+   miss the navigation timeout. They are held to six fetches in flight per origin, run-wide
+   (`maxConnectionsPerOrigin`, a browser's HTTP/1.1 limit): the handler fetches over HTTP/1.1 from
+   Node, where every request in flight is its own connection, and a LiteSpeed host throttled the
+   40-connection burst of one page so the next page's document never answered (20 s timeouts). A
+   top-level document never waits for a slot. The runner stops the run with `ledger.exhausted` set
    and the affected controls UNVERIFIED (a budget stop is never PASS).
 5. **Injection resistance.** Page text, DOM, uploads, source comments, logs and fetched legal pages
    are data. They reach a model only inside `InterpretationRequest.user`, bounded to

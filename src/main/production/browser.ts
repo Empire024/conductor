@@ -28,6 +28,14 @@ import { createTlsTrust, type TlsTrust, type TlsTrustOptions } from './tls-trust
  * which cannot be buffered, go to the network as the browser makes them. Service workers are blocked
  * so no request can bypass the handler, and popups are closed on sight.
  *
+ * The handler's fetches go out over HTTP/1.1 from Node, where Playwright opens a new keep-alive socket
+ * for every request in flight; a page with 40 assets opened 40 connections to one origin at once. A
+ * browser keeps six per origin (or one HTTP/2 connection), and hosts that throttle a client over its
+ * connection limit (LiteSpeed's per-client throttling) hold every new connection for a while after
+ * such a burst, so the next page's document never answered and checks timed out at 20 s. Subresource
+ * fetches therefore take one of `maxConnectionsPerOrigin` slots per origin, run-wide; a top-level
+ * document never waits for one.
+ *
  * The authenticated state comes from a login state the owner recorded by hand (`storageState`),
  * never from a login POST on production; see `loadLoginState`.
  */
@@ -105,6 +113,8 @@ export interface AuditBrowserOptions {
   resolve?: ResolveEngineOptions
   /** For tests: how the environment's extra certificate trust (policy.tls) handshakes and reads CA files. */
   tlsTrust?: TlsTrustOptions
+  /** Subresource fetches in flight per origin across the run (default six, a browser's HTTP/1.1 limit; 0 is no limit). */
+  maxConnectionsPerOrigin?: number
 }
 
 export interface ProductionAuditBrowser extends AuditBrowser {
@@ -181,11 +191,47 @@ const SETTLE_REASON_MS = 1_000
 const STREAMING_TYPES = new Set(['media', 'eventsource'])
 const READ_ONLY_METHODS = new Set(['GET', 'HEAD'])
 const HOP_DROPPED_HEADERS = /^(host|content-length|cookie|connection|transfer-encoding)$/i
+export const MAX_CONNECTIONS_PER_ORIGIN = 6
+
+/** Per-origin slots for the handler's own fetches: at most `limit` in flight per origin, the rest wait in order. */
+export class OriginLimiter {
+  private readonly active = new Map<string, number>()
+  private readonly waiting = new Map<string, Array<() => void>>()
+
+  constructor(readonly limit: number = MAX_CONNECTIONS_PER_ORIGIN) {}
+
+  inFlight(origin: string): number { return this.active.get(origin) ?? 0 }
+
+  /** Resolves with the release function once a slot is free; release exactly once, in a `finally`. */
+  async acquire(origin: string): Promise<() => void> {
+    if (this.limit > 0 && this.inFlight(origin) >= this.limit) {
+      await new Promise<void>(granted => {
+        const queue = this.waiting.get(origin) ?? []
+        queue.push(granted)
+        this.waiting.set(origin, queue)
+      })
+    } else {
+      this.active.set(origin, this.inFlight(origin) + 1)
+    }
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      const next = this.waiting.get(origin)?.shift()
+      // A waiter inherits the slot, so the count stays where it is.
+      if (next) return next()
+      this.waiting.delete(origin)
+      const left = this.inFlight(origin) - 1
+      if (left > 0) this.active.set(origin, left); else this.active.delete(origin)
+    }
+  }
+}
 
 export function createAuditBrowser(policy: NetworkPolicy, options: AuditBrowserOptions): ProductionAuditBrowser {
   const frozen = deepFreeze(structuredClone(policy))
   const gate = new NetworkGate(frozen, options.gate)
   const tlsTrust = createTlsTrust(frozen, options.tlsTrust)
+  const connections = new OriginLimiter(options.maxConnectionsPerOrigin ?? MAX_CONNECTIONS_PER_ORIGIN)
   let launched: Promise<Browser> | null = null
   let resolution: Promise<EngineResolution> | null = null
   const pages = new Set<AuditPageImpl>()
@@ -264,7 +310,7 @@ export function createAuditBrowser(policy: NetworkPolicy, options: AuditBrowserO
       }
       // A system browser that does not know the permission refuses it; it has no such check to satisfy either.
       const context = await browser.newContext(contextOptions).catch(() => browser.newContext({ ...contextOptions, permissions: [] }))
-      const page = new AuditPageImpl(context, gate, frozen, openOptions, options, secrets, tlsTrust)
+      const page = new AuditPageImpl(context, gate, frozen, openOptions, options, secrets, tlsTrust, connections)
       await page.attach()
       pages.add(page)
       page.onClose(() => pages.delete(page))
@@ -324,6 +370,7 @@ export class AuditPageImpl implements AuditPage {
     private readonly browserOptions: AuditBrowserOptions,
     private readonly secrets: readonly string[] = [],
     private readonly tlsTrust: TlsTrust | null = null,
+    private readonly connections: OriginLimiter = new OriginLimiter(),
   ) {
     this.timeout = browserOptions.navigationTimeoutMs ?? DEFAULT_NAVIGATION_TIMEOUT
     this.consentPending = ['rejected', 'accepted', 'selected', 'withdrawn'].includes(options.consent) ? options.consent : null
@@ -440,22 +487,28 @@ export class AuditPageImpl implements AuditPage {
     const resourceType = request.resourceType()
     const originalMethod = request.method().toUpperCase()
     const body = request.postDataBuffer()
-    const walk = await walkRedirects(
-      { url: request.url(), method: originalMethod },
-      async ({ url, method, index }) => {
-        if (index === 0) {
-          const response = await route.fetch({ maxRedirects: 0, timeout: this.timeout })
-          entry.status = response.status()
-          return response
-        }
-        const headers = Object.fromEntries(Object.entries(request.headers()).filter(([name]) => !HOP_DROPPED_HEADERS.test(name) && !(method === 'GET' && /^content-type$/i.test(name))))
-        return this.context.request.fetch(url, {
-          method, headers, maxRedirects: 0, timeout: this.timeout, failOnStatusCode: false,
-          data: method === originalMethod && body && !READ_ONLY_METHODS.has(method) ? body : undefined,
-        })
-      },
-      (url, method) => this.decide(url, method, resourceType, false, 'page'),
-    )
+    const release = await this.connections.acquire(originOf(request.url()) ?? request.url())
+    let walk
+    try {
+      walk = await walkRedirects(
+        { url: request.url(), method: originalMethod },
+        async ({ url, method, index }) => {
+          if (index === 0) {
+            const response = await route.fetch({ maxRedirects: 0, timeout: this.timeout })
+            entry.status = response.status()
+            return response
+          }
+          const headers = Object.fromEntries(Object.entries(request.headers()).filter(([name]) => !HOP_DROPPED_HEADERS.test(name) && !(method === 'GET' && /^content-type$/i.test(name))))
+          return this.context.request.fetch(url, {
+            method, headers, maxRedirects: 0, timeout: this.timeout, failOnStatusCode: false,
+            data: method === originalMethod && body && !READ_ONLY_METHODS.has(method) ? body : undefined,
+          })
+        },
+        (url, method) => this.decide(url, method, resourceType, false, 'page'),
+      )
+    } finally {
+      release()
+    }
     for (const hop of walk.hops) {
       this.record({ url: hop.url, method: hop.method, resourceType, party: this.gate.partyOf(hop.url), initiator: 'page', blocked: hop.blocked, status: hop.status, excerpt: excerptOf(hop.url, null, this.secrets), at: new Date().toISOString() })
     }

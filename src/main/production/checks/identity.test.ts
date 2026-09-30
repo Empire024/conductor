@@ -91,6 +91,13 @@ describe.skipIf(!engine.available)('C02 identity check', { timeout: 60_000 }, ()
     expect(result.reason).toMatch(/legal entity unknown.*target countries unknown/)
   })
 
+  it('finds the checkout through the home page\'s checkout link, never an add-to-cart link that is a mutation', async () => {
+    const result = await run({ site: 'identity-good', facts, routes: [] })
+    expect(result.coverage.tested.map(entry => entry.path)).toContain('/checkout/')
+    expect(JSON.stringify(result)).not.toContain('add-to-cart')
+    expect(server.requests('identity-good').some(request => request.path.includes('add-to-cart'))).toBe(false)
+  })
+
   it('requires a telephone number for California and finds it', async () => {
     const result = await run({ site: 'identity-good', facts: { ...facts, targetCountries: ['US-CA'] }, routes: [checkout] })
     expect(result.findings).toEqual([])

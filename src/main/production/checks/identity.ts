@@ -4,6 +4,7 @@ import {
   browserProblem, companyNames, draft, entityName, entityProblem, footerLinks, LINK_PATTERNS, markTested, matchesLink, MAX_DOCUMENTS,
   namesEntity, normalise, outcome, pathOf, planRoutes, registrationNumbers, review, throwIfAborted, visit, withPage,
 } from './document-support'
+import { isStateChangingUrl } from '../netpolicy'
 
 /**
  * C02 Business identity (docs/production-agent.md, M5). The identity elements each target
@@ -145,7 +146,8 @@ async function runIdentity(context: CheckContext): Promise<CheckOutcome> {
     evidence.push(ref.id)
     sources.push({ kind: 'site', where: '/', text: footerText || snapshot.text, evidence: ref.id })
   })
-  const allowed = (href: string): boolean => { try { return context.policy.allowedOrigins.includes(new URL(href).origin) } catch { return false } }
+  // An "Add to cart" link (`?add-to-cart=800`) matches the checkout pattern but is a mutation the policy refuses; never follow one.
+  const allowed = (href: string): boolean => { try { return context.policy.allowedOrigins.includes(new URL(href).origin) && !isStateChangingUrl(href) } catch { return false } }
   const linksTo = (pattern: RegExp): string[] => [...new Set(homeLinks.filter(link => allowed(link.href) && matchesLink(link, pattern)).map(link => link.href.split('#')[0]!))]
   for (const url of linksTo(LINK_PATTERNS.identity).slice(0, 3)) await read(url, 'identity-page')
   for (const url of [...linksTo(LINK_PATTERNS.privacy).slice(0, 1), ...linksTo(LINK_PATTERNS.terms).slice(0, 1)]) await read(url, 'policy')
