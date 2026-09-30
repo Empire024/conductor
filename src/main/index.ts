@@ -90,6 +90,9 @@ import { RemoteJobService } from './remote-jobs/service'
 import { RemoteJobStore } from './remote-jobs/store'
 import { sshTransport } from './remote-jobs/transport'
 import { durableJobPorts, gatedRuntime } from './durable-jobs/wiring'
+import { localCriteriaJudge } from './durable-jobs/criteria-judge'
+import { localModelId } from './durable-jobs/structured-runtime'
+import { chatCompletion } from './local-models/client'
 import { LocalGenerationGate, createLlamaServerPorts } from './durable-jobs/server-lifecycle'
 import { registerDurableJobsIpc } from './durable-jobs-ipc'
 import { recordTabOpener, registerTabArchiveIpc, reopenedConversation, uncollectedReport } from './tab-archive-ipc'
@@ -102,7 +105,7 @@ import { dockerAvailable, sandboxImageExists } from './local-models/sandbox'
 import { createLocalModelRunner, realRunnerPorts } from './local-assist/model-runner'
 import { listLocalServers, stopLocalServer, type LocalStopRequest } from './local-models/servers'
 import { agentTabIds, anonymousConversations } from './local-models/anonymous'
-import { loadConfig as loadLocalConfig, readApiKey as readLocalApiKey } from './local-models/config'
+import { endpointFor, loadConfig as loadLocalConfig, readApiKey as readLocalApiKey } from './local-models/config'
 import { DECIDER_MODEL, DeciderServer, deciderPaths } from './local-models/decider-server'
 import { localRoot } from './local-models/paths'
 import type { ScheduleRunner } from './schedule-runner'
@@ -2954,6 +2957,12 @@ app.whenReady().then(async () => {
     projectPath: projectId => database.getProject(projectId)?.path ?? null,
     // The local adapter falls back to its default model for an unknown id; a job must not.
     validateModel: model => { if (!localModel(model)) throw new Error(`${model} is not a configured local model on this machine`) },
+    // Criteria the mechanical check cannot parse are judged by the job's own local model against
+    // the produced files; a rejection goes back to the stage, and repeated ones fail the job.
+    judge: localCriteriaJudge({
+      complete: chatCompletion, gate: generationGate,
+      connection: modelId => { const model = localModel(localModelId(modelId)); return model ? { endpoint: localEndpointOverride() ?? endpointFor(model), apiKey: (() => { try { return readLocalApiKey() } catch { return '' } })(), model: model.id, contextTokens: model.contextTokens } : null }
+    }),
     ...withStageCapture(durableJobPorts({
       store: durableJobStore,
       gate: generationGate,

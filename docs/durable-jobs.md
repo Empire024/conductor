@@ -66,6 +66,25 @@ stage, files changed, results, tests and outcomes, git checkpoints, recoveries, 
 cloud escalation, and log paths. The report lists paths; it never pastes log contents. An interim
 report can be written at any time.
 
+## When a stage counts as done
+
+A stage's own "done" is never proof by itself. Its `completionCriteria` are checked before the
+stage completes:
+
+- A criterion phrased as a fact about a file (`X exists`, `X has at least N lines`) is checked on
+  disk (`completion-check.ts`).
+- Any other criterion ("CROSSREF.md has a row for every import listed in notes/") goes to the
+  verifier (`criteria-judge.ts`): one bounded call to the job's own local model, under the
+  generation gate, at temperature 0 with a JSON-schema answer. It reads the files the stage
+  changed and the files and folders the criterion names (inside the job's folder, at most 24
+  files and about half the model's window), never the stage's claims, and answers per criterion
+  met, not met with what is missing, or cannot tell.
+- "Not met" sends the stage back for another attempt, told what is missing. After
+  `maxVerifyRetries` such retries (default 2, counted from the owner's latest resume) the job
+  **fails** with the verifier's findings instead of completing. "Cannot tell", or a verifier that
+  does not answer, completes the stage but records a `note` event with `verify: "unverified"`;
+  each verdict is a `note` event with `data.verify` of `passed`, `rejected` or `unverified`.
+
 ## Recovering a blocked job
 
 `blocked` means the job needs the owner: an approval it may not grant itself (a step the sandbox

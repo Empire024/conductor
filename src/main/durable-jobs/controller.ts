@@ -3,7 +3,7 @@ import { makeId } from '../../shared/models'
 import type { DurableJob, DurableJobOperation, DurableJobStage } from '../../shared/durable-jobs'
 import { unmetCriteria, mechanicalCompletionCheck } from './completion-check'
 import { visibleContent } from './handoff'
-import type { CompletionCheckPort, HandoffPort, LoopGuardPort, ServerLifecyclePort, StageConclusion, StageObservation, StageRuntime, WatchdogPort } from './ports'
+import type { CompletionCheckPort, CriteriaJudgePort, HandoffPort, LoopGuardPort, ServerLifecyclePort, StageConclusion, StageObservation, StageRuntime, WatchdogPort } from './ports'
 import { StaleEpochError, type DurableJobStore, type StoredJob, type WriteGuard } from './store'
 import type { WorktreeOps } from './worktree'
 
@@ -38,6 +38,12 @@ export interface ControllerOptions {
   /** Verifies the stage's completionCriteria against its cwd before trusting a "done" self-report.
    *  Defaults to the mechanical file/line checker (completion-check.ts). */
   completion?: CompletionCheckPort
+  /** Judges the criteria `completion` could not parse against the produced files (criteria-judge.ts).
+   *  Without one those criteria stay trusted from the stage's own "done". */
+  judge?: CriteriaJudgePort
+  /** Verifier rejections of one stage sent back to it before the job fails (default 2), counted
+   *  from the owner's latest resume. */
+  maxVerifyRetries?: number
   /** This app process: `${pid}:${launchId}`. */
   ownerId: string
   clock?: () => Date
@@ -375,10 +381,19 @@ export class DurableJobController {
     // The model's own "done" is never proof by itself: a completion criterion phrased as a
     // checkable fact about a file (exists, line count) is verified against the job's cwd before
     // the stage is trusted. A criterion this cannot parse is left unchecked, never blocking on it.
+    // The rest (a row for every import, a section per module) goes to the model-judged verifier,
+    // which reads the files, not the stage's claims; its "not met" is the retry's feedback.
     let criteriaFailure: string | undefined
+    let verifyRejected = false
     if (succeeded && stage.completionCriteria.length) {
-      const unmet = unmetCriteria(await this.completion.check(job.cwd, stage.completionCriteria).catch(() => []))
+      const checks = await this.completion.check(job.cwd, stage.completionCriteria).catch(() => [])
+      const unmet = unmetCriteria(checks)
       if (unmet.length) { succeeded = false; criteriaFailure = `Completion criteria not met: ${unmet.map(check => check.detail).join('; ')}` }
+      else if (this.options.judge) {
+        const semantic = stage.completionCriteria.filter(criterion => !checks.some(check => check.criterion === criterion && check.checked))
+        const rejected = semantic.length ? await this.verify(run, job, stage, semantic, observation) : undefined
+        if (rejected) { succeeded = false; criteriaFailure = rejected; verifyRejected = true }
+      }
     }
     if (inFlight && inFlight.status === 'intended') this.store.settle(job.id, guard, inFlight.id, succeeded ? 'done' : 'failed', succeeded ? 'The conversation finished with a completed stop report' : (criteriaFailure ?? describeFailure(observation, wait.interruptedFor)))
     const latest = this.store.get(job.id)
@@ -455,6 +470,22 @@ export class DurableJobController {
       this.store.count(job.id, guard, { retries: 1, ...(observation.stop?.reason === 'context_limit' && !decision.contextRollover ? { contextRollovers: 1 } : {}) })
       if (progressed) this.store.creditAttempt(job.id, guard, stage.id)
     })
+    // The verifier keeps finding the result incomplete: after the capped retries the job fails
+    // with what is missing instead of completing with a result nobody checked.
+    if (verifyRejected) {
+      const rejections = this.store.matchingEvents(job.id, { kind: 'note', stageId: stage.id, dataEquals: { verify: 'rejected', since: this.lastResume(job.id) } }).length
+      const cap = this.options.maxVerifyRetries ?? 2
+      if (rejections > cap) {
+        const reason = `Stage ${stage.index + 1} "${stage.title}" reported done ${rejections} times, and each time the verifier found its completion criteria not met. ${error}`
+        this.store.batch(job.id, () => {
+          this.store.saveStage(job.id, guard, { ...failed, status: 'failed', completedAt: this.clock().toISOString() }, { kind: 'stage', message: `Stage ${stage.index + 1} "${stage.title}" failed verification ${rejections} times`, data: { stageId: stage.id } })
+          this.store.transition(job.id, 'failed', reason, guard, { handoff: { ...this.store.get(job.id).handoff, nextAction: `Finish what the verifier names for stage ${stage.index + 1}, or relax its completion criteria, then run the job again.`, updatedAt: this.clock().toISOString() } })
+        })
+        run.stop = true
+        this.options.finished?.(job.id)
+        return 'stop'
+      }
+    }
     // A tool call whose result was never saved has an unknown side effect. It is recorded and
     // never replayed; the owner inspects before the job continues.
     if (fresh && observation.execution?.pending) {
@@ -481,6 +512,37 @@ export class DurableJobController {
       return 'stop'
     }
     return 'continue'
+  }
+
+  /** The owner's latest resume of a blocked job (its transition event id, '' before any): the
+   *  verifier's rejections count from there, like a resume's fresh stage attempts. */
+  private lastResume(jobId: string): string {
+    return this.store.matchingEvents(jobId, { kind: 'transition', dataEquals: { from: 'blocked', to: 'running' } }, 1).at(-1)?.id ?? ''
+  }
+
+  /**
+   * Asks the judge about the criteria the mechanical check could not parse. Returns the retry
+   * reason when a criterion is not met; a pass, a "cannot tell" and an unavailable judge return
+   * undefined, and the job's events record which it was (an unverified criterion is never
+   * reported as verified).
+   */
+  private async verify(run: Run, job: StoredJob, stage: DurableJobStage, criteria: string[], observation: StageObservation): Promise<string | undefined> {
+    const judged = await this.options.judge!.judge({ job, stage, criteria, filesChanged: observation.filesChanged }).catch(error => ({ unavailable: `the verifier failed: ${error instanceof Error ? error.message : String(error)}` }))
+    if (!this.owned(run)) return undefined
+    const guard = this.guard(run)
+    if ('unavailable' in judged) {
+      this.store.event(job.id, guard, 'note', `Stage ${stage.index + 1}: ${criteria.length} completion criteria left unverified: ${judged.unavailable}`, { stageId: stage.id, attempt: stage.attempt, verify: 'unverified', criteria })
+      return undefined
+    }
+    const notMet = judged.verdicts.filter(verdict => verdict.verdict === 'not-met')
+    const unknown = judged.verdicts.filter(verdict => verdict.verdict === 'unknown')
+    if (!notMet.length) {
+      this.store.event(job.id, guard, 'note', unknown.length ? `Stage ${stage.index + 1}: the verifier passed ${judged.verdicts.length - unknown.length} criteria and could not tell for ${unknown.length}` : `Stage ${stage.index + 1}: the verifier found every completion criterion met`, { stageId: stage.id, attempt: stage.attempt, verify: unknown.length ? 'unverified' : 'passed', verdicts: judged.verdicts })
+      return undefined
+    }
+    const reason = `The verifier read the files and found completion criteria not met: ${notMet.map(verdict => `"${verdict.criterion}": ${verdict.missing}`).join('; ')}`
+    this.store.event(job.id, guard, 'note', `Stage ${stage.index + 1} attempt ${stage.attempt}: ${reason}`, { stageId: stage.id, attempt: stage.attempt, verify: 'rejected', since: this.lastResume(job.id), verdicts: judged.verdicts })
+    return reason
   }
 
   /**

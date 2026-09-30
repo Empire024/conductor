@@ -115,6 +115,19 @@ export interface CompletionCheckPort {
   check(cwd: string, criteria: readonly string[]): Promise<CompletionCheck[]>
 }
 
+export interface CriteriaVerdict {
+  criterion: string
+  /** `unknown`: the judge could not tell from what it was shown (left unverified, never blocking). */
+  verdict: 'met' | 'not-met' | 'unknown'
+  /** What is missing or wrong, for a `not-met` (the stage's retry is told this). */
+  missing: string
+}
+/** Judges the criteria the mechanical check could not parse (criteria-judge.ts): one bounded
+ *  model call that reads the produced files against each criterion. */
+export interface CriteriaJudgePort {
+  judge(input: { job: DurableJob; stage: DurableJobStage; criteria: string[]; filesChanged: string[]; signal?: AbortSignal }): Promise<{ verdicts: CriteriaVerdict[] } | { unavailable: string }>
+}
+
 export type ServerReadiness = { ready: true } | { ready: false; reason: string; retryable: boolean }
 /** Which job asks, so server events land in its log under its lease. */
 export interface ServerContext { jobId: string; epoch: number }

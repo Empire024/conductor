@@ -70,7 +70,7 @@ export function handoffPort(options: Pick<DurableJobsWiringOptions, 'modelConfig
       if (!built.ok) throw built.error
       return [
         built.prompt,
-        ...(retryOf ? ['', 'PREVIOUS ATTEMPT', `The previous attempt at this stage did not finish: ${clip(retryOf, 600)}`, 'Do not repeat what failed; check the current files first.'] : []),
+        ...(retryOf ? ['', 'PREVIOUS ATTEMPT', `The previous attempt at this stage did not finish: ${clip(retryOf, 1_500)}`, 'Do not repeat what failed; check the current files first.'] : []),
         '', `End your final answer with one line: "${JOB_STATUS_DONE}" when the whole job objective is met, or "${JOB_STATUS_CONTINUE}: <the concrete next step>" when more work remains.`
       ].join('\n')
     },
