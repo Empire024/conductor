@@ -346,8 +346,12 @@ describe('permissions.* through app control', () => {
     const coworkerOf = (controller: string) => (id: string) => controller === 'agent_wizard' && id === tab
     await expect(callPermissions(h.grants, { agentSessionId: tab, answers: () => true }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow('answers only')
     // A wizard answers only inside its answerable set (its project and the coworkers it controls).
-    await expect(callPermissions(h.grants, { agentSessionId: 'agent_stranger', wizard: true, answers: coworkerOf('agent_stranger') }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow('neither in this project nor one of your coworkers')
-    await expect(callPermissions(h.grants, { agentSessionId: 'agent_stranger', wizard: true }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow('neither in this project nor one of your coworkers')
+    await expect(callPermissions(h.grants, { agentSessionId: 'agent_stranger', wizard: true, answers: coworkerOf('agent_stranger') }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow(/nor a co-open project.s wizard or its coworkers/)
+    await expect(callPermissions(h.grants, { agentSessionId: 'agent_stranger', wizard: true }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow('nor a co-open project\'s wizard or its coworkers')
+    // A co-open project's wizard is in the answerable set too (agent-control.ts answerable), so the
+    // Conductor wizard answers the Haftheme wizard's own card; a deny leaves the request for the next check.
+    const coOpen = await callPermissions(h.grants, { agentSessionId: tab }, 'permissions.request', { command: 'npm run lint', reason: 'lint' }) as { requestId: string }
+    await expect(callPermissions(h.grants, { agentSessionId: 'agent_conductor_wizard', wizard: true, answers: id => id === tab }, 'permissions.decide', { agentSessionId: tab, requestId: coOpen.requestId, decision: 'deny' })).resolves.toMatchObject({ status: 'denied' })
     // Its controlling wizard answers even an external one (H13), attributed to a wizard tab.
     await expect(callPermissions(h.grants, { agentSessionId: 'agent_wizard', wizard: true, answers: coworkerOf('agent_wizard') }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).resolves.toMatchObject({ status: 'approved-once', grant: { decidedBy: 'wizard' } })
     const local = await callPermissions(h.grants, { agentSessionId: tab }, 'permissions.request', { command: 'npm run build', reason: 'build' }) as { requestId: string }

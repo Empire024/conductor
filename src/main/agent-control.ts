@@ -3400,17 +3400,32 @@ export class AgentControl {
 
   /** Whose approvals agents.approve and permissions.decide may answer (wizard-approvals.ts): the
    *  owner credential, every agent conversation of its project; a wizard, the same (itself and a
-   *  predecessor included) plus the coworkers it controls in other projects, and theirs. */
+   *  predecessor included) plus the coworkers it controls in other projects, the local wizard of
+   *  each project co-opened in this window and those wizards' coworkers, and theirs. A wizard a
+   *  paired machine drives, or one on a local model, reaches no other project's wizard. */
   private answerable(scope: WizardApprovalScope): AnswerableConversation[] {
+    const { database } = this.deps
     const describe = (id: string, title?: string): AnswerableConversation[] => {
-      const spec = this.deps.database.structured.spec<AgentSpec>(id)
+      const spec = database.structured.spec<AgentSpec>(id)
       return spec ? [{ agentSessionId: id, title, cwd: spec.cwd, projectId: spec.projectId, provider: spec.provider }] : []
     }
-    const project = this.deps.database.listSessions(scope.projectId).flatMap(workspace => this.tabs({ projectId: scope.projectId, sessionId: workspace.id, agentSessionId: '' }))
-      .flatMap(tab => tab.kind === 'agent' && tab.resourceId ? describe(tab.resourceId, tab.title) : [])
+    const tabs = database.listSessions(scope.projectId).flatMap(workspace => this.tabs({ projectId: scope.projectId, sessionId: workspace.id, agentSessionId: '' }))
+    const project = tabs.flatMap(tab => tab.kind === 'agent' && tab.resourceId ? describe(tab.resourceId, tab.title) : [])
     if (scope.owner) return project
     const found = new Map<string, AnswerableConversation>(project.map(entry => [entry.agentSessionId, entry]))
     let frontier = [scope.agentSessionId]
+    // Owner 2026-09-30 (wizard-means-wizard): a wizard answers "its own, its coworkers', and those
+    // of projects it coordinates", i.e. the co-open projects' wizards and their coworkers.
+    const acrossProjects = scope.wizard === true && !tabs.find(tab => tab.resourceId === scope.agentSessionId)?.state?.remotePeerId
+      && database.structured.spec<AgentSpec>(scope.agentSessionId)?.provider !== 'local'
+    if (acrossProjects) for (const other of database.listProjects()) {
+      if (other.id === scope.projectId) continue
+      for (const wizard of this.wizardsOf(other.id)) {
+        if (wizard.remote || wizard.agentSessionId === scope.agentSessionId || found.has(wizard.agentSessionId)) continue
+        for (const entry of describe(wizard.agentSessionId, wizard.title)) found.set(wizard.agentSessionId, entry)
+        frontier.push(wizard.agentSessionId)
+      }
+    }
     for (let depth = 0; depth < 4 && frontier.length; depth++) {
       frontier = frontier.flatMap(controller => this.controlledBy(controller).map(link => link.targetAgentSessionId)).filter(id => id !== scope.agentSessionId && !found.has(id))
       for (const id of frontier) for (const entry of describe(id)) found.set(id, entry)

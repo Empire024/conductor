@@ -1083,6 +1083,35 @@ describe('cross-project work goes to the target project’s wizard', () => {
     expect(f.control.listLinks(f.project.id, f.workspace.id).map(link => link.targetAgentSessionId)).not.toContain(f.spec.id)
   })
 
+  it('lets a wizard answer for a co-open project’s local wizard and its coworkers, not that project’s other tabs', async () => {
+    const { f, other, wizard } = withWizard()
+    const coworker = await f.control.call(wizard, 'tabs.open', { provider: 'claude', title: 'Theme worker' }) as AgentControlTab
+    const bystander = agentIn(f, other.project.id, other.workspace.id, 'theme-bystander')
+    const approvals = (agentSessionId: string) => f.control.call(f.scope, 'agents.approvals', { agentSessionId })
+    const remote = (sessionId: string, agentSessionId: string, remotePeerId: string | undefined) => {
+      const current = f.database.getSession(sessionId)!
+      if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+      const tab = current.layout.root.tabs.find(candidate => candidate.resourceId === agentSessionId)!
+      tab.state = { ...tab.state, remotePeerId }
+      f.database.saveSession(sessionId, current.layout, null, [])
+    }
+    // An ordinary conversation answers nothing.
+    await expect(approvals(wizard.agentSessionId)).rejects.toThrow(/answers only a wizard tab/)
+    const state = f.database.structured.snapshot(f.spec.id)!
+    f.database.structured.update(f.spec.id, { settings: { ...state.settings, wizard: true, model: 'gpt-6-astra' } })
+    await expect(approvals(wizard.agentSessionId)).resolves.toMatchObject({ approvals: [], coworkers: 1 })
+    await expect(approvals(coworker.resourceId!)).resolves.toMatchObject({ approvals: [], coworkers: 1 })
+    await expect(approvals(bystander.agentSessionId)).rejects.toThrow(/nor a co-open project's wizard or its coworkers/)
+    // A wizard a paired machine drives is answered by that machine, not from next door.
+    remote(other.workspace.id, wizard.agentSessionId, 'peer-1')
+    await expect(approvals(wizard.agentSessionId)).rejects.toThrow(/nor a co-open project's wizard/)
+    await expect(approvals(coworker.resourceId!)).rejects.toThrow(/nor a co-open project's wizard/)
+    remote(other.workspace.id, wizard.agentSessionId, undefined)
+    // A caller a paired machine drives stays inside the project shared with it.
+    remote(f.workspace.id, f.spec.id, 'peer-1')
+    await expect(approvals(wizard.agentSessionId)).rejects.toThrow(/nor a co-open project's wizard/)
+  })
+
   it('opens the caller’s own tab when it names a workspace or passes direct:true', async () => {
     const { f, other, wizard, agentTabs } = withWizard()
     const explicit = await f.control.call(f.scope, 'tabs.open', { projectId: other.project.id, workspaceId: other.workspace.id, provider: 'claude', title: 'Explicit', prompt: 'Work here' }) as AgentControlTab & { projectId: string; submitted: boolean }

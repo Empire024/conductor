@@ -37,7 +37,7 @@ describe('a wizard answers its coworkers\' approvals (wizard-answers-approvals)'
     const f = fixture()
     await expect(callWizardApprovals(f.ports, { agentSessionId: 'worker', projectId: 'project' }, 'agents.approvals', {})).rejects.toThrow('only a wizard tab')
     await expect(callWizardApprovals(f.ports, { agentSessionId: 'worker', projectId: 'project' }, 'agents.approve', { agentSessionId: 'coworker', requestId: 'run-tests', decision: 'allow', reason: 'x' })).rejects.toThrow('only a wizard tab')
-    await expect(callWizardApprovals(f.ports, { agentSessionId: 'other-wizard', projectId: 'project', wizard: true }, 'agents.approve', { agentSessionId: 'coworker', requestId: 'run-tests', decision: 'allow', reason: 'x' })).rejects.toThrow('neither in this project nor one of your coworkers')
+    await expect(callWizardApprovals(f.ports, { agentSessionId: 'other-wizard', projectId: 'project', wizard: true }, 'agents.approve', { agentSessionId: 'coworker', requestId: 'run-tests', decision: 'allow', reason: 'x' })).rejects.toThrow(/nor a co-open project.s wizard or its coworkers/)
     expect(f.responses).toHaveLength(0)
   })
 

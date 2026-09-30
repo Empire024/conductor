@@ -11,7 +11,8 @@ import { ownerOnlyEscalation } from './providers/codex'
  * "wizard needs exactly that ability"). agents.approvals lists what the caller's coworkers are
  * waiting on, with the exact action; agents.approve answers one, recorded in the approval journal
  * like a review. Only the owner's control credential (over the project's conversations) or a wizard
- * tab (the same, itself included, plus the coworkers it controls elsewhere) may call them. The wand
+ * tab (the same, itself included, plus the coworkers it controls elsewhere and a co-open project's
+ * wizard with its coworkers) may call them. The wand
  * holds the owner's authority, so, as in the card and in permissions.decide, every class may be
  * allowed (owner decision 2026-09-28, gap H13): a shared, destructive or external action, or one
  * that reaches credentials, the system or outside the workspace, is listed with why it needs
@@ -20,7 +21,7 @@ import { ownerOnlyEscalation } from './providers/codex'
  */
 export const WIZARD_APPROVAL_SIGNATURES: Record<string, string> = {
   'agents.approvals': '({agentSessionId?}) — wizard tab or owner credential only: the approvals your coworkers are waiting on (or one coworker\'s), each with requestId, the exact tool and arguments, its class (local/shared/destructive/external), attention (why a non-local action deserves a careful look, if it does), whether its runtime offers an allow (mayAllow), its choices, what allowing it "for the session" would really cover (sessionScope: "native-session", "once+app-rule" or "once", exactly as agents.approve then reports effectiveScope) with the app-side rule it would record (sessionClass, else null), and the stronger review\'s phase and rationale if one ran',
-  'agents.approve': '({agentSessionId, requestId, decision:"allow"|"deny", scope?:"once"|"session", reason}) — wizard tab or owner credential only, the same authority as permissions.decide: the owner answers any conversation of this project, a wizard the same, its own included, plus the coworkers it controls elsewhere; any class, local, shared, destructive or external (production included), so review the exact action first. Answers one pending native approval with a choice its runtime offers. scope "session" uses the runtime\'s own for-this-session choice when it offers one (effectiveScope "native-session", lasting as the runtime states); otherwise Conductor answers once, and only when the request is under stronger review and its action forms a class the review gate covers (the program and subcommand, workspace edits, one tool; never an owner ask rule or owner-only boundary) does an in-memory rule answer later requests of that class while this runtime runs ("once+app-rule"; a restart, reconnect or handoff ends it); else only this request is allowed ("once"). agents.approvals shows which beforehand (sessionScope). Recorded in the approval journal with your reason'
+  'agents.approve': '({agentSessionId, requestId, decision:"allow"|"deny", scope?:"once"|"session", reason}) — wizard tab or owner credential only, the same authority as permissions.decide: the owner answers any conversation of this project, a wizard the same, its own included, plus the coworkers it controls elsewhere and the wizard of a project co-opened in this window with its coworkers; any class, local, shared, destructive or external (production included), so review the exact action first. Answers one pending native approval with a choice its runtime offers. scope "session" uses the runtime\'s own for-this-session choice when it offers one (effectiveScope "native-session", lasting as the runtime states); otherwise Conductor answers once, and only when the request is under stronger review and its action forms a class the review gate covers (the program and subcommand, workspace edits, one tool; never an owner ask rule or owner-only boundary) does an in-memory rule answer later requests of that class while this runtime runs ("once+app-rule"; a restart, reconnect or handoff ends it); else only this request is allowed ("once"). agents.approvals shows which beforehand (sessionScope). Recorded in the approval journal with your reason'
 }
 export const WIZARD_APPROVAL_METHODS = Object.keys(WIZARD_APPROVAL_SIGNATURES)
 
@@ -28,7 +29,8 @@ export interface WizardApprovalScope { agentSessionId: string; projectId: string
 export interface AnswerableConversation { agentSessionId: string; title?: string; cwd: string; projectId: string; provider?: string }
 export interface WizardApprovalPorts {
   /** The conversations the caller may answer for: every agent conversation of the scope's project,
-   *  and for a wizard also the coworkers it controls in other projects (and theirs). */
+   *  and for a wizard also the coworkers it controls in other projects, the local wizards of co-open
+   *  projects and their coworkers (and theirs). */
   answerable(scope: WizardApprovalScope): AnswerableConversation[]
   snapshot(agentSessionId: string): SessionProjection | null | undefined
   respond(response: InteractionResponse): Promise<void>
@@ -113,7 +115,7 @@ export async function callWizardApprovals(ports: WizardApprovalPorts, scope: Wiz
   const answerable = ports.answerable(scope)
   const named = text(args, 'agentSessionId', 160, method === 'agents.approve')
   const targets = named ? answerable.filter(entry => entry.agentSessionId === named) : answerable
-  if (named && !targets.length) throw new Error(scope.owner ? 'No such agent conversation in this project' : 'That conversation is neither in this project nor one of your coworkers')
+  if (named && !targets.length) throw new Error(scope.owner ? 'No such agent conversation in this project' : 'That conversation is neither in this project, one of your coworkers, nor a co-open project\'s wizard or its coworkers')
   const by = scope.owner ? 'Owner control credential' : `Wizard ${scope.agentSessionId}`
 
   if (method === 'agents.approvals') {

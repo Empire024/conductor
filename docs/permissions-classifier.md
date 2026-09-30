@@ -21,7 +21,9 @@ then requests native `bypassPermissions` and counts it active only after provide
   owner (AGENTS.md) and answers **every** class itself, production included. Both app-control paths
   (`permissions.decide` for permission requests and denial cards, `agents.approve` for native
   approval cards) cover any conversation of the project, and for a wizard also its own requests
-  (a predecessor's too) and its coworkers in other projects. An ordinary conversation answers
+  (a predecessor's too), its coworkers in other projects, and the local wizard of each project
+  co-opened in the same window with that wizard's coworkers (a wizard a paired machine drives, or
+  one on a local model, reaches no other project). An ordinary conversation answers
   nothing. Each answer records who gave it. `agents.approve` only sends a choice the runtime
   offers, so no provider or managed restriction is lifted by it.
 - `agents.approve` with `scope:"session"` reports what it actually covered (`effectiveScope`):

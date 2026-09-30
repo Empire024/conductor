@@ -1004,7 +1004,8 @@ export class PermissionGrants {
   }
 
   /** The conversation that holds this request now, following the handoffs it was moved through;
-   *  permissions.decide refuses a caller answering what it holds itself. */
+   *  permissions.decide lets a wizard answer what it holds itself (its own, or one a handoff moved
+   *  to it), besides its answerable set (agent-control.ts answerable). */
   holder(agentSessionId: string, requestId: string): string {
     return this.holderOf(agentSessionId, this.aliases.get(agentSessionId)?.get(requestId) ?? requestId)
   }
