@@ -283,6 +283,7 @@ const bridge: ConductorBridge = {
       maximizedGroupId: string | null,
       closedTabs: PaneTab[]
     ): Promise<{ restoredTabIds: string[]; layout: WorkspaceLayout } | void> => ipcRenderer.invoke('sessions:save', sessionId, layout, maximizedGroupId, closedTabs),
+    moveTabs: (request) => ipcRenderer.invoke('sessions:move-tabs', request),
     listTemplates: (projectId) => ipcRenderer.invoke('sessions:list-templates', projectId),
     saveTemplate: (projectId, name, layout) =>
       ipcRenderer.invoke('sessions:save-template', projectId, name, layout)

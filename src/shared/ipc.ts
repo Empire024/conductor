@@ -51,6 +51,20 @@ import type { BrowserPresentation, BrowserSurfaceCommand, BrowserSurfaceRequest,
 import type { ModelUpgradeOffer, ModelUpgradesStatus } from './model-upgrades'
 import type { PromotedModels } from './promoted-models'
 
+/** Both workspaces as the window shows them after the move (feature-list ee0fbf15). */
+export interface WorkspaceTabMoveRequest {
+  projectId: string
+  tabIds: string[]
+  source: { id: string; layout: WorkspaceLayout; maximizedGroupId: string | null; closedTabs: PaneTab[] }
+  target: { id: string; layout: WorkspaceLayout; maximizedGroupId: string | null; closedTabs: PaneTab[] }
+}
+export interface WorkspaceTabMoveResult {
+  moved: string[]
+  /** The agent conversations that now belong to the target workspace. */
+  conversations: string[]
+  repairs: Array<{ sessionId: string; restoredTabIds: string[]; layout: WorkspaceLayout }>
+}
+
 export interface FileSearchOptions { showHidden?: boolean; activeProjectId?: string; recentPaths?: Array<{ projectId: string; path: string }> }
 
 export interface ConductorBridge {
@@ -185,6 +199,9 @@ export interface ConductorBridge {
     ): Promise<{ restoredTabIds: string[]; layout: WorkspaceLayout } | void>
     listTemplates(projectId: string): Promise<LayoutTemplateRecord[]>
     saveTemplate(projectId: string, name: string, layout: WorkspaceLayout): Promise<LayoutTemplateRecord>
+    /** Tabs dragged to another workspace of the same project: their conversations move with them
+     *  (running turns, links and credentials intact) and both layouts are written at once. */
+    moveTabs(request: WorkspaceTabMoveRequest): Promise<WorkspaceTabMoveResult>
   }
   recovery: {
     get(): Promise<WorkspaceRecoveryState>

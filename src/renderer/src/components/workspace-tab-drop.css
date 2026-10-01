@@ -1,0 +1,14 @@
+/* A workspace taking a dragged tab (workspace-tab-drop.ts): lit while the tab can land there,
+   struck through in red when it cannot (a tab from another project). */
+.workspace-drop-target {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent) !important;
+  border-radius: 4px;
+}
+.workspace-drop-refused {
+  outline: 1px dashed var(--danger, #d9534f);
+  outline-offset: -1px;
+  cursor: not-allowed;
+  border-radius: 4px;
+}

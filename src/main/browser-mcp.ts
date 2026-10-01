@@ -116,6 +116,12 @@ export class BrowserMcpServer {
     if (credential?.file) { try { rmSync(credential.file, { force: true }) } catch { /* the file is already gone */ } }
   }
 
+  /** The conversation's tab moved to another workspace of its project; its CLI keeps the token. */
+  rescope(agentSessionId: string, projectId: string, sessionId: string): void {
+    const credential = this.credentials.get(agentSessionId)
+    if (credential) credential.scope = { ...credential.scope, projectId, sessionId }
+  }
+
   release(agentSessionId: string): void {
     this.discard(this.credentials.get(agentSessionId))
     this.credentials.delete(agentSessionId)

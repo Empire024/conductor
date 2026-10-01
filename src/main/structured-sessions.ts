@@ -195,12 +195,12 @@ export class StructuredSessions {
   hasRuntime(id: string): boolean { const live = this.live.get(id); return Boolean(live?.adapter || live?.starting) }
   /** The conductor-local MCP server (src/main/local-assist): every Claude and Codex conversation
    *  gets it, unlike the browser tools, which the owner switches on per conversation. */
-  private localAssist?: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }
-  setLocalAssist(server: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }): void { this.localAssist = server }
+  private localAssist?: { configure(spec: AgentSpec): string; release(agentSessionId: string): void; rescope?(agentSessionId: string, projectId: string, sessionId: string): void }
+  setLocalAssist(server: { configure(spec: AgentSpec): string; release(agentSessionId: string): void; rescope?(agentSessionId: string, projectId: string, sessionId: string): void }): void { this.localAssist = server }
   /** The `conductor` MCP server and the owner's permission grants (src/main/permission-grants):
    *  Claude conversations get both, never an approval reviewer. */
-  private conductorMcp?: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }
-  setConductorMcp(server: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }): void { this.conductorMcp = server }
+  private conductorMcp?: { configure(spec: AgentSpec): string; release(agentSessionId: string): void; rescope?(agentSessionId: string, projectId: string, sessionId: string): void }
+  setConductorMcp(server: { configure(spec: AgentSpec): string; release(agentSessionId: string): void; rescope?(agentSessionId: string, projectId: string, sessionId: string): void }): void { this.conductorMcp = server }
   private permissionGrants?: PermissionGrants
   setPermissionGrants(grants: PermissionGrants): void { this.permissionGrants = grants }
   private claudeFullAutoPolicy: () => boolean = () => false
@@ -361,7 +361,7 @@ export class StructuredSessions {
     private observe?: (spec: AgentSpec, event: AgentEvent) => void,
     // Conductor-owned MCP servers for one session, serialized for the CLI's --mcp-config. Bound
     // at launch because a running conversation cannot be handed a new server later.
-    private mcp?: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }
+    private mcp?: { configure(spec: AgentSpec): string; release(agentSessionId: string): void; rescope?(agentSessionId: string, projectId: string, sessionId: string): void }
   ) {
     this.artifacts = new AgentArtifacts(database.structured)
     this.approvalGate = new ApprovalReviewGate(database, id => database.structured.snapshot(id)?.settings,
@@ -629,6 +629,28 @@ export class StructuredSessions {
     this.database.structured.rebindWorkspace(id, sessionId)
     this.database.upsertAgent(live.spec, process?.status ?? 'running', process?.activityPhase ?? 'idle')
     this.database.removeSetting('agentControlParent:' + id)
+  }
+
+  /** The owner dragged this conversation's tab to another workspace of its project (feature-list
+   *  ee0fbf15). Unlike bindWorkspace, which points a tab at a different conversation, the tab and
+   *  its conversation move together, so a running turn, its queue and its links carry on: the spec
+   *  follows, and every credential it holds is rescoped in place, so a CLI started with the old
+   *  token keeps its tools. The caller moves the control links (AgentControl.workspaceMoved). */
+  moveWorkspace(id: string, sessionId: string): void {
+    const spec = this.database.structured.spec<AgentSpec>(id)
+    if (!spec) throw new Error('Session not found')
+    if (spec.sessionId === sessionId) return
+    const workspace = this.database.getSession(sessionId)
+    if (!workspace || workspace.projectId !== spec.projectId) throw new Error('A tab moves only to another workspace of its own project')
+    const live = this.live.get(id)
+    if (live?.handoff) throw new Error('This conversation is switching views; move it once the switch finishes')
+    const moved = { ...spec, sessionId }
+    this.database.structured.rebindWorkspace(id, sessionId)
+    if (live) live.spec = { ...live.spec, sessionId }
+    const process = this.database.listProcesses(spec.projectId).find(item => item.id === id)
+    if (process) this.database.upsertAgent(live?.spec ?? moved, process.status, process.activityPhase)
+    if (live?.limitResumeAt) this.database.saveContinuation(id, spec.projectId, sessionId, live.limitResumeAt)
+    for (const server of [this.mcp, this.localAssist, this.conductorMcp]) server?.rescope?.(id, spec.projectId, sessionId)
   }
 
   /** The composer chooses model, effort and permission for the next message, which can be long

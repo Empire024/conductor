@@ -33,6 +33,7 @@ import { setLiveWorkspaces } from './conversation-directory'
 import { SettingsPanel } from './components/SettingsPanel'
 import { PaneWorkspace } from './layout/PaneWorkspace'
 import { applyTabGroupAction, applyWorkspaceTabAction, type WorkspaceTabAction } from './layout/workspace-tab-actions'
+import { moveTabsToWorkspace, type WorkspaceTabDrag } from './layout/workspace-tab-move'
 import { closePlacedTab } from './layout/machine-placement'
 import { CloseWorkConfirm } from './layout/CloseWorkConfirm'
 import { guardTabClose, offerCloseUndo, type WorkingTab } from './layout/close-work-guard'
@@ -1321,6 +1322,34 @@ export function App(): React.JSX.Element {
     } catch (reason) { setToast(reason instanceof Error ? reason.message : String(reason)) }
   }, [selectSession, offerUndo, phaseOfTab])
 
+  /** Tabs dragged onto another workspace of this project (feature-list ee0fbf15). Main moves their
+   *  conversations and writes both layouts before the window shows the move, so leaving the
+   *  project straight after cannot reload the tab into the workspace it left. */
+  const moveTabsAcross = useCallback(async (drag: WorkspaceTabDrag, targetSessionId: string): Promise<void> => {
+    const find = (id: string): SessionRecord | undefined => sessionsRef.current.find(item => item.id === id)
+    const source = find(drag.sessionId), target = find(targetSessionId)
+    if (!source || !target || source.projectId !== drag.projectId) return
+    const planned = moveTabsToWorkspace(source, target, drag.tabIds, focusedGroupIdsRef.current[target.id])
+    if (!planned) return
+    const ids = planned.moved.map(tab => tab.id)
+    const side = (session: SessionRecord) => ({ id: session.id, layout: session.layout, maximizedGroupId: session.maximizedGroupId, closedTabs: session.closedTabs })
+    try {
+      const result = await window.conductor.sessions.moveTabs({ projectId: source.projectId, tabIds: ids, source: side(planned.source), target: side(planned.target) })
+      // Whatever changed in either workspace while main wrote them stays; only the move is applied.
+      const latestSource = find(source.id), latestTarget = find(target.id)
+      const applied = latestSource && latestTarget ? moveTabsToWorkspace(latestSource, latestTarget, ids, planned.groupId) : null
+      if (applied) {
+        sessionsRef.current = sessionsRef.current.map(item => item.id === source.id ? applied.source : item.id === target.id ? applied.target : item)
+        flushSync(() => setSessions(sessionsRef.current))
+      }
+      applyLayoutRepairs(result.repairs)
+      focusedGroupIdsRef.current[target.id] = planned.groupId
+      setToast(`Moved ${ids.length === 1 ? `“${planned.moved[0]!.title}”` : `${ids.length} tabs`} to ${target.name}`)
+    } catch (reason) {
+      setToast((reason instanceof Error ? reason.message : String(reason)).replace(/^Error invoking remote method '[^']+': Error: /, ''))
+    }
+  }, [applyLayoutRepairs])
+
   useAgentControl({
     resolve: async request => {
       const available = activeProjectIdRef.current === request.projectId ? sessionsRef.current : await window.conductor.sessions.list(request.projectId)
@@ -1619,6 +1648,7 @@ export function App(): React.JSX.Element {
           onTabAction={(sessionId, groupId, tabId, action) => void sidebarTabAction(sessionId, groupId, tabId, action)}
           onTabGroupAction={sidebarTabGroupAction}
           onTabBulkAction={(sessionId, tabIds, action) => void sidebarBulkAction(sessionId, tabIds, action)}
+          onMoveTabs={(drag, targetSessionId) => void moveTabsAcross(drag, targetSessionId)}
           onRevealProject={(path) => void window.conductor.projects.reveal(path)}
           onNewSession={() => void newSession()}
           onCloseSession={(id) => void closeSession(id)}
@@ -1664,6 +1694,7 @@ export function App(): React.JSX.Element {
                 onRename={(id, name) => void renameSession(id, name)}
                 onReopen={reopenClosed}
                 onPalette={() => setPaletteOpen(true)}
+                onMoveTabs={(drag, targetSessionId) => void moveTabsAcross(drag, targetSessionId)}
                 onSaveTemplate={(name) => void saveTemplate(name)}
                 onApplyTemplate={applyTemplate}
                 continueOnLimit={Boolean(activeSession?.continueOnLimit)}

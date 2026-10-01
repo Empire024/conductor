@@ -16,6 +16,7 @@ import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState
 import { distinctTabLabels, type WorkspaceClarity } from '../../../shared/workspace-clarity'
 import { useWorkspaceClarity } from './use-workspace-clarity'
 import { markTabsSeen, moveTabToFront } from './tab-seen'
+import { beginWorkspaceTabDrag, overWorkspaceDrop } from './workspace-tab-move'
 import { createPortal, flushSync } from 'react-dom'
 import {
   Bot,
@@ -509,6 +510,9 @@ function PaneGroup({
     transparentImage.width = 1
     transparentImage.height = 1
     event.dataTransfer.setDragImage(transparentImage, 0, 0)
+    // The sidebar and session bar take the same drag into another workspace (workspace-tab-move.ts);
+    // a detached window's tabs are not in any workspace layout, so they are not offered there.
+    if (!workspace.detachedId) beginWorkspaceTabDrag({ projectId: workspace.project.id, sessionId: workspace.session.id, tabIds: selected?.map(item => item.id) ?? groupTabIds ?? [tab.id] })
     dragActions.start(group.id, tab, event.currentTarget.getBoundingClientRect().width, { x: event.clientX, y: event.clientY }, groupTabIds, selected)
   }
 
@@ -1250,6 +1254,13 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
     }
     const trackPointer = (event: DragEvent): void => {
       const drag = draggingRef.current
+      if (drag && overWorkspaceDrop(event.target)) {
+        // Over a workspace in the sidebar or session bar: that zone decides, and no pane previews.
+        if (dragGhostRef.current && (event.clientX || event.clientY)) dragGhostRef.current.style.transform = `translate3d(${event.clientX + 14}px, ${event.clientY + 14}px, 0)`
+        latestTargetRef.current = null
+        setDropTarget(null)
+        return
+      }
       if (drag) {
         if (!event.clientX && !event.clientY) return
         event.preventDefault()
@@ -1283,6 +1294,13 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
     }
     const commitDrop = (event: DragEvent): void => {
       const drag = draggingRef.current
+      if (drag && overWorkspaceDrop(event.target)) {
+        // The workspace zone moves the tab; this window's layout must not also dock it or, at
+        // dragend, take the accepted drop for another window's and close its copy.
+        consumedRef.current = true
+        endDrag(event)
+        return
+      }
       if (drag) {
         event.preventDefault()
         consumedRef.current = true

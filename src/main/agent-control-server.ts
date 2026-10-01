@@ -199,6 +199,16 @@ export class AgentControlServer {
     }
   }
 
+  /** The conversation's tab moved to another workspace of its project: the token it was briefed
+   *  with keeps working, now for that workspace, instead of being refused as a stale credential. */
+  rescope(agentSessionId: string, projectId: string, sessionId: string): void {
+    const credential = this.credentials.get(agentSessionId)
+    if (!credential) return
+    credential.scope = { ...credential.scope, projectId, sessionId }
+    const kept = this.kept?.credentials[agentSessionId]
+    if (kept) { kept.projectId = projectId; kept.sessionId = sessionId; this.saveKept() }
+  }
+
   briefing(spec: AgentSpec): string {
     if (!this.endpoint || this.disabled || !['codex', 'claude', 'grok'].includes(spec.provider)) return ''
     let credential = this.credentials.get(spec.id)

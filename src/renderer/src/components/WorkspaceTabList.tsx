@@ -17,6 +17,8 @@ import { ProviderIcon } from './ProviderIcon'
 import { useAgentControlLinks } from './useAgentControlLinks'
 import { ControlledByBadge } from './ControlActivity'
 import './WorkspaceTabList.css'
+import { beginWorkspaceTabDrag, WORKSPACE_TAB_MIME, type WorkspaceTabDrag } from '../layout/workspace-tab-move'
+import { workspaceDropHandlers, workspaceDropProps } from './workspace-tab-drop'
 
 export function tabControlRole(tabId: string, links: readonly AgentControlLink[]): { controlledBy?: AgentControlLink; controlling: AgentControlLink[] } {
   return { controlledBy: links.find(link => link.controlledTabId === tabId), controlling: links.filter(link => link.controllerTabId === tabId) }
@@ -55,7 +57,7 @@ function useArchiveCount(sessionId: string, enabled: boolean): number {
   return count
 }
 
-export function WorkspaceTabList({ session, active, expanded, activityPhases, onAction, onGroupAction, onBulkAction }: { session: SessionRecord; active: boolean; expanded: boolean; activityPhases: ReadonlyMap<string, AgentActivityPhase>; onAction(groupId: string, tabId: string, action: WorkspaceTabAction): void; onGroupAction(groupId: string, tabId: string, action: TabGroupAction): void; onBulkAction?(tabIds: string[], action: BulkTabAction): void }): React.JSX.Element {
+export function WorkspaceTabList({ session, active, expanded, activityPhases, onAction, onGroupAction, onBulkAction, onMoveTabs }: { session: SessionRecord; active: boolean; expanded: boolean; activityPhases: ReadonlyMap<string, AgentActivityPhase>; onAction(groupId: string, tabId: string, action: WorkspaceTabAction): void; onGroupAction(groupId: string, tabId: string, action: TabGroupAction): void; onBulkAction?(tabIds: string[], action: BulkTabAction): void; /** A tab dragged here from another workspace of the project (feature-list ee0fbf15). */ onMoveTabs?(drag: WorkspaceTabDrag): void }): React.JSX.Element {
   const [menu, setMenu] = useState<{ x: number; y: number; groupId: string; tab: PaneTab } | null>(null)
   const [selectionState, setSelection] = useState<TabSelection>(EMPTY_SELECTION)
   const [selectionMenu, setSelectionMenu] = useState<{ x: number; y: number } | null>(null)
@@ -96,7 +98,17 @@ export function WorkspaceTabList({ session, active, expanded, activityPhases, on
     // One MAIN per workspace; any other live controller leads its own coworkers.
     const role = !done && row.role === 'main' ? 'Main' : !done && row.role === 'lead' ? 'Lead' : undefined
     const picked = bulk && selection.ids.has(tab.id)
-    return <div key={tab.id} data-clarity-row={tab.id} data-clarity-status={row.status} aria-selected={bulk ? picked : undefined} className={`workspace-tab-row${picked ? ' multi-selected' : ''}${row.depth ? ' coworker-child' : ''}${active && group.activeTabId === tab.id ? ' selected' : ''} clarity-${row.status}${row.role === 'main' && !done ? ' clarity-main' : ''}`} onContextMenu={event => { if (picked) { showSelectionMenu(event); return } event.preventDefault(); event.stopPropagation(); setMenu({ x: event.clientX, y: event.clientY, groupId: group.id, tab }) }}>
+    // A row drags into another workspace's row or tab list; a selected row takes the selection along.
+    const dragOut = onMoveTabs ? {
+      draggable: true,
+      onDragStart: (event: React.DragEvent) => {
+        event.stopPropagation()
+        event.dataTransfer.effectAllowed = 'move'
+        event.dataTransfer.setData(WORKSPACE_TAB_MIME, tab.id)
+        beginWorkspaceTabDrag({ projectId: session.projectId, sessionId: session.id, tabIds: picked ? selectedIds : [tab.id] })
+      }
+    } : {}
+    return <div key={tab.id} {...dragOut} data-clarity-row={tab.id} data-clarity-status={row.status} aria-selected={bulk ? picked : undefined} className={`workspace-tab-row${picked ? ' multi-selected' : ''}${row.depth ? ' coworker-child' : ''}${active && group.activeTabId === tab.id ? ' selected' : ''} clarity-${row.status}${row.role === 'main' && !done ? ' clarity-main' : ''}`} onContextMenu={event => { if (picked) { showSelectionMenu(event); return } event.preventDefault(); event.stopPropagation(); setMenu({ x: event.clientX, y: event.clientY, groupId: group.id, tab }) }}>
       <button className="workspace-tab-select" title={row.controllerTitle ? `${tab.title} (coworker of ${row.controllerTitle})` : tab.title} onClick={event => {
         if (onBulkAction && (event.ctrlKey || event.metaKey || event.shiftKey)) { setSelection(current => selectionClick(rowOrder, pruneSelection(current, rowOrder), tab.id, activeTabId, { ctrl: event.ctrlKey || event.metaKey, shift: event.shiftKey })); return }
         setSelection(EMPTY_SELECTION)
@@ -125,7 +137,8 @@ export function WorkspaceTabList({ session, active, expanded, activityPhases, on
   }
 
   const allTabIds = groups.flatMap(group => group.tabs.map(tab => tab.id))
-  return <div className="workspace-tab-tree" aria-multiselectable={onBulkAction ? true : undefined} onContextMenu={event => event.stopPropagation()} onKeyDown={event => {
+  const dropHere = onMoveTabs ? workspaceDropProps(workspaceDropHandlers(session, onMoveTabs)) : {}
+  return <div className="workspace-tab-tree" {...dropHere} aria-multiselectable={onBulkAction ? true : undefined} onContextMenu={event => event.stopPropagation()} onKeyDown={event => {
     if (!onBulkAction) return
     if ((event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === 'a') { event.preventDefault(); event.stopPropagation(); setSelection(selectAll(rowOrder)); return }
     if (event.key === 'Escape' && selection.ids.size) { event.stopPropagation(); setSelection(EMPTY_SELECTION); return }

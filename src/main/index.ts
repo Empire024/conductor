@@ -29,6 +29,7 @@ import type { RevertScope } from '../shared/agent-change-history'
 import { AgentControl } from './agent-control'
 import { AgentControlServer } from './agent-control-server'
 import { AgentControlUi } from './agent-control-ui'
+import { moveTabsBetweenWorkspaces } from './workspace-tab-move'
 import { BrowserMcpServer } from './browser-mcp'
 import { startLocalAssist, type LocalAssist } from './local-assist/wiring'
 import { weeklyUsage as weeklyUsagePercent, type ModelIntelligence } from './model-intelligence'
@@ -66,6 +67,7 @@ import type {
 } from '../shared/models'
 import { AGENT_SOUND_PROFILES, isMemoryKind, THEME_IDS, THEME_VARIANTS } from '../shared/models'
 import type { LayoutNode, RestorePoint, RestoreScope } from '../shared/models'
+import type { WorkspaceTabMoveRequest } from '../shared/ipc'
 import { wizardActive, type SessionSettings } from '../shared/structured-agent'
 import type { AgentConfirmResponse } from '../shared/agent-confirm'
 import { AgentConfirmBroker } from './agent-confirm-broker'
@@ -218,6 +220,8 @@ let phoneServer: PhoneAccessServer | undefined
 let disposePhoneIpc: (() => void) | undefined
 let disposePhoneBroadcast: (() => void) | undefined
 let agentControlUi: AgentControlUi | undefined
+/** The app-control core, for owner actions registered before it exists (sessions:move-tabs). */
+let agentControlCore: AgentControl | undefined
 let browserMcp: BrowserMcpServer | undefined
 let localAssist: LocalAssist | undefined
 /** Model intelligence and routing (docs/model-routing.md); started in the background after launch. */
@@ -2104,6 +2108,23 @@ const registerIpc = (): void => {
       return repaired.restoredTabIds.length ? repaired : undefined
     }
   )
+  ipcMain.handle('sessions:move-tabs', (_event, request: WorkspaceTabMoveRequest) => moveTabsBetweenWorkspaces({
+    getSession: id => database.getSession(id),
+    spec: id => database.structured.spec<AgentSpec>(id),
+    isRemote: id => Boolean(remoteControl?.mirror.isRemote(id)),
+    save: (sessionId, layout, maximizedGroupId, closedTabs) => {
+      const repaired = guardSessionLayout(sessionId, layout, closedTabs)
+      database.saveSession(sessionId, repaired.layout, maximizedGroupId, closedTabs)
+      return repaired
+    },
+    moveConversation: (id, sessionId) => {
+      agents.structured.moveWorkspace(id, sessionId)
+      const spec = database.structured.spec<AgentSpec>(id)
+      if (spec) agentControlServer?.rescope(id, spec.projectId, sessionId)
+    },
+    linksMoved: (projectId, ids, from, to) => agentControlCore?.workspaceMoved(projectId, ids, from, to),
+    notifyTabs: (projectId, sessionId) => remoteControl?.transport.host.notifyTabs(projectId, sessionId)
+  }, request))
   ipcMain.handle('sessions:list-templates', (_event, projectId: string) =>
     database.listLayoutTemplates(projectId)
   )
@@ -2906,7 +2927,7 @@ app.whenReady().then(async () => {
     broadcast: (channel, payload) => { for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send(channel, payload) },
     log: message => console.warn(message)
   })
-  const control: AgentControl = new AgentControl({ database, sessions: agents.structured, modelUpgrades,
+  const control: AgentControl = agentControlCore = new AgentControl({ database, sessions: agents.structured, modelUpgrades,
     // A test launch may lower the context bound at which a relay rolls to a fresh session.
     relayContextTokens: !app.isPackaged && process.env.CONDUCTOR_TEST_USER_DATA ? Number(process.env.CONDUCTOR_TEST_RELAY_CONTEXT_TOKENS) || undefined : undefined,
     orchestration, collaboration, backlogs: projectBacklogs,

@@ -2,6 +2,8 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Bell, Check, Command, LayoutPanelTop, LayoutTemplate, Plus, Save, TimerReset, Undo2, X } from 'lucide-react'
 import type { LayoutTemplateRecord, SessionRecord } from '../../../shared/models'
 import { WorkspaceSessionMenu } from './WorkspaceSessionMenu'
+import { workspaceDropHandlers, workspaceDropProps } from './workspace-tab-drop'
+import type { WorkspaceTabDrag } from '../layout/workspace-tab-move'
 
 interface SessionBarProps {
   sessions: SessionRecord[]
@@ -27,6 +29,8 @@ interface SessionBarProps {
   lastSavedAt: number | null
   onSave(): void
   onContinuation(enabled: boolean): void
+  /** A pane tab dropped on another workspace's tab here moves to that workspace. */
+  onMoveTabs?(drag: WorkspaceTabDrag, targetSessionId: string): void
 }
 
 const TAB_ANIMATION_MS = 110
@@ -115,6 +119,7 @@ export function SessionBar(props: SessionBarProps): React.JSX.Element {
         {props.sessions.map((session) => (
           <button
             key={session.id}
+            {...(props.onMoveTabs ? workspaceDropProps(workspaceDropHandlers(session, drag => props.onMoveTabs!(drag, session.id))) : {})}
             className={`session-tab ${session.id === props.activeId ? 'active' : ''} ${props.attentionIds.has(session.id) ? 'needs-attention' : ''} ${session.continueOnLimit ? 'limit-active' : ''} ${openingIds.has(session.id) ? 'opening' : ''} ${closingIds.has(session.id) ? 'closing' : ''}`}
             onContextMenu={event => { event.preventDefault(); event.stopPropagation(); setWorkspaceMenu({ session, x: event.clientX, y: event.clientY }) }}
             onClick={() => props.onSelect(session.id)}

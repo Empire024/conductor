@@ -1,6 +1,8 @@
 import { Fragment, useEffect, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import { WorkspaceTabList, WorkspaceTabToggle } from './WorkspaceTabList'
+import { workspaceDropHandlers } from './workspace-tab-drop'
+import type { WorkspaceTabDrag } from '../layout/workspace-tab-move'
 import { RemoveProjectDialog } from './RemoveProjectDialog'
 import { ProcessStatusSummary } from './ProcessStatusSummary'
 import { NeedsAttention } from './NeedsAttention'
@@ -73,6 +75,8 @@ interface SidebarProps {
   onTabGroupAction(sessionId: string, groupId: string, tabId: string, action: TabGroupAction): void
   /** A selection of two or more of a workspace's tabs (layout/tab-selection.ts). */
   onTabBulkAction?(sessionId: string, tabIds: string[], action: BulkTabAction): void
+  /** Tabs dropped on a workspace (its row or tab list) from another workspace of the project. */
+  onMoveTabs?(drag: WorkspaceTabDrag, targetSessionId: string): void
   onRevealProject(path: string): void
   onCloseSession(id: string): void
   onRenameSession(id: string, name: string): void
@@ -461,12 +465,13 @@ ${project.path} (on ${project.remote!.machineName})` : project.path}
                       // it paints the same amber dot, but it never outranked a sibling working.
                       const activity = props.sessionActivity.get(session.id)
                       const activityDot = activity ? displayActivityStatus(activity) : undefined
+                      const tabDrop = props.onMoveTabs ? workspaceDropHandlers(session, drag => props.onMoveTabs!(drag, session.id)) : null
                       return (
-                        <Fragment key={session.id}><div className="sidebar-session-row" draggable={editingSessionId !== session.id} onContextMenu={event => { if (editingSessionId === session.id) return; event.preventDefault(); event.stopPropagation(); setMenu(null); setWorkspaceMenu({ session, x: event.clientX, y: event.clientY }) }}
+                        <Fragment key={session.id}><div className="sidebar-session-row" data-workspace-drop={tabDrop ? session.id : undefined} draggable={editingSessionId !== session.id} onContextMenu={event => { if (editingSessionId === session.id) return; event.preventDefault(); event.stopPropagation(); setMenu(null); setWorkspaceMenu({ session, x: event.clientX, y: event.clientY }) }}
                           onDragStart={(event) => { event.stopPropagation(); event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('application/x-conductor-session', session.id) }}
-                          onDragOver={(event) => { if (event.dataTransfer.types.includes('application/x-conductor-session')) { event.preventDefault(); event.currentTarget.classList.add('reorder-target') } }}
-                          onDragLeave={(event) => event.currentTarget.classList.remove('reorder-target')}
-                          onDrop={(event) => { event.preventDefault(); event.currentTarget.classList.remove('reorder-target'); const dragged = event.dataTransfer.getData('application/x-conductor-session'); if (!dragged || dragged === session.id) return; const ids = props.sessions.map((item) => item.id).filter((id) => id !== dragged); ids.splice(ids.indexOf(session.id) + (event.clientY > event.currentTarget.getBoundingClientRect().top + event.currentTarget.clientHeight / 2 ? 1 : 0), 0, dragged); props.onReorderSessions(ids) }}>
+                          onDragOver={(event) => { if (tabDrop?.onDragOver(event)) return; if (event.dataTransfer.types.includes('application/x-conductor-session')) { event.preventDefault(); event.currentTarget.classList.add('reorder-target') } }}
+                          onDragLeave={(event) => { if (tabDrop?.onDragLeave(event)) return; event.currentTarget.classList.remove('reorder-target') }}
+                          onDrop={(event) => { if (tabDrop?.onDrop(event)) return; event.preventDefault(); event.currentTarget.classList.remove('reorder-target'); const dragged = event.dataTransfer.getData('application/x-conductor-session'); if (!dragged || dragged === session.id) return; const ids = props.sessions.map((item) => item.id).filter((id) => id !== dragged); ids.splice(ids.indexOf(session.id) + (event.clientY > event.currentTarget.getBoundingClientRect().top + event.currentTarget.clientHeight / 2 ? 1 : 0), 0, dragged); props.onReorderSessions(ids) }}>
                         <WorkspaceTabToggle expanded={tabListOverrides[session.id] ?? session.id === props.activeSessionId} name={session.name} onToggle={() => setTabListOverrides(current => ({ ...current, [session.id]: !(current[session.id] ?? session.id === props.activeSessionId) }))} />
                         <button
                           className={`sidebar-session-open ${session.id === props.activeSessionId ? 'active' : ''} ${attention ? 'needs-attention' : ''}`}
@@ -481,7 +486,7 @@ ${project.path} (on ${project.remote!.machineName})` : project.path}
                         </button>
                         <button className="sidebar-session-close" aria-label={'Close ' + session.name} title={'Close ' + session.name} onClick={() => props.onCloseSession(session.id)}><X size={11} /></button>
                         </div>
-                        <WorkspaceTabList session={session} active={session.id === props.activeSessionId} expanded={tabListOverrides[session.id] ?? session.id === props.activeSessionId} activityPhases={props.activityPhases} onAction={(groupId, tabId, action) => props.onTabAction(session.id, groupId, tabId, action)} onGroupAction={(groupId, tabId, action) => props.onTabGroupAction(session.id, groupId, tabId, action)} onBulkAction={props.onTabBulkAction ? (tabIds, action) => props.onTabBulkAction!(session.id, tabIds, action) : undefined} />
+                        <WorkspaceTabList session={session} active={session.id === props.activeSessionId} expanded={tabListOverrides[session.id] ?? session.id === props.activeSessionId} activityPhases={props.activityPhases} onAction={(groupId, tabId, action) => props.onTabAction(session.id, groupId, tabId, action)} onGroupAction={(groupId, tabId, action) => props.onTabGroupAction(session.id, groupId, tabId, action)} onBulkAction={props.onTabBulkAction ? (tabIds, action) => props.onTabBulkAction!(session.id, tabIds, action) : undefined} onMoveTabs={props.onMoveTabs ? drag => props.onMoveTabs!(drag, session.id) : undefined} />
                         </Fragment>
                       )})}
                       <button className="new-session" onClick={props.onNewSession}>

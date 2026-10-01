@@ -172,6 +172,13 @@ export class ConductorMcpServer {
     if (credential?.file) { try { rmSync(credential.file, { force: true }) } catch { /* already gone */ } }
   }
 
+  /** The conversation's tab moved to another workspace of its project: the credential its CLI was
+   *  started with keeps working and now answers for the new workspace. */
+  rescope(agentSessionId: string, projectId: string, sessionId: string): void {
+    const credential = this.credentials.get(agentSessionId)
+    if (credential) credential.scope = { ...credential.scope, projectId, sessionId }
+  }
+
   release(agentSessionId: string): void {
     this.discard(this.credentials.get(agentSessionId))
     this.credentials.delete(agentSessionId)

@@ -1,3 +1,4 @@
+import { movedControlLink } from './workspace-tab-move'
 import { repointRestart, RESTART_INITIATOR_KEY, RESTART_REQUEST_KEY, type RestartInitiator, type RestartRequest } from './restart-initiator'
 import type { PendingStopConfirmation } from './stop-confirmation'
 import { localModelId, LocalServerBusy, type LocalServerEntry, type LocalStopRequest } from './local-models/servers'
@@ -1138,6 +1139,27 @@ export class AgentControl {
       }
     }
     throw new Error('The originating agent tab is no longer available.')
+  }
+
+  /** The owner moved these conversations' tabs from workspace `from` to `to` of one project
+   *  (feature-list ee0fbf15). A link names the workspace of each end, so every link with a moved
+   *  end is rewritten: a coworker moved away from its controller keeps it as a cross-workspace
+   *  link, and a controller and coworker moved together are one workspace again. Tab ids do not
+   *  change, so the cable ends stay valid. */
+  workspaceMoved(projectId: string, agentSessionIds: readonly string[], from: string, to: string): void {
+    const { database } = this.deps, moved = new Set(agentSessionIds)
+    if (!moved.size) return
+    for (const spec of database.structured.projectSpecs<AgentSpec>(projectId)) {
+      const key = 'agentControlParent:' + spec.id, stored = database.getSetting(key)
+      if (!stored) continue
+      let link: AgentControlLink
+      try { link = JSON.parse(stored) as AgentControlLink } catch { continue }
+      if (link.targetAgentSessionId !== spec.id) continue
+      const next = movedControlLink(link, moved, projectId, to)
+      if (next !== link) database.setSetting(key, JSON.stringify(next))
+    }
+    this.deps.linksChanged?.({ projectId, sessionId: from })
+    this.deps.linksChanged?.({ projectId, sessionId: to })
   }
 
   releaseByOwner(targetAgentSessionId: string): void {

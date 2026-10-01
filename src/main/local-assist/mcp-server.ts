@@ -92,6 +92,12 @@ export class LocalAssistMcpServer {
     if (credential?.file) { try { rmSync(credential.file, { force: true }) } catch { /* already gone */ } }
   }
 
+  /** The conversation's tab moved to another workspace of its project; its CLI keeps the token. */
+  rescope(agentSessionId: string, projectId: string, sessionId: string): void {
+    const credential = this.credentials.get(agentSessionId)
+    if (credential) Object.assign(credential, { projectId, sessionId })
+  }
+
   release(agentSessionId: string): void {
     this.discard(this.credentials.get(agentSessionId))
     this.credentials.delete(agentSessionId)
