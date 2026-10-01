@@ -1773,3 +1773,82 @@ describe('Conductor tool hook health (harness gap H16)', () => {
     expect(notices[0]!.data).toMatchObject({ payload: { classifierUnavailable: { toolUseId: 'toolu_c3', count: 1 } } })
   })
 })
+
+// Haftheme 2026-10-01: an approval interrupted a successor's first turn 0.3 s after its message was
+// sent, before the CLI had started it. No result ever closes a turn the CLI never ran, so the tab
+// stayed 'interrupting' through a restart and refused every message.
+describe('a turn interrupted before the CLI started it', () => {
+  const sessionEvents = (f: ReturnType<typeof fixture>) => f.events.filter(event => event.data.type === 'session').map(event => event.data as { phase: string; notStarted?: boolean })
+  const turnMessage = (f: ReturnType<typeof fixture>) => (f.transport.sent.find(message => (message as { type?: string }).type === 'user') as { uuid: string }).uuid
+  afterEach(() => { vi.useRealTimers() })
+
+  it('settles at once when the interrupt receipt cancels the turn\'s own message, and takes the next turn', async () => {
+    const f = fixture()
+    await f.adapter.start(); await f.adapter.submit('Successor brief', settings)
+    f.transport.autoControlResponses = false
+    const stopping = f.adapter.interrupt()
+    const request = f.transport.sent.at(-1) as { request_id: string }
+    f.transport.receive({ type: 'control_response', response: { subtype: 'success', request_id: request.request_id, response: { still_queued: [], cancelled: [turnMessage(f)] } } })
+    await stopping
+    expect(f.projection().phase).toBe('interrupted')
+    expect(sessionEvents(f).at(-1)).toMatchObject({ phase: 'interrupted', notStarted: true })
+    f.transport.autoControlResponses = true
+    await expect(f.adapter.submit('Approved retry', settings)).resolves.toBeUndefined()
+    expect(f.projection().phase).toBe('running')
+  })
+
+  it('settles a turn that showed no frame once the CLI has had time to close it, but waits for the result of one it started', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const silent = fixture()
+    await silent.adapter.start(); await silent.adapter.submit('Successor brief', settings)
+    await silent.adapter.interrupt()
+    expect(silent.projection().phase).toBe('interrupting')
+    vi.advanceTimersByTime(3_001)
+    expect(silent.projection().phase).toBe('interrupted')
+    expect(sessionEvents(silent).at(-1)).toMatchObject({ notStarted: true })
+
+    const started = fixture()
+    await started.adapter.start(); await started.adapter.submit('Long task', settings)
+    started.transport.receive({ type: 'stream_event', event: { type: 'message_start', message: { id: 'working' } } })
+    await started.adapter.interrupt()
+    vi.advanceTimersByTime(60_000)
+    expect(started.projection().phase).toBe('interrupting')
+    started.transport.receive({ type: 'result', subtype: 'error_during_execution', is_error: true, usage: {} })
+    expect(started.projection().phase).toBe('interrupted')
+    expect(sessionEvents(started).some(event => event.notStarted)).toBe(false)
+  })
+
+  it('re-interrupts a stopping turn on reattach and settles it when the CLI never started it, also from an older build\'s state', async () => {
+    const detached = async (olderBuild: boolean) => {
+      const before = fixture()
+      await before.adapter.start(); await before.adapter.submit('Successor brief', settings)
+      before.transport.autoControlResponses = false
+      const stopping = before.adapter.interrupt()
+      const request = before.transport.sent.at(-1) as { request_id: string }
+      before.transport.receive({ type: 'control_response', response: { subtype: 'success', request_id: request.request_id, response: { still_queued: [], cancelled: [] } } })
+      await stopping
+      Object.assign(before.transport, { detachable: true, detach: async () => ({ runtimeId: 'host-runtime', seq: 1 }) })
+      const detachment = (await before.adapter.detach())!
+      expect(detachment).not.toBeNull()
+      // An older build kept no record of whether the turn had started.
+      if (olderBuild) delete (detachment.state as { v: Record<string, unknown> }).v.turnEvidence
+      // Detaching polls with real timers; the reattached turn's settle is timed with fake ones.
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+      const after = fixture({ attach: detachment })
+      await after.adapter.start()
+      expect(after.transport.sent.some(message => (message as { request?: { subtype?: string } }).request?.subtype === 'interrupt')).toBe(true)
+      await flush()
+      vi.advanceTimersByTime(3_001)
+      vi.useRealTimers()
+      return after
+    }
+    const current = await detached(false)
+    expect(current.projection().phase).toBe('interrupted')
+    expect(sessionEvents(current).at(-1)).toMatchObject({ phase: 'interrupted', notStarted: true })
+    const older = await detached(true)
+    expect(older.projection().phase).toBe('interrupted')
+    // Unknown whether it ran, so its message is not offered again; the conversation is told.
+    expect(sessionEvents(older).at(-1)).not.toHaveProperty('notStarted')
+    expect(older.events.some(event => event.data.type === 'notice' && /showed no sign of the interrupted turn/.test(event.data.message))).toBe(true)
+  })
+})

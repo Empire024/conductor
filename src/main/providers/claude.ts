@@ -88,7 +88,13 @@ export function claudeTaskKind(taskType: string | undefined): ClaudeTaskKind {
 }
 interface Transport { start(): void; send(message: Json): void; close(): void; closeAndWait?(): Promise<void>; readonly connected: boolean; readonly detachable?: boolean; detach?(): Promise<HostedRuntimeHandle | null> }
 /** Adapter fields that hold promises, timers or callbacks, and never travel in a detachment. */
-const CLAUDE_TRANSIENT = ['controls', 'receiving'] as const
+const CLAUDE_TRANSIENT = ['controls', 'receiving', 'unstartedTimer'] as const
+/** After the CLI acknowledged an interrupt, how long a turn it showed no sign of having started
+ *  may still produce its closing result before Conductor settles it as never started. */
+const UNSTARTED_SETTLE_MS = 3_000
+/** Frames the CLI sends only while a turn runs (a tool request, model output, its result). */
+const TURN_FRAMES = new Set(['control_request', 'stream_event', 'assistant', 'user', 'tool_progress', 'result'])
+const TURN_SYSTEM_FRAMES = new Set(['init', 'compact_boundary'])
 /** How long Conductor takes to answer a tool hook while it runs; past it the tool is not run. */
 const HOOK_ANSWER_MS = 15_000
 /** How long a CLI kept by the runtime host waits for a hook answer. An app restart (an update
@@ -193,6 +199,10 @@ export class ClaudeAdapter implements ProviderAdapter {
   private disposed = false
   private active = false
   private stopRequested = false
+  /** Whether the CLI has shown the current turn under way: 'none' from submit until a frame of the
+   *  turn arrives, 'unknown' when no submit of this adapter opened it (a state from an older build). */
+  private turnEvidence: 'unknown' | 'none' | 'seen' = 'unknown'
+  private unstartedTimer?: ReturnType<typeof setTimeout>
   private hasAssistantText = false
   private requests = new Map<string, Request>()
   private controls = new Map<string, { resolve(value: ObjectValue): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>()
@@ -288,6 +298,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (this.active || this.stopRequested || this.disposed || !this.ready) return
     this.turnId = randomUUID()
     this.active = true
+    this.turnEvidence = 'seen'
     this.hasAssistantText = false
     this.emit({ data: { type: 'session', phase: 'running', capabilities: this.capabilities } })
   }
@@ -453,6 +464,10 @@ export class ClaudeAdapter implements ProviderAdapter {
       this.emit({ requestId: id, itemId: request.toolId, data: { type: 'interaction', interaction: request.interaction } })
     }
     this.emit({ data: { type: 'session', phase: this.phase, nativeSessionId: this.nativeSessionId } })
+    // A turn that was being stopped when the previous app let go is asked to stop again: one the
+    // CLI is running closes with its result, one it never started is settled (interrupt) rather
+    // than reattached as a turn that is still stopping and never will.
+    if (this.active && this.stopRequested) void this.interrupt().catch(error => console.warn('Could not re-interrupt a reattached Claude turn that was stopping', error))
     // A kept process retains its original launch flags. Re-evaluate the current persisted owner
     // policy and selected mode before the next turn; an older process may need a safe restart.
     await this.refreshClaudeFullAutoPolicy(this.options.settings)
@@ -511,6 +526,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     this.hasAssistantText = false
     this.stopRequested = false
     this.active = true
+    this.turnEvidence = 'none'
     try {
       this.transport.send(message)
       this.emit({ data: { type: 'session', phase: 'running', settings: { ...this.settings }, capabilities: this.capabilities } })
@@ -627,6 +643,7 @@ export class ClaudeAdapter implements ProviderAdapter {
 
   async interrupt(): Promise<void> {
     if (!this.active || !this.transport?.connected) return
+    const turnId = this.turnId
     this.stopRequested = true
     this.interruptWaitingTools()
     this.expireRequests('Interrupted by user')
@@ -635,7 +652,37 @@ export class ClaudeAdapter implements ProviderAdapter {
     // An ACK is not a completion event; await the final result or disconnect.
     const receipt = await this.control({ subtype: 'interrupt', cancel_queued: true })
     // Only the exact native cancellation receipt authorizes replay after Escape.
-    for (const id of array(receipt.cancelled)) if (typeof id === 'string') this.inputDelivery(id, 'cancelled', { method: 'interrupt', payload: receipt })
+    const cancelled = array(receipt.cancelled).filter((id): id is string => typeof id === 'string')
+    for (const id of cancelled) this.inputDelivery(id, 'cancelled', { method: 'interrupt', payload: receipt })
+    if (!this.active || !this.stopRequested || this.turnId !== turnId) return
+    // A turn whose own message the CLI took back out of its queue never ran, and no result will
+    // ever close it (Haftheme 2026-10-01: an approval interrupted a successor's first turn 0.3 s
+    // after it was sent, and the tab stayed 'interrupting' through a restart).
+    if (turnId && cancelled.includes(turnId)) this.settleUnstarted(true)
+    else if (this.turnEvidence !== 'seen') this.awaitUnstarted(turnId)
+  }
+
+  /** The CLI acknowledged the interrupt of a turn it has shown no frame of. A turn it did start
+   *  sends its closing result promptly; one it never started sends nothing, so it is settled here. */
+  private awaitUnstarted(turnId: string | undefined): void {
+    clearTimeout(this.unstartedTimer)
+    this.unstartedTimer = setTimeout(() => {
+      this.unstartedTimer = undefined
+      if (this.disposed || !this.transport?.connected || !this.active || !this.stopRequested || this.turnId !== turnId || this.turnEvidence === 'seen') return
+      this.settleUnstarted(this.turnEvidence === 'none')
+    }, UNSTARTED_SETTLE_MS)
+  }
+
+  /** Ends a stopped turn the CLI never ran. notStarted: this adapter sent its message and saw
+   *  nothing of it run, so the conversation may send it again. */
+  private settleUnstarted(notStarted: boolean): void {
+    clearTimeout(this.unstartedTimer)
+    this.unstartedTimer = undefined
+    this.active = false
+    this.expireRequests('Turn ended')
+    for (const [id, tool] of this.tools) if (!tool.detached && ['preparing', 'running', 'awaiting_approval'].includes(tool.status)) this.updateTool(id, { status: 'interrupted' })
+    if (!notStarted) this.emit({ data: { type: 'notice', message: 'Claude showed no sign of the interrupted turn and sent no result for it, so Conductor ended it here.' } })
+    this.emit({ data: { type: 'session', phase: 'interrupted', nativeSessionId: this.nativeSessionId, ...(notStarted ? { notStarted: true } : {}) } })
   }
 
   /** The flag-settings allow list: exact rules for Conductor's request tools when this tab has the
@@ -696,6 +743,7 @@ export class ClaudeAdapter implements ProviderAdapter {
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
+    clearTimeout(this.unstartedTimer)
     removeConfigFiles(this.relayFiles.splice(0))
     this.disconnected('Claude runtime stopped; history remains available and resume is explicit')
     this.transport?.close()
@@ -809,6 +857,8 @@ export class ClaudeAdapter implements ProviderAdapter {
       else pending.reject(new ClaudeControlRejectedError(string(response.error) ?? 'Claude control request failed'))
       return
     }
+    // A frame only a turn under way produces: from here on the turn ends with its own result.
+    if (this.active && (TURN_FRAMES.has(type ?? '') || type === 'system' && TURN_SYSTEM_FRAMES.has(string(message.subtype) ?? ''))) this.turnEvidence = 'seen'
     if (type === 'control_request') return this.runtimeRequest(message)
     if (type === 'control_cancel_request') {
       const id = string(message.request_id)
@@ -834,7 +884,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       if (message.state === 'queued') this.inputDelivery(inputId, 'accepted', native)
       else if (message.state === 'started') {
         // A command may start a fresh native turn after the preceding result.
-        if (!this.active) { this.turnId = inputId; this.active = true; this.stopRequested = false; this.hasAssistantText = false; this.emit({ data: { type: 'session', phase: 'running' } }) }
+        if (!this.active) { this.turnId = inputId; this.active = true; this.stopRequested = false; this.hasAssistantText = false; this.turnEvidence = 'seen'; this.emit({ data: { type: 'session', phase: 'running' } }) }
         this.inputDelivery(inputId, 'delivered', native)
       } else if (message.state === 'discarded' || message.state === 'refused') this.inputDelivery(inputId, 'cancelled', native)
       // 'cancelled' also describes an already absorbed message in an aborted turn.
@@ -1415,8 +1465,11 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (paths.length) await this.options.afterTool?.(id, paths, success)
     // The call ran, so the permission check is behind it: an approve-once grant for exactly this
     // call is spent now, and the service takes it back out of the live settings.
-    const spent = (this.options.permissionGrants?.rules() ?? []).find(entry => entry.once && callMatchesRule(entry.rule, name, args, this.options.cwd))
-    if (spent) this.options.permissionGrants?.used(spent.rule)
+    // A session grant is not spent, but the service records that its call ran, so a handoff does
+    // not tell the successor to run it again.
+    const matching = (this.options.permissionGrants?.rules() ?? []).filter(entry => callMatchesRule(entry.rule, name, args, this.options.cwd))
+    const spent = matching.find(entry => entry.once)
+    for (const rule of new Set([...spent ? [spent.rule] : [], ...matching.filter(entry => !entry.once).map(entry => entry.rule)])) this.options.permissionGrants?.used(rule)
     const stdout = string(response.stdout), stderr = string(response.stderr)
     const priorStatus = this.tools.get(id)?.status
     this.updateTool(id, { status: priorStatus === 'rejected' || priorStatus === 'interrupted' ? priorStatus : success ? 'completed' : input.is_interrupt === true || response.interrupted === true ? 'interrupted' : 'failed' }, {

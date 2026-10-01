@@ -3111,6 +3111,23 @@ describe('H15 error texts and agents.interrupt expedite', () => {
     await expect(f.control.call(f.scope, 'agents.interrupt', { agentSessionId: child.resourceId, now: true })).rejects.toThrow(/agents.interrupt accepts only agentSessionId, expedite/)
   })
 
+  // Haftheme 2026-10-01: a tab stuck 'interrupting' held a "retry it now" for a production script
+  // that had already run; dropQueued discards it before the stop, so no later turn end sends it.
+  it('agents.interrupt dropQueued:true discards the waiting queue before the stop, and refuses it with expedite', async () => {
+    const f = fixture()
+    const child = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab
+    const id = child.resourceId!
+    const interrupt = vi.spyOn(f.sessions, 'interrupt')
+    phase(f, id, 'interrupting')
+    const retry = { id: 'stale-retry', text: '[Conductor] approved: Bash(bash prod.sh) (for this session); retry it now.', settings: { permission: 'auto' as const, plan: false }, attachments: [] }
+    f.database.structured.append({ schemaVersion: 1, id: 'h15-queue-' + Math.random(), sequence: f.database.structured.snapshot(id)!.sequence + 1, sessionId: id, runtimeId: 'h15-runtime', provider: 'codex', projectId: f.project.id, workspaceId: f.workspace.id, cwd: f.project.path, timestamp: new Date().toISOString(), data: { type: 'queue', prompt: retry, prompts: [retry] } as AgentEventData })
+    await expect(f.control.call(f.scope, 'agents.interrupt', { agentSessionId: id, dropQueued: true, expedite: true })).rejects.toThrow(/pass one of them/)
+    expect(f.database.structured.snapshot(id)!.queuedPrompts).toHaveLength(1)
+    expect(await f.control.call(f.scope, 'agents.interrupt', { agentSessionId: id, dropQueued: true })).toMatchObject({ interrupted: true, dropped: [retry.text] })
+    expect(f.database.structured.snapshot(id)!.queuedPrompts ?? []).toEqual([])
+    expect(interrupt).toHaveBeenLastCalledWith(id, false)
+  })
+
   it('suffixes the small refusals with the next step', async () => {
     const f = fixture()
     await expect(f.control.call(f.scope, 'tabs.open', { kind: 'editor' })).rejects.toThrow(/kind "editor" is not a tab kind; kinds are agent, terminal/)

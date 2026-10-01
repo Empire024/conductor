@@ -544,6 +544,30 @@ describe('a pending owner approval survives a handoff (grant-survives-handoff)',
     expect(h.grants.list(successor).requests[0]!.status).toBe('used')
   })
 
+  // Haftheme 2026-10-01: a production script approved for the session at 00:10 ran at 00:11; the
+  // handoff at 00:12 told the successor "retry it now" and interrupted its first turn for it.
+  it('does not tell the successor to retry a session grant whose call already ran in the predecessor', async () => {
+    const saved: { value?: SavedPermissionGrants } = {}
+    const h = harness({ persist: value => { saved.value = value } })
+    const asked = h.grants.request(tab, { command: `bash ${script}`, reason: 'location follow-ups' })
+    await h.grants.decide(tab, asked.id, 'approve-session', 'owner')
+    const told = h.told.length
+    h.grants.adapterPort(tab).used(`Bash(bash ${script})`)
+    // Still in force for the conversation that holds it, and the run survives a restart.
+    expect(h.grants.rules(tab)).toEqual([{ rule: `Bash(bash ${script})`, once: false }])
+    expect(saved.value!.grants[0]).toMatchObject({ ranAt: '2026-09-25T22:00:00.000Z' })
+    await expect(h.grants.transfer(tab, successor)).resolves.toEqual({ requests: 0, grants: 0 })
+    expect(h.told).toHaveLength(told)
+    expect(h.grants.rules(successor)).toEqual([])
+    expect(h.notices.at(-1)).toMatchObject({ id: tab, message: expect.stringMatching(/already ran in this conversation .* not told to run it again/) })
+    // One that has not run yet still moves with its retry, as before.
+    const fresh = harness()
+    const pending = fresh.grants.request(tab, { command: `bash ${script}`, reason: 'fix' })
+    await fresh.grants.decide(tab, pending.id, 'approve-session', 'owner')
+    await expect(fresh.grants.transfer(tab, successor)).resolves.toEqual({ requests: 0, grants: 1 })
+    expect(fresh.told.at(-1)).toEqual({ id: successor, text: expect.stringMatching(/retry it now/) })
+  })
+
   it('spends a moved grant once even if the predecessor CLI still held the rule and ran it', async () => {
     // Its runtime took the rule at launch through --settings, so taking it back live is unsupported.
     const once = harness({ apply: vi.fn(async (id: string) => id === tab ? 'unsupported' as const : 'applied' as const), idleWaitMs: 1 })

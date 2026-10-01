@@ -799,7 +799,14 @@ export class PermissionGrants {
       grant = (this.grants.get(next) ?? []).find(entry => entry.rule === rule && entry.scope === 'once' && this.movedFrom.get(entry.id)?.includes(reporter))
       if (grant) agentSessionId = next
     }
-    if (!grant) return
+    if (!grant) {
+      // A session grant stays, but its call has now run: a handoff must not tell the successor to
+      // run it again (Haftheme 2026-10-01: a production script approved and run at 00:11 reached
+      // the successor as "retry it now" at 00:12).
+      const session = (this.grants.get(reporter) ?? []).find(entry => entry.rule === rule && entry.scope === 'session')
+      if (session && !session.ranAt) { session.ranAt = this.now(); this.changed() }
+      return
+    }
     // The provider has announced this exact attempt and will report its real result. A pre-tool
     // hook alone proves neither success nor failure, so keep the grant until that result arrives.
     if (grant.execution && !TERMINAL_EXECUTIONS.has(grant.execution.status)) return
@@ -873,7 +880,8 @@ export class PermissionGrants {
     if (fromId === toId || (!pending.length && !held.length) || this.ports.provider(toId) !== 'claude') return { requests: 0, grants: 0 }
     // Only a recent approval is the successor's to retry; an older unspent grant (a session grant
     // is never spent) would reach it as "retry it now" for a call it never made.
-    const granted = held.filter(grant => !(now - Date.parse(grant.grantedAt) > HANDOFF_FRESH_MS))
+    // A session grant whose call already ran here is not the successor's to retry either.
+    const granted = held.filter(grant => !(now - Date.parse(grant.grantedAt) > HANDOFF_FRESH_MS) && !grant.ranAt)
     const stale = held.filter(grant => !granted.includes(grant))
     const title = this.ports.title?.(toId)
     const holder = { agentSessionId: toId, ...(title ? { title } : {}) }
@@ -911,8 +919,10 @@ export class PermissionGrants {
     }
     for (const grant of stale) {
       this.retries.delete(grant.id)
-      this.statusOf(fromId, grant.requestId, 'expired')
-      this.ports.notice(fromId, `Not handed on to ${grantHolderLabel(holder)}: ${grant.rule} was approved ${Math.round((now - Date.parse(grant.grantedAt)) / 60_000)} min ago and not retried in this conversation, so its successor is not told to retry a call it never made. It asks again if it needs the call.`, { permissionGrantStale: { rule: grant.rule } }, `grant-stale:${grant.id}`)
+      this.statusOf(fromId, grant.requestId, grant.ranAt ? 'used' : 'expired')
+      this.ports.notice(fromId, grant.ranAt
+        ? `Not handed on to ${grantHolderLabel(holder)}: ${grant.rule} already ran in this conversation (${grant.ranAt}), so its successor is not told to run it again. It asks again if it needs the call.`
+        : `Not handed on to ${grantHolderLabel(holder)}: ${grant.rule} was approved ${Math.round((now - Date.parse(grant.grantedAt)) / 60_000)} min ago and not retried in this conversation, so its successor is not told to retry a call it never made. It asks again if it needs the call.`, { permissionGrantStale: { rule: grant.rule, ...(grant.ranAt ? { ranAt: grant.ranAt } : {}) } }, `grant-stale:${grant.id}`)
     }
     this.changed()
     if (held.length) await this.ports.apply(fromId).catch(error => console.warn('Moved grants could not be taken back out of the previous conversation; a spend it reports still spends them', error))

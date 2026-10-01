@@ -92,6 +92,8 @@ export interface PermissionGrant {
   nativeRules?: string[]
   installedIn?: string
   execution?: GrantExecution
+  /** A session grant whose call has run in the conversation that holds it (it stays in force). */
+  ranAt?: string
 }
 
 /** What the renderer holds: every open request and live grant, per conversation. */

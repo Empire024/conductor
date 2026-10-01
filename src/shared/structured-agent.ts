@@ -167,7 +167,9 @@ export type AgentEventData =
    * `backgroundTasks` counts the provider-tracked work that outlives the turn which started it -
    * a backgrounded shell process, an armed watcher - so a settled turn can still say it is
    * waiting rather than finished. Restated on every session event; absent means "unchanged". */
-  | { type: 'session'; phase: SessionPhase; view?: 'visual' | 'cli'; nativeSessionId?: string; message?: string; capabilities?: ProviderCapabilities; title?: string; archived?: boolean; settings?: SessionSettings; limitResumeAt?: string | null; backgroundTasks?: number }
+  | { type: 'session'; phase: SessionPhase; view?: 'visual' | 'cli'; nativeSessionId?: string; message?: string; capabilities?: ProviderCapabilities; title?: string; archived?: boolean; settings?: SessionSettings; limitResumeAt?: string | null; backgroundTasks?: number
+    /** An 'interrupted' turn the provider never started: its message was not run and may be sent again. */
+    notStarted?: boolean }
   | { type: 'text'; role: 'user' | 'assistant' | 'status'; text: string; mode: 'delta' | 'snapshot'; attachments?: Omit<ContextAttachment, 'content'>[]; origin?: PromptOrigin }
   /** `detached` is true only for provider-confirmed background work that can outlive its parent
    * turn. It remains a tool/process, not a subagent, but terminal parent phases must not end it. */

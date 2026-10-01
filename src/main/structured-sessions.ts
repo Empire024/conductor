@@ -101,6 +101,8 @@ export interface DetachedRuntimeRecord {
   at: string
 }
 const active = new Set<SessionPhase>(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
+/** How long a repeated interrupt waits for the runtime to end a turn before ending it here. */
+const STUCK_INTERRUPT_MS = 5_000
 /** What steerOrStart did with a message: started a turn with it, steered it into the running turn
  *  (the provider took it), or queued it behind that turn. */
 export type SteerDelivery = 'started' | 'steered' | 'queued'
@@ -1333,7 +1335,11 @@ export class StructuredSessions {
   async interrupt(id: string, expediteSubmittedInput = false): Promise<void> {
     const live = this.get(id), state = this.database.structured.snapshot(id)!
     if (live.interrupting) return live.interrupting
-    if (!live.adapter || !active.has(state.phase)) return
+    if (!active.has(state.phase)) return
+    // Nothing attached can end this turn or report it ended, so it is ended here.
+    if (!live.adapter) { this.settleStuckTurn(live, 'No provider runtime is attached to this turn, so Conductor ended it here.'); return }
+    // Already stopping and asked again: the stop before this one never settled.
+    const repeated = state.phase === 'interrupting'
     // Escape expedites only already-submitted input; composer drafts never reach here.
     const pending = (state.pendingSteering ?? []).filter(input => input.runtimeId === live.runtimeId && ['sending', 'accepted'].includes(input.status))
     live.expediteInput = expediteSubmittedInput && pending.length ? new Set(pending.map(input => input.id)) : undefined
@@ -1344,6 +1350,38 @@ export class StructuredSessions {
     try { await interrupted; live.expediteReady = Boolean(live.expediteInput?.size || live.expediteQueued?.size) }
     catch (error) { live.expediteInput = undefined; live.expediteQueued = undefined; live.expediteReady = false; throw error }
     finally { live.interrupting = undefined; void this.drainQueue(live) }
+    if (repeated) this.settleIfStillStopping(live)
+  }
+  /** A repeated interrupt of a turn that stays 'interrupting': once the runtime has had
+   *  STUCK_INTERRUPT_MS to close it and has not, the turn is ended here, so an interrupt can
+   *  always unstick a tab (agents.interrupt). A result that still arrives restates the phase. */
+  private settleIfStillStopping(live: LiveSession): void {
+    const runtimeId = live.runtimeId
+    setTimeout(() => {
+      const state = this.database.structured.snapshot(live.spec.id)
+      if (!state || live.closed || this.live.get(live.spec.id) !== live || live.runtimeId !== runtimeId || live.interrupting || state.phase !== 'interrupting') return
+      this.settleStuckTurn(live, 'The runtime did not end the interrupted turn, so Conductor ended it here.')
+    }, STUCK_INTERRUPT_MS).unref?.()
+  }
+  private settleStuckTurn(live: LiveSession, message: string): void {
+    this.emit(live, { data: { type: 'notice', message } })
+    this.emit(live, { data: { type: 'session', phase: 'interrupted' } })
+  }
+  /** The provider never started the turn it was interrupted in (session notStarted), so its message
+   *  was not run: it goes back to the head of the queue. Expedited, it goes with the queue straight
+   *  after the stop; otherwise it is held above the composer like the rest of the queue. */
+  private requeueUnstartedTurn(live: LiveSession): void {
+    const turn = live.currentTurn
+    if (!turn) return
+    live.currentTurn = undefined
+    const state = this.database.structured.snapshot(live.spec.id)!
+    const prompts = state.queuedPrompts ?? (state.queued ? [state.queued] : [])
+    if (prompts.length >= 100) return
+    const prompt: import('../shared/structured-agent').QueuedPrompt = { id: randomUUID(), text: turn.text, settings: structuredClone(turn.settings), attachments: structuredClone(turn.attachments), ...(turn.origin ? { origin: structuredClone(turn.origin) } : {}) }
+    this.setQueue(live, [prompt, ...prompts])
+    const expedited = Boolean(live.expediteQueued)
+    if (expedited) live.expediteQueued!.add(prompt.id)
+    this.emit(live, { data: { type: 'notice', message: `The provider had not started this turn when it was interrupted, so its message was not run. It is back at the head of the queue${expedited ? ' and is sent with the queued messages now' : ', held above the composer'}.` } })
   }
   private stopLive(live: LiveSession, message: string): void {
     if (!active.has(this.database.structured.snapshot(live.spec.id)!.phase) || live.shutdownTimer) return
@@ -1680,6 +1718,7 @@ export class StructuredSessions {
       try { this.enforceUsageCap(live) } catch { /* A cap never breaks the event pipeline it observes. */ }
     }, 250)
     this.scheduleFlush()
+    if (data.type === 'session' && data.phase === 'interrupted' && data.notStarted) this.requeueUnstartedTurn(live)
     // The provider announces a closed usage window as an ordinary turn failure. Read it here,
     // between appending the error and recording the phase it produces, so the phase below can
     // report the wait rather than a dead end. `noteUsageLimit` re-enters `emit` for its own
