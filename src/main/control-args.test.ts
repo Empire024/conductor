@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { ArgumentError, closestKey, modelError, pickModel, providerError, resolveModel, validateArgs } from './control-args'
+import { advertisedModel, ArgumentError, closestKey, modelError, pickModel, providerError, resolveModel, validateArgs } from './control-args'
 
 const claude = [
   { id: 'opus[1m]', label: 'Claude Opus 5.5 (1M context)' },
@@ -11,6 +11,26 @@ const codex = [{ id: 'gpt-6-astra', label: 'GPT-6-Astra' }, { id: 'gpt-5.6-sol',
 const catalog = [{ provider: 'claude', available: true, models: claude }, { provider: 'codex', available: true, models: codex }, { provider: 'grok', available: false, models: [] }]
 
 describe('resolveModel', () => {
+  it('maps an Opus request onto what the live Claude runtime advertises, keeping the 1M form when offered', () => {
+    // Claude Code 2.1.287: `opus` stands for claude-opus-5-5 and there is no `opus[1m]`.
+    const live = [
+      { id: 'default', label: 'Default (recommended)', resolvedModel: 'claude-fable-5-1' },
+      { id: 'opus', label: 'Opus 5.5', resolvedModel: 'claude-opus-5-5' },
+      { id: 'claude-opus-5', label: 'Opus 5' }
+    ]
+    expect(advertisedModel(live, 'opus[1m]')?.id).toBe('opus')
+    expect(advertisedModel(live, 'opus')?.id).toBe('opus')
+    expect(advertisedModel(live, 'claude-opus-5-5')?.id).toBe('opus')
+    expect(advertisedModel(live, 'claude-opus-5-5[1m]')?.id).toBe('opus')
+    expect(advertisedModel(live, 'claude-opus-5')?.id).toBe('claude-opus-5')
+    expect(advertisedModel(live, 'gpt-6-astra')).toBeUndefined()
+    // Claude Code 2.1.282 still offered the 1M alias: it is kept.
+    const older = [...live, { id: 'opus[1m]', label: 'Opus (1M context)', resolvedModel: 'claude-opus-5-5[1m]' }]
+    expect(advertisedModel(older, 'opus[1m]')?.id).toBe('opus[1m]')
+    expect(advertisedModel(older, 'claude-opus-5-5')?.id).toBe('opus[1m]')
+    expect(pickModel([{ provider: 'claude', available: true, models: live }], 'claude', 'claude-opus-5-5')).toMatchObject({ model: { id: 'opus' }, resolvedFrom: 'claude-opus-5-5' })
+  })
+
   it('takes the exact id, then case, then the 1M form, then a full label, then one unique match', () => {
     expect(resolveModel(claude, 'sonnet')).toEqual({ model: claude[2] })
     expect(resolveModel(claude, 'Sonnet')).toEqual({ model: claude[2], resolvedFrom: 'Sonnet' })

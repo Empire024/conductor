@@ -12,6 +12,9 @@ export const MAX_PROMPT_CHARS = 600_000
 export const PROVIDER_SAFEGUARD_REFUSAL = 'provider_safeguard_refusal'
 /** The provider says the account is out of quota (Codex usageLimitExceeded); the turn has stopped. */
 export const PROVIDER_USAGE_LIMIT = 'provider_usage_limit'
+/** The provider CLI lost its login (expired OAuth session, 401, "Please run /login"): every turn
+ *  fails until the owner logs in again, so the host alerts once per provider and resumes after. */
+export const PROVIDER_AUTH_EXPIRED = 'provider_auth_expired'
 export type ActivityStatus = 'preparing' | 'running' | 'awaiting_approval' | 'completed' | 'failed' | 'rejected' | 'interrupted'
 export interface ProviderCapabilities {
   provider: StructuredProvider
@@ -34,7 +37,8 @@ export interface ProviderCapabilities {
   effectiveSettings?: Json
   approvalRouting?: 'stronger-review' | 'isolated-reviewer'
   effort: string[]
-  models: Array<{ id: string; label: string; effort?: string[]; defaultEffort?: string; isDefault?: boolean }>
+  /** resolvedModel: the API model a CLI alias stands for (Claude's `opus` → `claude-opus-5-5`). */
+  models: Array<{ id: string; label: string; effort?: string[]; defaultEffort?: string; isDefault?: boolean; resolvedModel?: string }>
   limitations: string[]
 }
 export interface SessionSettings {

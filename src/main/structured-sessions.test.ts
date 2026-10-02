@@ -6,12 +6,12 @@ import { join, dirname } from 'node:path'
 import { claudeHistoryPath } from './native-history'
 import { ConductorDatabase } from './database'
 import { StructuredAgentStore } from './structured-store'
-import { evaluationCwd, StructuredSessions } from './structured-sessions'
+import { evaluationCwd, StructuredSessions, stoppedOnLogin, type AuthStop } from './structured-sessions'
 import type { AgentSpec } from '../shared/models'
 import type { StructuredProvider } from '../shared/structured-agent'
 import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './providers/adapter'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, PromptOrigin, ProviderCapabilities, SessionSettings } from '../shared/structured-agent'
-import { MAX_PROMPT_CHARS } from '../shared/structured-agent'
+import { MAX_PROMPT_CHARS, PROVIDER_AUTH_EXPIRED } from '../shared/structured-agent'
 import { LocalSetupError } from './providers/local'
 import { LOCAL_MODEL_SETUP_ERROR_CODE, LOCAL_MODEL_SETUP_URL } from '../shared/local-models'
 import { composeLocalPrompt, LOCAL_BACKGROUND_OPEN, splitLocalPrompt } from './local-models/briefing'
@@ -1974,6 +1974,61 @@ describe('provider usage limits and automatic continuation', () => {
     reopened.ensure({ ...f.spec, continueOnLimit: true })
     await vi.advanceTimersByTimeAsync(2 * 60 * 60_000)
     expect(f.current.submissions.at(-1)?.text).toBe('continue')
+  })
+})
+
+describe('a provider login lost mid-conversation (logged-out-alert)', () => {
+  const expired = 'Claude login expired: run `claude /login` (or `claude auth login`) in a terminal. (Failed to authenticate: OAuth session expired and could not be refreshed)'
+  const loggedOut = (f: ReturnType<typeof fixture>): void => {
+    f.current.emit({ data: { type: 'error', message: expired, code: PROVIDER_AUTH_EXPIRED } })
+    f.current.emit({ data: { type: 'session', phase: 'failed' } })
+  }
+  const settle = async (): Promise<void> => { for (let index = 0; index < 5; index++) await Promise.resolve() }
+
+  it('announces the failed turn once, never as a usage limit, and resumes it with the given message', async () => {
+    const f = fixture()
+    f.manager.ensure({ ...f.spec, continueOnLimit: true })
+    const stops: AuthStop[] = []
+    f.manager.onAuthStop(stop => stops.push(stop))
+    await f.manager.submit(f.spec.id, 'Long running work', settings)
+    loggedOut(f)
+    await settle()
+    expect(stops).toHaveLength(1)
+    expect(stops[0]).toMatchObject({ spec: { id: f.spec.id }, message: expired, wizard: false })
+    // Not a usage window: nothing is scheduled, and the tab reads failed rather than limited.
+    expect(f.database.getContinuation(f.spec.id)?.status).not.toBe('pending')
+    f.manager.flush()
+    expect(f.database.listProcesses().find(process => process.id === f.spec.id)?.activityPhase).toBe('failed')
+    // A later settle of the same conversation is not announced again.
+    f.current.emit({ data: { type: 'session', phase: 'idle' } })
+    await settle()
+    expect(stops).toHaveLength(1)
+
+    expect(await f.manager.resumeAfterLogin(f.spec.id, 'Your Claude login expired at T1 and was restored at T2')).toBe('sent')
+    expect(f.current.submissions.at(-1)?.text).toContain('restored at T2')
+    expect(await f.manager.resumeAfterLogin(f.spec.id, 'again')).toBe('busy')
+    f.current.emit({ data: { type: 'session', phase: 'completed' } })
+    expect(await f.manager.resumeAfterLogin(f.spec.id, 'again')).toBe('recovered')
+    expect(f.current.submissions).toHaveLength(2)
+  })
+
+  it('leaves a conversation the owner already continued by hand', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Long running work', settings)
+    loggedOut(f)
+    await f.manager.submit(f.spec.id, 'continue', settings)
+    f.current.emit({ data: { type: 'session', phase: 'completed' } })
+    expect(await f.manager.resumeAfterLogin(f.spec.id, 'login back')).toBe('recovered')
+    expect(f.current.submissions.map(submission => submission.text)).toEqual(['Long running work', 'continue'])
+  })
+
+  it('reads a stop on the login from the newest error with nothing typed since', () => {
+    const error = (code?: string) => ({ data: { type: 'error', ...(code ? { code } : {}) } })
+    const user = { data: { type: 'text', role: 'user' } }, assistant = { data: { type: 'text', role: 'assistant' } }
+    expect(stoppedOnLogin([user, assistant, error(PROVIDER_AUTH_EXPIRED)])).toBe(true)
+    expect(stoppedOnLogin([error(PROVIDER_AUTH_EXPIRED), user])).toBe(false)
+    expect(stoppedOnLogin([error(PROVIDER_AUTH_EXPIRED), error()])).toBe(false)
+    expect(stoppedOnLogin([])).toBe(false)
   })
 })
 

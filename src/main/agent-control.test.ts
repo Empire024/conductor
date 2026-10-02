@@ -2925,6 +2925,19 @@ describe('harness gaps H05, H08, H09, H11: arguments, aliases and reports', () =
     expect(dispatched[0]).toMatchObject({ accepted: true, model: 'codex-advanced', modelResolvedFrom: 'CODEX-ADVANCED' })
   })
 
+  it('H09: router.dispatch opens Opus on the id the live runtime advertises when the pick catalog was another CLI version\'s', async () => {
+    // The live runtime (Claude Code 2.1.287) offers `opus` only; the catalog the pick was made from
+    // (an older CLI's tab, here the model-upgrade probe) still offered `opus[1m]`.
+    const f = fixture(false, undefined, undefined, [{ id: 'opus', label: 'Opus 5.5', effort: ['high'], defaultEffort: 'high', resolvedModel: 'claude-opus-5-5' }])
+    ;(f.deps as Record<string, unknown>).modelUpgrades = { discoveredCatalog: (provider: string) => provider === 'claude' ? { version: '2.1.282', models: [{ id: 'opus[1m]', label: 'Opus (1M context)', effort: ['high'], defaultEffort: 'high' }, { id: 'opus', label: 'Opus 5.5', effort: ['high'], defaultEffort: 'high' }] } : undefined }
+    for (const model of ['opus', 'opus[1m]']) {
+      const [result] = await f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: `Opus ${model}`, prompt: 'Do it', provider: 'claude', model, effort: 'high' }] }) as Array<{ accepted: boolean; error?: string; agentSessionId: string }>
+      expect(result, model).toMatchObject({ accepted: true })
+      expect(f.database.structured.snapshot(result!.agentSessionId)?.settings).toMatchObject({ model: 'opus', effort: 'high' })
+      expect(f.submissions.at(-1)?.settings).toMatchObject({ model: 'opus', effort: 'high' })
+    }
+  })
+
   it('H05: a worker marks its dispatched task done with taskId; stray keys and a missing id are named', async () => {
     const f = fixture()
     const [worker] = await f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Worker', prompt: 'Do it', provider: 'codex' }] }) as Array<{ agentSessionId: string; taskId: string }>

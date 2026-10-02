@@ -6,7 +6,8 @@ import { SteeringUnavailableError, type AdapterOptions, type ProviderAdapter, ty
 import { captureAdapterState, restoreAdapterState, settled } from './adapter-state'
 import { currentRuntimeHost, JsonLineTransport, type HostedRuntimeHandle, type TransportOptions } from './transport'
 import { relayMcpConfigs, relaysMcp } from '../runtime-host/relay-config'
-import { PROVIDER_SAFEGUARD_REFUSAL, PROVIDER_USAGE_LIMIT } from '../../shared/structured-agent'
+import { PROVIDER_AUTH_EXPIRED, PROVIDER_SAFEGUARD_REFUSAL, PROVIDER_USAGE_LIMIT } from '../../shared/structured-agent'
+import { authExpiredMessage } from '../provider-auth'
 import type { ActivityStatus, AdapterEvent, ContextAttachment, FileChange, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 import type { ClientRequest } from './generated/codex/ClientRequest'
 import type { InitializeResponse } from './generated/codex/InitializeResponse'
@@ -40,6 +41,8 @@ export const CODEX_PROTOCOL_BASELINE = '0.159.1'
  *  adapter still speaks unchanged (docs/codex-compatibility.md, "Rebaseline 0.155.1 → 0.159.1"),
  *  so the installed app keeps its Codex tabs across a global CLI upgrade in either order. */
 export const CODEX_VERIFIED_RUNTIMES: readonly string[] = [CODEX_PROTOCOL_BASELINE, '0.155.1']
+/** Codex's own classification of a lost ChatGPT login or rejected API key (HTTP 401). */
+const unauthorized = (info: unknown): boolean => info === 'unauthorized'
 const safeguardRefusal = (message: string): boolean => /(?:safeguards? flagged this message|safety (?:policy|classifier).*(?:blocked|refused)|request (?:was )?refused by.*safety)/i.test(message)
 type WireTransport = Pick<JsonLineTransport, 'start' | 'send' | 'close' | 'connected'> & Partial<Pick<JsonLineTransport, 'closeAndWait' | 'detach' | 'detachable'>>
 /** Adapter fields that hold promises, timers or callbacks, and never travel in a detachment. */
@@ -815,7 +818,7 @@ export class CodexAdapter implements ProviderAdapter {
           // snapshots above reconcile any input already consumed before cancellation.
           for (const [id, turnId] of this.steeringInputs) if (turnId === params.turn.id) this.inputDelivery(id, params.turn.status === 'interrupted' ? 'cancelled' : 'uncertain', native)
           this.turnId = undefined
-          if (params.turn.error) { this.sandboxSetupNotice(params.turn.error.message, context); send({ type: 'error', message: params.turn.error.message, ...(safeguardRefusal(params.turn.error.message) ? { code: PROVIDER_SAFEGUARD_REFUSAL } : params.turn.error.codexErrorInfo === 'usageLimitExceeded' ? { code: PROVIDER_USAGE_LIMIT } : {}) }) }
+          if (params.turn.error) { this.sandboxSetupNotice(params.turn.error.message, context); send(unauthorized(params.turn.error.codexErrorInfo) ? { type: 'error', message: authExpiredMessage('codex', params.turn.error.message), code: PROVIDER_AUTH_EXPIRED } : { type: 'error', message: params.turn.error.message, ...(safeguardRefusal(params.turn.error.message) ? { code: PROVIDER_SAFEGUARD_REFUSAL } : params.turn.error.codexErrorInfo === 'usageLimitExceeded' ? { code: PROVIDER_USAGE_LIMIT } : {}) }) }
           send({ type: 'session', phase: completedPhase }, { turnId: params.turn.id })
         }
         return
@@ -890,7 +893,8 @@ export class CodexAdapter implements ProviderAdapter {
         return
       case 'error':
         this.sandboxSetupNotice(params.error.message, context)
-        send({ type: 'error', message: params.error.message, ...(safeguardRefusal(params.error.message) ? { code: PROVIDER_SAFEGUARD_REFUSAL } : params.error.codexErrorInfo === 'usageLimitExceeded' && !params.willRetry ? { code: PROVIDER_USAGE_LIMIT } : {}) })
+        send(unauthorized(params.error.codexErrorInfo) && !params.willRetry ? { type: 'error', message: authExpiredMessage('codex', params.error.message), code: PROVIDER_AUTH_EXPIRED }
+          : { type: 'error', message: params.error.message, ...(safeguardRefusal(params.error.message) ? { code: PROVIDER_SAFEGUARD_REFUSAL } : params.error.codexErrorInfo === 'usageLimitExceeded' && !params.willRetry ? { code: PROVIDER_USAGE_LIMIT } : {}) })
         if (params.willRetry && (this.options.environment ?? process.env).CONDUCTOR_LIVE_TESTS === '1' && !this.liveRetryStopped) {
           this.liveRetryStopped = true
           this.interrupted = true

@@ -93,7 +93,7 @@ export function unknownMethodError(method: string, known: Iterable<string>, vers
 }
 
 /** A model as models.list offers it. */
-export interface OfferedModel { id: string; label: string }
+export interface OfferedModel { id: string; label: string; resolvedModel?: string }
 export interface OfferedProvider<M extends OfferedModel = OfferedModel> { provider: string; available: boolean; models: M[] }
 
 /**
@@ -109,13 +109,30 @@ export function resolveModel<M extends OfferedModel>(models: readonly M[], reque
   if (exact) return { model: exact }
   const lower = requested.trim().toLowerCase()
   if (!lower) return null
+  // The API model an alias stands for (`claude-opus-5-5` → `opus`), its 1M form first when offered.
+  const api = (model: M): string => (model.resolvedModel ?? '').toLowerCase()
   const found = models.find(model => model.id.toLowerCase() === lower)
     ?? models.find(model => model.id.toLowerCase() === `${lower}[1m]`)
+    ?? models.find(model => api(model) === `${lower}[1m]`)
+    ?? models.find(model => api(model) === lower)
     ?? models.find(model => model.label.toLowerCase() === lower)
     ?? (lower.length >= 3 ? unique(models.filter(model => model.id.toLowerCase().includes(lower))) ?? unique(models.filter(model => model.label.toLowerCase().includes(lower))) : undefined)
   return found ? { model: found, resolvedFrom: requested } : null
 }
 const unique = <T>(list: T[]): T | undefined => list.length === 1 ? list[0] : undefined
+
+/**
+ * The live runtime's own entry for a model picked from another catalog: an older CLI's tab, the
+ * model-upgrade probe or the configured list. resolveModel's rules first, so the 1M form is kept
+ * whenever the runtime offers it; then, for a 1M form the runtime no longer advertises (Claude Code
+ * 2.1.287 lists `opus` and no `opus[1m]`), the same model without the suffix.
+ */
+export function advertisedModel<M extends OfferedModel>(live: readonly M[], wanted: string): M | undefined {
+  const resolved = resolveModel(live, wanted)
+  if (resolved) return resolved.model
+  const base = wanted.replace(/\[1m\]$/i, '')
+  return base !== wanted ? resolveModel(live, base)?.model : undefined
+}
 
 const listing = (models: readonly OfferedModel[]): string => models.map(model => model.label && model.label !== model.id ? `${model.id} (${model.label})` : model.id).join(', ')
 

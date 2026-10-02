@@ -4,7 +4,8 @@ import { StopConfirmations, type StopDecision } from './stop-confirmation'
 import { connectRuntimeHost } from './runtime-host/launcher'
 import { createRecovery, findCheckout, type RecoveryController } from './recovery/controller'
 import { startWatchdogProcess, watchdogRuntime } from './recovery/detached'
-import { recoveryNote } from './recovery/protocol'
+import { recoveryNote, TEST_TOAST_FILE } from './recovery/protocol'
+import { isAuthProvider, probeClaudeAuth, probeCodexAuth, ProviderAuthMonitor, type AuthOutage, type AuthProvider } from './provider-auth'
 import { importLoginShellPath } from './login-shell-path'
 import { workspaceWindowChrome } from './window-chrome'
 import { startParkedPriority } from './background-priority'
@@ -43,7 +44,7 @@ import { safeStorageCipher } from './safe-storage-vault'
 import { ProjectFileChanges } from './project-file-changes'
 import { isStructuredRendererUrl } from './structured-ipc-policy'
 import { installContextMenu } from './context-menu'
-import { app, BrowserWindow, clipboard, ipcMain, Menu, powerMonitor, screen, shell, webContents } from 'electron'
+import { app, BrowserWindow, clipboard, ipcMain, Menu, Notification, powerMonitor, screen, shell, webContents } from 'electron'
 import * as testDialogs from './test-mode-dialogs'
 import { startTestModeWatchdog } from './test-mode-watchdog'
 import { SystemMetricsSampler } from './system-metrics.ts'
@@ -216,6 +217,7 @@ let snapshotPruneTimer: NodeJS.Timeout | undefined
 let agentControlServer: AgentControlServer | undefined
 let remoteControl: RemoteControlService | undefined
 let phoneAccess: PhoneAccessService | undefined
+let providerAuth: ProviderAuthMonitor | undefined
 let phoneServer: PhoneAccessServer | undefined
 let disposePhoneIpc: (() => void) | undefined
 let disposePhoneBroadcast: (() => void) | undefined
@@ -3017,6 +3019,32 @@ app.whenReady().then(async () => {
   } catch (error) {
     console.warn('Cloud sessions are unavailable', error)
   }
+  // A provider CLI that lost its login (src/main/provider-auth.ts): one owner alert per outage on
+  // the desktop and the paired phones, a free `auth status` probe every few minutes, and every tab
+  // that failed on it resumed - wizards first - once the login is back.
+  const authOutageKey = (provider: AuthProvider): string => `providerAuth.outage.${provider}`
+  providerAuth = new ProviderAuthMonitor({
+    probe: async provider => {
+      const executable = agents.listProviders().find(entry => entry.id === provider)?.executable
+      if (!executable) throw new Error(`no ${provider} CLI found`)
+      return provider === 'claude' ? probeClaudeAuth(executable) : probeCodexAuth(executable)
+    },
+    alert: async (_outage, { title, body }) => {
+      // A test profile never puts a notification over the owner's desktop.
+      if (process.env.CONDUCTOR_TEST_USER_DATA) appendFileSync(join(app.getPath('userData'), TEST_TOAST_FILE), `${JSON.stringify({ at: new Date().toISOString(), title, body })}\n`)
+      else if (Notification.isSupported()) new Notification({ title, body }).show()
+      const phone = phoneAccess ? await phoneAccess.announce({ id: randomUUID(), kind: 'attention', sessionId: null, title, body, at: new Date().toISOString(), url: '/#/' }) : 'Phone access is not running.'
+      console.log(`Login alert: ${title} (phone: ${phone})`)
+    },
+    // Only a conversation that still has its tab: a closed one stays as the owner left it.
+    resume: async (tab, message) => openAgentTabs().some(open => open.resourceId === tab.id) ? agents.structured.resumeAfterLogin(tab.id, message) : 'closed',
+    persist: (provider, outage) => database.setSetting(authOutageKey(provider), outage ? JSON.stringify(outage) : ''),
+    restore: () => (['claude', 'codex'] as const).flatMap(provider => {
+      try { const raw = database.getSetting(authOutageKey(provider)); return raw ? [JSON.parse(raw) as AuthOutage] : [] } catch { return [] }
+    }),
+    log: message => console.log(`[provider-auth] ${message}`)
+  })
+  agents.structured.onAuthStop(stop => { if (isAuthProvider(stop.spec.provider)) providerAuth?.noteFailure(stop.spec.provider, { id: stop.spec.id, title: stop.title, wizard: stop.wizard, failedAt: stop.at }, stop.message) })
   // Finished coworkers close themselves, and a settled CLI is released after the owner's idle
   // timeout (src/main/coworker-autoclose.ts). A test launch may shorten the timeout to seconds.
   const autoCloseOverride = !app.isPackaged && process.env.CONDUCTOR_TEST_USER_DATA ? Number(process.env.CONDUCTOR_TEST_COWORKER_AUTOCLOSE_MS) || undefined : undefined

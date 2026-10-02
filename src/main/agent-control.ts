@@ -69,7 +69,7 @@ import { callWizardApprovals, WIZARD_APPROVAL_METHODS, WIZARD_APPROVAL_SIGNATURE
 import type { PermissionGrants } from './permission-grants/service'
 import { CONTROL_WAIT_MAX_SECONDS } from './permission-grants/control-mcp'
 import { isControlActivityNotice, type AppControlEntry, type ControlTarget } from '../shared/control-activity'
-import { ArgumentError, modelError, pickModel, resolveModel, unknownMethodError, validateArgs } from './control-args'
+import { advertisedModel, ArgumentError, modelError, pickModel, resolveModel, unknownMethodError, validateArgs } from './control-args'
 import { readHistory } from './agent-history'
 import type { ApprovalReviewRouting } from './approval-review-gate'
 import type { ModelKey, RegistryRecord, RouteConstraints, RouteDecision, TaskFeatures } from '../shared/model-routing'
@@ -3198,8 +3198,18 @@ export class AgentControl {
       try {
         await this.deps.sessions.connectSession(tab.resourceId!)
         const state = this.deps.database.structured.snapshot(tab.resourceId!)!
-        const model = state.capabilities?.models.find(model => model.id === tab.state!.model)
-        if (!model || state.settings.effort && !model.effort?.includes(state.settings.effort)) throw new Error('The native runtime did not advertise the selected model and effort; no worker prompt was sent')
+        // The model was picked from the freshest catalog Conductor knew; the runtime this tab
+        // launched may be another CLI version that names it differently (2.1.287 dropped
+        // `opus[1m]` for `opus`). Its own entry for the same model wins, applied before the prompt.
+        const wanted = String(tab.state!.model)
+        const model = advertisedModel(state.capabilities?.models ?? [], wanted)
+        if (!model) throw new Error(`The native runtime did not advertise the selected model ${wanted} (it offers ${(state.capabilities?.models ?? []).map(entry => entry.id).join(', ') || 'none'}); no worker prompt was sent`)
+        if (state.settings.effort && !model.effort?.includes(state.settings.effort)) throw new Error(`The native runtime does not offer effort ${state.settings.effort} for ${model.id} (it offers ${model.effort?.join(', ') || 'none'}); no worker prompt was sent`)
+        if (model.id !== wanted) {
+          const effort = state.settings.effort ?? (model.effort?.length ? model.defaultEffort ?? (model.effort.includes('medium') ? 'medium' : model.effort[0]) : undefined)
+          await this.call(scope, 'agents.configure', { agentSessionId: tab.resourceId, model: model.id, ...(effort ? { effort } : {}) })
+          tab.state = { ...tab.state!, model: model.id }
+        }
         if (request.projectTaskIds.length) {
           const current = await this.deps.backlogs.get(scope.projectId)
           for (const id of request.projectTaskIds) {

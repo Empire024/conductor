@@ -7,7 +7,7 @@ import { mkdirSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentActivityPhase, AgentSpec, LayoutNode, RuntimeEnsureResult } from '../shared/models'
-import { isFrontierModel, MAX_PROMPT_CHARS, PROVIDER_SAFEGUARD_REFUSAL, PROVIDER_USAGE_LIMIT, settingsForRuntime, WIZARD_MODEL_HINT, wizardActive } from '../shared/structured-agent'
+import { isFrontierModel, MAX_PROMPT_CHARS, PROVIDER_AUTH_EXPIRED, PROVIDER_SAFEGUARD_REFUSAL, PROVIDER_USAGE_LIMIT, settingsForRuntime, WIZARD_MODEL_HINT, wizardActive } from '../shared/structured-agent'
 import type { ActivityStatus, AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, Json, PendingSteering, PromptDispatchAuthority, PromptOrigin, QueuedPrompt, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import type { AgentChangeHistory, RevertOutcome, RevertScope } from '../shared/agent-change-history'
 import type { ConductorDatabase } from './database'
@@ -82,12 +82,28 @@ interface LiveSession {
   limitResumeAt?: string
   /** The usage-limit error of the turn under way; announced through onLimitStop once it settles. */
   limitStop?: string
+  /** The lost-login error of the turn under way; announced through onAuthStop once it settles. */
+  authStop?: string
   currentTurn?: { text: string; settings: SessionSettings; attachments: ContextAttachment[]; origin?: PromptOrigin; fallbackAttempted: boolean }
   refusalFallback?: { text: string; settings: SessionSettings; attachments: ContextAttachment[]; origin?: PromptOrigin; model: string; notice: string }
 }
 type Factory = (provider: StructuredProvider, options: AdapterOptions) => ProviderAdapter
 /** A turn that ended on the provider's usage limit (onLimitStop). continues: Conductor sends it "continue" at resumeAt. */
 export interface UsageLimitStop { spec: AgentSpec; message: string; resumeAt: string | null; continues: boolean }
+/** A turn that failed because the provider CLI lost its login (onAuthStop, provider-auth.ts). */
+export interface AuthStop { spec: AgentSpec; title: string; message: string; at: string; wizard: boolean }
+/** What resumeAfterLogin did: sent the message, found the turn busy, found the conversation no
+ *  longer stopped on the login (the owner got there first), or found it gone. */
+export type LoginResumeResult = 'sent' | 'busy' | 'recovered' | 'closed' | 'failed'
+/** Whether a conversation's newest error is a lost login with nothing typed into it since. */
+export const stoppedOnLogin = (items: ReadonlyArray<{ data: { type: string; code?: string; role?: string } }>): boolean => {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const data = items[index]!.data
+    if (data.type === 'text' && data.role === 'user') return false
+    if (data.type === 'error') return data.code === PROVIDER_AUTH_EXPIRED
+  }
+  return false
+}
 export interface ClaudeFullAutoRefreshResult { agentSessionId: string; status: 'confirmed' | 'restart-pending' | 'blocked' | 'unchanged'; error?: string }
 /** Settings key of the conversations whose provider processes the runtime host kept running
  *  while this app restarted, by agent session id (docs/runtime-host.md). */
@@ -343,6 +359,31 @@ export class StructuredSessions {
   onLimitStop(listener: (stop: UsageLimitStop) => void): () => void {
     this.limitStopListeners.add(listener)
     return () => { this.limitStopListeners.delete(listener) }
+  }
+  private authStopListeners = new Set<(stop: AuthStop) => void>()
+  /** Called once for every turn that failed because its provider CLI lost its login. */
+  onAuthStop(listener: (stop: AuthStop) => void): () => void {
+    this.authStopListeners.add(listener)
+    return () => { this.authStopListeners.delete(listener) }
+  }
+  /** The login is back (provider-auth.ts): send the conversation its continue message, unless it
+   *  is busy, gone, or no longer stopped on the login because someone already continued it. */
+  async resumeAfterLogin(id: string, message: string): Promise<LoginResumeResult> {
+    const spec = this.database.structured.spec<AgentSpec>(id), state = this.database.structured.snapshot(id)
+    if (!spec || !state || this.live.get(id)?.closed || this.archiving.has(id)) return 'closed'
+    if (active.has(state.phase)) return 'busy'
+    if (!stoppedOnLogin(state.items)) return 'recovered'
+    const live = this.get(id)
+    this.emit(live, { data: { type: 'notice', message: 'Login restored; Conductor asked this conversation to continue.' } })
+    this.flush()
+    try {
+      await this.submit(id, message, state.settings, [], { agentSessionId: 'owner', label: 'Conductor' })
+      return 'sent'
+    } catch (error) {
+      this.emit(live, { data: { type: 'notice', message: `Automatic continuation after the login came back could not be sent: ${error instanceof Error ? error.message : String(error)}` } })
+      this.flush()
+      return 'failed'
+    }
   }
   private turnSettledListeners = new Set<(spec: AgentSpec) => void>()
   /** Called after every turn settles (a running phase gave way to an idle, finished or failed one). */
@@ -1725,8 +1766,10 @@ export class StructuredSessions {
     // notice; `live.limitResumeAt` is set first, so that pass is inert.
     if (data.type === 'error') {
       // Before noteUsageLimit, which restates a phase already settled and so announces it.
-      if (!live.limitStop && data.code !== PROVIDER_SAFEGUARD_REFUSAL && (data.code === PROVIDER_USAGE_LIMIT || isUsageLimitMessage(data.message))) live.limitStop = data.message
-      this.noteUsageLimit(live, data.message)
+      // A lost login is neither a usage limit nor a refusal: it is announced once the turn settles.
+      if (data.code === PROVIDER_AUTH_EXPIRED) live.authStop = data.message
+      if (!live.limitStop && data.code !== PROVIDER_SAFEGUARD_REFUSAL && data.code !== PROVIDER_AUTH_EXPIRED && (data.code === PROVIDER_USAGE_LIMIT || isUsageLimitMessage(data.message))) live.limitStop = data.message
+      if (data.code !== PROVIDER_AUTH_EXPIRED) this.noteUsageLimit(live, data.message)
       if (data.code === PROVIDER_SAFEGUARD_REFUSAL) this.noteSafeguardRefusal(live)
     }
     // A turn that ended on a usage limit is announced once it settles, so whoever waits on this
@@ -1735,6 +1778,13 @@ export class StructuredSessions {
       const stop: UsageLimitStop = { spec: live.spec, message: live.limitStop, resumeAt: live.limitResumeAt ?? null, continues: Boolean(live.spec.continueOnLimit && live.limitResumeAt) }
       live.limitStop = undefined
       queueMicrotask(() => { for (const listener of this.limitStopListeners) try { listener(stop) } catch { /* a listener never breaks the event pipeline */ } })
+    }
+    // A turn that failed on a lost login is announced once it settles (2026-10-01: a wizard stopped
+    // on an expired OAuth session sat dead for 18.5 h because nothing said so).
+    if (data.type === 'session' && live.authStop && !active.has(data.phase)) {
+      const stop: AuthStop = { spec: live.spec, title: state.title || live.spec.title || 'Conversation', message: live.authStop, at: new Date().toISOString(), wizard: live.spec.provider !== 'local' && wizardActive(state.settings, live.spec.provider) }
+      live.authStop = undefined
+      queueMicrotask(() => { for (const listener of this.authStopListeners) try { listener(stop) } catch { /* a listener never breaks the event pipeline */ } })
     }
     if (data.type === 'session' && data.phase && active.has(state.phase) && !active.has(data.phase) && this.turnSettledListeners.size) {
       const spec = live.spec

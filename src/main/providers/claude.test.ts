@@ -60,6 +60,30 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     limited.transport.receive({ type: 'result', subtype: 'error_during_execution', is_error: true, result: "You've hit your session limit · resets in 2 hours", usage: {} })
     expect(limited.events.find(event => event.data.type === 'error')?.data).not.toHaveProperty('code')
   })
+  it('fails a turn the CLI answered with an expired login as a lost login, never as a completed turn (logged-out-alert)', async () => {
+    // The frames Claude Code 2.1.282 sent on 2026-10-01 when its OAuth refresh failed.
+    const expired = fixture()
+    await expired.adapter.start(); await expired.adapter.submit('Timer fired', settings)
+    expired.transport.receive({ type: 'assistant', uuid: 'synthetic-auth', parent_tool_use_id: null, error: 'authentication_failed', message: { id: 'synthetic-auth-message', model: '<synthetic>', role: 'assistant', content: [{ type: 'text', text: 'Failed to authenticate: OAuth session expired and could not be refreshed' }], usage: { input_tokens: 0, output_tokens: 0 } } })
+    expired.transport.receive({ type: 'result', subtype: 'success', is_error: true, terminal_reason: 'api_error', api_error_status: null, result: 'Failed to authenticate: OAuth session expired and could not be refreshed', usage: {} })
+    const error = expired.events.find(event => event.data.type === 'error')?.data
+    expect(error).toMatchObject({ type: 'error', code: 'provider_auth_expired', message: expect.stringMatching(/^Claude login expired: run `claude \/login`/) })
+    expect(error).toMatchObject({ message: expect.stringContaining('OAuth session expired') })
+    expect(expired.events.filter(event => event.data.type === 'session').at(-1)?.data).toMatchObject({ phase: 'failed' })
+
+    // Older wording, result frame only: still a lost login.
+    const missing = fixture()
+    await missing.adapter.start(); await missing.adapter.submit('Work', settings)
+    missing.transport.receive({ type: 'result', subtype: 'success', is_error: true, result: 'Not logged in · Please run /login', usage: {} })
+    expect(missing.events.find(event => event.data.type === 'error')?.data).toMatchObject({ code: 'provider_auth_expired' })
+
+    // An ordinary failure is not one, and the flag never leaks into the next turn.
+    const ordinary = fixture()
+    await ordinary.adapter.start(); await ordinary.adapter.submit('Work', settings)
+    ordinary.transport.receive({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'API Error: 500 overloaded', usage: {} })
+    expect(ordinary.events.find(event => event.data.type === 'error')?.data).not.toHaveProperty('code')
+  })
+
   it('isolates a host reviewer before startup and refuses a resumed reviewer', async () => {
     const f = fixture({ approvalReviewer: true, mcpConfig: '{"mcpServers":{"unwanted":{}}}' })
     await f.adapter.start()

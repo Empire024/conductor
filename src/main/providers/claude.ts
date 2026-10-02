@@ -7,7 +7,8 @@ import { InteractionResponseRejectedError, SteeringUnavailableError, type Adapte
 import { captureAdapterState, restoreAdapterState, settled } from './adapter-state'
 import { currentRuntimeHost, JsonLineTransport, type HostedRuntimeHandle, type TransportOptions } from './transport'
 import { privateConfigFile, relayMcpConfigs, relaysMcp, removeConfigFiles } from '../runtime-host/relay-config'
-import { PROVIDER_SAFEGUARD_REFUSAL, settingsForRuntime } from '../../shared/structured-agent'
+import { PROVIDER_AUTH_EXPIRED, PROVIDER_SAFEGUARD_REFUSAL, settingsForRuntime } from '../../shared/structured-agent'
+import { authExpiredMessage, isAuthFailureMessage } from '../provider-auth'
 import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, classifierOutageMessage, classifierOutagePayload, classifierOutageStoppedTurn, hookDenialReason, isClassifierOutage, parseAutoModeDenialReason, type DenialGrantRequest } from '../../shared/auto-mode-denial'
 import { callMatchesRule, describeGrantRequest, nativeGrantRules } from '../../shared/permission-grants'
 import { BROWSER_MCP_SERVER_NAME, BROWSER_TOOLS } from '../../shared/browser-mcp'
@@ -204,6 +205,8 @@ export class ClaudeAdapter implements ProviderAdapter {
   private turnEvidence: 'unknown' | 'none' | 'seen' = 'unknown'
   private unstartedTimer?: ReturnType<typeof setTimeout>
   private hasAssistantText = false
+  /** The CLI's synthetic `authentication_failed` answer in the turn under way (a lost login). */
+  private authFailure?: string
   private requests = new Map<string, Request>()
   private controls = new Map<string, { resolve(value: ObjectValue): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>()
   private tools = new Map<string, Tool>()
@@ -300,6 +303,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     this.active = true
     this.turnEvidence = 'seen'
     this.hasAssistantText = false
+    this.authFailure = undefined
     this.emit({ data: { type: 'session', phase: 'running', capabilities: this.capabilities } })
   }
 
@@ -373,7 +377,7 @@ export class ClaudeAdapter implements ProviderAdapter {
         const effort = model.supportsEffort === false ? [] : Array.isArray(model.supportedEffortLevels)
           ? model.supportedEffortLevels.filter((value): value is string => typeof value === 'string' && this.capabilities.effort.includes(value))
           : model.supportsEffort === true ? this.capabilities.effort : []
-        return id ? [{ id, label: string(model.displayName) ?? string(model.name) ?? id, effort, ...(string(model.defaultEffort) ? { defaultEffort: string(model.defaultEffort) } : {}), ...(model.isDefault === true ? { isDefault: true } : {}) }] : []
+        return id ? [{ id, label: string(model.displayName) ?? string(model.name) ?? id, effort, ...(string(model.defaultEffort) ? { defaultEffort: string(model.defaultEffort) } : {}), ...(model.isDefault === true ? { isDefault: true } : {}), ...(string(model.resolvedModel) ? { resolvedModel: string(model.resolvedModel) } : {}) }] : []
       })
       this.ready = true
       this.initializedMetadata = initialized
@@ -524,6 +528,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     this.emit({ data: { type: 'notice', message: 'Claude settings acknowledged by native runtime', payload: this.capabilities.effectiveSettings } })
     this.turnId = messageId
     this.hasAssistantText = false
+    this.authFailure = undefined
     this.stopRequested = false
     this.active = true
     this.turnEvidence = 'none'
@@ -903,6 +908,9 @@ export class ClaudeAdapter implements ProviderAdapter {
         this.emit({ data: { type: 'session', phase: this.active ? 'running' : 'idle', capabilities: this.capabilities } })
       }
       if (type === 'assistant' && messageId) this.usage(object(body.usage), `usage:message:${messageId}`, 'message', parentId)
+      // A lost login is answered by the CLI itself: a synthetic assistant message (model
+      // "<synthetic>", error "authentication_failed") followed by an is_error result.
+      if (type === 'assistant' && !parentId && message.error === 'authentication_failed') this.authFailure = array(body.content).map(entry => string(object(entry).text) ?? '').join(' ').trim() || 'authentication_failed'
       let textIndex = 0
       for (const content of array(body.content)) {
         const block = object(content)
@@ -978,9 +986,14 @@ export class ClaudeAdapter implements ProviderAdapter {
       this.active = false
       this.expireRequests('Turn ended')
       this.confirmAutoModeDenials(array(message.permission_denials))
+      const authFailure = this.authFailure
+      this.authFailure = undefined
       if (failure && !this.stopRequested) {
         const error = this.visibleText(array(message.errors).map(display).join('\n')) || resultText || string(message.subtype) || 'Claude turn failed'
-        this.emit({ data: { type: 'error', message: error, ...(safeguardRefusal(error) ? { code: PROVIDER_SAFEGUARD_REFUSAL } : {}) } })
+        // A lost login fails every turn until the owner logs in again: its own code, so the host
+        // alerts once and resumes the conversation when the login is back (provider-auth.ts).
+        if (!safeguardRefusal(error) && (authFailure !== undefined || isAuthFailureMessage(error))) this.emit({ data: { type: 'error', message: authExpiredMessage('claude', authFailure ?? error), code: PROVIDER_AUTH_EXPIRED } })
+        else this.emit({ data: { type: 'error', message: error, ...(safeguardRefusal(error) ? { code: PROVIDER_SAFEGUARD_REFUSAL } : {}) } })
       }
       for (const [id, tool] of this.tools) if (!tool.detached && ['preparing', 'running', 'awaiting_approval'].includes(tool.status)) this.updateTool(id, { status: this.stopRequested ? 'interrupted' : 'failed' })
       this.emit({ data: { type: 'session', phase: this.stopRequested ? 'interrupted' : failure ? 'failed' : 'completed', nativeSessionId: this.nativeSessionId }, native: { method: 'result', payload: message } })

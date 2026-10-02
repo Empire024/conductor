@@ -269,6 +269,15 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
     expect(Date.now() - before).toBeLessThan(2500)
   })
 
+  it('classifies an unauthorized (expired ChatGPT login) turn as a lost login with the exact fix', async () => {
+    const { adapter, events } = create()
+    await adapter.submit('synthetic:unauthorized', settings)
+    await waitFor(() => events.some(event => event.data.type === 'session' && event.data.phase === 'failed'))
+    const errors = events.filter(event => event.data.type === 'error').map(event => event.data)
+    expect(errors.length).toBeGreaterThan(0)
+    for (const error of errors) expect(error).toMatchObject({ code: 'provider_auth_expired', message: expect.stringContaining('Codex login expired: run `codex login`') })
+  })
+
   it('explains a Codex Windows sandbox setup failure once instead of leaving bare failed commands', async () => {
     const { adapter, events } = create()
     await adapter.submit('synthetic:sandbox-helper-failure', settings)

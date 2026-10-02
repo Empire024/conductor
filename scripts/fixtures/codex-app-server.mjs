@@ -180,6 +180,13 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     if (scenario === 'synthetic:steer-compact') itemEvent('item/started', { type: 'contextCompaction', id: 'compact' })
     return
   }
+  if (scenario === 'synthetic:unauthorized') {
+    // An expired ChatGPT login: the request is refused with HTTP 401 and the turn fails.
+    const error = { message: 'unexpected status 401 Unauthorized: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.', codexErrorInfo: 'unauthorized', additionalDetails: null }
+    notify('error', { threadId, turnId: currentTurn, error, willRetry: false })
+    notify('turn/completed', { threadId, turn: { id: currentTurn, items: [], status: 'failed', error } })
+    return
+  }
   if (scenario === 'synthetic:sandbox-helper-failure') {
     // What codex-cli reports when its Windows sandbox helper could not refresh before the command.
     itemEvent('item/completed', command('sandbox-1', 'failed', 'Failed to create unified exec process: helper_unknown_error: setup refresh had errors', 1))
