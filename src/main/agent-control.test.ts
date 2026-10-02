@@ -1461,6 +1461,16 @@ describe('context handoff to a fresh tab', () => {
     expect(f.submissions.at(-1)).toMatchObject({ provider: 'claude', prompt: expect.stringContaining(handoff()) })
   })
 
+  it('continues a caller whose model id the live runtime no longer advertises under the live id, keeping its effort', async () => {
+    const f = fixture()
+    // Claude Code 2.1.287 lists `opus` and no `opus[1m]`; a tab opened before keeps the old id.
+    f.database.structured.update(f.spec.id, { settings: { ...f.database.structured.snapshot(f.spec.id)!.settings, model: 'codex-synthetic[1m]', effort: 'low' } })
+    const result = await f.control.call(f.scope, 'agents.handoff', { handoff: handoff() }) as { handedOff: boolean; model: string; effort: string }
+    expect(result).toMatchObject({ handedOff: true, model: 'codex-synthetic', effort: 'low' })
+    // A model the caller names is still checked as named.
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), model: 'codex-synthetic[1m]' })).rejects.toThrow(/not offered/)
+  })
+
   it('refuses a cross-provider handoff that omits the model, names an unknown one, targets cloud, or gives a non-string provider, before anything opens', async () => {
     const f = fixture()
     const before = f.control.tabs(f.scope).filter(tab => tab.kind === 'agent').length

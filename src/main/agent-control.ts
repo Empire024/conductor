@@ -3508,12 +3508,15 @@ export class AgentControl {
     if (!entry) throw new Error(`The provider “${provider}” is not available for a handoff; available: ${catalog.filter(entry => entry.available).map(entry => entry.provider).join(', ')} (models.list)`)
     const sameProvider = provider === spec.provider
     if (!sameProvider && args.model === undefined) throw new Error(`A handoff to another provider names its model; choose one of ${provider}'s models: ${entry.models.map(candidate => candidate.id).join(', ')}`)
-    const requested = (args.model ?? settings.model ?? spec.model) as string
-    const resolved = resolveModel(entry.models, requested)
-    if (!resolved) throw new Error(modelError(catalog, provider, requested))
-    const model = resolved.model.id
+    const own = (settings.model ?? spec.model) as string
+    const requested = (args.model ?? own) as string
+    // The caller's own id may be one an older CLI advertised (`opus[1m]` before 2.1.287 listed only
+    // `opus`); the same model under the live catalog's id continues it, as dispatch does.
+    const inherited = sameProvider && args.model === undefined
+    const model = (inherited ? advertisedModel(entry.models, requested) : resolveModel(entry.models, requested)?.model)?.id
+    if (!model) throw new Error(modelError(catalog, provider, requested))
     // The caller's effort only carries over to the same model; another model starts on its own default.
-    const effort = args.effort ?? (sameProvider && model === (settings.model ?? spec.model) ? settings.effort : undefined)
+    const effort = args.effort ?? (sameProvider && (inherited || model === own) ? settings.effort : undefined)
     return { kind: 'agent', provider, model, permission: settings.permission, exactPermission: true, ...(effort ? { effort } : {}) }
   }
 
