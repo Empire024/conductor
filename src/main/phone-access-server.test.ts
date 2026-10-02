@@ -5,7 +5,7 @@ import type { ProjectRecord } from '../shared/models'
 import type { PhoneProjectTaskPage } from '../shared/phone-access'
 import { LOCAL_CONNECTION, LOCAL_MACHINE_ID } from '../shared/remote-control'
 import { PhoneAccessService } from './phone-access'
-import { PhoneAccessServer } from './phone-access-server'
+import { MAX_PHONE_IMAGE_BYTES, PhoneAccessServer } from './phone-access-server'
 import { MemoryVault, type SecretKeyValueStore } from './secret-store'
 
 class MapStore implements SecretKeyValueStore {
@@ -18,14 +18,15 @@ class MapStore implements SecretKeyValueStore {
 const cleanup: Array<() => Promise<void> | void> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 
-function serviceFixture(): { service: PhoneAccessService; store: MapStore; ui: ReturnType<typeof vi.fn>; createTask: ReturnType<typeof vi.fn>; listTasks: ReturnType<typeof vi.fn> } {
+function serviceFixture(): { service: PhoneAccessService; store: MapStore; ui: ReturnType<typeof vi.fn>; createTask: ReturnType<typeof vi.fn>; listTasks: ReturnType<typeof vi.fn>; importImage: ReturnType<typeof vi.fn> } {
   const store = new MapStore()
   const ui = vi.fn(async () => ({}))
   const project = { id: 'project-a', name: 'Conductor', path: 'C:\\work\\conductor', createdAt: 't', updatedAt: 't' }
   const createTask = vi.fn(async (_project, input) => ({ id: 'phone-task', projectId: 'project-a', ...input }))
   const listTasks = vi.fn(async (_project:ProjectRecord, query:{offset:number;limit:number}):Promise<PhoneProjectTaskPage> => ({ projectId: 'project-a', tasks: [{ id: 'open', title: 'Open', kind: 'task', status: 'todo', priority: 'normal', weight: 'medium' }], page: { ...query, total: 1, hasMore: false } }))
+  const importImage = vi.fn(async (_cwd: string, name: string) => ({ id: 'image-1', kind: 'image' as const, name, path: '.conductor/prompt-images/00000001-0000-4000-8000-000000000000.png' }))
   const service = new PhoneAccessService({
-    store, vault: new MemoryVault(),
+    store, vault: new MemoryVault(), importImage,
     database: { listProjects: () => [project], getProject: id => id === project.id ? project : null, listSessions: () => [], listDetachedWindows: () => [], listProcesses: () => [], listAgentActivity: () => [], structured: { snapshot: () => null, spec: () => null, history: () => [], update: () => undefined } },
     sessions: { ensure: () => ({ id: 'x', available: false, status: 'unavailable', transcript: '' }), connectSession: async () => undefined, submit: async () => undefined, steer: async () => undefined, queue: async () => undefined, respond: async () => undefined, interrupt: async () => undefined, resume: async () => undefined },
     providers: () => [], machines: () => [{ id: LOCAL_MACHINE_ID, name: 'MAIN', kind: 'local', status: 'online', accountLogin: null, projects: [], connection: LOCAL_CONNECTION }],
@@ -33,12 +34,12 @@ function serviceFixture(): { service: PhoneAccessService; store: MapStore; ui: R
     metrics: async () => ({ sampledAt: 'now', cpuPercent: 1, cpuCores: 4, memoryUsedBytes: 1, memoryTotalBytes: 2, gpus: [], processes: [], localServers: [], unavailable: [] }),
     push: vi.fn(async () => ({ status: 201, gone: false, retryAfter: null, body: '' })), log: () => undefined
   })
-  return { service, store, ui, createTask, listTasks }
+  return { service, store, ui, createTask, listTasks, importImage }
 }
 
 interface Reply { status: number; headers: IncomingMessage['headers']; body: string; raw: Buffer }
 
-function call(port: number, path: string, options: { method?: string; headers?: Record<string, string>; body?: string; ca: string; servername?: string }): Promise<Reply> {
+function call(port: number, path: string, options: { method?: string; headers?: Record<string, string>; body?: string | Buffer; ca: string; servername?: string }): Promise<Reply> {
   return new Promise((resolve, reject) => {
     const requestOptions: RequestOptions = { host: '127.0.0.1', port, path, method: options.method ?? 'GET', ca: options.ca, rejectUnauthorized: true, headers: { host: `127.0.0.1:${port}`, ...options.headers }, ...(options.servername ? { servername: options.servername } : {}) }
     const req = httpsRequest(requestOptions, response => {
@@ -52,15 +53,15 @@ function call(port: number, path: string, options: { method?: string; headers?: 
   })
 }
 
-async function listening(): Promise<{ service: PhoneAccessService; server: PhoneAccessServer; port: number; ca: string; ui: ReturnType<typeof vi.fn> }> {
-  const { service, ui } = serviceFixture()
+async function listening(): Promise<{ service: PhoneAccessService; server: PhoneAccessServer; port: number; ca: string; ui: ReturnType<typeof vi.fn>; importImage: ReturnType<typeof vi.fn> }> {
+  const { service, ui, importImage } = serviceFixture()
   service.updateSettings({ enabled: true, port: 0 })
   const server = new PhoneAccessServer({ service, localAddresses: () => ['127.0.0.1'], hostname: () => 'main-pc', assets: { 'index.html': '<!doctype html><script src="/app.js"></script>', 'app.js': 'console.log(1)', 'app.css': 'body{}', 'sw.js': 'self.x=1', 'manifest.webmanifest': '{}', 'icon.svg': '<svg/>' }, log: () => undefined })
   cleanup.push(() => server.dispose())
   const status = await server.apply()
   if (!status.listening) throw new Error('listener did not start: ' + status.message)
   const port = Number(new URL(status.endpoints[0]!).port)
-  return { service, server, port, ca: service.certificateAuthority().certificatePem, ui }
+  return { service, server, port, ca: service.certificateAuthority().certificatePem, ui, importImage }
 }
 
 async function pair(service: PhoneAccessService, port: number, ca: string): Promise<string> {
@@ -69,6 +70,42 @@ async function pair(service: PhoneAccessService, port: number, ca: string): Prom
   expect(reply.status).toBe(200)
   return (JSON.parse(reply.body) as { token: string }).token
 }
+
+describe('phone image uploads', () => {
+  it('takes raw image bytes from a paired phone only, within the size limit, and answers with the saved attachment', { timeout: 20_000 }, async () => {
+    const { service, port, ca, importImage } = await listening()
+    const token = await pair(service, port, ca)
+    const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3])
+    const upload = (path: string, headers: Record<string, string>, body: string | Buffer) => call(port, path, { ca, method: 'POST', headers, body })
+    const auth = { authorization: `Bearer ${token}` }
+    // No token, no upload: the bytes are never read and nothing is saved.
+    expect((await upload('/api/projects/project-a/images?name=shot.png', { 'content-type': 'image/png' }, png)).status).toBe(401)
+    expect(importImage).not.toHaveBeenCalled()
+    const saved = await upload('/api/projects/project-a/images?name=Screenshot%201.png', { ...auth, 'content-type': 'image/png' }, png)
+    expect(saved.status).toBe(200)
+    expect(JSON.parse(saved.body)).toEqual({ id: 'image-1', kind: 'image', name: 'Screenshot 1.png', path: '.conductor/prompt-images/00000001-0000-4000-8000-000000000000.png' })
+    expect(importImage).toHaveBeenCalledWith('C:\\work\\conductor','Screenshot 1.png', new Uint8Array(png))
+    // JSON reaches the route (so the lock gate answers it first) but is not an image.
+    expect((await upload('/api/projects/project-a/images', { ...auth, 'content-type': 'application/json' }, '{}')).status).toBe(415)
+    // Any other type is refused before anything is read, like every non-JSON body.
+    expect((await upload('/api/projects/project-a/images', { ...auth, 'content-type': 'image/svg+xml' }, '<svg/>')).status).toBe(415)
+    expect((await upload('/api/projects/project-a/tasks', { ...auth, 'content-type': 'image/png' }, png)).status).toBe(415)
+    const huge = await upload('/api/projects/project-a/images', { ...auth, 'content-type': 'image/jpeg' }, Buffer.alloc(MAX_PHONE_IMAGE_BYTES + 1, 1))
+    expect(huge.status).toBe(413)
+    expect(JSON.parse(huge.body).error).toContain('12 MiB')
+    expect((await upload('/api/projects/project-a/images', { ...auth, 'content-type': 'image/png' }, Buffer.alloc(0))).status).toBe(400)
+    // A conversation the phone cannot see is a 404, not an upload.
+    expect((await upload('/api/sessions/missing/images', { ...auth, 'content-type': 'image/png' }, png)).status).toBe(404)
+    expect(importImage).toHaveBeenCalledTimes(1)
+  })
+
+  it('sends a share-target POST that reached the computer to the share screen unread', async () => {
+    const { port, ca } = await listening()
+    const shared = await call(port, '/share', { ca, method: 'POST', headers: { 'content-type': 'multipart/form-data; boundary=x' }, body: '--x--' })
+    expect(shared.status).toBe(303)
+    expect(shared.headers.location).toBe('/#/share')
+  })
+})
 
 describe('the phone listener', () => {
   it('stays off until enabled, then serves the app shell over the CA-signed chain with the right headers', { timeout: 20_000 }, async () => {

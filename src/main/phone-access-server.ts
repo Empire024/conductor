@@ -30,6 +30,11 @@ import { resolveBindHost } from './remote-control-server'
 import { INSTALL_TAILSCALE_MESSAGE, isTailscaleAddress, isTailscaleIpv4, type TailscaleReader } from './tailscale'
 
 const MAX_BODY = 1024 * 1024
+/** One image a phone uploads. The app downscales photos to a 2560 px edge first, so a real one is
+ *  a few hundred KiB; this only stops an unscaled panorama or a misbehaving client. */
+export const MAX_PHONE_IMAGE_BYTES = 12 * 1024 * 1024
+const IMAGE_UPLOAD = /^\/api\/(?:projects|sessions)\/[^/]+\/images$/
+const IMAGE_TYPE = /^image\/(?:png|jpeg|webp|gif)(?:\s*;|$)/i
 const MAX_SOCKETS = 64
 const MAX_STREAMS = 16
 const MAX_STREAMS_PER_DEVICE = 4
@@ -70,6 +75,8 @@ interface PhoneRequestContext {
   /** The phone's live unlocked session; null only when no code is set. */
   unlock: { id: string } | null
   params: string[]
+  /** The request body is image bytes (an image upload route), still unread. */
+  image: boolean
   request: IncomingMessage
   response: ServerResponse
 }
@@ -418,6 +425,8 @@ export class PhoneAccessServer {
     const session = /^\/api\/sessions\/([^/]+)$/
     const sessionAction = /^\/api\/sessions\/([^/]+)\/(message|respond|interrupt|resume)$/
     const projectTasks = /^\/api\/projects\/([^/]+)\/tasks$/
+    const projectImages = /^\/api\/projects\/([^/]+)\/images$/
+    const sessionImages = /^\/api\/sessions\/([^/]+)\/images$/
     const terminal = (action: string): RegExp => new RegExp(`^/api/terminal/([^/]+)/${action}$`)
     return [
       { method: 'GET', path: '/api/me', sample: '/api/me', run: ctx => service.self(ctx.device.id) },
@@ -429,6 +438,10 @@ export class PhoneAccessServer {
       { method: 'POST', path: '/api/tabs/open', sample: '/api/tabs/open', run: ctx => service.openTab(ctx.body as never) },
       { method: 'GET', path: projectTasks, sample: '/api/projects/project-a/tasks', run: ctx => service.listProjectTasks(ctx.params[0]!, { offset: ctx.query.get('offset') ?? undefined, limit: ctx.query.get('limit') ?? undefined }) },
       { method: 'POST', path: projectTasks, sample: '/api/projects/project-a/tasks', run: ctx => service.createProjectTask(ctx.params[0]!, ctx.body as never) },
+      // Image uploads: the raw bytes, named by ?name=, become a project prompt image; the answer
+      // is the attachment a task or a message then names.
+      { method: 'POST', path: projectImages, sample: '/api/projects/project-a/images', run: async ctx => service.importProjectImage(ctx.params[0]!, ctx.query.get('name'), await this.imageBytes(ctx)) },
+      { method: 'POST', path: sessionImages, sample: '/api/sessions/session-a/images', run: async ctx => service.importSessionImage(ctx.params[0]!, ctx.query.get('name'), await this.imageBytes(ctx)) },
       { method: 'POST', path: '/api/push/subscribe', sample: '/api/push/subscribe', run: ctx => { service.setSubscription(ctx.device.id, ctx.body.subscription); return { ok: true } } },
       { method: 'POST', path: '/api/push/unsubscribe', sample: '/api/push/unsubscribe', run: ctx => { service.setSubscription(ctx.device.id, null); return { ok: true } } },
       { method: 'POST', path: '/api/push/test', sample: '/api/push/test', run: async ctx => ({ ok: true, ...await service.testNotification(ctx.device.id) }) },
@@ -437,7 +450,7 @@ export class PhoneAccessServer {
       {
         method: 'POST', path: sessionAction, sample: '/api/sessions/session-a/message', run: ctx => {
           const [id, action] = [ctx.params[0]!, ctx.params[1]!]
-          if (action === 'message') return service.sendMessage(id, { text: ctx.body.text, mode: ctx.body.mode })
+          if (action === 'message') return service.sendMessage(id, { text: ctx.body.text, mode: ctx.body.mode, attachments: ctx.body.attachments })
           if (action === 'respond') return service.respond(id, { requestId: ctx.body.requestId, decision: ctx.body.decision, answers: ctx.body.answers })
           if (action === 'interrupt') return service.interrupt(id)
           return service.resume(id)
@@ -491,6 +504,10 @@ export class PhoneAccessServer {
         return
       }
       if (!url.pathname.startsWith('/api/')) {
+        // The installed app's share target posts here. Its service worker answers that POST on
+        // the phone and never lets it reach this computer; one that does arrive (no worker yet)
+        // is dropped unread and sent to the screen that explains the share did not come through.
+        if (url.pathname === '/share' && method === 'POST') { request.resume(); response.writeHead(303, { Location: '/#/share', 'Cache-Control': 'no-store' }); response.end(); return }
         if (method !== 'GET' && method !== 'HEAD') { reply(405, { error: 'Method not allowed' }, { Allow: 'GET, HEAD' }); request.resume(); return }
         if (url.pathname === '/ca.crt') {
           const authority = this.deps.service.certificateAuthority()
@@ -514,9 +531,11 @@ export class PhoneAccessServer {
         if (origin && origin.toLowerCase() !== `https://${host.toLowerCase()}`) throw new PhoneAccessError('Requests must come from the phone app itself.', 403)
         const site = String(request.headers['sec-fetch-site'] ?? '')
         if (site && site !== 'same-origin' && site !== 'none') throw new PhoneAccessError('Requests must come from the phone app itself.', 403)
-        if (!/^application\/json(?:\s*;|$)/i.test(request.headers['content-type'] ?? '')) throw new PhoneAccessError('Send JSON.', 415)
       }
-      const body = method === 'POST' ? await this.body(request) : {}
+      // An image upload carries its bytes, read only once the phone is authenticated and unlocked.
+      const image = method === 'POST' && IMAGE_UPLOAD.test(url.pathname) && IMAGE_TYPE.test(request.headers['content-type'] ?? '')
+      if (method === 'POST' && !image && !/^application\/json(?:\s*;|$)/i.test(request.headers['content-type'] ?? '')) throw new PhoneAccessError('Send JSON.', 415)
+      const body = method === 'POST' && !image ? await this.body(request) : {}
       const address = request.socket.remoteAddress ?? 'unknown'
       if (url.pathname === '/api/pair') {
         if (method !== 'POST') throw new PhoneAccessError('Method not allowed', 405)
@@ -534,7 +553,7 @@ export class PhoneAccessServer {
       // The gate. Everything below this line - the table and every registered extension - is
       // answered only to a phone that is unlocked, whenever a code is set.
       if (lock.configured() && !unlock) { reply(423, { error: 'Unlock Conductor on this phone first.', locked: true }); request.resume(); return }
-      const ctx: PhoneRequestContext = { method, path: url.pathname, body, query: url.searchParams, device, unlock, params: [], request, response }
+      const ctx: PhoneRequestContext = { method, path: url.pathname, body, query: url.searchParams, device, unlock, params: [], image, request, response }
       for (const route of this.routes) {
         if (route.method !== method) continue
         if (typeof route.path === 'string' ? route.path !== url.pathname : !route.path.test(url.pathname)) continue
@@ -600,6 +619,22 @@ export class PhoneAccessServer {
     let parsed: unknown
     try { parsed = JSON.parse(text) } catch { throw new PhoneAccessError('Malformed JSON body.', 400) }
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}
+  }
+
+  /** An upload's image bytes, up to MAX_PHONE_IMAGE_BYTES. */
+  private async imageBytes(ctx: PhoneRequestContext): Promise<Uint8Array> {
+    if (!ctx.image) throw new PhoneAccessError('Send the image itself as image/jpeg, image/png, image/webp or image/gif.', 415)
+    const tooLarge = (): PhoneAccessError => new PhoneAccessError(`Images from a phone are limited to ${MAX_PHONE_IMAGE_BYTES / 1024 / 1024} MiB.`, 413)
+    if (Number(ctx.request.headers['content-length']) > MAX_PHONE_IMAGE_BYTES) throw tooLarge()
+    const chunks: Buffer[] = []
+    let size = 0
+    for await (const chunk of ctx.request) {
+      size += Buffer.byteLength(chunk as Buffer)
+      if (size > MAX_PHONE_IMAGE_BYTES) throw tooLarge()
+      chunks.push(Buffer.from(chunk as Buffer))
+    }
+    if (!size) throw new PhoneAccessError('The image was empty.', 400)
+    return new Uint8Array(Buffer.concat(chunks))
   }
 
   /**

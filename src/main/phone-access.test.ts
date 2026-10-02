@@ -46,6 +46,7 @@ interface Fixture {
   machines: MachineDescriptor[]
   changed: ReturnType<typeof vi.fn>
   projectTasks: { list: ReturnType<typeof vi.fn>; create: ReturnType<typeof vi.fn> }
+  importImage: ReturnType<typeof vi.fn>
 }
 
 function fixture(options: { now?: () => number } = {}): Fixture {
@@ -105,6 +106,8 @@ function fixture(options: { now?: () => number } = {}): Fixture {
     { id: 'gemini', displayName: 'Gemini CLI', available: true, installUrl: '', models: [{ id: 'gemini-3', label: 'Gemini 3' }], efforts: [] }
   ]
   const changed = vi.fn()
+  let imported = 0
+  const importImage = vi.fn(async (_cwd: string, name: string) => ({ id: 'image-' + ++imported, kind: 'image' as const, name, path: '.conductor/prompt-images/' + String(imported).padStart(8, '0') + '-0000-4000-8000-000000000000.png' }))
   const projectTasks = {
     list: vi.fn(async (project:ProjectRecord,query:{offset:number;limit:number})=>({projectId:project.id,tasks:[{id:'open-task',title:'Open task',kind:'task' as const,status:'todo' as const,priority:'normal' as const,weight:'medium' as const}],page:{...query,total:1,hasMore:false}})),
     create: vi.fn(async (project: ProjectRecord, input: { title: string; kind: 'task' | 'bug' | 'feature' | 'idea'; priority: 'high' | 'normal' | 'low'; weight: 'heavy' | 'medium' | 'light' }) => ({ id: 'task-created', projectId: project.id, ...input }))
@@ -112,9 +115,9 @@ function fixture(options: { now?: () => number } = {}): Fixture {
   const service = new PhoneAccessService({
     store, vault: new MemoryVault(), database, sessions, remote, providers: () => providers, machines: () => machines, machineName: () => 'MAIN', version: '0.1.3',
     ui, metrics: async () => ({ sampledAt: 'now', cpuPercent: 12, cpuCores: 16, memoryUsedBytes: 8e9, memoryTotalBytes: 32e9, gpus: [], processes: [], localServers: [], unavailable: [] }),
-    projectTasks, push, changed, log: () => undefined, ...(options.now ? { now: options.now } : {})
+    projectTasks, importImage, push, changed, log: () => undefined, ...(options.now ? { now: options.now } : {})
   })
-  return { store, service, projections, specs, workspaces, projects, detached, activity, sessions, remote, ui, push, machines, changed, projectTasks }
+  return { store, service, projections, specs, workspaces, projects, detached, activity, sessions, remote, ui, push, machines, changed, projectTasks, importImage }
 }
 
 /** Puts the listener in the "up" state the pairing code needs, without a socket. */
@@ -386,6 +389,72 @@ describe('driving a conversation', () => {
     ;(fix.workspaces[0]!.layout.root as { tabs: PaneTab[] }).tabs.push(tab('tab-g', 'gem-1', { provider: 'gemini', model: 'gemini-3' }))
     expect(fix.service.phoneState().sessions[0]).toMatchObject({ id: 'gem-1', provider: 'gemini', state: 'idle', tabId: 'tab-g' })
     await expect(fix.service.sendMessage('gem-1', { text: 'hi' })).rejects.toThrow(/only be driven from the computer/)
+  })
+})
+
+describe('images from the phone', () => {
+  const image = (n: number) => ({ id: 'image-' + n, kind: 'image' as const, name: 'shot ' + n + '.png', path: '.conductor/prompt-images/' + String(n).padStart(8, '0') + '-0000-4000-8000-000000000000.png' })
+
+  it('saves an upload in the conversation folder and sends it with the message as a desktop image attachment', async () => {
+    const fix = fixture()
+    openConversation(fix, 'agent-1', { capabilities: { ...projection('agent-1').capabilities!, imageAttachments: true } })
+    fix.specs.get('agent-1')!.cwd = 'C:\\work\\conductor-worktree'
+    expect(fix.service.conversation('agent-1').canAttachImages).toBe(true)
+    const bytes = new Uint8Array([137, 80, 78, 71])
+    const saved = await fix.service.importSessionImage('agent-1', 'Screenshot 1.png', bytes)
+    expect(fix.importImage).toHaveBeenCalledWith('C:\\work\\conductor-worktree', 'Screenshot 1.png', bytes)
+    expect(saved).toEqual({ id: 'image-1', kind: 'image', name: 'Screenshot 1.png', path: image(1).path })
+    await expect(fix.service.sendMessage('agent-1', { text: 'This is the bug', attachments: [saved] })).resolves.toMatchObject({ mode: 'submit' })
+    expect(fix.sessions.submit).toHaveBeenCalledWith('agent-1', 'This is the bug', expect.anything(), [saved])
+    // A screenshot alone still carries words for the provider's prompt.
+    await fix.service.sendMessage('agent-1', { text: '  ', attachments: [image(1), image(2)] })
+    expect(fix.sessions.submit).toHaveBeenLastCalledWith('agent-1', 'See the attached images.', expect.anything(), [image(1), image(2)])
+    fix.projections.set('agent-1', projection('agent-1', { phase: 'running', capabilities: { ...projection('agent-1').capabilities!, imageAttachments: true } }))
+    await fix.service.sendMessage('agent-1', { text: 'And this', attachments: [image(3)] })
+    expect(fix.sessions.steer).toHaveBeenCalledWith('agent-1', 'And this', expect.anything(), [image(3)])
+  })
+
+  it('accepts only paths its own uploads write, at most ten, and only for a provider that takes images on this computer', async () => {
+    const fix = fixture()
+    openConversation(fix, 'agent-1', { capabilities: { ...projection('agent-1').capabilities!, imageAttachments: true } })
+    for (const path of ['../secrets.png', 'C:\\Users\\me\\x.png', '.conductor/prompt-images/../../x.png', '.conductor/prompt-images/abc.png', 'src/main/index.ts']) {
+      await expect(fix.service.sendMessage('agent-1', { text: 'x', attachments: [{ ...image(1), path }] })).rejects.toThrow(/Upload each image/)
+    }
+    await expect(fix.service.sendMessage('agent-1', { text: 'x', attachments: 'nope' })).rejects.toThrow(/as a list/)
+    await expect(fix.service.sendMessage('agent-1', { text: 'x', attachments: Array.from({ length: 11 }, (_, n) => image(n + 1)) })).rejects.toThrow(/at most 10/)
+    expect(fix.sessions.submit).not.toHaveBeenCalled()
+    openConversation(fix, 'agent-2', { capabilities: { ...projection('agent-2').capabilities!, imageAttachments: false } })
+    expect(fix.service.conversation('agent-2').canAttachImages).toBe(false)
+    await expect(fix.service.importSessionImage('agent-2', 'x.png', new Uint8Array([1]))).rejects.toThrow(/does not take images/)
+    await expect(fix.service.sendMessage('agent-2', { text: 'x', attachments: [image(1)] })).rejects.toThrow(/does not take images/)
+    fix.specs.set('mirror-1', { id: 'mirror-1', projectId: 'project-b', sessionId: 'ws-b', provider: 'claude', title: 'Remote', cwd: 'D:\\render', machineId: 'empirium' })
+    fix.projections.set('mirror-1', projection('mirror-1', { capabilities: { ...projection('mirror-1').capabilities!, imageAttachments: true } }))
+    ;(fix.workspaces[1]!.layout.root as { tabs: PaneTab[] }).tabs.push(tab('tab-m', 'mirror-1', { machineId: 'empirium' }))
+    expect(fix.service.conversation('mirror-1').canAttachImages).toBe(false)
+    await expect(fix.service.importSessionImage('mirror-1', 'x.png', new Uint8Array([1]))).rejects.toThrow(/on this computer/)
+    await expect(fix.service.sendMessage('mirror-1', { text: 'x', attachments: [image(1)] })).rejects.toThrow(/on this computer/)
+    expect(fix.remote.submit).not.toHaveBeenCalled()
+    expect(fix.importImage).not.toHaveBeenCalled()
+  })
+
+  it('reports the importer refusing bytes as the phone request failing, with its reason', async () => {
+    const fix = fixture()
+    fix.importImage.mockRejectedValueOnce(new Error('Choose a PNG, JPEG, GIF or WebP image'))
+    const refused = await fix.service.importProjectImage('project-a', 'notes.txt', new Uint8Array([1, 2])).catch(error => error)
+    expect(refused).toBeInstanceOf(PhoneAccessError)
+    expect(refused).toMatchObject({ status: 400, message: 'Choose a PNG, JPEG, GIF or WebP image' })
+  })
+
+  it('embeds task images as the desktop task pane does, in the project on this computer only', async () => {
+    const fix = fixture()
+    const saved = await fix.service.importProjectImage('project-a', 'Bug [settings].png', new Uint8Array([1]))
+    expect(fix.importImage).toHaveBeenCalledWith('C:\\work\\conductor', 'Bug [settings].png', expect.any(Uint8Array))
+    await fix.service.createProjectTask('project-a', { title: ' Settings page overflows ', kind: 'bug', images: [saved] })
+    expect(fix.projectTasks.create).toHaveBeenCalledWith(fix.projects[0], { title: 'Settings page overflows\n\n![Bug settings.png](' + saved.path + ')', kind: 'bug', priority: 'normal', weight: 'medium' })
+    await expect(fix.service.importProjectImage('project-b', 'x.png', new Uint8Array([1]))).rejects.toThrow(/lives on Empirium/)
+    await expect(fix.service.createProjectTask('project-b', { title: 'x', kind: 'bug', images: [saved] })).rejects.toThrow(/lives on Empirium/)
+    await expect(fix.service.createProjectTask('project-a', { title: 'x', kind: 'bug', images: [{ ...saved, path: 'feature-list.md' }] })).rejects.toThrow(/Upload each image/)
+    await expect(fix.service.importProjectImage('missing', 'x.png', new Uint8Array([1]))).rejects.toThrow(/project/)
   })
 })
 

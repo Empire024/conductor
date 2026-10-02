@@ -250,14 +250,17 @@ export interface PhoneAccessBridge {
  *                                         ({ id, sequence, phase }), `notification`
  *                                         (PhoneNotification), `ping`
  *   GET  /api/sessions/:id                                          -> PhoneConversation
- *   POST /api/sessions/:id/message        { text, mode? }           -> { phase, mode }
+ *   POST /api/sessions/:id/message        { text, mode?, attachments?: PhoneImage[] } -> { phase, mode }
+ *   POST /api/sessions/:id/images?name=   image bytes (image/jpeg|png|webp|gif, at most 12 MiB)
+ *                                         -> PhoneImage, saved in that conversation's folder
  *   POST /api/sessions/:id/respond        { requestId, decision?, answers? } -> { phase }
  *   POST /api/sessions/:id/interrupt                                -> { phase }
  *   POST /api/sessions/:id/resume                                   -> { phase }
  *   POST /api/tabs/open                   PhoneOpenTabRequest       -> PhoneOpenTabResult
  *   GET  /api/projects/:id/tasks?offset=&limit=                     -> PhoneProjectTaskPage
  *   POST /api/projects/:id/tasks          PhoneProjectTaskRequest   -> PhoneProjectTaskResult
- *   GET  /api/metrics                                               -> PhoneMetrics
+ *   POST /api/projects/:id/images?name=   image bytes, as above     -> PhoneImage, for a task's `images`
+ *   GET  /api/metrics                                              -> PhoneMetrics
  *   POST /api/push/subscribe              { subscription }          -> { ok: true }
  *   POST /api/push/unsubscribe                                      -> { ok: true }
  *   POST /api/push/test                                             -> { ok: true }
@@ -431,6 +434,8 @@ export interface PhoneConversation {
   truncated: boolean
   /** The provider accepts a message into the running turn (Steer); otherwise it queues. */
   canSteer: boolean
+  /** The provider takes images with a message, and the conversation runs on this computer. */
+  canAttachImages: boolean
   /** The conversation must be resumed before it takes a message. */
   needsResume: boolean
 }
@@ -461,7 +466,25 @@ export interface PhoneProjectTaskRequest {
   kind: ProjectTaskKind
   priority?: ProjectTaskPriority
   weight?: ProjectTaskWeight
+  /** Uploaded first through /api/projects/:id/images; embedded like a desktop task's images. */
+  images?: PhoneImage[]
 }
+
+/**
+ * An image a phone uploaded: the same workspace prompt image (.conductor/prompt-images/) the
+ * desktop composer and task pane make, so a message or task names it exactly as they do.
+ */
+export interface PhoneImage {
+  id: string
+  kind: 'image'
+  name: string
+  path: string
+}
+
+/** The only paths a phone may name: images the upload routes wrote. */
+export const PHONE_IMAGE_PATH = /^\.conductor\/prompt-images\/[0-9a-f-]{36}\.(?:png|jpg)$/
+/** Per message or task, below the desktop composer's 20 attachments. */
+export const PHONE_IMAGE_LIMIT = 10
 
 export interface PhoneProjectTaskResult {
   id: string

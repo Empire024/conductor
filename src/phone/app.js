@@ -129,7 +129,14 @@
     locked: false,
     /* Memory only, never stored: a reload or a crash locks the phone. */
     unlockToken: null,
-    terminalProject: null
+    terminalProject: null,
+    /* Images waiting to go with the next project task, and per conversation with its next
+       message: { key, name, blob, type, thumb, uploaded, uploadedTo }. Memory only. */
+    taskImages: [],
+    chatImages: {},
+    /* What the share sheet handed over, until the owner picks where it goes. */
+    shareImages: null,
+    shareText: ''
   }
 
   let appRoot = null
@@ -349,7 +356,11 @@
     if (state.token) headers.Authorization = 'Bearer ' + state.token
     if (state.unlockToken) headers[UNLOCK_HEADER] = state.unlockToken
     let body
-    if (settings.body !== undefined) {
+    if (settings.raw !== undefined) {
+      /* An image upload: the bytes themselves, typed, never base64 in JSON. */
+      headers['Content-Type'] = settings.contentType || 'application/octet-stream'
+      body = settings.raw
+    } else if (settings.body !== undefined) {
       headers['Content-Type'] = 'application/json'
       body = JSON.stringify(settings.body)
     }
@@ -602,6 +613,7 @@
     }
     if (hash.indexOf('#/idea-runs') === 0) return { name: 'idea-runs', key: 'idea-runs' }
     if (hash.indexOf('#/tasks') === 0) return { name: 'tasks', key: 'tasks' }
+    if (hash.indexOf('#/share') === 0) return { name: 'share', key: 'share' }
     if (hash.indexOf('#/new') === 0) return { name: 'new', key: 'new' }
     if (hash.indexOf('#/system') === 0) return { name: 'system', key: 'system' }
     if (hash.indexOf('#/phone') === 0) return { name: 'phone', key: 'phone' }
@@ -669,6 +681,7 @@
     if (route.name === 'terminal') return terminalScreen()
     if (route.name === 'session') return conversationScreen(route.id)
     if (route.name === 'tasks') return projectTasksScreen()
+    if (route.name === 'share') return shareScreen()
     if (route.name === 'idea') return ideaEditorScreen(route.id)
     if (route.name === 'ideas') return ideasListScreen(route)
     if (route.name === 'idea-runs') return ideaRunsScreen()
@@ -2044,6 +2057,16 @@
       grow()
       paintComposer()
     })
+    /* Images go up only when the message is sent, into this conversation's own folder, and reach
+       the agent as the desktop composer's image attachments do. */
+    const chatImages = state.chatImages[id] || (state.chatImages[id] = [])
+    const chatTray = imageTray(chatImages, { buttons: false, onChange: () => paintComposer() })
+    let imagesRefused = false
+    chatTray.node.classList.add('composer-images')
+    const attach = button('composer-attach', null, () => pickImages(composer, false, files => void chatTray.add(files)))
+    attach.appendChild(icon(IMAGE_ICONS.image, 20))
+    attach.setAttribute('aria-label', 'Attach images')
+    composer.appendChild(attach)
     composer.appendChild(input)
     composer.appendChild(dictation.node)
     composer.appendChild(stop)
@@ -2051,6 +2074,7 @@
     footer.appendChild(pendingHost)
     footer.appendChild(queuedHost)
     footer.appendChild(errorHost)
+    footer.appendChild(chatTray.node)
     footer.appendChild(composer)
 
     const lineHeight = 21
@@ -2091,13 +2115,20 @@
       const text = input.value.trim()
       const conversation = state.conversation
       const resume = conversation && conversation.needsResume
-      if (!resume && !text) return
+      if (!resume && !text && !chatImages.length) return
       dictation.stop()
       await run(async () => {
-        if (resume) await api('/api/sessions/' + encodeURIComponent(id) + '/resume', { method: 'POST' })
-        if (text) await api('/api/sessions/' + encodeURIComponent(id) + '/message', { method: 'POST', body: { text: text, mode: 'auto' } })
+        const base = '/api/sessions/' + encodeURIComponent(id)
+        if (resume) await api(base + '/resume', { method: 'POST' })
+        if (text || chatImages.length) {
+          const attachments = []
+          for (const image of chatImages) attachments.push(await uploadImage(base, image))
+          await api(base + '/message', { method: 'POST', body: attachments.length ? { text: text, mode: 'auto', attachments: attachments } : { text: text, mode: 'auto' } })
+        }
         input.value = ''
         state.drafts[id] = ''
+        chatImages.length = 0
+        chatTray.paint()
         grow()
       })
     }
@@ -2225,8 +2256,14 @@
       if (conversation && conversation.needsResume) label = 'Resume'
       else if (working) label = conversation && conversation.canSteer ? 'Steer' : 'Queue'
       primary.textContent = busy ? '…' : label
-      const empty = !input.value.trim()
+      const empty = !input.value.trim() && !chatImages.length
       primary.disabled = busy || (empty && label !== 'Resume')
+      const takesImages = Boolean(conversation && conversation.canAttachImages)
+      attach.hidden = !takesImages && !chatImages.length
+      attach.disabled = busy || !takesImages || chatImages.length >= IMAGE_LIMIT
+      const refused = Boolean(chatImages.length && conversation && !takesImages)
+      if (refused !== imagesRefused) chatTray.say(refused ? 'This conversation cannot take images: its provider does not accept them, or it runs on another computer. Remove them, or share them to another conversation.' : '')
+      imagesRefused = refused
       input.placeholder = label === 'Steer' ? 'Add to this turn' : label === 'Queue' ? 'Send after this turn' : 'Message'
       const stoppable = phase === 'running' || phase === 'starting' || phase === 'waiting_approval' || phase === 'waiting_input' || phase === 'interrupting'
       stop.hidden = !stoppable
@@ -2256,6 +2293,300 @@
         if (refetchTimer) { clearTimeout(refetchTimer); refetchTimer = null }
       }
     }
+  }
+
+  // ------------------------------------------------------------------ images
+
+  /* A photo leaves the phone at most this big: a 12 MP camera shot becomes a few hundred KiB
+     instead of a slow 5 MB upload, and the desktop's importer would shrink it anyway. */
+  const IMAGE_EDGE = 2560
+  const IMAGE_QUALITY = 0.85
+  /* A small image already inside the edge goes up untouched, so a PNG screenshot stays sharp. */
+  const IMAGE_PASS_BYTES = 1536 * 1024
+  const IMAGE_LIMIT = 10
+  /* Where the service worker leaves what the share sheet posted (sw.js receiveShare). */
+  const SHARE_CACHE = 'conductor-phone-share'
+
+  const readAsDataUrl = blob => new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result))
+    reader.onerror = () => reject(reader.error || new Error('This image could not be read.'))
+    reader.readAsDataURL(blob)
+  })
+
+  /* createImageBitmap needs no URL at all; the fallback is a data: URL, the only image URL the
+     page's CSP allows besides its own files. */
+  const decodeImage = async file => {
+    if (window.createImageBitmap) {
+      try { return await window.createImageBitmap(file) } catch (error) { /* try the element */ }
+    }
+    const url = await readAsDataUrl(file)
+    return new Promise((resolve, reject) => {
+      const image = new Image()
+      image.onload = () => resolve(image)
+      image.onerror = () => reject(new Error('This phone cannot read that image. Try a screenshot or a JPEG.'))
+      image.src = url
+    })
+  }
+
+  const drawImage = (source, width, height) => {
+    const canvas = document.createElement('canvas')
+    canvas.width = width
+    canvas.height = height
+    const context = canvas.getContext('2d')
+    /* JPEG has no transparency: a transparent screenshot gets white behind it, not black. */
+    context.fillStyle = '#fff'
+    context.fillRect(0, 0, width, height)
+    context.drawImage(source, 0, 0, width, height)
+    return canvas
+  }
+
+  const canvasBlob = (canvas, type, quality) => new Promise(resolve => {
+    if (!canvas.toBlob) { resolve(null); return }
+    canvas.toBlob(blob => resolve(blob), type, quality)
+  })
+
+  /* One picked or shared file, ready to upload: a downscaled copy, a small thumbnail, its name. */
+  const prepareImage = async file => {
+    const source = await decodeImage(file)
+    const width = source.naturalWidth || source.width
+    const height = source.naturalHeight || source.height
+    if (!width || !height) throw new Error('This image could not be read.')
+    const scale = Math.min(1, IMAGE_EDGE / Math.max(width, height))
+    const baseName = String(file.name || 'Phone image').replace(/[\\/\r\n\0]/g, '_').slice(0, 150) || 'Phone image'
+    let blob = null
+    let name = baseName
+    if (scale === 1 && file.size <= IMAGE_PASS_BYTES && /^image\/(png|jpeg|webp|gif)$/.test(file.type)) blob = file
+    else {
+      blob = await canvasBlob(drawImage(source, Math.max(1, Math.round(width * scale)), Math.max(1, Math.round(height * scale))), 'image/jpeg', IMAGE_QUALITY)
+      if (blob) name = baseName.replace(/\.[a-z0-9]{2,5}$/i, '') + '.jpg'
+    }
+    /* No canvas encoder (very old WebView): send the original and let the computer judge it. */
+    if (!blob) blob = file
+    const thumbScale = Math.min(1, 160 / Math.max(width, height))
+    const thumb = drawImage(source, Math.max(1, Math.round(width * thumbScale)), Math.max(1, Math.round(height * thumbScale))).toDataURL('image/jpeg', 0.7)
+    if (source.close) source.close()
+    return { key: Math.random().toString(36).slice(2) + Date.now().toString(36), name: name, blob: blob, type: blob.type || 'image/jpeg', thumb: thumb, uploaded: null, uploadedTo: '' }
+  }
+
+  /* A task title's image lines (`![name](path)`, as the desktop embeds them) are counted, not shown. */
+  const splitTaskImages = title => {
+    let images = 0
+    const lines = String(title || '').split('\n').filter(line => {
+      if (!/^!\[[^\]]*\]\([^\s()]+\)$/.test(line.trim())) return true
+      images += 1
+      return false
+    })
+    return { text: lines.join('\n').replace(/\n{3,}/g, '\n\n').trim(), images: images }
+  }
+
+  /* `base` is /api/projects/<id> or /api/sessions/<id>; an image already uploaded there is reused,
+     so a retry after a failed send does not upload it twice. */
+  const uploadImage = async (base, image) => {
+    if (image.uploaded && image.uploadedTo === base) return image.uploaded
+    const saved = await api(base + '/images?name=' + encodeURIComponent(image.name), { method: 'POST', raw: image.blob, contentType: /^image\/(png|jpeg|webp|gif)$/.test(image.type) ? image.type : 'image/jpeg' })
+    image.uploaded = saved
+    image.uploadedTo = base
+    return saved
+  }
+
+  const IMAGE_ICONS = {
+    camera: ['M4 8.5A1.5 1.5 0 0 1 5.5 7h2l1.5-2h6l1.5 2h2A1.5 1.5 0 0 1 20 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 17.5Z', 'M12 16a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z'],
+    image: ['M4.5 5h15A1.5 1.5 0 0 1 21 6.5v11a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5v-11A1.5 1.5 0 0 1 4.5 5Z', 'M3 16l5-5 4 4 3-3 6 6', 'M15.5 9.5h.01']
+  }
+
+  /* Opens the system picker. `camera` asks for the camera straight away (Android honours it; iOS
+     offers it in its sheet either way); otherwise several images may be chosen. */
+  const pickImages = (host, camera, onFiles) => {
+    const input = el('input', 'image-file')
+    input.type = 'file'
+    input.accept = 'image/*'
+    if (camera) input.setAttribute('capture', 'environment')
+    else input.multiple = true
+    input.hidden = true
+    input.addEventListener('change', () => {
+      const files = Array.prototype.slice.call(input.files || [])
+      if (input.parentNode) input.parentNode.removeChild(input)
+      if (files.length) onFiles(files)
+    })
+    /* iOS opens a picker only for an input that is in the page. */
+    host.appendChild(input)
+    input.click()
+  }
+
+  /* Prepares files into `list` (the caller's array, kept in state so a redraw never loses it). */
+  const addImages = async (list, files, onProblem) => {
+    const images = files.filter(file => !file.type || file.type.indexOf('image/') === 0)
+    if (images.length < files.length) onProblem('Only images can be attached.')
+    const room = IMAGE_LIMIT - list.length
+    if (images.length > room) onProblem('Attach at most ' + IMAGE_LIMIT + ' images at a time.')
+    for (const file of images.slice(0, Math.max(0, room))) {
+      try { list.push(await prepareImage(file)) } catch (error) { onProblem(errorMessage(error) || 'That image could not be read.') }
+    }
+  }
+
+  /* The thumbnails waiting to go, each with a remove button, and the buttons that add more.
+     `options.buttons` false hides the add buttons (the chat has its own); `onChange` redraws. */
+  const imageTray = (list, options) => {
+    const node = el('div', 'image-tray')
+    const strip = el('div', 'image-strip')
+    const actions = el('div', 'image-actions')
+    const problem = el('p', 'image-problem')
+    problem.hidden = true
+    let preparing = false
+    const say = text => { problem.textContent = text; problem.hidden = !text; fit() }
+    /* Without its own buttons (the chat) an empty tray takes no room at all. */
+    const fit = () => { if (options.buttons === false) node.hidden = !list.length && !preparing && problem.hidden }
+    const changed = () => { paint(); if (options.onChange) options.onChange() }
+    const add = async files => {
+      say('')
+      preparing = true
+      paint()
+      try { await addImages(list, files, say) } finally { preparing = false; changed() }
+    }
+    const paint = () => {
+      clear(strip)
+      for (const image of list) {
+        const item = el('figure', 'image-thumb')
+        const picture = el('img')
+        picture.src = image.thumb
+        picture.alt = image.name
+        item.appendChild(picture)
+        const remove = button('image-remove', null, () => {
+          const index = list.indexOf(image)
+          if (index >= 0) list.splice(index, 1)
+          changed()
+        })
+        remove.appendChild(icon(['M7 7l10 10', 'M17 7L7 17'], 14))
+        remove.setAttribute('aria-label', 'Remove ' + image.name)
+        item.appendChild(remove)
+        strip.appendChild(item)
+      }
+      if (preparing) strip.appendChild(el('span', 'image-preparing', 'Preparing…'))
+      strip.hidden = !list.length && !preparing
+      for (const control of actions.querySelectorAll('button')) control.disabled = preparing || list.length >= IMAGE_LIMIT || Boolean(options.disabled)
+      fit()
+    }
+    if (options.buttons !== false) {
+      const camera = button('ghost image-add', null, () => pickImages(node, true, files => void add(files)))
+      camera.appendChild(icon(IMAGE_ICONS.camera, 18))
+      camera.appendChild(el('span', null, 'Take photo'))
+      const gallery = button('ghost image-add', null, () => pickImages(node, false, files => void add(files)))
+      gallery.appendChild(icon(IMAGE_ICONS.image, 18))
+      gallery.appendChild(el('span', null, 'Add images'))
+      actions.appendChild(camera)
+      actions.appendChild(gallery)
+      node.appendChild(actions)
+    }
+    node.appendChild(strip)
+    node.appendChild(problem)
+    paint()
+    return { node: node, paint: paint, add: add, say: say }
+  }
+
+  // ------------------------------------------------------------------ share target
+
+  /* What the service worker kept from the share sheet, read once and then dropped. */
+  const takeShared = async () => {
+    if (!window.caches) return { files: [], text: '' }
+    const files = []
+    let text = ''
+    try {
+      const cache = await window.caches.open(SHARE_CACHE)
+      for (const request of await cache.keys()) {
+        const response = await cache.match(request)
+        if (!response) continue
+        const path = new URL(request.url).pathname
+        if (path === '/__share/text') { text = (await response.text()).slice(0, 4000); continue }
+        const blob = await response.blob()
+        let name = 'Shared image'
+        try { name = decodeURIComponent(response.headers.get('X-Name') || '') || name } catch (error) { /* keep the default */ }
+        files.push(new File([blob], name, { type: blob.type || response.headers.get('Content-Type') || 'image/jpeg' }))
+      }
+      await window.caches.delete(SHARE_CACHE)
+    } catch (error) { /* nothing usable arrived */ }
+    return { files: files, text: text }
+  }
+
+  /* Where Share > Conductor lands: the shared images, then a new task or a conversation. */
+  const shareScreen = () => {
+    const root = el('div', 'screen')
+    const header = topbar()
+    const scroll = scroller()
+    root.appendChild(header)
+    root.appendChild(scroll)
+    clear(header).appendChild(fill(el('div', 'topbar-main'), [el('h1', 'topbar-title', 'Share to Conductor')]))
+    let reading = state.shareImages === null
+    let problem = ''
+
+    const handOver = () => {
+      const images = state.shareImages || []
+      state.shareImages = null
+      return images
+    }
+
+    const draw = () => {
+      clear(scroll)
+      const body = el('div', 'form share-target')
+      if (reading) { body.appendChild(emptyNote('Reading what you shared…')); scroll.appendChild(body); return }
+      const images = state.shareImages || []
+      if (!images.length) {
+        body.appendChild(emptyNote('Nothing arrived', problem || 'Share the image to Conductor again. If this keeps happening, open Conductor once and wait for it to load, then share again.'))
+        body.appendChild(button('ghost wide', 'Back to sessions', () => go('#/')))
+        scroll.appendChild(body)
+        return
+      }
+      const tray = imageTray(images, { buttons: true, onChange: () => draw() })
+      if (problem) tray.say(problem)
+      body.appendChild(tray.node)
+
+      const task = el('section', 'card')
+      task.appendChild(el('h2', 'card-title', 'New task'))
+      task.appendChild(el('p', 'card-note', 'Write it on the Tasks screen; the images go with it.'))
+      task.appendChild(button('primary wide', 'Add as a task', () => {
+        state.taskImages = state.taskImages.concat(handOver())
+        if (state.shareText && state.form && !state.form.taskTitle) state.form.taskTitle = state.shareText
+        state.shareText = ''
+        go('#/tasks')
+      }))
+      body.appendChild(task)
+
+      const chat = el('section', 'card')
+      chat.appendChild(el('h2', 'card-title', 'Send to a conversation'))
+      const sessions = ((state.phone && state.phone.sessions) || [])
+        .filter(session => session.tabId && !session.archived && (!session.machineId || session.machineId === 'local'))
+        .slice()
+        .sort((left, right) => String(right.updatedAt || '').localeCompare(String(left.updatedAt || '')))
+        .slice(0, 30)
+      if (!sessions.length) chat.appendChild(el('p', 'card-note', state.phone ? 'No conversation on this computer is open.' : 'Reading this computer…'))
+      for (const session of sessions) {
+        const row = button('share-session', null, () => {
+          state.chatImages[session.id] = (state.chatImages[session.id] || []).concat(handOver())
+          if (state.shareText && !state.drafts[session.id]) state.drafts[session.id] = state.shareText
+          state.shareText = ''
+          go('#/session/' + encodeURIComponent(session.id))
+        })
+        row.appendChild(el('span', 'share-session-title', session.title || 'Untitled'))
+        row.appendChild(el('span', 'share-session-meta', dotRow([providerWord(session.provider), session.projectName, STATE_WORDS[session.state] || 'Idle'])))
+        chat.appendChild(row)
+      }
+      body.appendChild(chat)
+      scroll.appendChild(body)
+    }
+
+    if (reading) {
+      void (async () => {
+        const shared = await takeShared()
+        const images = []
+        await addImages(images, shared.files, text => { problem = text })
+        state.shareImages = images
+        state.shareText = shared.text
+        reading = false
+        if (screen && screen.key === 'share') draw()
+      })()
+    }
+    draw()
+    return { key: 'share', root: root, update: () => { if (!reading) draw() } }
   }
 
   // ------------------------------------------------------------------ project tasks screen
@@ -2296,7 +2627,7 @@
       const top = scroll.scrollTop
       clear(scroll)
       const phone = state.phone
-      if (!phone) { scroll.appendChild(emptyNote('Reading this computerâ€¦')); return }
+      if (!phone) { scroll.appendChild(emptyNote('Reading this computer…')); return }
       const form = state.form
       const body = el('div', 'form project-tasks-phone')
       body.appendChild(field('Project', select(
@@ -2322,19 +2653,31 @@
       taskKind.setAttribute('aria-label', 'Task type'); taskPriority.setAttribute('aria-label', 'Task priority'); taskWeight.setAttribute('aria-label', 'Task weight')
       scales.appendChild(taskKind); scales.appendChild(taskPriority); scales.appendChild(taskWeight)
       quick.appendChild(scales)
+      /* Images ride the task as Markdown lines, the way the desktop task pane embeds them. */
+      const tray = imageTray(state.taskImages, { onChange: () => paintAdd() })
+      quick.appendChild(tray.node)
       const add = button('primary wide', 'Add task', async () => {
         if (adding || !form.taskTitle.trim()) return
         adding = true; paintAdd(); problem = ''
         try {
-          const created = await api('/api/projects/' + encodeURIComponent(form.projectId) + '/tasks', { method: 'POST', body: { title: form.taskTitle, kind: form.taskKind, priority: form.taskPriority, weight: form.taskWeight } })
+          const base = '/api/projects/' + encodeURIComponent(form.projectId)
+          const images = []
+          for (const image of state.taskImages) images.push(await uploadImage(base, image))
+          const created = await api(base + '/tasks', { method: 'POST', body: { title: form.taskTitle, kind: form.taskKind, priority: form.taskPriority, weight: form.taskWeight, images: images } })
           form.taskTitle = ''
+          state.taskImages.length = 0
           showToast({ kind: 'done', title: 'Project task added', body: created && created.title, url: '#/tasks' })
           page = { tasks: [], page: { offset: 0, limit: 20, total: 0, hasMore: false } }
           adding = false
           await load(true)
         } catch (error) { problem = errorMessage(error); adding = false; draw() }
       })
-      const paintAdd = () => { add.disabled = adding || !form.projectId || !form.taskTitle.trim(); add.textContent = adding ? 'Addingâ€¦' : 'Add task' }
+      const paintAdd = () => {
+        const count = state.taskImages.length
+        add.disabled = adding || !form.projectId || !form.taskTitle.trim()
+        add.textContent = adding ? 'Adding…' : count ? 'Add task with ' + count + (count === 1 ? ' image' : ' images') : 'Add task'
+        report.placeholder = count ? 'Describe what the image shows' : 'Add a task, bug, feature, or idea'
+      }
       paintAdd()
       quick.appendChild(add)
       body.appendChild(quick)
@@ -2347,18 +2690,21 @@
       const list = el('div', 'phone-task-list')
       for (const task of page.tasks || []) {
         const card = el('article', 'card phone-task')
-        const text = el('button', 'phone-task-title' + (expanded[task.id] ? ' expanded' : ''), task.title)
+        const shown = splitTaskImages(task.title)
+        const text = el('button', 'phone-task-title' + (expanded[task.id] ? ' expanded' : ''), shown.text)
         text.type = 'button'
         text.setAttribute('aria-expanded', expanded[task.id] ? 'true' : 'false')
         text.addEventListener('click', () => { expanded[task.id] = !expanded[task.id]; draw() })
         card.appendChild(text)
-        card.appendChild(el('p', 'card-note', [task.status === 'doing' ? 'In progress' : 'To do', task.kind, task.priority + ' priority', task.weight + ' weight'].join(' · ')))
+        const facts = [task.status === 'doing' ? 'In progress' : 'To do', task.kind, task.priority + ' priority', task.weight + ' weight']
+        if (shown.images) facts.push(shown.images + (shown.images === 1 ? ' image' : ' images'))
+        card.appendChild(el('p', 'card-note', facts.join(' · ')))
         list.appendChild(card)
       }
       if (!page.tasks.length && !loading) list.appendChild(emptyNote('No open tasks in this project.'))
       body.appendChild(list)
-      if (page.page.hasMore) body.appendChild(button('ghost wide task-more', loading ? 'Loadingâ€¦' : 'Load more', () => { if (!loading) void load(false) }))
-      if (loading && !page.tasks.length) body.appendChild(emptyNote('Loading tasksâ€¦'))
+      if (page.page.hasMore) body.appendChild(button('ghost wide task-more', loading ? 'Loading…' : 'Load more', () => { if (!loading) void load(false) }))
+      if (loading && !page.tasks.length) body.appendChild(emptyNote('Loading tasks…'))
       if (problem) body.appendChild(el('p', 'pending-error', problem))
       scroll.appendChild(body)
       scroll.scrollTop = top

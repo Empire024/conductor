@@ -3232,6 +3232,7 @@ app.whenReady().then(async () => {
     version: app.getVersion(),
     ui: agentControlUi.request,
     metrics: () => systemMetrics.sample(),
+    importImage: async (cwd, name, bytes) => { const attachment = await importPromptImage(cwd, name, bytes); invalidateProjectFiles(cwd); return attachment },
     weeklyUsage,
     projectTasks: new PhoneProjectTasks({
       backlogs: projectBacklogs,

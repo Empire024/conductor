@@ -74,6 +74,30 @@ certificate for everything but that one name, so a phone that trusts the authori
   short) as the providers last reported them.
 - **Phone**: the phone's own name, notifications on/off with a test button, and unpair.
 
+### Images from the phone
+
+- **Tasks**: Quick add has **Take photo** (opens the camera) and **Add images** (the gallery,
+  several at once). Thumbnails show before adding, each with a remove button. The images go with the
+  task as Markdown image lines, exactly as the desktop task pane embeds them, so the desktop shows
+  them on the task. Only projects on this computer take images.
+- **A conversation**: the image button beside the composer attaches gallery images (iOS also offers
+  the camera in its sheet). They reach the agent as the desktop composer's native image attachments.
+  An image with no text sends "See the attached image." The button shows only when the provider
+  accepts images and the conversation runs on this computer.
+- **Share**: the installed app is a Web Share Target. Share a screenshot to **Conductor** from the
+  gallery and it opens on a picker: **Add as a task**, or one of the open conversations on this
+  computer. The service worker keeps the shared files on the phone (the share POST carries no token),
+  and the app uploads them once a target is picked. Android Chrome supports this for an installed
+  app. **iOS Safari does not support share targets**, so on an iPhone, open Conductor and use Add
+  images or the composer's image button.
+- **Limits**: a photo is downscaled on the phone to a 2560 px long edge as JPEG quality 0.85, and a
+  small image already inside that edge goes up unchanged, so a PNG screenshot stays sharp. The
+  listener takes at most 12 MiB per upload and 10 images per task or message. It saves each image
+  through the desktop importer (`src/main/prompt-images.ts`: decode check, 4096 px and 2 MiB cap)
+  under the gitignored `.conductor/prompt-images/`. Uploads use the paired phone's token and the
+  lock like every other route (`POST /api/projects/:id/images`, `POST /api/sessions/:id/images`). A
+  message or task may name only the paths those uploads write.
+
 ## When the phone shows nothing
 
 A Home Screen app on iOS shows its splash colour and then a blank page when the address it was added
@@ -162,3 +186,11 @@ first while a phone is connected.
   connection check, the trust page, the iPhone Chrome and Safari landings, a real pairing, the boot
   card with app.js blocked, and "not answering" after phone access is switched off. Screenshots and
   `smoke-report.json` go to `artifacts/swarm-2026-09-23/phone-app/`.
+- `scripts/smoke-phone-images.mjs` (run under `scripts/smoke-lock.mjs`): a parked Electron app with
+  the synthetic Claude fixture. A paired phone uploads raw image bytes, which the real importer
+  saves. A message carries the image, and the fixture's `SYNTHETIC IMAGES` turn confirms that the
+  Claude CLI received a native PNG block. A task embeds its image, and the desktop task pane shows
+  it. A forged path and a share POST that reached the computer are handled. The served phone app
+  then runs headless in WebKit and Chromium, with no window: it picks files through the real file
+  chooser, removes a thumbnail, downscales a 4000 px photo to 2560 px before upload, and sends
+  images with a message and a task. Screenshots go to `artifacts/phone-images/`.

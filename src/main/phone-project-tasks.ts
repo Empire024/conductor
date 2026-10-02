@@ -30,7 +30,7 @@ export class PhoneProjectTasks {
     return {projectId:project.id,tasks,page:{offset:Number(page.offset),limit:Number(page.limit),total:Number(page.total),hasMore:page.hasMore as boolean}}
   }
 
-  async create(project: ProjectRecord, input: Required<PhoneProjectTaskRequest>): Promise<PhoneProjectTaskResult> {
+  async create(project: ProjectRecord, input: Required<Omit<PhoneProjectTaskRequest, 'images'>>): Promise<PhoneProjectTaskResult> {
     let result: unknown
     if (project.remote) {
       // Use the origin's own project id. A remote project never falls back to a same-named local

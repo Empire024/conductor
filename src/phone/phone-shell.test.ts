@@ -355,10 +355,19 @@ describe('phone notification preferences', () => {
 
 /* app.js itself, booted on a paired phone at a given hash, with the same stub DOM. The server is a
    function from each request to its JSON answer; throwing from it is a network failure. */
-interface AppCall { path: string; method: string; body: any; keepalive: boolean }
+interface AppCall { path: string; method: string; body: any; keepalive: boolean; raw?: unknown; contentType?: string }
+
+/* Just enough canvas for the image tray: a thumbnail data URL and a re-encoded JPEG blob. */
+const fakeCanvas = () => Object.assign(new FakeNode('canvas'), {
+  width: 0,
+  height: 0,
+  getContext: () => ({ fillStyle: '', fillRect: () => undefined, drawImage: () => undefined }),
+  toDataURL: () => 'data:image/jpeg;base64,dGh1bWI=',
+  toBlob: (done: (blob: Blob) => void, type: string) => done(new Blob(['scaled'], { type }))
+})
 
 /* A test that is not about the lock never sees its boot-time read: the computer has no code set. */
-const bootApp = (hash: string, respond: (call: AppCall) => unknown, options: { lock?: boolean; markdown?: boolean; globals?: Record<string, unknown> } = {}) => {
+const bootApp = (hash: string, respond: (call: AppCall) => unknown, options: { lock?: boolean; markdown?: boolean; globals?: Record<string, unknown>; phoneState?: unknown } = {}) => {
   focusedNode = null
   const timers: Array<{ at: number; fn: () => void; id: number }> = []
   let now = 0
@@ -394,7 +403,7 @@ const bootApp = (hash: string, respond: (call: AppCall) => unknown, options: { l
     body: new FakeNode('body'),
     documentElement: { style: { setProperty: () => undefined } },
     get activeElement() { return focusedNode },
-    createElement: (tag: string) => new FakeNode(tag),
+    createElement: (tag: string) => (tag === 'canvas' ? fakeCanvas() : new FakeNode(tag)),
     createElementNS: (_ns: string, tag: string) => new FakeNode(tag),
     createTextNode: (text: string) => { const node = new FakeNode('#text'); node.textContent = text; return node },
     getElementById: (id: string) => ({ app, pill, toasts } as Record<string, FakeNode>)[id] ?? null,
@@ -402,9 +411,15 @@ const bootApp = (hash: string, respond: (call: AppCall) => unknown, options: { l
     removeEventListener: () => undefined
   }
   const fetch = async (path: string, init: any = {}) => {
-    if (path === '/api/stream') { streams.push({ headers: { ...(init.headers || {}) } }); return new Promise(() => undefined) }
+    if (path === '/api/stream') {
+      streams.push({ headers: { ...(init.headers || {}) } })
+      /* One `state` event, then the stream ends; a reconnect only waits on a timer. */
+      if (options.phoneState) return new Response('event: state\ndata: ' + JSON.stringify(options.phoneState) + '\n\n', { status: 200 })
+      return new Promise(() => undefined)
+    }
     if (path === '/api/lock/state' && !options.lock) return { status: 200, ok: true, text: async () => JSON.stringify({ configured: false, unlocked: false }) }
-    const call: AppCall = { path, method: init.method || 'GET', body: init.body ? JSON.parse(init.body) : undefined, keepalive: Boolean(init.keepalive) }
+    const text = typeof init.body === 'string'
+    const call: AppCall = { path, method: init.method || 'GET', body: text ? JSON.parse(init.body) : undefined, keepalive: Boolean(init.keepalive), ...(init.body && !text ? { raw: init.body, contentType: (init.headers || {})['Content-Type'] } : {}) }
     calls.push(call)
     headersSent.push({ path, headers: { ...(init.headers || {}) } })
     const answer = await respond(call) as any
@@ -433,7 +448,7 @@ const bootApp = (hash: string, respond: (call: AppCall) => unknown, options: { l
   if (options.markdown) runInNewContext(markdownSource, { window })
   runInNewContext(appSource, {
     window, document, navigator: window.navigator, fetch, setTimeout: setTimer, clearTimeout: clearTimer,
-    setInterval: () => 0, clearInterval: () => undefined, AbortController, TextDecoder, Response, URL
+    setInterval: () => 0, clearInterval: () => undefined, AbortController, TextDecoder, Response, URL, Blob, File
   })
 
   const advance = (ms: number) => {
@@ -658,6 +673,38 @@ describe('sw.js', () => {
     expect(await (await sw.request('/'))!.text()).toContain('cached shell')
   })
 
+  it('keeps a share-sheet POST on the phone: images and text into the share cache, then #/share', async () => {
+    const listeners: Record<string, Listener> = {}
+    const stored = new Map<string, Response>()
+    const opened: string[] = []
+    const caches = {
+      open: async (name: string) => { opened.push(name); return { put: async (key: string, response: Response) => { stored.set(key, response) }, add: async () => undefined } },
+      delete: async () => true, keys: async () => [], match: async () => undefined
+    }
+    const self = { location: new URL(ORIGIN + '/sw.js'), addEventListener: (type: string, fn: Listener) => { listeners[type] = fn }, skipWaiting: () => undefined, clients: { claim: async () => undefined, matchAll: async () => [] }, registration: {} }
+    runInNewContext(swSource, { self, caches, fetch: () => Promise.reject(new Error('the share must not reach the network')), Response, URL })
+    const form = new FormData()
+    form.append('images', new File(['png'], 'Screenshot.png', { type: 'image/png' }))
+    form.append('images', new File(['text'], 'notes.txt', { type: 'text/plain' }))
+    form.append('text', 'Look at this')
+    let answer: Promise<Response> | null = null
+    listeners.fetch!({ request: { method: 'POST', url: ORIGIN + '/share', formData: async () => form }, respondWith: (value: Promise<Response>) => { answer = value } })
+    const response = await answer!
+    expect(response.status).toBe(303)
+    expect(response.headers.get('Location')).toBe(ORIGIN + '/#/share')
+    expect(opened).toEqual(['conductor-phone-share'])
+    expect([...stored.keys()]).toEqual(['/__share/0', '/__share/text'])
+    expect(stored.get('/__share/0')!.headers.get('X-Name')).toBe('Screenshot.png')
+    expect(await stored.get('/__share/0')!.text()).toBe('png')
+    expect(await stored.get('/__share/text')!.text()).toBe('Look at this')
+  })
+
+  it('declares the share target the worker answers', () => {
+    const manifest = JSON.parse(readFileSync(new URL('./manifest.webmanifest', import.meta.url), 'utf8'))
+    expect(manifest.share_target).toMatchObject({ action: '/share', method: 'POST', enctype: 'multipart/form-data', params: { files: [{ name: 'images' }] } })
+    expect(manifest.share_target.params.files[0].accept).toContain('image/*')
+  })
+
   it('never touches /api, so the health check always asks the computer', async () => {
     const sw = worker({}, unreachable)
     expect(await sw.request('/api/health', 'cors')).toBeNull()
@@ -783,6 +830,151 @@ describe('phone conversation markdown', () => {
     const assistant = page.app.querySelector('assistant')!
     expect(assistant.find(node => node.tagName === 'STRONG')).toBeUndefined()
     expect(assistant.textContent).toContain('plain **text**')
+  })
+})
+
+describe('phone images', () => {
+  /* createImageBitmap is how the app reads a picked file; the size decides whether it is scaled. */
+  const bitmaps = (width: number, height: number) => ({ createImageBitmap: async () => ({ width, height, close: () => undefined }) })
+  const imageConversation = (canAttachImages: boolean) => (call: AppCall) => {
+    if (call.path === '/api/sessions/s1') {
+      return { summary: { id: 's1', title: 'Chat', phase: 'idle', state: 'idle', provider: 'claude', model: 'opus' }, items: [], pending: [], queued: [], canAttachImages }
+    }
+    if (call.path.startsWith('/api/sessions/s1/images?name=')) {
+      const name = decodeURIComponent(call.path.slice(call.path.indexOf('=') + 1))
+      return { id: 'img-' + name, kind: 'image', name, path: '.conductor/prompt-images/' + name.length.toString().padStart(8, '0') + '-0000-4000-8000-000000000000.png' }
+    }
+    return {}
+  }
+  const pick = async (page: ReturnType<typeof bootApp>, files: unknown[]) => {
+    const input = page.app.find(node => node.tagName === 'INPUT' && node.className.includes('image-file'))!
+    expect(input.getAttribute('capture')).toBeNull()
+    expect((input as any).multiple).toBe(true)
+    expect((input as any).accept).toBe('image/*')
+    ;(input as any).files = files
+    input.dispatch('change')
+    await settleAll()
+  }
+  const thumbs = (page: ReturnType<typeof bootApp>) => page.app.querySelectorAll('image-thumb')
+
+  it('attaches gallery images to a message: thumbnails first, one removable, then uploads and sends them as attachments', async () => {
+    const page = bootApp('#/session/s1', imageConversation(true), { globals: bitmaps(1080, 2400) })
+    await settleAll()
+    const attach = page.app.querySelector('composer-attach')!
+    expect(attach.hidden).toBe(false)
+    attach.click()
+    const screenshot = new File(['png-bytes'], 'Screenshot_1.png', { type: 'image/png' })
+    const second = new File(['other'], 'second.png', { type: 'image/png' })
+    await pick(page, [screenshot, second])
+    expect(thumbs(page)).toHaveLength(2)
+    expect(thumbs(page)[0]!.find(node => node.tagName === 'IMG')!.src).toBe('data:image/jpeg;base64,dGh1bWI=')
+    /* Images alone can be sent. */
+    expect((page.app.querySelector('composer-send') as any).disabled).toBe(false)
+    thumbs(page)[1]!.find(node => node.className.includes('image-remove'))!.click()
+    expect(thumbs(page)).toHaveLength(1)
+    page.app.find(node => node.tagName === 'TEXTAREA' && node.className.includes('composer-input'))!.typeText('This is the bug')
+    page.app.querySelector('composer-send')!.click()
+    await settleAll()
+    const posts = page.posts()
+    const upload = posts.find(call => call.path.startsWith('/api/sessions/s1/images'))!
+    expect(upload.path).toBe('/api/sessions/s1/images?name=Screenshot_1.png')
+    /* A small screenshot inside the size limit goes up untouched, as its own type. */
+    expect(upload.raw).toBe(screenshot)
+    expect(upload.contentType).toBe('image/png')
+    expect(posts.filter(call => call.path.startsWith('/api/sessions/s1/images'))).toHaveLength(1)
+    const message = posts.find(call => call.path === '/api/sessions/s1/message')!
+    expect(message.body).toEqual({ text: 'This is the bug', mode: 'auto', attachments: [{ id: 'img-Screenshot_1.png', kind: 'image', name: 'Screenshot_1.png', path: '.conductor/prompt-images/00000016-0000-4000-8000-000000000000.png' }] })
+    expect(posts.indexOf(upload)).toBeLessThan(posts.indexOf(message))
+    expect(thumbs(page)).toHaveLength(0)
+  })
+
+  it('downscales a large photo to a JPEG before it leaves the phone', async () => {
+    const page = bootApp('#/session/s1', imageConversation(true), { globals: bitmaps(4032, 3024) })
+    await settleAll()
+    page.app.querySelector('composer-attach')!.click()
+    await pick(page, [new File(['x'.repeat(10)], 'IMG_0001.HEIC.jpeg', { type: 'image/jpeg' })])
+    page.app.querySelector('composer-send')!.click()
+    await settleAll()
+    const upload = page.posts().find(call => call.path.startsWith('/api/sessions/s1/images'))!
+    expect(upload.path).toBe('/api/sessions/s1/images?name=IMG_0001.HEIC.jpg')
+    expect(upload.contentType).toBe('image/jpeg')
+    expect(await (upload.raw as Blob).text()).toBe('scaled')
+    expect(page.posts().find(call => call.path === '/api/sessions/s1/message')!.body.text).toBe('')
+  })
+
+  it('offers no attach button to a conversation that cannot take images', async () => {
+    const page = bootApp('#/session/s1', imageConversation(false), { globals: bitmaps(10, 10) })
+    await settleAll()
+    expect(page.app.querySelector('composer-attach')!.hidden).toBe(true)
+  })
+
+  const phoneState = {
+    projects: [{ id: 'p1', name: 'Conductor', machineId: 'local', workspaces: [{ id: 'w1', name: 'Main' }] }],
+    sessions: [{ id: 's1', title: 'Fix the login bug', provider: 'claude', projectName: 'Conductor', machineId: 'local', tabId: 't1', state: 'idle', archived: false, updatedAt: '2026-10-02T10:00:00.000Z' }],
+    machines: [{ id: 'local', name: 'MAIN', status: 'online' }], providers: [], counts: { attention: 0 }
+  }
+
+  it('adds a task with a photo: uploads it to the project, names it on the task, and lists the task without the image line', async () => {
+    let tasks: unknown[] = []
+    const page = bootApp('#/tasks', call => {
+      if (call.path.startsWith('/api/projects/p1/tasks?')) return { projectId: 'p1', tasks, page: { offset: 0, limit: 20, total: tasks.length, hasMore: false } }
+      if (call.path.startsWith('/api/projects/p1/images?name=')) return { id: 'img-1', kind: 'image', name: 'photo.jpg', path: '.conductor/prompt-images/00000001-0000-4000-8000-000000000000.jpg' }
+      if (call.path === '/api/projects/p1/tasks') {
+        tasks = [{ id: 'task-1', title: call.body.title + '\n\n![photo.jpg](.conductor/prompt-images/00000001-0000-4000-8000-000000000000.jpg)', kind: 'bug', status: 'todo', priority: 'normal', weight: 'medium' }]
+        return { id: 'task-1', projectId: 'p1', title: call.body.title, kind: 'bug', priority: 'normal', weight: 'medium' }
+      }
+      return {}
+    }, { globals: bitmaps(1200, 900), phoneState })
+    await settleAll()
+    const camera = page.app.find(node => node.tagName === 'BUTTON' && node.textContent.includes('Take photo'))!
+    camera.click()
+    const input = page.app.find(node => node.tagName === 'INPUT' && node.className.includes('image-file'))!
+    expect(input.getAttribute('capture')).toBe('environment')
+    ;(input as any).files = [new File(['jpeg'], 'photo.jpg', { type: 'image/jpeg' })]
+    input.dispatch('change')
+    await settleAll()
+    expect(thumbs(page)).toHaveLength(1)
+    const add = page.app.find(node => node.tagName === 'BUTTON' && node.className.includes('primary wide') && node.textContent.startsWith('Add task'))!
+    expect(add.textContent).toBe('Add task with 1 image')
+    page.app.find(node => node.tagName === 'TEXTAREA' && node.getAttribute('aria-label') === 'New project task')!.typeText('Settings page overflows')
+    add.click()
+    await settleAll()
+    const posted = page.posts().find(call => call.path === '/api/projects/p1/tasks')!
+    expect(posted.body).toMatchObject({ title: 'Settings page overflows', images: [{ id: 'img-1', kind: 'image', path: '.conductor/prompt-images/00000001-0000-4000-8000-000000000000.jpg' }] })
+    expect(page.posts().find(call => call.path.startsWith('/api/projects/p1/images'))!.contentType).toBe('image/jpeg')
+    const card = page.app.querySelector('phone-task')!
+    expect(card.textContent).toContain('Settings page overflows')
+    expect(card.textContent).not.toContain('prompt-images')
+    expect(card.textContent).toContain('1 image')
+  })
+
+  it('lands a share-sheet image on #/share and hands it to the chosen conversation', async () => {
+    const shared = new Map<string, Response>([
+      [ORIGIN + '/__share/0', new Response(new Blob(['png'], { type: 'image/png' }), { headers: { 'Content-Type': 'image/png', 'X-Name': encodeURIComponent('Screenshot 2026.png') } })],
+      [ORIGIN + '/__share/text', new Response('Look at this')]
+    ])
+    let deleted = ''
+    const caches = {
+      open: async () => ({ keys: async () => [...shared.keys()].map(url => ({ url })), match: async (request: { url: string }) => shared.get(request.url) }),
+      delete: async (name: string) => { deleted = name; return true }
+    }
+    const page = bootApp('#/share', imageConversation(true), { globals: { ...bitmaps(1080, 2400), caches }, phoneState })
+    await settleAll()
+    expect(deleted).toBe('conductor-phone-share')
+    expect(page.app.textContent).toContain('Share to Conductor')
+    expect(thumbs(page)).toHaveLength(1)
+    page.app.find(node => node.tagName === 'BUTTON' && node.className.includes('share-session'))!.click()
+    page.advance(0)
+    await settleAll()
+    expect(page.window.location.hash).toBe('#/session/s1')
+    expect(thumbs(page)).toHaveLength(1)
+    const composer = page.app.find(node => node.tagName === 'TEXTAREA' && node.className.includes('composer-input'))!
+    expect(composer.value).toBe('Look at this')
+    page.app.querySelector('composer-send')!.click()
+    await settleAll()
+    const message = page.posts().find(call => call.path === '/api/sessions/s1/message')!
+    expect(message.body.attachments).toHaveLength(1)
+    expect(message.body.attachments[0].name).toBe('Screenshot 2026.png')
   })
 })
 

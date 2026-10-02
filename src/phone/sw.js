@@ -11,6 +11,9 @@ const CACHE = 'conductor-phone-v3'
    can be re-registered without a window open. Same origin-scoped exposure as localStorage. */
 const AUTH_CACHE = 'conductor-phone-auth'
 const AUTH_KEY = '/__push-auth'
+/* What the share sheet posted to /share, until the app's #/share screen reads and drops it. */
+const SHARE_CACHE = 'conductor-phone-share'
+const SHARE_LIMIT = 10
 
 const SHELL = [
   '/',
@@ -168,6 +171,26 @@ const resubscribe = async () => {
   })
 }
 
+/* The manifest's share_target. The POST never leaves the phone: it carries no bearer token, so
+   the files are kept here and the app, which has one, uploads them once the owner picks a task
+   or a conversation. A share that fails to parse still lands on #/share, which says so. */
+const receiveShare = async request => {
+  try {
+    const form = await request.formData()
+    const files = form.getAll('images').filter(file => file && typeof file === 'object' && typeof file.type === 'string' && file.type.indexOf('image/') === 0).slice(0, SHARE_LIMIT)
+    const text = [form.get('title'), form.get('text'), form.get('url')].filter(value => typeof value === 'string' && value.trim()).join('\n').slice(0, 4000)
+    await caches.delete(SHARE_CACHE)
+    const cache = await caches.open(SHARE_CACHE)
+    let index = 0
+    for (const file of files) {
+      await cache.put('/__share/' + index, new Response(file, { headers: { 'Content-Type': file.type, 'X-Name': encodeURIComponent(file.name || 'Shared image ' + (index + 1)) } }))
+      index += 1
+    }
+    if (text) await cache.put('/__share/text', new Response(text, { headers: { 'Content-Type': 'text/plain; charset=utf-8' } }))
+  } catch (error) { /* the share screen reports that nothing arrived */ }
+  return Response.redirect(new URL('/#/share', self.location.origin).href, 303)
+}
+
 self.addEventListener('install', event => {
   self.skipWaiting()
   /* Per-file so one missing icon cannot fail the whole install. */
@@ -179,17 +202,18 @@ self.addEventListener('install', event => {
 self.addEventListener('activate', event => {
   event.waitUntil((async () => {
     const names = await caches.keys()
-    await Promise.all(names.map(name => (name === CACHE || name === AUTH_CACHE ? undefined : caches.delete(name))))
+    await Promise.all(names.map(name => (name === CACHE || name === AUTH_CACHE || name === SHARE_CACHE ? undefined : caches.delete(name))))
     await self.clients.claim()
   })())
 })
 
 self.addEventListener('fetch', event => {
   const request = event.request
-  if (request.method !== 'GET') return
   let url = null
   try { url = new URL(request.url) } catch (error) { return }
   if (url.origin !== self.location.origin) return
+  if (request.method === 'POST' && url.pathname === '/share') { event.respondWith(receiveShare(request)); return }
+  if (request.method !== 'GET') return
   if (url.pathname.startsWith('/api/')) return
   if (!SHELL.includes(url.pathname)) return
   event.respondWith(networkFirst(request))

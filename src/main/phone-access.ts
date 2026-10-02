@@ -10,8 +10,8 @@ import { settingsForRuntime } from '../shared/structured-agent'
 import type { SystemMetricsSnapshot } from '../shared/system-metrics'
 import { normalizeUsageWindows, summarizeUsage, updatedSequence, usageWindowAppliesToModel, type UsageWindow } from '../shared/usage-accounting'
 import {
-  DEFAULT_PHONE_NOTIFICATION_PREFS, DEFAULT_PHONE_SETTINGS, PHONE_PAIRING_TTL_MS, PHONE_STATE_LIMITS,
-  type PhoneAccessSettings, type PhoneAccessState, type PhoneConversation, type PhoneDevice, type PhoneMessageMode, type PhoneMetrics,
+  DEFAULT_PHONE_NOTIFICATION_PREFS, DEFAULT_PHONE_SETTINGS, PHONE_IMAGE_LIMIT, PHONE_IMAGE_PATH, PHONE_PAIRING_TTL_MS, PHONE_STATE_LIMITS,
+  type PhoneAccessSettings, type PhoneImage, type PhoneAccessState, type PhoneConversation, type PhoneDevice, type PhoneMessageMode, type PhoneMetrics,
   type PhoneNotification, type PhoneNotificationPrefs, type PhoneOpenTabRequest, type PhoneOpenTabResult, type PhonePairingOffer, type PhoneProjectTaskPage, type PhoneProjectTaskRequest, type PhoneProjectTaskResult, type PhonePushSubscription,
   type PhoneSelf, type PhoneSessionSummary, type PhoneState, type PhoneTailnetView, type PhoneTimelineItem, type PhoneUsageWindow
 } from '../shared/phone-access'
@@ -163,6 +163,8 @@ export interface PhoneAccessDependencies {
   version: string
   ui(request: AgentControlUiRequest): Promise<unknown>
   metrics(): Promise<SystemMetricsSnapshot>
+  /** Saves uploaded bytes as a workspace prompt image under `cwd` (src/main/prompt-images.ts). */
+  importImage?(cwd: string, name: string, bytes: Uint8Array): Promise<ContextAttachment>
   /** Injected for tests; defaults to the real sender over global fetch. */
   push?: typeof sendWebPush
   now?(): number
@@ -876,6 +878,7 @@ export class PhoneAccessService {
       queued: (projection?.queuedPrompts ?? (projection?.queued ? [projection.queued] : [])).map(prompt => ({ id: prompt.id, text: previewText(prompt.text, 400) })),
       truncated: Boolean(projection?.truncated) || kept.length < roots.length,
       canSteer: projection?.capabilities?.steering === true,
+      canAttachImages: projection?.capabilities?.imageAttachments === true && !this.deps.remote?.isRemote(id) && Boolean(this.deps.importImage),
       needsResume: Boolean(projection?.nativeSessionId) && (projection?.phase === 'interrupted' || projection?.phase === 'disconnected')
     }
   }
@@ -898,12 +901,50 @@ export class PhoneAccessService {
     return { projection, remote: Boolean(this.deps.remote?.isRemote(id)) }
   }
 
-  async sendMessage(id: string, input: { text: unknown; mode?: unknown }): Promise<{ phase: SessionProjection['phase']; mode: Exclude<PhoneMessageMode, 'auto'> }> {
-    const text = typeof input.text === 'string' ? input.text.trim() : ''
+  /** Uploaded bytes become a prompt image of a project on this computer, for one of its tasks. */
+  async importProjectImage(projectId: unknown, name: unknown, bytes: Uint8Array): Promise<PhoneImage> {
+    if (typeof projectId !== 'string' || !projectId || projectId.length > 160) throw new PhoneAccessError('Choose a project that is open in Conductor.', 404)
+    const project = this.deps.database.getProject(projectId)
+    if (!project) throw new PhoneAccessError('Choose a project that is open in Conductor.', 404)
+    if (project.remote || !project.path) throw new PhoneAccessError(`“${project.name}” lives on ${project.remote?.machineName ?? 'another machine'}; images can only be added to projects on this computer.`, 409)
+    return this.importImage(project.path, name, bytes)
+  }
+
+  /** Uploaded bytes become a prompt image in the conversation's own folder, as the desktop composer saves them. */
+  async importSessionImage(id: string, name: unknown, bytes: Uint8Array): Promise<PhoneImage> {
+    const { projection, remote } = this.structuredOnly(id)
+    if (remote) throw new PhoneAccessError('Images can only be sent to conversations running on this computer.', 409)
+    if (projection.capabilities?.imageAttachments !== true) throw new PhoneAccessError('This conversation’s provider does not take images.', 409)
+    const cwd = this.deps.database.structured.spec<AgentSpec>(id)?.cwd
+    if (!cwd) throw new PhoneAccessError('That conversation has no folder to keep the image in.', 409)
+    return this.importImage(cwd, name, bytes)
+  }
+
+  private async importImage(cwd: string, name: unknown, bytes: Uint8Array): Promise<PhoneImage> {
+    if (!this.deps.importImage) throw new PhoneAccessError('Images are unavailable in this Conductor.', 503)
+    const label = typeof name === 'string' && name.trim() ? name.trim().slice(0, 160) : 'Phone image'
+    let saved: ContextAttachment
+    try { saved = await this.deps.importImage(cwd, label, bytes) } catch (error) {
+      // The importer's own messages are the useful ones: not an image, cannot decode, too large.
+      throw new PhoneAccessError(error instanceof Error ? error.message : 'That image could not be saved.', 400)
+    }
+    if (!saved.path) throw new PhoneAccessError('That image could not be saved.', 500)
+    return { id: saved.id, kind: 'image', name: saved.name, path: saved.path }
+  }
+
+  async sendMessage(id: string, input: { text: unknown; mode?: unknown; attachments?: unknown }): Promise<{ phase: SessionProjection['phase']; mode: Exclude<PhoneMessageMode, 'auto'> }> {
+    const images = phoneImages(input.attachments)
+    // A message that is only a screenshot still needs words for the provider's prompt.
+    const text = (typeof input.text === 'string' ? input.text.trim() : '') || (images.length ? images.length === 1 ? 'See the attached image.' : 'See the attached images.' : '')
     if (!text) throw new PhoneAccessError('Write a message first.')
     if (text.length > 100_000) throw new PhoneAccessError('That message is too long to send from a phone.')
     const requested = (['auto', 'submit', 'steer', 'queue'] as const).includes(input.mode as PhoneMessageMode) ? input.mode as PhoneMessageMode : 'auto'
     const { projection, remote } = this.structuredOnly(id)
+    if (images.length && remote) throw new PhoneAccessError('Images can only be sent to conversations running on this computer.', 409)
+    if (images.length && projection.capabilities?.imageAttachments !== true) throw new PhoneAccessError('This conversation’s provider does not take images.', 409)
+    // structured-sessions resolves each path inside the conversation's folder and checks the
+    // file, exactly as for a desktop attachment; fresh objects, because it rewrites `path`.
+    const attachments: ContextAttachment[] = images.map(image => ({ ...image }))
     const settings = settingsForRuntime(projection.settings, projection.runtimeId)
     const active = activeSessionPhases.has(projection.phase)
     const canSteer = projection.capabilities?.steering === true
@@ -914,9 +955,9 @@ export class PhoneAccessService {
     if (remote) {
       if (mode === 'queue') await this.deps.remote!.queue(id, text, settings)
       else await this.deps.remote!.submit(id, text, mode === 'steer' ? 'agents.steer' : 'agents.submit', settings)
-    } else if (mode === 'submit') await this.deps.sessions.submit(id, text, settings, [])
-    else if (mode === 'steer') await this.deps.sessions.steer(id, text, settings, [])
-    else await this.deps.sessions.queue(id, text, settings, [])
+    } else if (mode === 'submit') await this.deps.sessions.submit(id, text, settings, attachments)
+    else if (mode === 'steer') await this.deps.sessions.steer(id, text, settings, attachments)
+    else await this.deps.sessions.queue(id, text, settings, attachments)
     return { phase: this.deps.database.structured.snapshot(id)?.phase ?? projection.phase, mode }
   }
 
@@ -1019,7 +1060,9 @@ export class PhoneAccessService {
     if (!this.deps.projectTasks) throw new PhoneAccessError('Project tasks are unavailable in this Conductor.', 503)
     const raw = input && typeof input === 'object' ? input as unknown as Record<string, unknown> : {}
     if (typeof raw.title !== 'string' || !raw.title.trim()) throw new PhoneAccessError('Write the project task first.')
-    const title = raw.title.replace(/\r\n?/g, '\n').trim()
+    const images = phoneImages(raw.images)
+    if (images.length && (project.remote || !project.path)) throw new PhoneAccessError(`“${project.name}” lives on ${project.remote?.machineName ?? 'another machine'}; images can only be added to projects on this computer.`, 409)
+    const title = embedPhoneTaskImages(raw.title.replace(/\r\n?/g, '\n').trim(), images)
     if (title.length > PROJECT_TASK_MAX_LENGTH) throw new PhoneAccessError(`Keep the project task under ${PROJECT_TASK_MAX_LENGTH.toLocaleString()} characters.`)
     if (/\0|<!--\s*conductor-task\s*:/i.test(title)) throw new PhoneAccessError('Project tasks cannot contain task markers.')
     if (!projectTaskKinds.includes(raw.kind as ProjectTaskKind)) throw new PhoneAccessError('Choose task, bug, feature, or idea.')
@@ -1093,6 +1136,25 @@ function normalizeAnswers(value: unknown): Record<string, string[]> | undefined 
     answers[key] = list.filter((entry): entry is string => typeof entry === 'string').map(entry => entry.slice(0, 4000)).slice(0, 50)
   }
   return answers
+}
+
+/** The images a phone names on a message or task: only paths its uploads could have written. */
+export function phoneImages(value: unknown): PhoneImage[] {
+  if (value === undefined || value === null) return []
+  if (!Array.isArray(value)) throw new PhoneAccessError('Attach images as a list.')
+  if (value.length > PHONE_IMAGE_LIMIT) throw new PhoneAccessError(`Attach at most ${PHONE_IMAGE_LIMIT} images at a time.`)
+  return value.map(entry => {
+    const raw = (entry && typeof entry === 'object' ? entry : {}) as Record<string, unknown>
+    if (typeof raw.path !== 'string' || !PHONE_IMAGE_PATH.test(raw.path)) throw new PhoneAccessError('Upload each image before attaching it.')
+    const name = typeof raw.name === 'string' && raw.name.trim() ? raw.name.replace(/[\\/\r\n\0]/g, '_').trim().slice(0, 160) : 'Phone image'
+    return { id: typeof raw.id === 'string' && raw.id ? raw.id.slice(0, 80) : raw.path, kind: 'image', name, path: raw.path }
+  })
+}
+
+/** The desktop task pane's embedTaskImages: each image is its own Markdown continuation line. */
+export function embedPhoneTaskImages(title: string, images: PhoneImage[]): string {
+  const lines = images.map(image => '![' + image.name.replace(/[[\]]/g, '').slice(0, 160) + '](' + image.path + ')')
+  return lines.length ? title.trim() + '\n\n' + lines.join('\n') : title
 }
 
 /** Long output is the desktop's business; the phone gets enough to know what happened. */

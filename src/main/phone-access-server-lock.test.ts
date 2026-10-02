@@ -161,7 +161,9 @@ describe('the phone lock on the listener', () => {
     // could be answered to a locked phone, so it has to be added to this list on purpose.
     const source = readFileSync(new URL('./phone-access-server.ts', import.meta.url), 'utf8')
     const early = [...source.matchAll(/url\.pathname(?:\s*===\s*|\.startsWith\()'([^']+)'/g)].map(match => match[1])
-    expect(new Set(early)).toEqual(new Set(['/api/health', '/api/', '/ca.crt', '/api/pair', '/api/lock/']))
+    // '/share' is the share target's POST that a service worker did not catch: it is drained
+    // unread and redirected to the app's own #/share screen, which then sits behind the gate.
+    expect(new Set(early)).toEqual(new Set(['/api/health', '/api/', '/ca.crt', '/api/pair', '/api/lock/', '/share']))
   })
 
   it('unlocks with the code, counts wrong codes, and backs off', { timeout: 30_000 }, async () => {
