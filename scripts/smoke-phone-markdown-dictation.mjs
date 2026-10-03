@@ -11,9 +11,9 @@ import assert from 'node:assert/strict'
 // a scripted webkitSpeechRecognition says what was "heard" (no microphone, no speech service, no
 // inference). Run after `npm.cmd run build`, one smoke at a time:
 //   node scripts/smoke-lock.mjs -- node scripts/smoke-phone-markdown-dictation.mjs
-// Screenshots and report.json go to artifacts/phone-markdown-dictation/.
+// Screenshots and report.json go to .conductor-scratch/phone-redesign/markdown-dictation/.
 const root = await mkdtemp(join(tmpdir(), 'conductor-phone-md-'))
-const output = resolve('artifacts/phone-markdown-dictation')
+const output = resolve('.conductor-scratch/phone-redesign/markdown-dictation')
 await mkdir(output, { recursive: true })
 const env = { ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_EMPTY_HISTORY: '1', CONDUCTOR_TEST_NODE_EXECUTABLE: process.execPath, CONDUCTOR_TEST_USER_DATA: join(root, 'profile'), CONDUCTOR_PROJECTS_ROOT: join(root, 'projects') }
 delete env.ELECTRON_RUN_AS_NODE; delete env.CONDUCTOR_LIVE_TESTS
@@ -103,6 +103,9 @@ const STAND_INS = `(() => {
   window.__posts = []
   window.fetch = async (path, init) => {
     const url = String(path)
+    const json = body => new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+    if (url === '/api/usage') return json({ providers: ['claude', 'codex'].map(provider => ({ provider, windows: [{ kind: 'weekly', scope: 'provider', label: 'Weekly', usedPercent: 42, state: 'current', observedAt: new Date().toISOString(), resetsAt: new Date(Date.now() + 86400000).toISOString() }] })), allowance: ['claude', 'codex'].map(provider => ({ provider, weekly: { label: 'Weekly', points: [[0, 12], [.3, 24], [.7, 31], [1, 42]] } })) })
+    if (url === '/api/activity') return json({ since: new Date(Date.now() - 604800000).toISOString(), hasMore: false, items: [{ id: 'smoke-receipt', kind: 'email', title: 'Sent email to Print Spot', detail: 'Smoke fixture: confirmed SMTP receipt', at: new Date().toISOString(), projectId: 'smoke', projectName: 'Conductor', sessionId: 'smoke-md', tabTitle: 'Print order' }] })
     if (url.startsWith('/api/sessions/smoke-md')) {
       const json = body => new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
       if (init && init.method === 'POST') { window.__posts.push({ path: url, body: init.body ? JSON.parse(init.body) : null }); return json({ ok: true }) }
@@ -141,7 +144,7 @@ try {
   await tab.load(origin + '/#pair=' + desktop.pairing.code)
   await until(() => tab.run('Boolean(document.querySelector(".code-input") && document.querySelector(".code-input").value)'), Boolean, 'the code filled in')
   await tab.run('document.querySelector("form.pair-form").requestSubmit()')
-  await until(() => tab.run('Boolean(document.querySelector(".live-dot.live"))'), Boolean, 'the live session list')
+  await until(() => tab.run('Boolean(document.querySelector(".home-hero") && document.querySelector(".connection-banner")?.hidden)'), Boolean, 'the connected Home screen')
   assert.equal(await tab.run('typeof window.ConductorMarkdown === "object" && typeof window.ConductorMarkdown.render === "function"'), true, 'markdown.js loaded before app.js')
   check('The paired phone loads the served markdown.js next to app.js')
 
@@ -231,12 +234,30 @@ try {
   await tab.go('#/session/smoke-md')
   await until(() => tab.run('Boolean(document.querySelector(".composer-mic"))'), Boolean, 'the composer again')
   const fallback = await tab.run(`(() => { const node = document.querySelector('.composer-mic'); return { unsupported: node.classList.contains('unsupported'), label: node.getAttribute('aria-label') } })()`)
-  assert.deepEqual(fallback, { unsupported: true, label: 'Dictation is not available in this browser' })
+  assert.equal(fallback.unsupported, true)
+  assert.match(fallback.label, /[Dd]ictation/)
   await tab.run(`document.querySelector('.composer-mic').click(); true`)
-  const toast = await until(() => tab.run(`document.getElementById('toasts').textContent`), text => typeof text === 'string' && text.includes('Dictation is not available here'), 'the fallback note')
-  assert.match(toast, /microphone key/)
+  const toast = await until(() => tab.run(`document.body.innerText`), text => typeof text === 'string' && /keyboard.*microphone|microphone.*keyboard/i.test(text), 'the persistent fallback note')
+  assert.match(toast, /keyboard/i)
   await tab.shot('dictation-unsupported')
   check('Without speech recognition the mic is dimmed and a tap says to use the keyboard microphone key')
+
+  await until(() => tab.run('document.getElementById("toasts").textContent'), text => text === '', 'dictation toast to clear')
+  await app.evaluate(({ BrowserWindow }, id) => BrowserWindow.fromId(id).setContentSize(320, 740), opened.id)
+  for (const theme of ['dark', 'light']) {
+    await tab.go('#/more')
+    await until(() => tab.run('Boolean(document.querySelector(".appearance-options"))'), Boolean, 'appearance controls')
+    await tab.run('document.querySelector(".appearance-options [data-theme=' + theme + ']").click(); true')
+    for (const [route, ready] of [['#/', '.home-hero'], ['#/new', '.new-task-prompt'], ['#/usage', '.sparkline'], ['#/activity', '.activity-card'], ['#/session/smoke-md', '.composer']]) {
+      await tab.go(route)
+      await until(() => tab.run('Boolean(document.querySelector(' + JSON.stringify(ready) + '))'), Boolean, route + ' content')
+      assert.equal(await tab.run('document.documentElement.scrollWidth > document.documentElement.clientWidth'), false, '320px overflow: ' + route)
+      assert.equal(await tab.run('document.querySelector(".tabbar").hidden'), false)
+      await new Promise(resolve => setTimeout(resolve, 220))
+      await tab.shot(theme + '-' + (route === '#/' ? 'home' : route.split('/')[1]) + '-320')
+    }
+  }
+  check('Real served Home, New task, Usage graphs, Activity and conversation render in both themes at 320px with persistent navigation and no page overflow')
 
   const phoneErrors = (await tab.consoleErrors()).filter(text => /Uncaught|Content Security Policy/.test(text))
   assert.deepEqual(phoneErrors, [], 'no uncaught error or CSP violation in the phone window')

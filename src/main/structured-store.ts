@@ -1,5 +1,6 @@
 import { recoverClaudeMessageDuplicates } from '../shared/claude-message-recovery'
 import { randomUUID } from 'node:crypto'
+import { PhoneActivityStore, activityReceipt } from './phone-activity'
 import { mkdirSync, readFileSync, renameSync, writeFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
@@ -179,7 +180,9 @@ export class StructuredAgentStore {
   /** The output artifacts the one-off pass walks, listed once per launch, and the next one to read. */
   private artifactWalk?: { names: string[]; next: number }
   readonly artifactDirectory: string
+  readonly activity: PhoneActivityStore
   constructor(private db: DatabaseSync, dataDirectory: string) {
+    this.activity = new PhoneActivityStore(db)
     this.artifactDirectory = join(dataDirectory, 'agent-artifacts')
     mkdirSync(this.artifactDirectory, { recursive: true, mode: 0o700 })
     this.artifactBytes = readdirSync(this.artifactDirectory).filter(name => /^[a-f0-9-]+\.(json|txt)$/.test(name)).reduce((sum, name) => sum + statSync(join(this.artifactDirectory, name)).size, 0)
@@ -377,6 +380,16 @@ export class StructuredAgentStore {
   private writeEvent(safe: AgentEvent): void {
     if (this.volatileSpecs.has(safe.sessionId)) return
     this.db.prepare('INSERT INTO structured_events(session_id,sequence,event_json) VALUES(?,?,?)').run(safe.sessionId, safe.sequence, JSON.stringify(safe))
+    if ((safe.data.type === 'tool' && safe.data.status === 'completed') || (safe.data.type === 'interaction' && safe.data.interaction.status === 'resolved')) {
+      const projection = this.snapshot(safe.sessionId)
+      let merged: AgentEventData = safe.data
+      for (let i = (projection?.items.length ?? 0) - 1; i >= 0; i--) {
+        const item = projection!.items[i]!
+        if ((item.updatedSequence ?? item.sequence) === safe.sequence) { merged = item.data; break }
+      }
+      const receipt = activityReceipt(merged)
+      if (receipt) this.activity.record({ ...receipt, id: this.activity.key(safe.sessionId, receipt.key || (safe.itemId || safe.requestId || safe.id) + ':' + receipt.kind), at: safe.timestamp, projectId: safe.projectId, sessionId: safe.sessionId, tabTitle: projection?.title || 'Conversation' })
+    }
     // Sequence is assigned monotonically, so the first row wins and remains the runtime's start
     // even after `checkpoint` compacts the events it was read from.
     if (safe.runtimeId && safe.timestamp) this.db.prepare('INSERT OR IGNORE INTO structured_runtimes(session_id,runtime_id,started_at,first_sequence) VALUES(?,?,?,?)').run(safe.sessionId, safe.runtimeId, safe.timestamp, safe.sequence)

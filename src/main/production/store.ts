@@ -1,6 +1,7 @@
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { PhoneActivityStore } from '../phone-activity'
 import { makeId } from '../../shared/models'
 import {
   MODEL_ROLES, PRODUCTION_RUN_RETENTION, PRODUCTION_TABLES as T, RUN_TRANSITIONS, TERMINAL_RUN_STATUSES,
@@ -123,6 +124,7 @@ export const canTransitionRun = (from: RunStatus, to: RunStatus): boolean => RUN
 
 export class ProductionStore {
   private readonly db: DatabaseSync
+  private readonly activity: PhoneActivityStore
   private readonly listeners = new Set<(projectId: string) => void>()
   private depth = 0
   private dirty = new Set<string>()
@@ -134,6 +136,7 @@ export class ProductionStore {
     } else this.db = path
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 3000;')
     this.migrate()
+    this.activity = new PhoneActivityStore(this.db)
   }
 
   /** Idempotent: every statement is IF NOT EXISTS, so a second launch (or a second store on the
@@ -353,6 +356,7 @@ export class ProductionStore {
   private saveRun(run: AuditRun): void {
     const { steps: _steps, status, ...data } = run
     this.db.prepare(`UPDATE ${T.runs} SET status = ?, updated_at = ?, finished_at = ?, data = ? WHERE id = ?`).run(status, this.now(), run.finishedAt, JSON.stringify(data), run.id)
+    if (status === 'completed' && run.finishedAt) this.activity.record({ id: 'production:' + run.id, kind: 'production', title: 'Production ' + run.kind + ' completed', detail: run.environmentId, at: run.finishedAt, projectId: run.projectId, sessionId: run.trigger.by.agentSessionId, tabTitle: run.trigger.by.title || 'Production' })
   }
 
   private insertEvent(runId: string, kind: ProductionRunEventKind, message: string, data?: ProductionRunEvent['data']): void {

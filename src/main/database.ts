@@ -3,6 +3,7 @@ import { readStoredIdentity } from '../shared/remote-control'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { StructuredAgentStore } from './structured-store'
+import { ACTIVITY_WINDOW_MS, activityReceipt } from './phone-activity'
 import { TabArchiveStore } from './tab-archive'
 import { anonymousConversations, isAnonymousTab, persistableClosedTabs, persistableLayout } from './local-models/anonymous'
 import { LOCAL_MACHINE_ID } from '../shared/remote-control'
@@ -587,6 +588,7 @@ export class ConductorDatabase {
       CREATE INDEX IF NOT EXISTS terminal_sessions_process_board_time ON terminal_sessions(updated_at DESC);
       CREATE INDEX IF NOT EXISTS terminal_sessions_process_board_status ON terminal_sessions(status, updated_at DESC);
       CREATE INDEX IF NOT EXISTS agent_sessions_process_board_time ON agent_sessions(updated_at DESC);
+      CREATE INDEX IF NOT EXISTS agent_sessions_phone_activity_time ON agent_sessions(updated_at DESC,id DESC);
       CREATE INDEX IF NOT EXISTS agent_sessions_process_board_status ON agent_sessions(status, updated_at DESC);
       CREATE INDEX IF NOT EXISTS agent_sessions_process_board_phase ON agent_sessions(activity_phase, updated_at DESC);
     `)
@@ -817,6 +819,7 @@ export class ConductorDatabase {
   recordProjectTaskActivity(entry: {
     projectId: string
     taskId: string
+    title?: string
     status: ProjectTaskStatus
     actor: 'agent' | 'you' | 'file'
     assignedAgentId?: string
@@ -829,6 +832,7 @@ export class ConductorDatabase {
   }): ProjectTaskActivity {
     const id = makeId('task-activity')
     const at = now()
+    const prior = entry.status === 'done' ? this.db.prepare('SELECT status FROM project_task_activity WHERE project_id=? AND task_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1').get(entry.projectId, entry.taskId) as { status: string } | undefined : undefined
     this.db
       .prepare(
         `INSERT INTO project_task_activity
@@ -836,7 +840,37 @@ export class ConductorDatabase {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(id, entry.projectId, entry.taskId, entry.status, entry.actor, entry.agentId ?? null, entry.agentTitle ?? null, entry.provider ?? null, entry.sessionId ?? null, entry.workspace ?? null, entry.commit ?? null, at, entry.assignedAgentId ?? '')
+    if (entry.status === 'done' && prior && prior.status !== 'done') this.structured.activity.record({ id, kind: 'task', title: 'Task completed: ' + (entry.title || entry.taskId), at, projectId: entry.projectId, sessionId: entry.agentId || entry.assignedAgentId || null, tabTitle: entry.agentTitle || 'Project tasks', ...(entry.commit ? { detail: 'Commit ' + entry.commit } : {}) })
     return { id, at, status: entry.status, actor: entry.actor, assignedAgentId: entry.assignedAgentId, agentId: entry.agentId, agentTitle: entry.agentTitle, provider: entry.provider, sessionId: entry.sessionId, workspace: entry.workspace, commit: entry.commit }
+  }
+
+  private phoneActivitySeeds = new Map<string, number>()
+  private phoneActivityCursor: { at: string; id: string } | null = null
+  /** Backfill recent visible receipts from resident projections, not the multi-GB journal.
+   * At most 32 sessions x 256 items; each matching receipt seeks ONE primary-key journal row
+   * for its durable update timestamp. Never use a reconciled item's first-seen timestamp. */
+  phoneActivity(before?: string) {
+    const cutoff = new Date(Date.now() - ACTIVITY_WINDOW_MS).toISOString()
+    const cursor = this.phoneActivityCursor
+    const sessions = (cursor
+      ? this.db.prepare('SELECT id,project_id,updated_at FROM agent_sessions WHERE updated_at>=? AND (updated_at,id)<(?,?) ORDER BY updated_at DESC,id DESC LIMIT 32').all(cutoff, cursor.at, cursor.id)
+      : this.db.prepare('SELECT id,project_id,updated_at FROM agent_sessions WHERE updated_at>=? ORDER BY updated_at DESC,id DESC LIMIT 32').all(cutoff)) as Array<{ id: string; project_id: string; updated_at: string }>
+    const last = sessions[sessions.length - 1]
+    this.phoneActivityCursor = sessions.length === 32 && last ? { at: last.updated_at, id: last.id } : null
+    for (const session of sessions) {
+      const projection = this.structured.snapshot(session.id)
+      if (!projection || this.phoneActivitySeeds.get(session.id) === projection.sequence) continue
+      this.phoneActivitySeeds.set(session.id, projection.sequence)
+      for (const item of projection.items.slice(-256)) {
+        const receipt = activityReceipt(item.data)
+        if (!receipt) continue
+        const sequence = item.updatedSequence ?? item.sequence
+        const event = this.structured.journalRange(session.id, sequence, sequence + 1, 1)[0]
+        if (!event || event.timestamp < cutoff) continue
+        this.structured.activity.record({ ...receipt, id: this.structured.activity.key(session.id, receipt.key || (event.itemId || event.requestId || event.id) + ':' + receipt.kind), at: event.timestamp, projectId: session.project_id, sessionId: session.id, tabTitle: projection.title })
+      }
+    }
+    return this.structured.activity.list(Date.now(), before)
   }
 
   /** Newest first, so a task can show who last moved it without another query. */

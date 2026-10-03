@@ -26,6 +26,9 @@ import { generateVapidKeys, isValidVapidKeys, sendWebPush, type VapidKeys } from
 import { PhoneLock } from './phone-lock'
 import { anonymousConversations } from './local-models/anonymous'
 import type { WeeklyModelUsageReport } from '../shared/weekly-model-usage'
+import type { AccountLimitsReport } from '../shared/usage-accounting'
+import type { ProviderAllowanceRow } from '../shared/provider-allowance'
+import type { PhoneActivityPage } from '../shared/phone-activity'
 
 const SETTINGS_KEY = 'phone-access.settings'
 const DEVICES_KEY = 'phone-access.devices'
@@ -48,6 +51,24 @@ const PAIR_LOCKOUT_MS = 10 * 60 * 1000
 /** How often the phone list's "last seen" is written back; every request would be a write per tap. */
 const SEEN_WRITE_INTERVAL_MS = 30_000
 const REFRESH_DEBOUNCE_MS = 400
+
+/** Keep input evidence separate from chat; a successful POST is not delivery. */
+export function phoneInputDeliveries(projection: SessionProjection | null): NonNullable<PhoneConversation['inputDeliveries']> {
+  const receipts = new Map<string, NonNullable<PhoneConversation['inputDeliveries']>[number]>()
+  for (const item of (projection?.items ?? []).slice(-500)) {
+    const data = item.data, sequence = item.updatedSequence ?? item.sequence
+    if (data.type === 'queue' || data.type === 'steering') {
+      const prompts = data.type === 'steering' ? data.prompts : data.prompts ?? (data.prompt ? [data.prompt] : [])
+      for (const prompt of prompts) receipts.set(prompt.id, { id: prompt.id, text: previewText(prompt.text, 4000), status: data.type === 'queue' ? 'queued' : 'status' in prompt ? prompt.status as 'sending' | 'accepted' | 'cancelled' | 'uncertain' : 'accepted', sequence })
+    } else if (data.type === 'input_delivery') {
+      const prior = receipts.get(data.inputId)
+      receipts.set(data.inputId, { id: data.inputId, text: prior?.text || '', status: data.status, sequence })
+    }
+  }
+  for (const prompt of projection?.queuedPrompts ?? (projection?.queued ? [projection.queued] : [])) receipts.set(prompt.id, { id: prompt.id, text: previewText(prompt.text, 4000), status: 'queued', sequence: projection?.sequence || 0 })
+  for (const prompt of projection?.pendingSteering ?? []) receipts.set(prompt.id, { id: prompt.id, text: previewText(prompt.text, 4000), status: prompt.status, sequence: projection?.sequence || 0 })
+  return [...receipts.values()].sort((a, b) => a.sequence - b.sequence).slice(-60)
+}
 
 export class PhoneAccessError extends Error {
   constructor(message: string, readonly status = 400) { super(message) }
@@ -157,6 +178,8 @@ export interface PhoneAccessDependencies {
   remote?: PhoneRemoteSessions
   projectTasks?: PhoneProjectTasks
   weeklyUsage?: { read(): WeeklyModelUsageReport }
+  usage?(): { providers: AccountLimitsReport[]; allowance: ProviderAllowanceRow[] }
+  activity?(before?: string): PhoneActivityPage
   providers(): AgentProviderInfo[]
   machines(): MachineDescriptor[]
   machineName(): string
@@ -876,6 +899,7 @@ export class PhoneAccessService {
       items: kept.map(trimItem),
       pending: items.flatMap(item => item.data.type === 'interaction' && item.data.interaction.status === 'pending' ? [item.data.interaction] : []),
       queued: (projection?.queuedPrompts ?? (projection?.queued ? [projection.queued] : [])).map(prompt => ({ id: prompt.id, text: previewText(prompt.text, 400) })),
+      inputDeliveries: phoneInputDeliveries(projection),
       truncated: Boolean(projection?.truncated) || kept.length < roots.length,
       canSteer: projection?.capabilities?.steering === true,
       canAttachImages: projection?.capabilities?.imageAttachments === true && !this.deps.remote?.isRemote(id) && Boolean(this.deps.importImage),
@@ -890,6 +914,9 @@ export class PhoneAccessService {
     const runtimes = this.deps.database.listProcesses().filter(process => process.status !== 'exited' && process.status !== 'unavailable').map(process => ({ ...process, projectName: projects.get(process.projectId)?.name ?? 'Project', workspaceName: workspaces.get(process.sessionId) ?? 'Workspace' }))
     return { system: await this.deps.metrics(), runtimes }
   }
+
+  usage() { return this.deps.usage?.() ?? { providers: [], allowance: [] } }
+  activity(before?: string) { return this.deps.activity?.(before) ?? { items: [], hasMore: false, since: new Date(this.now() - 7 * 86400000).toISOString() } }
 
   /* ----------------------------------------------------------------------- *
    * Actions
@@ -973,10 +1000,11 @@ export class PhoneAccessService {
     return { phase: this.deps.database.structured.snapshot(id)?.phase ?? projection.phase }
   }
 
-  async interrupt(id: string): Promise<{ phase: SessionProjection['phase'] }> {
+  async interrupt(id: string): Promise<{ phase: SessionProjection['phase']; held: number }> {
     const { projection, remote } = this.structuredOnly(id)
-    await (remote ? this.deps.remote!.interrupt(id) : this.deps.sessions.interrupt(id))
-    return { phase: this.deps.database.structured.snapshot(id)?.phase ?? projection.phase }
+    await (remote ? this.deps.remote!.interrupt(id, false) : this.deps.sessions.interrupt(id, false))
+    const after = this.deps.database.structured.snapshot(id) ?? projection
+    return { phase: after.phase, held: (after.queuedPrompts ?? (after.queued ? [after.queued] : [])).length + (after.pendingSteering ?? []).filter(prompt => prompt.status === 'sending' || prompt.status === 'accepted').length }
   }
 
   async resume(id: string): Promise<{ phase: SessionProjection['phase'] }> {

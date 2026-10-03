@@ -2757,6 +2757,15 @@ app.whenReady().then(async () => {
   app.setAppUserModelId('io.conductor.desktop')
   const databasePath = join(app.getPath('userData'), 'conductor.db')
   database = new ConductorDatabase(databasePath)
+  if (app.isPackaged) {
+    const previous = database.getSetting('phone.activity.installedVersion')
+    const version = app.getVersion()
+    const initiator = launchRestartInitiator(database.getSetting(RESTART_INITIATOR_KEY), database.getSetting(RESTART_REQUEST_KEY), new Date())
+    const source = initiator ? database.structured.spec<AgentSpec>(initiator.agentSessionId) : null
+    const project = source ? database.getProject(source.projectId) : database.listProjects().find(entry => isConductorCheckout(entry.path))
+    if (project && ((previous && previous !== version) || (!previous && initiator?.method === 'app.update.install'))) database.structured.activity.record({ id: 'installed:' + version, kind: 'update', title: 'Installed Conductor ' + version, at: new Date().toISOString(), projectId: project.id, sessionId: initiator?.agentSessionId || null, tabTitle: source?.title || 'Conductor updates' })
+    database.setSetting('phone.activity.installedVersion', version)
+  }
   // A development or test build never writes the OS login items (src/main/login-item.ts).
   loginItem = new LoginItem({ app, platform: process.platform, execPath: process.execPath, argv: process.argv, system: app.isPackaged && !process.env.CONDUCTOR_TEST_USER_DATA, store: database })
   localMachineReadiness = localReadiness({
@@ -2910,6 +2919,7 @@ app.whenReady().then(async () => {
   const failedShips = new Set<string>()
   delivery.onChanged(run => {
     publish('delivery:changed', run)
+    if (run.state === 'delivered' && run.commit) database.structured.activity.record({ id: 'ship:' + run.id, kind: 'commit', title: 'Shipped ' + run.commit.slice(0, 8) + ': ' + run.message, at: run.finishedAt || new Date().toISOString(), projectId: run.projectId, sessionId: run.requestedBy.kind === 'agent' ? run.requestedBy.agentSessionId : null, tabTitle: run.requestedBy.kind === 'agent' ? run.requestedBy.title : 'Source control', detail: run.publish ? 'Published release' : 'Verified local commit' })
     if (run.state === 'failed' && !failedShips.has(run.id)) { failedShips.add(run.id); updates?.recordFailedShip() }
   })
   // Annotated because the browser bridge is built earlier and reaches back through this handle;
@@ -3234,6 +3244,8 @@ app.whenReady().then(async () => {
     metrics: () => systemMetrics.sample(),
     importImage: async (cwd, name, bytes) => { const attachment = await importPromptImage(cwd, name, bytes); invalidateProjectFiles(cwd); return attachment },
     weeklyUsage,
+    usage: () => ({ providers: agents.structured.usageLimits(), allowance: agents.structured.providerAllowance() }),
+    activity: before => database.phoneActivity(before),
     projectTasks: new PhoneProjectTasks({
       backlogs: projectBacklogs,
       remote: remoteControl.client,

@@ -106,6 +106,21 @@ const openAgentTab = (f: ReturnType<typeof fixture>, resourceId: string, tabId: 
   f.database.saveSession(f.workspace.id, current.layout, null, [])
 }
 
+describe('explicit outward activity receipts', () => {
+  it('binds the receipt to the caller project/tab, deduplicates keys and validates time', async () => {
+    const f = fixture()
+    const args = { kind: 'email', title: 'Sent email: print quote', key: 'email:message-1', detail: 'SMTP accepted' }
+    await f.control.call(f.scope, 'activity.record', args)
+    await f.control.call(f.scope, 'activity.record', args)
+    const items = f.database.structured.activity.list().items
+    expect(items).toHaveLength(1)
+    expect(items[0]).toMatchObject({ kind: 'email', projectId: f.project.id, sessionId: f.scope.agentSessionId, title: args.title })
+    await expect(f.control.call(f.scope, 'activity.record', { ...args, kind: 'invented' })).rejects.toThrow('activity kind')
+    await expect(f.control.call(f.scope, 'activity.record', { ...args, at: '2000-01-01' })).rejects.toThrow('last seven days')
+    await expect(f.control.call(f.scope, 'activity.record', { ...args, projectId: 'other' })).rejects.toThrow()
+  })
+})
+
 /** An uncontrolled Claude tab, present only so agents.handoff's cross-provider catalog lookup
  *  sees Claude's full synthetic model list (its -advanced model and any extraModels) through the
  *  runtime capabilities a registered session carries, rather than the bare configured fallback

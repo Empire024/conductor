@@ -6,7 +6,7 @@
 
 /* v2: the shell gained /boot.js, and an old cache without it must not answer for the new shell.
    v3: likewise /markdown.js. */
-const CACHE = 'conductor-phone-v3'
+const CACHE = 'conductor-phone-v4'
 /* The bearer token and VAPID key the page leaves behind, so a subscription the browser rotates
    can be re-registered without a window open. Same origin-scoped exposure as localStorage. */
 const AUTH_CACHE = 'conductor-phone-auth'
@@ -78,8 +78,12 @@ a.button { display: block; min-height: 46px; box-sizing: border-box; padding: 12
 /* Network first: the desktop can ship a new app at any time and a phone must never be stuck on
    a stale shell. The cache is only the answer for "the computer is unreachable right now". */
 const networkFirst = async request => {
+  const controller = new AbortController()
+  // A sleeping computer can leave fetch pending for minutes. Cached static shell is safe to
+  // show promptly; authentication and lock are still checked by the page before any state.
+  const timer = setTimeout(() => controller.abort(), 3500)
   try {
-    const response = await fetch(request)
+    const response = await fetch(request, { signal: controller.signal })
     if (response && response.ok) {
       const cache = await caches.open(CACHE)
       await cache.put(request, response.clone())
@@ -94,7 +98,7 @@ const networkFirst = async request => {
       return notAnsweringPage()
     }
     return new Response('Conductor is offline.', { status: 503, headers: { 'Content-Type': 'text/plain; charset=utf-8' } })
-  }
+  } finally { clearTimeout(timer) }
 }
 
 const hashOf = url => {

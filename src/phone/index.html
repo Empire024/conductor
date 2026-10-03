@@ -3,8 +3,9 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-    <meta name="theme-color" content="#090b0e">
-    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#edf1f7" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#01111f" media="(prefers-color-scheme: dark)">
+    <meta name="color-scheme" content="light dark">
     <meta name="description" content="Watch and steer this Conductor's agents from your phone.">
     <!-- Home Screen install on iOS reads these four, not the manifest. -->
     <meta name="apple-mobile-web-app-capable" content="yes">
@@ -24,13 +25,40 @@
     <script src="/app.js" defer></script>
   </head>
   <body>
-    <div id="app" class="app" aria-live="polite"></div>
+    <!-- No project or conversation data appears before pairing and lock checks finish. -->
+    <div id="app" class="app" aria-live="polite">
+      <div class="screen loading-screen" aria-busy="true">
+        <header class="topbar">
+          <div class="topbar-main">
+            <span class="brand-mark" aria-hidden="true">C</span>
+            <h1 class="topbar-title">Conductor</h1>
+            <span class="connection-dot" aria-hidden="true"></span>
+          </div>
+        </header>
+        <main class="scroll loading-content">
+          <div class="loading-heading" role="status">
+            <h2>Opening your workspace</h2>
+            <p>Connecting securely to your computer&hellip;</p>
+          </div>
+          <div class="skeleton-card" aria-hidden="true"><div class="skeleton skeleton-title"></div><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-short"></div></div>
+          <div class="skeleton-card" aria-hidden="true"><div class="skeleton skeleton-title"></div><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-short"></div></div>
+          <div class="skeleton-card" aria-hidden="true"><div class="skeleton skeleton-title"></div><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-short"></div></div>
+        </main>
+        <nav class="tabbar loading-tabbar" aria-label="Sections loading" aria-hidden="true">
+          <span class="tab"><span class="skeleton skeleton-nav"></span><span class="tab-label">Home</span></span>
+          <span class="tab"><span class="skeleton skeleton-nav"></span><span class="tab-label">Tabs</span></span>
+          <span class="tab"><span class="skeleton skeleton-nav"></span><span class="tab-label">Attention</span></span>
+          <span class="tab"><span class="skeleton skeleton-nav"></span><span class="tab-label">New task</span></span>
+          <span class="tab"><span class="skeleton skeleton-nav"></span><span class="tab-label">More</span></span>
+        </nav>
+      </div>
+    </div>
     <div id="overlay" class="overlay">
-      <div id="pill" class="pill" hidden>Reconnecting&hellip;</div>
+      <div id="pill" class="pill" role="status" hidden>Connecting to your computer&hellip;</div>
       <div id="toasts" class="toasts"></div>
     </div>
     <noscript>
-      <p style="padding:24px;color:#a3a9b2;font:16px system-ui">Conductor needs JavaScript to talk to this computer.</p>
+      <p class="noscript-note">Conductor needs JavaScript to talk to this computer.</p>
     </noscript>
   </body>
 </html>

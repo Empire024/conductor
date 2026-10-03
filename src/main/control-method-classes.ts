@@ -10,7 +10,7 @@ export const MUTATION_FAMILIES = {
   tabs: ['tabs.open', 'tabs.focus', 'tabs.rename', 'tabs.split', 'tabs.detach', 'tabs.close', 'tabs.archive', 'router.start', 'router.dispatch', 'workspace.rename'],
   agents: ['agents.compact', 'agents.configure', 'agents.grant', 'agents.submit', 'agents.steer', 'agents.interrupt', 'agents.resume', 'agents.fork', 'agents.release', 'agents.handoff', 'agents.supersede', 'agents.report', 'agents.finish', 'agents.await', 'agents.approve'],
   app: ['projects.open', 'app.update', 'app.update.offer', 'app.update.authorize', 'app.update.check', 'app.update.download', 'app.update.install', 'app.restart', 'app.restart.request', 'app.quit.confirm', 'local.stop', 'supervisor.alert'],
-  files: ['files.write', 'files.open', 'tasks.update', 'memory.remember', 'memory.forget'],
+  files: ['files.write', 'files.open', 'tasks.update', 'memory.remember', 'memory.forget', 'activity.record'],
   schedules: [
     'jobs.create', 'jobs.pause', 'jobs.resume', 'jobs.cancel', 'jobs.report',
     'schedules.create', 'schedules.update', 'schedules.pause', 'schedules.resume', 'schedules.runNow', 'schedules.delete', 'schedules.scripts.save', 'schedules.scripts.delete',

@@ -5,8 +5,8 @@
   "start_url": "/#/",
   "scope": "/",
   "display": "standalone",
-  "background_color": "#090b0e",
-  "theme_color": "#090b0e",
+  "background_color": "#01111f",
+  "theme_color": "#01111f",
   "description": "Watch and steer this Conductor's agents from your phone.",
   "share_target": {
     "action": "/share",

@@ -179,7 +179,7 @@ describe('control method classes', () => {
     const advertised = [
       'tools.list', 'app.state', 'projects.list', 'machines.list', 'models.list', 'tabs.list', 'tabs.open', 'tabs.focus', 'tabs.rename', 'tabs.split', 'tabs.detach', 'tabs.close', 'tabs.archive',
       'agents.list', 'agents.snapshot', 'agents.history', 'agents.artifact', 'agents.status', 'agents.compact', 'agents.configure', 'agents.grant', 'agents.submit', 'agents.steer', 'agents.interrupt', 'agents.resume', 'agents.supersede', 'agents.fork', 'agents.release', 'agents.handoff', 'agents.report', 'agents.finish', 'agents.await',
-      'files.list', 'files.read', 'files.write', 'files.open', 'tasks.list', 'tasks.update', 'memory.recall', 'memory.remember', 'memory.forget',
+      'files.list', 'files.read', 'files.write', 'files.open', 'tasks.list', 'tasks.update', 'memory.recall', 'memory.remember', 'memory.forget', 'activity.record',
       'orchestration.snapshot', 'orchestration.tasks.create', 'orchestration.tasks.update', 'orchestration.routines.save', 'workspace.rename',
       'app.update', 'app.update.offer', 'app.update.status', 'app.update.authorize', 'git.status', 'git.ship', 'git.ship.status', 'local.servers', 'local.stop', 'usage.limits',
       'loops.list', 'loops.get', 'loops.history', 'loops.run', 'loops.record', 'loops.propose', 'loops.apply', 'loops.reject', 'loops.proposals',
@@ -203,6 +203,7 @@ describe('control method classes', () => {
     expect(advertised.every(method => controlMethodClass(method) !== undefined)).toBe(true)
     expect([...CONTROL_METHOD_CLASSES].every(entry => advertised.includes(entry.slice(entry.indexOf(':') + 1)))).toBe(true)
     expect(controlMethodClass('tabs.open')).toBe('mutation')
+    expect(controlMethodClass('activity.record')).toBe('mutation')
     expect(controlMethodClass('jobs.pause')).toBe('mutation')
     expect(controlMethodClass('agents.history')).toBe('read')
     expect(controlMethodClass('git.ship.status')).toBe('read')
@@ -216,6 +217,7 @@ describe('control method classes', () => {
     expect(controlMethodFamily('agents.steer')).toBe('agents')
     expect(controlMethodFamily('app.restart')).toBe('app')
     expect(controlMethodFamily('files.write')).toBe('files')
+    expect(controlMethodFamily('activity.record')).toBe('files')
     expect(controlMethodFamily('schedules.create')).toBe('schedules')
     expect(controlMethodFamily('agents.status')).toBeUndefined()
   })

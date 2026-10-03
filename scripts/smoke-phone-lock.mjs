@@ -14,7 +14,7 @@ import assert from 'node:assert/strict'
 // Screenshots and report.json go to artifacts/phone-lock/.
 const CODE = '482915'
 const root = await mkdtemp(join(tmpdir(), 'conductor-phone-lock-'))
-const output = resolve('artifacts/phone-lock')
+const output = resolve('.conductor-scratch/phone-redesign/lock')
 await mkdir(output, { recursive: true })
 const userData = join(root, 'profile')
 const env = { ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_EMPTY_HISTORY: '1', CONDUCTOR_TEST_NODE_EXECUTABLE: process.execPath, CONDUCTOR_TEST_USER_DATA: userData, CONDUCTOR_PROJECTS_ROOT: join(root, 'projects') }
@@ -108,7 +108,7 @@ try {
   await tab.load(origin + '/#pair=' + desktop.pairing.code)
   await until(() => tab.run('document.querySelector(".code-input") && document.querySelector(".code-input").value.length'), value => value > 0, 'the pairing code filled in')
   await tab.run('document.querySelector("form.pair-form").requestSubmit()')
-  await until(() => tab.run('Boolean(document.querySelector(".live-dot.live"))'), Boolean, 'the live session list')
+  await until(() => tab.run('Boolean(document.querySelector(".home-hero") && document.querySelector(".connection-banner")?.hidden)'), Boolean, 'the connected Home screen')
   const token = await tab.run('localStorage.getItem("conductor.phone.token")')
   assert.ok(token)
   check('A phone pairs and reaches the live session list while no code is set')
@@ -136,7 +136,7 @@ try {
   check('A wrong code says so with the tries left, and the desktop counts it')
 
   await tapCode(tab, CODE)
-  await until(() => tab.run('Boolean(document.querySelector(".live-dot.live"))'), Boolean, 'the session list after unlocking')
+  await until(() => tab.run('Boolean(document.querySelector(".home-hero") && document.querySelector(".connection-banner")?.hidden)'), Boolean, 'Home after unlocking')
   desktop = await page.evaluate(() => window.conductor.phone.state())
   assert.equal(desktop.lock.failures, 0)
   assert.equal(desktop.lock.unlockedDevices.length, 1)

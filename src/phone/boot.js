@@ -298,6 +298,14 @@
       var screen = make('div', 'boot-screen')
       screen.setAttribute('data-boot', 'placeholder')
       screen.appendChild(make('p', 'boot-starting', 'Starting Conductor…'))
+      screen.setAttribute('aria-busy', 'true')
+      screen.appendChild(make('h1', 'boot-title', 'Conductor'))
+      screen.appendChild(make('p', 'boot-lead', 'Connecting to your computer.'))
+      for (var index = 0; index < 3; index += 1) {
+        var row = make('div', 'skeleton')
+        row.setAttribute('aria-hidden', 'true')
+        screen.appendChild(row)
+      }
       target.appendChild(screen)
     })
   }

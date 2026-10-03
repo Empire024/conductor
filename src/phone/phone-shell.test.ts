@@ -309,7 +309,7 @@ describe('index.html', () => {
 describe('phone task section', () => {
   it('has a dedicated Tasks route and keeps project-task creation out of New', () => {
     expect(appSource).toContain("hash.indexOf('#/tasks')")
-    expect(appSource).toContain("{ id: 'tasks', label: 'Tasks', hash: '#/tasks' }")
+    expect(appSource).toContain("'Project tasks'")
     expect(appSource).toContain("api('/api/projects/' + encodeURIComponent(form.projectId) + '/tasks?offset='")
     expect(appSource).not.toContain("{ id: 'project', label: 'Project task' }")
   })
@@ -336,10 +336,9 @@ describe('new conversation defaults', () => {
     expect(appSource).toContain('form.settingsOpen')
     expect(appSource).toContain('settings.hidden = !form.settingsOpen')
   })
-  it('picks the provider with the most weekly usage left and a mid-tier model, never the frontier one', () => {
-    expect(appSource).toContain('usageRemainingByProvider')
-    expect(appSource).toContain('FRONTIER_MODEL')
-    expect(appSource).toContain('MID_TIER_MODEL')
+  it('uses a remembered successful choice or Claude Opus rather than quota ranking', () => {
+    expect(appSource).not.toContain('usageRemainingByProvider')
+    expect(appSource).toContain('LAST_AGENT_KEY')
     expect(appSource).toContain('preferredModel')
   })
 })
@@ -418,6 +417,7 @@ const bootApp = (hash: string, respond: (call: AppCall) => unknown, options: { l
       return new Promise(() => undefined)
     }
     if (path === '/api/lock/state' && !options.lock) return { status: 200, ok: true, text: async () => JSON.stringify({ configured: false, unlocked: false }) }
+    if (path === '/api/state') return { status: 200, ok: true, text: async () => JSON.stringify(options.phoneState || { projects: [], sessions: [], providers: [], machines: [], counts: {} }) }
     const text = typeof init.body === 'string'
     const call: AppCall = { path, method: init.method || 'GET', body: text ? JSON.parse(init.body) : undefined, keepalive: Boolean(init.keepalive), ...(init.body && !text ? { raw: init.body, contentType: (init.headers || {})['Content-Type'] } : {}) }
     calls.push(call)
@@ -434,7 +434,7 @@ const bootApp = (hash: string, respond: (call: AppCall) => unknown, options: { l
     history: { replaceState: (_state: unknown, _title: string, url: string) => { currentHash = url.slice(url.indexOf('#')) } },
     localStorage: { getItem: (key: string) => (key === 'conductor.phone.token' ? 'phone-token' : null), setItem: () => undefined, removeItem: () => undefined },
     innerHeight: 800,
-    isSecureContext: false,
+    isSecureContext: true,
     setTimeout: setTimer,
     clearTimeout: clearTimer,
     setInterval: () => 0,
@@ -478,13 +478,14 @@ const ideaDetail = (id: string, text: string) => ({
 const settleAll = async () => { for (let index = 0; index < 6; index += 1) await settle() }
 
 describe('phone Ideas screen', () => {
-  it('#/ideas opens a full-screen new note with the cursor already in it and no tab bar', () => {
+  it('#/ideas opens a new note with the cursor already in it and Home always reachable', async () => {
     const page = bootApp('#/ideas', () => ({}))
+    await settleAll()
     const editor = page.editor()
     expect(editor).toBeDefined()
     expect(page.document.activeElement).toBe(editor)
     expect(editor!.value).toBe('')
-    expect(page.app.querySelector('.tabbar')!.hidden).toBe(true)
+    expect(page.app.querySelector('.tabbar')!.hidden).toBe(false)
     const labels = page.app.querySelectorAll('.idea-bar-button').map(node => node.getAttribute('aria-label'))
     expect(labels).toEqual(['Ideas', 'New idea', 'Search ideas', 'More'])
   })
@@ -496,6 +497,7 @@ describe('phone Ideas screen', () => {
       if (call.path === '/api/ideas/idea-1' && call.method === 'POST') return ideaDetail('idea-1', call.body.text)
       return {}
     })
+    await settleAll()
     const editor = page.editor()!
     editor.typeText('Solar')
     editor.typeText('Solar kettle')
@@ -520,6 +522,7 @@ describe('phone Ideas screen', () => {
 
   it('never creates an empty idea, even when the app goes to the background', async () => {
     const page = bootApp('#/ideas', () => ideaDetail('idea-1', ''))
+    await settleAll()
     const editor = page.editor()!
     editor.typeText('   ')
     editor.typeText('  \n ')
@@ -535,6 +538,7 @@ describe('phone Ideas screen', () => {
     const page = bootApp('#/ideas', call => new Promise(resolve => {
       answers.push(() => resolve(ideaDetail('idea-7', call.body ? call.body.text : '')))
     }))
+    await settleAll()
     const editor = page.editor()!
     editor.typeText('a')
     page.advance(700)
@@ -561,6 +565,7 @@ describe('phone Ideas screen', () => {
       if (!online) throw new TypeError('Failed to fetch')
       return ideaDetail('idea-3', call.body.text)
     })
+    await settleAll()
     page.editor()!.typeText('Call the plumber')
     page.setVisibility('hidden')
     await settleAll()
@@ -587,7 +592,7 @@ describe('phone Ideas screen', () => {
     expect(page.posts()).toEqual([{ path: '/api/ideas/idea-9', method: 'POST', body: { text: 'Old thought, sharpened' }, keepalive: false }])
   })
 
-  it('lists ideas with what has happened to each, and has an Ideas tab', async () => {
+  it('lists ideas with what has happened to each under More', async () => {
     const page = bootApp('#/ideas/list', call => {
       if (call.path.indexOf('/api/ideas?') === 0) {
         return {
@@ -608,7 +613,7 @@ describe('phone Ideas screen', () => {
     expect(text).toContain('Explored')
     expect(text).toContain('Never touched')
     expect(page.app.querySelector('.tabbar')!.hidden).toBe(false)
-    const tab = page.app.querySelectorAll('.tab').find(node => node.dataset.tab === 'ideas')!
+    const tab = page.app.querySelectorAll('.tab').find(node => node.dataset.tab === 'more')!
     expect(tab.classList.contains('active')).toBe(true)
     page.app.querySelectorAll('.idea-row')[2]!.click()
     page.advance(0)
@@ -635,7 +640,7 @@ describe('sw.js', () => {
       clients: { claim: async () => undefined, matchAll: async () => [] },
       registration: {}
     }
-    runInNewContext(swSource, { self, caches, fetch: network, Response, URL })
+    runInNewContext(swSource, { self, caches, fetch: network, Response, URL, AbortController, setTimeout, clearTimeout })
     const request = async (path: string, mode = 'navigate') => {
       let answer = null as Promise<Response> | null
       listeners.fetch!({ request: { method: 'GET', url: ORIGIN + path, mode }, respondWith: (value: Promise<Response>) => { answer = value } })
@@ -647,7 +652,7 @@ describe('sw.js', () => {
 
   it('precaches the boot guard with the rest of the shell under a new cache name', async () => {
     const sw = worker({}, unreachable)
-    expect(swSource).toContain("const CACHE = 'conductor-phone-v3'")
+    expect(swSource).toContain("const CACHE = 'conductor-phone-v4'")
     let done: Promise<unknown> = Promise.resolve()
     sw.listeners.install!({ waitUntil: (value: Promise<unknown>) => { done = value } })
     await done
@@ -717,14 +722,14 @@ describe('phone viewing state', () => {
     if (!source) throw new Error('missing ' + name)
     return new Function(source[1]!, source[2]!) as (value: unknown) => unknown
   }
-  it('says Viewing for a settled turn whose background tasks still run, and drops the turn timer', () => {
+  it('says Waiting for a settled turn whose background tasks still run, and drops the turn timer', () => {
     const viewing = extract('sessionViewing')
     expect(viewing({ state: 'working', activity: 'waiting_background', phase: 'completed', backgroundTasks: 1 })).toBe(true)
     expect(viewing({ state: 'working', activity: 'complete', phase: 'idle', backgroundTasks: 2 })).toBe(true)
     expect(viewing({ state: 'working', activity: 'working', phase: 'running', backgroundTasks: 1 })).toBe(false)
     expect(viewing({ state: 'done', activity: 'complete', phase: 'completed', backgroundTasks: 0 })).toBe(false)
     expect(extract('viewingDescription')(1)).toBe('Turn ended; 1 background task still running; the agent continues when they finish')
-    expect(appSource).toContain("viewing ? 'Viewing' : STATE_WORDS[session.state]")
+    expect(appSource).toContain("label: 'Waiting'")
     expect(appSource).toContain("session.state === 'working' && !viewing && session.turnStartedAt")
   })
 })

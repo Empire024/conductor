@@ -14,7 +14,7 @@ import assert from 'node:assert/strict'
 // The window is parked off-screen (CONDUCTOR_TEST_USER_DATA). Run under scripts/smoke-lock.mjs;
 // CONDUCTOR_SMOKE_MAIN points at another build's main entry (default out/main/index.js).
 const root = await mkdtemp(join(tmpdir(), 'conductor-phone-images-'))
-const output = resolve('artifacts/phone-images')
+const output = resolve('.conductor-scratch/phone-redesign/images')
 await mkdir(output, { recursive: true })
 const env = { ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_EMPTY_HISTORY: '1', CONDUCTOR_TEST_NODE_EXECUTABLE: process.execPath, CONDUCTOR_TEST_USER_DATA: join(root, 'profile'), CONDUCTOR_PROJECTS_ROOT: join(root, 'projects') }
 delete env.ELECTRON_RUN_AS_NODE; delete env.CONDUCTOR_LIVE_TESTS

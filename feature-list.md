@@ -1906,3 +1906,16 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 - [x] agents.handoff refused a caller whose stored model id the live runtime no longer advertises (2026-10-02: the wizard on `opus[1m]`, Claude Code 2.1.287 lists only `opus`); 03256da mapped dispatch and tabs.open but not handoff. Done: an inherited model resolves through advertisedModel (same model under the live id, effort kept); a model the caller names is still checked as named. Test in agent-control.test.ts. <!-- conductor-task:handoff-stale-model-id agent=agent_murl5bjy_vu2hy80 -->
 
 - [x] Need to be able to add image from phone to these tasks in WebApp plus in chats <!-- conductor-task:6528fe02-8c18-4bc1-be8e-385589629ae2 agent=agent_murjyp3q_o50y9jy -->
+
+## Phone WebApp: ultimate, snappy control suite (2026-10-03)
+
+- [x] 1. Repair phone dictation and explain iOS/Android browser, permission and PWA limitations with keyboard fallback. <!-- conductor-task:phone-redesign-dictation agent=agent_murrdn5k_umf5k4m -->
+- [x] 2. Persistent Home access and correct Back/browser/swipe history from every phone screen. <!-- conductor-task:phone-redesign-home agent=agent_murrdn5k_umf5k4m -->
+- [x] 3. Consolidate primary navigation around projects, tabs, attention and new task; everything else under More. <!-- conductor-task:phone-redesign-navigation agent=agent_murrdn5k_umf5k4m -->
+- [x] 4. Project name/colour on every tab, live phase, running indicator and recent activity ordering/highlights. <!-- conductor-task:phone-redesign-tabs agent=agent_murrdn5k_umf5k4m -->
+- [x] 5. Redesign new-tab flow; last-used provider/model or Claude Opus default, never accidental Grok. <!-- conductor-task:phone-redesign-new-tab agent=agent_murrdn5k_umf5k4m -->
+- [x] 6. Full phone UI redesign using current desktop light/dark palette and accessible thumb-friendly controls. <!-- conductor-task:phone-redesign-visual agent=agent_murrdn5k_umf5k4m -->
+- [x] 7. Immediate cached shell, skeleton/loading and connection transitions with fast reconnect and preserved lock/auth. <!-- conductor-task:phone-redesign-connection agent=agent_murrdn5k_umf5k4m -->
+- [x] 8. Optimistic sent/queued/steered/delivered feedback and working end-to-end Stop matching agents.interrupt. <!-- conductor-task:phone-redesign-message-stop agent=agent_murrdn5k_umf5k4m -->
+- [x] 9. Claude/Codex/Grok usage-limit graphs and weekly/session reset times from the desktop usage.limits source. <!-- conductor-task:phone-redesign-usage agent=agent_murrdn5k_umf5k4m -->
+- [x] 10. Indexed, bounded cross-project activity feed of outward actions and completed deliveries; trace the Conductor print-shop email. <!-- conductor-task:phone-redesign-activity agent=agent_murrdn5k_umf5k4m -->

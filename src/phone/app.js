@@ -15,6 +15,10 @@
 
   const TOKEN_KEY = 'conductor.phone.token'
   const FILTER_KEY = 'conductor.phone.filter'
+  const LAST_AGENT_KEY = 'conductor.phone.lastAgent'
+  const THEME_KEY = 'conductor.phone.theme'
+  const STATE_CACHE_KEY = 'conductor.phone.lastState'
+  const STATE_CACHE_MAX_AGE = 24 * 60 * 60 * 1000
   /* The service worker cannot read localStorage, so a re-subscription after the browser rotates
      the push endpoint reads the key (and token) from here instead. */
   const AUTH_CACHE = 'conductor-phone-auth'
@@ -104,6 +108,11 @@
     metrics: null,
     metricsError: '',
     connected: false,
+    authReady: false,
+    stale: false,
+    cachedAt: 0,
+    messages: {},
+    stops: {},
     filter: 'all',
     pairCode: '',
     showClosed: false,
@@ -147,6 +156,9 @@
   /* Functions re-run once a second so relative times and elapsed timers stay honest without
      rebuilding any list. Cleared by whichever view rebuilt its rows. */
   let tickers = []
+  let authEpoch = 0
+  const activeReads = new Set()
+  let connectionBanner = null
 
   // ------------------------------------------------------------------ storage
 
@@ -162,9 +174,56 @@
   }
 
   const setToken = token => {
+    if (state.token !== (token || null)) {
+      authEpoch += 1
+      clearStateCache()
+      state.authReady = false
+      abortReads()
+      state.phone = null
+      state.me = null
+      state.conversation = null
+      state.metrics = null
+      state.messages = {}
+      state.stops = {}
+    }
     state.token = token || null
     writeStored(TOKEN_KEY, state.token)
   }
+
+  const clearStateCache = () => {
+    writeStored(STATE_CACHE_KEY, null)
+    state.stale = false
+    state.cachedAt = 0
+  }
+
+  const cachePhoneState = () => {
+    // A configured lock has only an in-memory unlock capability. Never persist its data.
+    if (!state.token || !state.authReady || state.locked || !state.lock || state.lock.configured !== false) return
+    try {
+      const value = JSON.stringify({ token: state.token, at: Date.now(), phone: state.phone })
+      if (value.length <= 512 * 1024) writeStored(STATE_CACHE_KEY, value)
+      else clearStateCache()
+    } catch (error) { clearStateCache() }
+  }
+
+  const restorePhoneState = () => {
+    // Even a previously unlocked cache waits for CURRENT server auth/lock validation.
+    if (!state.authReady || state.locked || !state.lock || state.lock.configured !== false || state.phone) return
+    try {
+      const cached = JSON.parse(readStored(STATE_CACHE_KEY) || 'null')
+      if (!cached || cached.token !== state.token || !cached.phone || !Array.isArray(cached.phone.sessions) || !Array.isArray(cached.phone.projects) || !Number.isFinite(cached.at) || Date.now() - cached.at > STATE_CACHE_MAX_AGE || cached.at > Date.now()) { clearStateCache(); return }
+      state.phone = cached.phone
+      state.stale = true
+      state.cachedAt = cached.at
+    } catch (error) { clearStateCache() }
+  }
+
+  const abortReads = () => {
+    for (const controller of activeReads) controller.abort()
+    activeReads.clear()
+  }
+
+  const abortedRequest = () => { const error = new Error('This read was replaced.'); error.name = 'AbortError'; return error }
 
   /* The key the service worker needs to re-subscribe on its own, plus the token that POST needs. */
   const rememberPushAuth = async (key, token) => {
@@ -352,6 +411,7 @@
 
   const api = async (path, options) => {
     const settings = options || {}
+    const epoch = authEpoch
     const headers = {}
     if (state.token) headers.Authorization = 'Bearer ' + state.token
     if (state.unlockToken) headers[UNLOCK_HEADER] = state.unlockToken
@@ -364,20 +424,33 @@
       headers['Content-Type'] = 'application/json'
       body = JSON.stringify(settings.body)
     }
+    const controller = new AbortController()
+    const cancel = () => controller.abort()
+    if (settings.signal) {
+      if (settings.signal.aborted) cancel()
+      else settings.signal.addEventListener('abort', cancel, { once: true })
+    }
+    const reading = !settings.method || settings.method === 'GET'
+    if (reading) activeReads.add(controller)
+    const timeout = settings.timeoutMs || (reading ? HEALTH_TIMEOUT_MS : 0)
+    const timer = timeout ? setTimeout(cancel, timeout) : null
+    try {
     const response = await fetch(path, {
       method: settings.method || 'GET',
       headers: headers,
       body: body,
       cache: 'no-store',
-      signal: settings.signal,
+      signal: controller.signal,
       /* Lets a save started as the page is hidden or closed outlive the page. */
       keepalive: Boolean(settings.keepalive)
     })
+    if (epoch !== authEpoch || controller.signal.aborted) throw abortedRequest()
     if (response.status === 401) {
       handleUnauthorized()
       throw ApiError('This phone is no longer paired.', 401)
     }
     const text = await response.text()
+    if (epoch !== authEpoch || controller.signal.aborted) throw abortedRequest()
     let data = null
     if (text) {
       try { data = JSON.parse(text) } catch (error) { data = null }
@@ -389,6 +462,11 @@
       throw ApiError(message, response.status, data)
     }
     return data
+    } finally {
+      if (timer !== null) clearTimeout(timer)
+      activeReads.delete(controller)
+      if (settings.signal) settings.signal.removeEventListener('abort', cancel)
+    }
   }
 
   /* One place decides what "no longer paired" means, because both the API and the stream can
@@ -404,6 +482,8 @@
     state.conversation = null
     state.conversationId = null
     state.metrics = null
+    state.messages = {}
+    state.stops = {}
     stopStream()
     void forgetPushAuth()
     render()
@@ -425,6 +505,7 @@
   const setConnected = value => {
     if (state.connected === value) return
     state.connected = value
+    if (!value && state.phone) state.stale = true
     downSince = value ? 0 : Date.now()
     if (overlayPill) overlayPill.hidden = value || !state.token
     /* The header carries a live dot of its own, and it only repaints when a view is asked to. */
@@ -445,13 +526,17 @@
     if (!state.token || streamTimer || streamController || state.locked) return
     const delay = BACKOFF_MS[Math.min(streamAttempt, BACKOFF_MS.length - 1)]
     streamAttempt += 1
-    streamTimer = setTimeout(() => { streamTimer = null; connectStream() }, delay)
+    streamTimer = setTimeout(() => {
+      streamTimer = null
+      if (state.authReady) connectStream()
+      else void checkLock()
+    }, delay)
   }
 
   /* SSE without EventSource: EventSource cannot carry an Authorization header, so the frames are
      read off a fetch body and parsed here. Lines are cut on \n with a trailing \r stripped, which
      keeps a \r\n that straddles two chunks from looking like a blank line - a false frame end. */
-  const readStream = async (body, handler) => {
+  const readStream = async (body, handler, heartbeat) => {
     const reader = body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
@@ -475,7 +560,7 @@
 
     const handleLine = line => {
       if (line === '') { dispatch(); return }
-      if (line.charAt(0) === ':') { if (!handler) lastEventAt = Date.now(); return }
+      if (line.charAt(0) === ':') { if (heartbeat) heartbeat(); else if (!handler) lastEventAt = Date.now(); return }
       const colon = line.indexOf(':')
       const name = colon < 0 ? line : line.slice(0, colon)
       let value = colon < 0 ? '' : line.slice(colon + 1)
@@ -502,7 +587,7 @@
   }
 
   const connectStream = () => {
-    if (!state.token || streamController || state.locked) return
+    if (!state.token || !state.authReady || streamController || state.locked) return
     if (streamTimer) { clearTimeout(streamTimer); streamTimer = null }
     const controller = new AbortController()
     streamController = controller
@@ -514,6 +599,7 @@
       cache: 'no-store',
       signal: controller.signal
     }).then(async response => {
+      if (streamController !== controller) return
       if (response.status === 401) { handleUnauthorized(); return }
       if (response.status === 423) { void checkLock(); return }
       if (!response.ok || !response.body) {
@@ -523,7 +609,13 @@
       streamAttempt = 0
       state.streamProblem = ''
       setConnected(true)
-      await readStream(response.body)
+      await readStream(response.body, (name, data) => {
+        if (streamController !== controller || state.locked || !state.authReady) return
+        lastEventAt = Date.now()
+        onStreamEvent(name, data)
+      }, () => {
+        if (streamController === controller) lastEventAt = Date.now()
+      })
       state.streamProblem = 'The computer closed it.'
     }).catch(error => {
       /* Every failure is retried the same way, slower; the connection check only needs the word. */
@@ -545,8 +637,12 @@
 
   const onStreamEvent = (name, data) => {
     if (name === 'state') {
-      if (!data) return
+      if (!data || state.locked || !state.authReady) return
+      phoneRevision += 1
       state.phone = data
+      state.stale = false
+      state.cachedAt = Date.now()
+      cachePhoneState()
       reconcileForm()
       render()
       return
@@ -566,6 +662,45 @@
     /* 'ping' only proves the pipe is alive, which lastEventAt already recorded. */
   }
 
+  let stateRead = null
+  let phoneRevision = 0
+  const refreshPhoneState = async () => {
+    if (!state.token || !state.authReady || state.locked) return
+    if (stateRead) stateRead.abort()
+    const controller = new AbortController()
+    stateRead = controller
+    const revision = phoneRevision
+    try {
+      const phone = await api('/api/state', { signal: controller.signal })
+      if (stateRead !== controller || revision !== phoneRevision || !state.authReady || state.locked || !phone || !Array.isArray(phone.projects) || !Array.isArray(phone.sessions)) return
+      state.phone = phone
+      state.stale = false
+      state.cachedAt = Date.now()
+      cachePhoneState()
+      reconcileForm()
+      render()
+    } catch (error) {
+      if (error && error.name !== 'AbortError') state.streamProblem = errorMessage(error)
+    } finally {
+      if (stateRead === controller) stateRead = null
+      paintConnection()
+    }
+  }
+
+  const refreshRuntime = async () => {
+    if (!state.token) return
+    abortReads()
+    stopStream()
+    streamAttempt = 0
+    // Keep an already validated screen and its unsaved editor while rechecking access.
+    // Cold starts remain gated by authReady=false; a 423 immediately clears this screen.
+    paintConnection()
+    if (!await checkLock()) return
+    restartStream()
+    void refreshPhoneState()
+    if (state.conversationId) void loadConversation(state.conversationId, true)
+  }
+
   const scheduleConversationRefetch = () => {
     if (refetchTimer) return
     refetchTimer = setTimeout(() => {
@@ -579,7 +714,7 @@
   const openUrl = url => {
     const text = String(url || '')
     const hash = text.indexOf('#')
-    if (hash >= 0) { window.location.hash = text.slice(hash); return }
+    if (hash >= 0) { go(text.slice(hash)); return }
     if (text) window.location.assign(text)
   }
 
@@ -600,6 +735,11 @@
 
   const currentRoute = () => {
     const hash = window.location.hash || '#/'
+    const path = hash.split('?')[0]
+    const projectMatch = /[?&]project=([^&]*)/.exec(hash)
+    const projectId = projectMatch ? decodeURIComponent(projectMatch[1]) : ''
+    if (path === '#/tabs' || path === '#/attention') return { name: path.slice(2), projectId: projectId, key: path.slice(2) + ':' + projectId }
+    for (const name of ['more', 'usage', 'activity']) if (path === '#/' + name) return { name: name, key: name }
     const session = /^#\/session\/(.+)$/.exec(hash)
     if (session) return { name: 'session', id: decodeURIComponent(session[1]), key: 'session:' + session[1] }
     /* #/ideas is a new note (bookmarkable: open, type, leave); #/ideas/<id> is the same editor on
@@ -620,34 +760,88 @@
     if (hash.indexOf('#/terminal') === 0) return { name: 'terminal', key: 'terminal' }
     if (hash.indexOf('#diagnose') === 0) return { name: 'diagnose', key: 'diagnose' }
     if (hash.indexOf('#trust') === 0) return { name: 'trust', key: 'trust' }
-    return { name: 'sessions', key: 'sessions' }
+    return { name: 'home', key: 'home' }
   }
 
   /* The two pages a phone needs before it is paired, or when pairing is what broke. */
   const OPEN_ROUTES = ['diagnose', 'trust']
 
+  let navigationDepth = 0
+  let navigationDirection = 'push'
+  let navigationHash = ''
+  const navigationUrl = hash => (window.location.pathname || '/') + (window.location.search || '') + hash
+  const navigationState = depth => ({ conductorPhone: { depth, bounded: true } })
+  const seedNavigation = () => {
+    const history = window.history
+    const hash = window.location.hash || '#/'
+    navigationHash = hash
+    if (!history || !history.replaceState || !history.pushState) return
+    const owned = history.state && history.state.conductorPhone
+    if (owned && owned.bounded && Number.isInteger(owned.depth) && owned.depth >= 0) { navigationDepth = owned.depth; return }
+    /* Keep one same-origin boundary behind Home so a native edge swipe cannot expose a stale route. */
+    history.replaceState(navigationState(-1), '', navigationUrl('#/'))
+    history.pushState(navigationState(0), '', navigationUrl('#/'))
+    if (hash !== '#/') {
+      navigationDepth = 1
+      history.pushState(navigationState(1), '', navigationUrl(hash))
+    }
+  }
   const go = hash => {
     if (window.location.hash === hash) render()
-    else window.location.hash = hash
+    else if (hash === '#/' && navigationDepth > 0 && window.history && window.history.go) window.history.go(-navigationDepth)
+    else if (window.history && window.history.pushState) {
+      navigationDirection = 'push'
+      navigationDepth += 1
+      navigationHash = hash
+      window.history.pushState(navigationState(navigationDepth), '', navigationUrl(hash))
+      render()
+    } else window.location.hash = hash
   }
 
   /* Opens a page that has a back button, remembering where back goes. */
   const visit = hash => {
-    state.returnTo = window.location.hash || '#/'
     go(hash)
   }
 
   /* iOS only raises the keyboard for a focus() made inside the tap itself, and hashchange arrives
      after the tap has ended; screens that open with the cursor in a field are rendered right away. */
   const goNow = hash => {
-    if (window.location.hash !== hash) window.location.hash = hash
-    render()
+    go(hash)
   }
 
   const goBack = () => {
-    const target = state.returnTo && state.returnTo !== window.location.hash ? state.returnTo : '#/'
-    state.returnTo = ''
-    go(target)
+    navigationDirection = 'pop'
+    if (navigationDepth > 0 && window.history && window.history.back) window.history.back()
+    else {
+      navigationDepth = 0
+      navigationHash = '#/'
+      if (window.history && window.history.replaceState) window.history.replaceState(navigationState(0), '', navigationUrl('#/'))
+      else window.location.hash = '#/'
+      render()
+    }
+  }
+
+  const restoreNavigation = () => {
+    const owned = window.history && window.history.state && window.history.state.conductorPhone
+    /* Fragment links produce popstate with null state before hashchange in Chromium/WebKit. */
+    if (!owned && window.history && window.history.replaceState) {
+      navigationDirection = 'push'
+      navigationDepth += 1
+      navigationHash = window.location.hash || '#/'
+      window.history.replaceState(navigationState(navigationDepth), '', navigationUrl(navigationHash))
+      render()
+      return
+    }
+    if (owned && owned.bounded && owned.depth === -1 && window.history.go) {
+      navigationHash = '#/'
+      window.history.go(1)
+      return
+    }
+    const depth = owned && Number.isInteger(owned.depth) ? owned.depth : 0
+    navigationDirection = depth < navigationDepth ? 'pop' : 'push'
+    navigationDepth = depth
+    navigationHash = window.location.hash || '#/'
+    render()
   }
 
   const beginTicks = () => { tickers = [] }
@@ -656,26 +850,30 @@
   const render = () => {
     const wanted = currentRoute()
     const open = OPEN_ROUTES.indexOf(wanted.name) >= 0
-    const route = !state.token && !open ? { name: 'pair', key: 'pair' } : state.token && state.locked && !open ? { name: 'lock', key: 'lock' } : wanted
+    const route = !state.token && !open ? { name: 'pair', key: 'pair' } : state.token && state.locked && !open ? { name: 'lock', key: 'lock' } : state.token && !state.authReady && !open ? { name: 'connecting', key: 'connecting' } : wanted
     if (screen && screen.key === route.key) {
       if (screen.update) screen.update(route)
       updateTabBar(route)
+      paintConnection()
       return
     }
     if (screen && screen.destroy) screen.destroy()
     stopDictation()
     beginTicks()
     screen = buildScreen(route)
+    if (state.token && !state.locked) screen.root.classList.add('nav-' + navigationDirection)
     clear(appRoot)
     appRoot.appendChild(screen.root)
     appRoot.appendChild(tabBar)
     updateTabBar(route)
+    paintConnection()
     if (overlayPill) overlayPill.hidden = state.connected || !state.token || state.locked
     /* A field can only take focus once it is in the page. */
     if (screen.onShown) screen.onShown()
   }
 
   const buildScreen = route => {
+    if (route.name === 'connecting') return connectingScreen()
     if (route.name === 'pair') return pairScreen()
     if (route.name === 'lock') return lockScreen()
     if (route.name === 'terminal') return terminalScreen()
@@ -690,12 +888,63 @@
     if (route.name === 'phone') return phoneScreen()
     if (route.name === 'diagnose') return diagnoseScreen()
     if (route.name === 'trust') return trustScreen()
-    return sessionsScreen()
+    if (route.name === 'more') return moreScreen()
+    if (route.name === 'usage') return usageScreen()
+    if (route.name === 'activity') return activityScreen()
+    if (route.name === 'tabs' || route.name === 'attention') return sessionsScreen(route)
+    return homeScreen()
+  }
+
+  const safeSkeleton = (title, hint) => {
+    const node = el('section', 'loading-shell')
+    node.setAttribute('aria-busy', 'true')
+    node.appendChild(el('p', 'card-note', title))
+    if (hint) node.appendChild(el('p', 'card-note', hint))
+    for (let index = 0; index < 3; index += 1) {
+      const row = el('div', 'skeleton')
+      row.setAttribute('aria-hidden', 'true')
+      node.appendChild(row)
+    }
+    return node
+  }
+
+  const connectingScreen = () => {
+    const view = overviewScreen('Conductor', 'connecting')
+    view.body.appendChild(safeSkeleton('Connecting to your computer…', 'Checking this phone’s access before reading projects.'))
+    view.body.appendChild(button('primary', 'Retry connection', () => void refreshRuntime()))
+    view.body.appendChild(button('ghost', 'Connection help', () => visit('#diagnose')))
+    return { key: view.key, root: view.root }
+  }
+
+  const paintConnection = () => {
+    if (!screen || !screen.root) return
+    if (!connectionBanner) {
+      connectionBanner = el('div', 'connection-banner')
+      connectionBanner.setAttribute('role', 'status')
+      connectionBanner.appendChild(el('span', 'connection-dot'))
+      connectionBanner.appendChild(el('span', 'connection-copy'))
+      const actions = el('div', 'connection-actions')
+      actions.appendChild(button('ghost', 'Retry', () => void refreshRuntime()))
+      actions.appendChild(button('ghost', 'Help', () => visit('#diagnose')))
+      connectionBanner.appendChild(actions)
+    }
+    if (connectionBanner.parentNode !== screen.root) screen.root.insertBefore(connectionBanner, screen.root.children[1] || null)
+    connectionBanner.hidden = !state.token || state.locked || (state.connected && !state.stale)
+    connectionBanner.classList.toggle('stale', state.stale)
+    const copy = connectionBanner.querySelector('.connection-copy')
+    if (copy) copy.textContent = state.stale
+      ? 'Showing the last saved state. Refreshing…'
+      : navigator.onLine === false ? 'This phone is offline. Reconnect to reach your computer.'
+        : state.streamProblem || 'Connecting to your computer…'
   }
 
   // ------------------------------------------------------------------ shell chrome
 
   const TAB_ICONS = {
+    home: ['M3 11l9-8 9 8', 'M5 10v11h14V10', 'M9 21v-7h6v7'],
+    tabs: ['M4 7h16', 'M4 12h16', 'M4 17h11'],
+    attention: ['M12 3l10 18H2L12 3Z', 'M12 9v5', 'M12 17h.01'],
+    more: ['M5 12h.01', 'M12 12h.01', 'M19 12h.01'],
     sessions: ['M4 7h16', 'M4 12h16', 'M4 17h11'],
     tasks: ['M9 6h11', 'M9 12h11', 'M9 18h11', 'M3.5 6h.01', 'M3.5 12h.01', 'M3.5 18h.01'],
     ideas: ['M9.5 18h5', 'M10.5 21h3', 'M12 3a6 6 0 0 0-3.6 10.8c.7.5 1.1 1.3 1.1 2.1v.1h5v-.1c0-.8.4-1.6 1.1-2.1A6 6 0 0 0 12 3Z'],
@@ -709,21 +958,18 @@
     const bar = el('nav', 'tabbar')
     bar.setAttribute('aria-label', 'Sections')
     const tabs = [
-      { id: 'sessions', label: 'Sessions', hash: '#/' },
-      { id: 'tasks', label: 'Tasks', hash: '#/tasks' },
-      /* Opens a new note with the keyboard up, so it renders inside the tap (goNow). */
-      { id: 'ideas', label: 'Ideas', hash: '#/ideas', now: true },
-      { id: 'idea-runs', label: 'Idea runs', hash: '#/idea-runs' },
-      { id: 'new', label: 'New', hash: '#/new' },
-      { id: 'system', label: 'System', hash: '#/system' },
-      { id: 'phone', label: 'Phone', hash: '#/phone' }
+      { id: 'home', label: 'Home', hash: '#/' },
+      { id: 'tabs', label: 'Tabs', hash: '#/tabs' },
+      { id: 'attention', label: 'Attention', hash: '#/attention' },
+      { id: 'new', label: 'New task', hash: '#/new' },
+      { id: 'more', label: 'More', hash: '#/more' }
     ]
     for (const tab of tabs) {
       const node = button('tab', null, () => (tab.now ? goNow(tab.hash) : go(tab.hash)))
       node.dataset.tab = tab.id
       const glyph = el('span', 'tab-icon')
       glyph.appendChild(icon(TAB_ICONS[tab.id], 22))
-      if (tab.id === 'sessions') glyph.appendChild(el('span', 'tab-badge'))
+      if (tab.id === 'attention') glyph.appendChild(el('span', 'tab-badge'))
       node.appendChild(glyph)
       node.appendChild(el('span', 'tab-label', tab.label))
       bar.appendChild(node)
@@ -732,11 +978,12 @@
   }
 
   const updateTabBar = route => {
-    const hidden = route.name === 'pair' || route.name === 'lock' || route.name === 'terminal' || route.name === 'session' || route.name === 'idea' || OPEN_ROUTES.indexOf(route.name) >= 0
+    const hidden = route.name === 'pair' || route.name === 'lock' || !state.token || state.locked
     tabBar.hidden = hidden
     const attention = state.phone && state.phone.counts ? state.phone.counts.attention : 0
     for (const node of tabBar.querySelectorAll('.tab')) {
-      const active = node.dataset.tab === route.name
+      const destination = route.name === 'session' ? 'tabs' : ['home', 'tabs', 'attention', 'new'].indexOf(route.name) >= 0 ? route.name : 'more'
+      const active = node.dataset.tab === destination
       node.classList.toggle('active', active)
       node.setAttribute('aria-current', active ? 'page' : 'false')
       const mark = node.querySelector('.tab-badge')
@@ -861,7 +1108,7 @@
            can still become the app; the list offers it once, if Chrome offered an install. */
         if (!shell.isStandalone() && shell.currentPlatform().android) state.offerInstall = true
         streamAttempt = 0
-        connectStream()
+        void checkLock()
         go('#/')
       } catch (error) {
         problem.textContent = errorMessage(error) || 'That code did not work.'
@@ -1301,6 +1548,196 @@
 
   // ------------------------------------------------------------------ sessions screen
 
+  const activityTime = session => Date.parse(session.updatedAt || session.lastActivityAt || session.createdAt || '') || 0
+  const recentSessions = sessions => sessions.slice().sort((a, b) => activityTime(b) - activityTime(a) || String(a.id).localeCompare(String(b.id)))
+  const sessionPhase = session => {
+    if (session.state === 'attention' || session.state === 'failed' || session.phase === 'waiting_approval' || session.phase === 'waiting_input') return { id: 'attention', label: 'Needs you' }
+    if (sessionViewing(session) || ['limited', 'disconnected', 'idle'].indexOf(session.state) >= 0 || session.activity === 'waiting') return { id: 'waiting', label: 'Waiting' }
+    if (session.state === 'working' || ['starting', 'running', 'interrupting'].indexOf(session.phase) >= 0) return { id: 'running', label: 'Running' }
+    return { id: 'done', label: 'Done' }
+  }
+  const projectColour = id => {
+    const colours = ['#82aaff', '#7fdbca', '#c792ea', '#ffcb6b', '#f78c6c', '#89ddff', '#c3e88d']
+    let hash = 0
+    for (const letter of String(id || '')) hash = (hash * 31 + letter.charCodeAt(0)) >>> 0
+    return colours[hash % colours.length]
+  }
+  const projectBadge = (id, name) => {
+    const node = el('span', 'project-badge', name || 'Project')
+    node.style.setProperty('--project-color', projectColour(id))
+    return node
+  }
+  const sectionHead = (title, label, hash) => {
+    const node = el('div', 'section-head')
+    node.appendChild(el('h2', 'group-title', title))
+    if (hash) node.appendChild(button('ghost', label || 'View all', () => go(hash)))
+    return node
+  }
+  const overviewScreen = (title, key) => {
+    const root = el('div', 'screen')
+    const header = topbar()
+    header.appendChild(fill(el('div', 'topbar-main'), [el('h1', 'topbar-title', title)]))
+    const scroll = scroller()
+    const body = el('div', 'form')
+    scroll.appendChild(body)
+    root.appendChild(header)
+    root.appendChild(scroll)
+    return { key: key, root: root, body: body }
+  }
+  const activityCard = item => {
+    const node = item.sessionId
+      ? button('card activity-card', null, () => go('#/session/' + encodeURIComponent(item.sessionId)))
+      : el('section', 'card activity-card')
+    node.appendChild(el('strong', 'card-title activity-title', item.title || 'Completed action'))
+    node.appendChild(projectBadge(item.projectId, item.projectName))
+    node.appendChild(el('span', 'card-note activity-meta', dotRow([item.tabTitle, relativeTime(item.at), item.kind])))
+    if (item.detail) node.appendChild(el('p', 'card-note activity-summary', oneLine(item.detail, 240)))
+    return node
+  }
+  const sortedActivity = items => (items || []).slice().sort((a, b) => (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0))
+  const homeScreen = () => {
+    const view = overviewScreen('Home', 'home')
+    let activity = null, activityError = '', destroyed = false
+    const draw = () => {
+      beginTicks()
+      clear(view.body)
+      const phone = state.phone
+      const hero = el('section', 'home-hero')
+      hero.appendChild(el('h2', 'card-title', phone ? phone.machineName || 'Conductor' : 'Conductor'))
+      const sessions = phone ? phone.sessions || [] : []
+      const running = sessions.filter(row => sessionPhase(row).id === 'running').length
+      const attention = sessions.filter(row => sessionPhase(row).id === 'attention').length
+      const stats = el('div', 'home-stats')
+      for (const [value, label, hash] of [[running, 'Running', '#/tabs'], [attention, 'Needs you', '#/attention']]) {
+        const stat = button('home-stat', null, () => go(hash))
+        stat.appendChild(el('strong', 'home-stat-value', value))
+        stat.appendChild(el('span', 'home-stat-label', label))
+        stats.appendChild(stat)
+      }
+      hero.appendChild(stats)
+      view.body.appendChild(hero)
+      if (!phone) { view.body.appendChild(safeSkeleton('Reading projects…', 'Your project overview appears when the computer connects.')); return }
+      if (state.offerInstall && state.installPrompt) view.body.appendChild(installCard())
+      view.body.appendChild(sectionHead('Projects'))
+      const projects = el('div', 'home-projects')
+      for (const project of phone.projects || []) {
+        const rows = sessions.filter(row => row.projectId === project.id)
+        const card = button('card project-card', null, () => go('#/tabs?project=' + encodeURIComponent(project.id)))
+        card.appendChild(projectBadge(project.id, project.name))
+        card.appendChild(el('span', 'card-note', dotRow([rows.length + ' tabs', rows.filter(row => sessionPhase(row).id === 'running').length + ' running', rows.filter(row => sessionPhase(row).id === 'attention').length + ' need you'])))
+        projects.appendChild(card)
+      }
+      if (!(phone.projects || []).length) projects.appendChild(emptyNote('No projects yet.', 'Add a project on the computer.'))
+      view.body.appendChild(projects)
+      view.body.appendChild(sectionHead('Recent tabs', 'All tabs', '#/tabs'))
+      const recent = el('div', 'list')
+      for (const session of recentSessions(sessions).slice(0, 5)) recent.appendChild(sessionRow(session))
+      view.body.appendChild(recent)
+      view.body.appendChild(sectionHead('Recent activity', 'View all', '#/activity'))
+      if (activityError) view.body.appendChild(el('p', 'card-note', activityError))
+      else if (!activity) view.body.appendChild(el('p', 'card-note', 'Reading activity…'))
+      else if (!activity.items.length) view.body.appendChild(el('p', 'card-note', 'No completed actions in this activity window.'))
+      else for (const item of sortedActivity(activity.items).slice(0, 3)) view.body.appendChild(activityCard(item))
+    }
+    draw()
+    api('/api/activity').then(result => { if (!destroyed) { activity = { items: result.items || [] }; draw() } }).catch(error => { if (!destroyed) { activityError = errorMessage(error); draw() } })
+    return { key: view.key, root: view.root, update: draw, destroy: () => { destroyed = true } }
+  }
+  const applyTheme = value => {
+    const theme = ['system', 'light', 'dark'].indexOf(value) >= 0 ? value : 'system'
+    if (document.documentElement && document.documentElement.setAttribute) document.documentElement.setAttribute('data-theme', theme)
+    if (document.querySelectorAll) for (const meta of document.querySelectorAll('meta[name="theme-color"]')) {
+      const light = theme === 'light' || (theme === 'system' && String(meta.getAttribute('media') || '').indexOf('light') >= 0)
+      meta.setAttribute('content', light ? '#edf1f7' : '#01111f')
+    }
+    writeStored(THEME_KEY, theme)
+  }
+  const moreScreen = () => {
+    const view = overviewScreen('More', 'more')
+    for (const [title, hash] of [['Project tasks', '#/tasks'], ['Ideas', '#/ideas/list'], ['Idea runs', '#/idea-runs'], ['Usage', '#/usage'], ['Activity', '#/activity'], ['System', '#/system'], ['Terminal', '#/terminal'], ['Phone & security', '#/phone'], ['Connection help', '#diagnose']]) {
+      const row = button('more-row', null, () => visit(hash))
+      row.appendChild(fill(el('span', 'more-row-main'), [el('span', 'more-row-title', title)]))
+      row.appendChild(el('span', 'chev', '›'))
+      view.body.appendChild(row)
+    }
+    view.body.appendChild(sectionHead('Appearance'))
+    const options = el('div', 'appearance-options')
+    for (const theme of ['system', 'light', 'dark']) {
+      const node = button('chip', theme.charAt(0).toUpperCase() + theme.slice(1), () => { applyTheme(theme); paint() })
+      node.dataset.theme = theme
+      options.appendChild(node)
+    }
+    const paint = () => {
+      for (const node of options.childNodes) {
+        const selected = node.dataset.theme === (readStored(THEME_KEY) || 'system')
+        node.classList.toggle('selected', selected)
+        node.setAttribute('aria-pressed', String(selected))
+      }
+    }
+    paint()
+    view.body.appendChild(options)
+    return { key: view.key, root: view.root }
+  }
+  const remoteOverview = (title, key, path, drawData) => {
+    const view = overviewScreen(title, key)
+    let destroyed = false, busy = false, data = null, problem = '', lastLoad = 0
+    const draw = () => {
+      beginTicks()
+      clear(view.body)
+      const refresh = button('ghost', busy ? 'Refreshing…' : 'Refresh', () => { void load() })
+      refresh.disabled = busy
+      view.body.appendChild(refresh)
+      if (problem) view.body.appendChild(el('p', 'pending-error', problem))
+      if (data) drawData(view.body, data)
+      else view.body.appendChild(emptyNote(busy ? 'Reading ' + title.toLowerCase() + '…' : 'No data available yet.'))
+    }
+    const load = async () => {
+      if (busy || destroyed) return
+      lastLoad = Date.now()
+      busy = true; problem = ''; draw()
+      try { const result = await api(path); if (!destroyed) data = result }
+      catch (error) { if (!destroyed) problem = errorMessage(error) }
+      finally { busy = false; if (!destroyed) draw() }
+    }
+    void load()
+    return { key: view.key, root: view.root, destroy: () => { destroyed = true }, onVisibility: visible => { if (visible) void load() }, onSecond: () => { if (document.visibilityState !== 'hidden' && Date.now() - lastLoad >= 15000) void load() } }
+  }
+  const activityScreen = () => remoteOverview('Activity', 'activity', '/api/activity', (host, data) => {
+    host.appendChild(el('p', 'card-note', data.since ? 'Completed actions since ' + new Date(data.since).toLocaleString() : 'Recent completed actions across projects.'))
+    const items = sortedActivity(data.items)
+    if (!items.length) host.appendChild(emptyNote('No completed actions in this window.'))
+    for (const item of items) host.appendChild(activityCard(item))
+    if (data.hasMore) host.appendChild(el('p', 'card-note', 'Showing the latest activity in this window. Older records remain on the computer.'))
+  })
+  const usageScreen = () => remoteOverview('Usage', 'usage', '/api/usage', (host, data) => {
+    host.appendChild(el('p', 'card-note', 'Provider-reported allowance. Unknown or expired windows do not imply unused quota.'))
+    for (const id of ['claude', 'codex', 'grok']) {
+      const report = (data.providers || []).find(row => row.provider === id)
+      const allowance = (data.allowance || []).find(row => row.provider === id)
+      const card = el('section', 'card')
+      card.appendChild(el('h2', 'card-title', providerWord(id)))
+      const windows = report ? report.windows || [] : []
+      if (!windows.length) card.appendChild(el('p', 'card-note', 'Allowance unknown — no provider report.'))
+      for (const window_ of windows) {
+        const expired = window_.state !== 'current' || (window_.resetsAt && Date.parse(window_.resetsAt) <= Date.now())
+        const percent = !expired && typeof window_.usedPercent === 'number' ? Math.round(window_.usedPercent) + '% used' : 'Current use unknown'
+        card.appendChild(el('strong', 'usage-window', window_.label + ' · ' + percent))
+        card.appendChild(el('p', 'card-note', dotRow([window_.scope === 'model' ? (window_.models || []).join(', ') : '', window_.resetsAt ? 'Reset ' + new Date(window_.resetsAt).toLocaleString() : 'Reset time unknown', window_.observedAt ? 'Observed ' + relativeTime(window_.observedAt) : 'Freshness unknown'])))
+        const gauge = allowance && allowance[window_.kind]
+        if (window_.scope === 'provider' && gauge && gauge.label === window_.label && gauge.points && gauge.points.length > 1) {
+          const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
+          svg.setAttribute('class', 'sparkline'); svg.setAttribute('viewBox', '0 0 200 40'); svg.setAttribute('role', 'img'); svg.setAttribute('aria-label', window_.label + ' historical usage')
+          const line = document.createElementNS('http://www.w3.org/2000/svg', 'polyline')
+          line.setAttribute('points', gauge.points.map(point => (Math.max(0, Math.min(1, point[0])) * 200) + ',' + (40 - Math.max(0, Math.min(100, point[1])) * .4)).join(' '))
+          line.setAttribute('fill', 'none'); line.setAttribute('stroke', 'currentColor'); line.setAttribute('stroke-width', '2')
+          svg.appendChild(line); card.appendChild(svg)
+        }
+      }
+      for (const unknown of report ? report.unknown || [] : []) card.appendChild(el('p', 'card-note', unknown))
+      host.appendChild(card)
+    }
+  })
+
   const matchesFilter = session => {
     if (state.filter === 'all') return true
     return session.state === state.filter
@@ -1308,6 +1745,8 @@
 
   const sessionRow = (session, compact) => {
     const node = button('session' + (compact ? ' coworker-session' : ''), null, () => go('#/session/' + encodeURIComponent(session.id)))
+    const phase = sessionPhase(session)
+    if (session.state === 'done' && Date.now() - activityTime(session) < 86400000) node.classList.add('recent-done')
     node.appendChild(badge(session.state))
 
     const main = el('div', 'session-main')
@@ -1319,10 +1758,11 @@
     main.appendChild(head)
 
     const meta = el('div', 'session-meta')
+    meta.appendChild(projectBadge(session.projectId, session.projectName))
     const parts = [providerWord(session.provider), session.model]
     if (session.machineId && session.machineId !== 'local') parts.push('on ' + session.machineName)
     const viewing = sessionViewing(session)
-    const stateWord = el('span', 'session-state tone-' + (session.state || 'idle') + (viewing ? ' viewing' : ''), viewing ? 'Viewing' : STATE_WORDS[session.state] || 'Idle')
+    const stateWord = el('span', 'session-state phase-badge phase-' + phase.id + ' tone-' + (session.state || 'idle') + (viewing ? ' viewing' : ''), phase.label)
     if (viewing) stateWord.title = viewingDescription(session.backgroundTasks)
     meta.appendChild(stateWord)
     meta.appendChild(el('span', 'session-facts', dotRow(parts)))
@@ -1353,7 +1793,7 @@
   const groupSessions = sessions => {
     const projects = []
     const byProject = {}
-    for (const session of sessions) {
+    for (const session of recentSessions(sessions)) {
       let project = byProject[session.projectId]
       if (!project) {
         project = { id: session.projectId, name: session.projectName, workspaces: [], byWorkspace: {} }
@@ -1389,7 +1829,10 @@
           }
           return current.id
         }
-        const roots = workspace.sessions.filter(session => rootId(session) === session.id)
+        const roots = workspace.sessions.filter(session => rootId(session) === session.id).sort((a, b) => {
+          const latest = root => Math.max(...workspace.sessions.filter(row => rootId(row) === root.id).map(activityTime))
+          return latest(b) - latest(a)
+        })
         for (const root of roots) {
           list.appendChild(sessionRow(root, false))
           const coworkers = workspace.sessions.filter(session => session.id !== root.id && rootId(session) === root.id)
@@ -1442,7 +1885,7 @@
     return card
   }
 
-  const sessionsScreen = () => {
+  const sessionsScreen = route => {
     const root = el('div', 'screen')
     const header = topbar()
     const scroll = scroller()
@@ -1463,18 +1906,22 @@
       const title = el('div', 'topbar-heading')
       const dot = el('span', 'live-dot' + (state.connected ? ' live' : ''))
       title.appendChild(dot)
-      title.appendChild(el('h1', 'topbar-title', phone ? phone.machineName : 'Conductor'))
+      title.appendChild(el('h1', 'topbar-title', route.name === 'attention' ? 'Attention' : 'Tabs'))
       line.appendChild(title)
       const counts = el('div', 'counts')
       const attention = phone && phone.counts ? phone.counts.attention : 0
       const working = phone && phone.counts ? phone.counts.working : 0
-      counts.appendChild(el('span', 'count tone-attention', attention + ' waiting'))
-      counts.appendChild(el('span', 'count tone-working', working + ' working'))
+      counts.appendChild(el('span', 'count tone-attention', attention + ' need you'))
+      counts.appendChild(el('span', 'count tone-working', working + ' running'))
       line.appendChild(counts)
       header.appendChild(line)
 
       const chips = el('div', 'chips')
-      for (const entry of FILTERS) {
+      if (route.projectId) {
+        const project = projectById(route.projectId)
+        chips.appendChild(button('chip selected', (project ? project.name : 'Project') + ' ×', () => go('#/' + route.name)))
+      }
+      for (const entry of route.name === 'attention' ? [] : FILTERS) {
         const chip = button('chip' + (state.filter === entry.id ? ' selected' : ''), entry.label, () => {
           state.filter = entry.id
           writeStored(FILTER_KEY, entry.id)
@@ -1493,13 +1940,14 @@
       clear(scroll)
       const phone = state.phone
       if (!phone) {
-        scroll.appendChild(emptyNote('Reading this computer…', 'The list appears as soon as the stream connects.'))
+        scroll.appendChild(safeSkeleton('Reading this computer…', 'The list appears as soon as the computer connects.'))
         return
       }
       if (state.offerInstall && state.installPrompt) scroll.appendChild(installCard())
-      const all = phone.sessions || []
-      const open = all.filter(session => session.tabId !== null && matchesFilter(session))
-      const closed = all.filter(session => session.tabId === null && matchesFilter(session))
+      const all = recentSessions((phone.sessions || []).filter(session => !route.projectId || session.projectId === route.projectId))
+      const matches = session => route.name === 'attention' ? sessionPhase(session).id === 'attention' : matchesFilter(session)
+      const open = all.filter(session => session.tabId !== null && matches(session))
+      const closed = all.filter(session => session.tabId === null && matches(session))
 
       if (!open.length && !closed.length) {
         const hint = state.filter === 'all'
@@ -1535,7 +1983,7 @@
     drawList()
     drawReach()
     return {
-      key: 'sessions',
+      key: route.key,
       root: root,
       update: () => { drawHeader(); drawList(); drawReach() },
       onSecond: drawReach
@@ -1581,34 +2029,48 @@
     flushParagraph()
   }
 
-  /* Dictation through the browser's own speech recognition (the Web Speech API: Safari on iOS and
-     Chrome on Android have it). It uses whatever speech service that browser already uses;
-     Conductor adds none. Where it is missing the button stays, dimmed, and a tap says to use the
-     keyboard's own microphone key, which every phone keyboard has. One dictation runs at a time. */
+  /* Browser dictation is optional: exposing a constructor does not guarantee a speech service
+     in an iOS Home Screen app or Android browser. Keyboard dictation stays available. */
   let activeDictation = null
   const stopDictation = () => { if (activeDictation) activeDictation() }
-  const speechRecognition = () => window.SpeechRecognition || window.webkitSpeechRecognition || null
+  const speechRecognition = () => typeof window.SpeechRecognition === 'function' ? window.SpeechRecognition : typeof window.webkitSpeechRecognition === 'function' ? window.webkitSpeechRecognition : null
   const MIC_PATHS = ['M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z', 'M5.5 11a6.5 6.5 0 0 0 13 0', 'M12 17.5V21']
 
   const dictationButton = (input, onChange) => {
     const Recognition = speechRecognition()
-    const node = button('composer-mic' + (Recognition ? '' : ' unsupported'), null, () => toggle())
+    const supported = Boolean(Recognition && window.isSecureContext)
+    const node = button('composer-mic' + (supported ? '' : ' unsupported'), null, () => toggle())
     node.appendChild(icon(MIC_PATHS, 20))
+    const status = el('div', 'dictation-status')
+    const noteText = el('span', 'dictation-note', 'You can also use dictation on your keyboard, if available.')
+    noteText.setAttribute('role', 'status')
+    status.appendChild(noteText)
+    status.appendChild(button('ghost', 'Use keyboard', () => { stop(); input.focus() }))
     let recognition = null
+    let timer = null
+    let started = false
     let before = ''
     let after = ''
     const paint = () => {
       const listening = Boolean(recognition)
       node.classList.toggle('listening', listening)
       node.setAttribute('aria-pressed', listening ? 'true' : 'false')
-      node.setAttribute('aria-label', !Recognition ? 'Dictation is not available in this browser' : listening ? 'Stop dictation' : 'Dictate')
+      node.setAttribute('aria-label', !supported ? 'Dictation is not available in this browser' : listening ? 'Stop dictation' : 'Dictate')
     }
-    const note = (title, body) => showToast({ kind: 'failed', title: title, body: body, url: null })
+    const note = (title, body) => {
+      noteText.textContent = title + '. ' + body
+      noteText.className = 'dictation-note dictation-error'
+      showToast({ kind: 'failed', title: title, body: body, url: null })
+    }
     /* Every result event carries the whole utterance so far; rebuilding from all of it avoids the
        doubled words iOS produces when results are appended one at a time. */
     const write = results => {
       let spoken = ''
-      for (let index = 0; index < results.length; index++) spoken += results[index][0].transcript
+      let interim = false
+      for (let index = 0; index < results.length; index++) {
+        if (results[index] && results[index][0]) spoken += results[index][0].transcript || ''
+        if (results[index] && !results[index].isFinal) interim = true
+      }
       spoken = spoken.replace(/\s+/g, ' ').trim()
       const lead = before && spoken && !/\s$/.test(before) ? ' ' : ''
       const tail = after && spoken && !/^\s/.test(after) ? ' ' : ''
@@ -1616,12 +2078,18 @@
       const caret = (before + lead + spoken).length
       try { input.setSelectionRange(caret, caret) } catch (error) { /* not focused; the value is what matters */ }
       onChange()
+      noteText.className = 'dictation-note' + (interim ? ' dictation-interim' : '')
+      noteText.textContent = interim ? 'Listening… words are still being recognised.' : 'Listening… tap the microphone to finish.'
     }
     /* The mic button stops and keeps the last words; sending, leaving or hiding the page drops
        whatever is still in flight, so a late result cannot refill a composer that was just sent. */
     const finish = () => {
       if (!recognition) return
-      try { recognition.stop() } catch (error) { /* already ended */ }
+      try {
+        recognition.stop()
+        if (timer) clearTimeout(timer)
+        timer = setTimeout(stop, 1500)
+      } catch (error) { stop() }
     }
     const stop = () => {
       const current = recognition
@@ -1631,13 +2099,21 @@
     }
     const ended = () => {
       recognition = null
+      started = false
+      if (timer) { clearTimeout(timer); timer = null }
       if (activeDictation === stop) activeDictation = null
       paint()
+      if (!noteText.className.includes('dictation-error')) {
+        noteText.className = 'dictation-note'
+        noteText.textContent = 'Dictation finished. You can also use dictation on your keyboard, if available.'
+      }
     }
     const toggle = () => {
       if (recognition) { finish(); return }
-      if (!Recognition) {
-        note('Dictation is not available here', 'This browser has no speech recognition. Use the microphone key on the keyboard instead.')
+      if (!supported) {
+        note('Dictation is not available here', !window.isSecureContext
+          ? 'Dictation requires a secure, trusted HTTPS connection. Use keyboard dictation, if available.'
+          : 'This browser or Home Screen app has no speech recognition. Use the microphone key on the keyboard, if available.')
         return
       }
       stopDictation()
@@ -1645,31 +2121,60 @@
       /* Tapping the mic blurs the field, but a textarea keeps its caret; dictation goes there. */
       const caret = typeof input.selectionStart === 'number' ? input.selectionStart : value.length
       before = value.slice(0, caret)
-      after = value.slice(caret)
-      const current = new Recognition()
+      after = value.slice(typeof input.selectionEnd === 'number' && input.selectionEnd >= caret ? input.selectionEnd : caret)
+      let current
+      try {
+      current = new Recognition()
       current.lang = (window.navigator && window.navigator.language) || 'en-US'
       current.continuous = true
       current.interimResults = true
-      current.onresult = event => { if (recognition === current) write(event.results) }
+      current.onresult = event => {
+        if (recognition !== current || !event || !event.results) return
+        started = true
+        if (timer) { clearTimeout(timer); timer = null }
+        write(event.results)
+      }
+      current.onstart = () => {
+        if (recognition !== current) return
+        started = true
+        if (timer) { clearTimeout(timer); timer = null }
+        noteText.textContent = 'Listening… tap the microphone to finish.'
+      }
       current.onerror = event => {
+        if (recognition !== current) return
         const code = event && event.error
-        if (code === 'not-allowed' || code === 'service-not-allowed') note('Microphone is off for this page', 'Allow the microphone for this site in the browser settings, or use the keyboard microphone key.')
-        else if (code === 'audio-capture') note('No microphone', 'The phone did not give this page a microphone.')
-        else if (code && code !== 'no-speech' && code !== 'aborted') note('Dictation stopped', String(code))
+        stop()
+        if (code === 'not-allowed') note('Microphone is off for this page', 'Allow the microphone for this site in the browser settings, or use the keyboard microphone key.')
+        else if (code === 'service-not-allowed') note('Speech service is unavailable', 'This browser or Home Screen app cannot use its speech service. On iPhone, check Siri settings or try Safari. Use keyboard dictation, if available.')
+        else if (code === 'audio-capture') note('No microphone', 'The phone did not give this page a microphone. Check the microphone or use keyboard dictation.')
+        else if (code === 'network') note('Speech service connection failed', 'The browser’s speech service needs a working network connection. Use keyboard dictation, if available.')
+        else if (code === 'no-speech') note('No speech heard', 'Try the microphone again, or use keyboard dictation.')
+        else if (code !== 'aborted') note('Dictation stopped', 'The browser could not recognise speech' + (code ? ' (' + code + ')' : '') + '. Use keyboard dictation, if available.')
       }
       current.onend = () => { if (recognition === current) ended() }
       recognition = current
       activeDictation = stop
       paint()
-      try {
+      noteText.className = 'dictation-note'
+      noteText.textContent = 'Starting dictation… allow microphone access if asked.'
+      // No awaited permission query or microphone preflight: start stays inside the mic tap.
         current.start()
+        if (!started && recognition === current) timer = setTimeout(() => {
+          if (recognition !== current || started) return
+          stop()
+          note('Dictation did not start', 'The browser or Home Screen app did not start its speech service. Check microphone permission, or use keyboard dictation.')
+        }, 12000)
       } catch (error) {
-        ended()
-        note('Dictation could not start', errorMessage(error) || 'The browser refused to start speech recognition.')
+        stop()
+        if (error && (error.name === 'NotAllowedError' || error.name === 'SecurityError')) note('Microphone is off for this page', 'Allow the microphone for this site in browser settings, or use keyboard dictation.')
+        else if (error && error.name === 'NotFoundError') note('No microphone', 'The browser could not find a microphone. Use keyboard dictation, if available.')
+        else if (error && error.name === 'NetworkError') note('Speech service connection failed', 'The browser’s speech service could not connect. Use keyboard dictation, if available.')
+        else note('Dictation could not start', (errorMessage(error) || 'The browser refused to start its speech service.') + ' Use keyboard dictation, if available.')
       }
     }
+    input.addEventListener('input', () => { if (recognition) stop() })
     paint()
-    return { node: node, stop: stop }
+    return { node: node, status: status, stop: stop }
   }
 
   const textItem = (item, data) => {
@@ -2000,23 +2505,107 @@
 
   // ------------------------------------------------------------------ conversation screen
 
+  const messageRows = id => state.messages[id] || (state.messages[id] = [])
+  const messageStatus = row => {
+    const words = { sending: 'Sending…', sent: 'Sent', queued: 'Queued', steered: 'Steered', delivered: 'Delivered', failed: 'Not sent', uncertain: 'Delivery unconfirmed' }
+    const node = el('span', 'message-status ' + (row.status === 'uncertain' ? 'failed' : row.status), words[row.status] || 'Sent')
+    node.setAttribute('role', 'status')
+    return node
+  }
+  const receiptText = text => String(text || '').trim()
+  const reconcileMessages = (id, conversation) => {
+    const rows = messageRows(id)
+    const receipts = conversation.inputDeliveries || []
+    const userItems = (conversation.items || []).filter(item => item.data && item.data.type === 'text' && item.data.role === 'user')
+    const usedReceipts = new Set(rows.map(row => row.receiptId).filter(Boolean))
+    const usedItems = new Set(rows.map(row => row.itemId).filter(Boolean))
+    for (const row of rows) {
+      if (row.status === 'failed') continue
+      if (row.resumeOnly) {
+        if (conversation.sequence > row.baseline && ['running', 'starting'].includes(conversation.summary.phase)) {
+          row.status = 'delivered'; row.ambiguous = false; row.acknowledged = true
+        }
+        continue
+      }
+      const wasDelivered = row.status === 'delivered'
+      const wasAmbiguous = row.ambiguous
+      let receipt = row.receiptId ? receipts.find(entry => entry.id === row.receiptId) : null
+      if (!receipt) {
+        const matches = receipts.filter(entry => entry.sequence > row.baseline && !row.baselineIds.includes(entry.id) && !usedReceipts.has(entry.id) && receiptText(entry.text) === row.text)
+        if (matches.length === 1) {
+          receipt = matches[0]
+          row.receiptId = receipt.id
+          usedReceipts.add(receipt.id)
+        }
+      }
+      if (receipt) {
+        row.acknowledged = true
+        row.ambiguous = false
+        if (receipt.status === 'delivered') row.status = 'delivered'
+        else if (receipt.status === 'queued') { row.status = 'queued'; row.mode = 'queue' }
+        else if (receipt.status === 'accepted') { row.status = 'steered'; row.mode = 'steer' }
+        else if (receipt.status === 'sending') { row.status = 'sent'; row.mode = 'steer' }
+        else if (receipt.status === 'cancelled') { row.status = 'failed'; row.error = 'This input was cancelled. Your draft is available to edit and send again.' }
+        else if (receipt.status === 'uncertain') { row.status = 'uncertain'; row.ambiguous = true; row.error = 'Delivery is uncertain. Check status before sending this message again.' }
+      }
+      // A submit/queued turn reaches the runtime when a new user timeline item appears. Steering
+      // requires its input-delivery receipt; an accepted steer alone is never labelled Delivered.
+      if (row.mode !== 'steer' && !row.itemId) {
+        const matches = userItems.filter(item => item.sequence > row.baseline && !usedItems.has(item.id) && receiptText(item.data.text) === row.text)
+        if (matches.length === 1) {
+          row.itemId = matches[0].id
+          usedItems.add(row.itemId)
+          row.status = 'delivered'
+          row.acknowledged = true
+          row.ambiguous = false
+        }
+      }
+      if (wasDelivered || row.itemId) { row.status = 'delivered'; row.ambiguous = false }
+      if (wasAmbiguous && row.acknowledged && !row.ambiguous) {
+        row.error = ''
+        if (receiptText(state.drafts[id]) === row.text || (!state.drafts[id] && row.images.length)) {
+          state.drafts[id] = ''
+          const images = state.chatImages[id] || []
+          for (const image of row.images) {
+            const index = images.indexOf(image)
+            if (index >= 0) images.splice(index, 1)
+          }
+          row.clearDraft = true
+        }
+      }
+    }
+    const stopping = state.stops[id]
+    if (stopping && stopping.status === 'pending' && !BUSY_PHASES.includes(conversation.summary.phase) && (conversation.sequence > stopping.baseline || stopping.accepted)) {
+      stopping.status = 'confirmed'
+    }
+  }
+
+  let conversationRead = null
   const loadConversation = async (id, quiet) => {
+    if (!state.authReady || state.locked) return
+    if (conversationRead) conversationRead.abort()
+    const controller = new AbortController()
+    conversationRead = controller
     if (!quiet) {
       state.conversationLoading = true
       state.conversation = null
     }
     try {
-      const data = await api('/api/sessions/' + encodeURIComponent(id))
-      if (state.conversationId !== id) return
+      const data = await api('/api/sessions/' + encodeURIComponent(id), { signal: controller.signal })
+      if (conversationRead !== controller || state.conversationId !== id || state.locked || !state.authReady) return
       state.conversation = data
+      reconcileMessages(id, data)
       state.conversationError = ''
     } catch (error) {
-      if (state.conversationId !== id) return
+      if (conversationRead !== controller || state.conversationId !== id) return
       const message = errorMessage(error)
       if (message) state.conversationError = message
     } finally {
-      state.conversationLoading = false
-      render()
+      if (conversationRead === controller) {
+        conversationRead = null
+        state.conversationLoading = false
+        render()
+      }
     }
   }
 
@@ -2038,7 +2627,8 @@
     const workingWords = ['Thinking…', 'Spelunking…', 'Working…', 'Considering…']
     const stopWorking = () => { if (workingTimer !== null) { clearInterval(workingTimer); workingTimer = null } }
     let firstPaint = true
-    let busy = false
+    let busy = messageRows(id).some(row => row.status === 'sending' && row.inflight)
+    let destroyed = false
 
     const pendingHost = el('div', 'pending-host')
     const queuedHost = el('div', 'queued-host')
@@ -2076,6 +2666,7 @@
     footer.appendChild(errorHost)
     footer.appendChild(chatTray.node)
     footer.appendChild(composer)
+    footer.appendChild(dictation.status)
 
     const lineHeight = 21
     const grow = () => {
@@ -2095,46 +2686,97 @@
     const atBottom = () => scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 64
     const toBottom = () => { scroll.scrollTop = scroll.scrollHeight }
 
-    const run = async work => {
-      if (busy) return
-      busy = true
-      paintComposer()
-      try {
-        await work()
-        state.conversationError = ''
-      } catch (error) {
-        const message = errorMessage(error)
-        if (message) state.conversationError = message
-      } finally {
-        busy = false
-        await loadConversation(id, true)
+    const ambiguousMessage = () => messageRows(id).find(row => row.ambiguous && (row.resumeOnly ? !input.value.trim() && !chatImages.length : row.text === (input.value.trim() || (chatImages.length === 1 ? 'See the attached image.' : chatImages.length ? 'See the attached images.' : ''))))
+    const checkMessageStatus = async () => {
+      await loadConversation(id, true)
+      if (ambiguousMessage()) {
+        state.conversationError = 'Delivery could not be confirmed yet. Your draft and attachments are kept; checking status does not resend.'
+        if (!destroyed) update()
       }
     }
-
     const sendPrimary = async () => {
+      if (busy) return
+      if (ambiguousMessage()) { await checkMessageStatus(); return }
       const text = input.value.trim()
       const conversation = state.conversation
       const resume = conversation && conversation.needsResume
       if (!resume && !text && !chatImages.length) return
       dictation.stop()
-      await run(async () => {
+      const images = chatImages.slice()
+      const rows = messageRows(id)
+      const stopAtSend = state.stops[id]
+      const retryIndex = rows.findIndex(entry => entry.status === 'failed' && entry.text === (text || (images.length === 1 ? 'See the attached image.' : 'See the attached images.')))
+      if (retryIndex >= 0) rows.splice(retryIndex, 1)
+      const row = {
+        id: 'phone-' + Date.now() + '-' + Math.random().toString(36).slice(2),
+        text: text || (images.length === 1 ? 'See the attached image.' : 'See the attached images.'),
+        status: 'sending', mode: null, baseline: conversation ? conversation.sequence : 0,
+        baselineIds: ((conversation && conversation.inputDeliveries) || []).map(entry => entry.id),
+        images: images, inflight: true, ambiguous: false, acknowledged: false, error: '', resumeOnly: !text && !images.length
+      }
+      rows.push(row)
+      if (rows.length > 60) rows.splice(0, rows.length - 60)
+      busy = true
+      state.conversationError = ''
+      update()
+      let mutationStarted = false
+      try {
         const base = '/api/sessions/' + encodeURIComponent(id)
-        if (resume) await api(base + '/resume', { method: 'POST' })
-        if (text || chatImages.length) {
+        // sendMessage resumes as part of auto submit. A separate resume before a message could
+        // mutate twice and race Stop; use /resume only when there is no message at all.
+        if (resume && !text && !images.length) { mutationStarted = true; await api(base + '/resume', { method: 'POST' }) }
+        if (text || images.length) {
           const attachments = []
-          for (const image of chatImages) attachments.push(await uploadImage(base, image))
-          await api(base + '/message', { method: 'POST', body: attachments.length ? { text: text, mode: 'auto', attachments: attachments } : { text: text, mode: 'auto' } })
+          for (const image of images) attachments.push(await uploadImage(base, image))
+          if (!state.authReady || state.locked) throw abortedRequest()
+          if (state.stops[id] !== stopAtSend) throw ApiError('Sending was cancelled by Stop. Your draft and attachments are kept.', 409)
+          mutationStarted = true
+          const result = await api(base + '/message', { method: 'POST', body: attachments.length ? { text: text, mode: 'auto', attachments: attachments } : { text: text, mode: 'auto' } })
+          row.mode = result && result.mode
+          if (!row.acknowledged) row.status = row.mode === 'queue' ? 'queued' : row.mode === 'steer' ? 'steered' : 'sent'
         }
-        input.value = ''
-        state.drafts[id] = ''
-        chatImages.length = 0
-        chatTray.paint()
-        grow()
-      })
+        if (state.drafts[id] === input.value && input.value.trim() === text) { state.drafts[id] = ''; input.value = '' }
+        for (const image of images) {
+          const index = chatImages.indexOf(image)
+          if (index >= 0) chatImages.splice(index, 1)
+        }
+        if (!destroyed) { chatTray.paint(); grow() }
+      } catch (error) {
+        const ambiguous = mutationStarted && (!error || !error.status || error.status >= 500)
+        if (!row.acknowledged) {
+          row.status = ambiguous ? 'uncertain' : 'failed'
+          row.ambiguous = ambiguous
+          row.error = ambiguous ? 'The connection ended before delivery was confirmed. Check status before sending again.' : errorMessage(error) || 'Message was not sent. Your draft and attachments are kept.'
+        }
+        state.conversationError = row.error || errorMessage(error)
+      } finally {
+        row.inflight = false
+        busy = false
+        if (!destroyed) update()
+        if (state.conversationId === id) await loadConversation(id, true)
+      }
     }
 
     const interrupt = async () => {
-      await run(async () => { await api('/api/sessions/' + encodeURIComponent(id) + '/interrupt', { method: 'POST' }) })
+      const prior = state.stops[id]
+      if (prior && prior.inflight) return
+      const stopping = { status: 'pending', inflight: true, accepted: false, held: 0, baseline: state.conversation ? state.conversation.sequence : 0, error: '', startedAt: Date.now() }
+      state.stops[id] = stopping
+      paintComposer()
+      drawFooter()
+      try {
+        const result = await api('/api/sessions/' + encodeURIComponent(id) + '/interrupt', { method: 'POST', timeoutMs: 12000 })
+        stopping.accepted = true
+        stopping.held = result && result.held || 0
+        if (result && result.phase && !BUSY_PHASES.includes(result.phase)) stopping.status = 'confirmed'
+      } catch (error) {
+        stopping.status = 'failed'
+        stopping.error = errorMessage(error) || 'Stop could not be confirmed. Check status and try Stop again.'
+      } finally {
+        stopping.inflight = false
+        if (!destroyed) drawFooter()
+        if (state.conversationId === id) await loadConversation(id, true)
+      }
     }
 
     const respond = async payload => {
@@ -2155,8 +2797,8 @@
       clear(header)
       const conversation = state.conversation
       const summary = conversation ? conversation.summary : null
-      const back = button('back', null, () => go('#/'))
-      back.setAttribute('aria-label', 'Back to sessions')
+      const back = button('back', null, goBack)
+      back.setAttribute('aria-label', 'Back')
       back.appendChild(icon(['M15 5l-7 7 7 7'], 24))
       const heading = el('div', 'conversation-heading')
       heading.appendChild(el('h1', 'topbar-title', summary ? summary.title || 'Untitled' : 'Conversation'))
@@ -2180,7 +2822,7 @@
       clear(scroll)
       const conversation = state.conversation
       if (!conversation) {
-        scroll.appendChild(emptyNote(state.conversationError ? 'Could not read this conversation.' : 'Loading…', state.conversationError || null))
+        scroll.appendChild(safeSkeleton(state.conversationError ? 'Could not read this conversation.' : 'Loading conversation…', state.conversationError || null))
         return
       }
       if (conversation.truncated) scroll.appendChild(el('p', 'timeline-note', 'Older messages stayed on the computer.'))
@@ -2193,6 +2835,34 @@
         if (item.data.type === 'text' && item.data.role === 'status' && next && next.data.type === 'text' && next.data.role === 'status') continue
         const node = renderTimelineItem(item, pendingIds)
         if (!node) continue
+        const optimistic = messageRows(id).find(row => row.itemId === item.id)
+        if (optimistic) node.appendChild(messageStatus(optimistic))
+        scroll.appendChild(node)
+        drawn += 1
+      }
+      for (const row of messageRows(id)) {
+        if (row.itemId || row.resumeOnly) continue
+        const node = el('div', 'bubble user optimistic-message')
+        const body = el('div', 'bubble-body')
+        appendRichText(body, row.text, true)
+        node.appendChild(body)
+        if (row.images.length) {
+          const chips = el('div', 'attachments')
+          for (const image of row.images) chips.appendChild(el('span', 'attachment', image.name || 'Image'))
+          node.appendChild(chips)
+        }
+        node.appendChild(messageStatus(row))
+        if (row.error) node.appendChild(el('p', 'card-note', row.error))
+        if (row.ambiguous) node.appendChild(button('ghost', 'Check status', () => void checkMessageStatus()))
+        else if (row.status === 'failed') node.appendChild(button('ghost', 'Edit and retry', () => {
+          input.value = row.text
+          state.drafts[id] = row.text
+          for (const image of row.images) if (!chatImages.includes(image)) chatImages.push(image)
+          chatTray.paint()
+          grow()
+          paintComposer()
+          input.focus()
+        }))
         scroll.appendChild(node)
         drawn += 1
       }
@@ -2238,6 +2908,15 @@
       }
 
       clear(errorHost)
+      const stopping = state.stops[id]
+      if (stopping && stopping.status === 'pending') {
+        errorHost.appendChild(el('p', 'message-status sending', 'Stopping… waiting for the computer to confirm.'))
+        if (stopping.accepted) errorHost.appendChild(button('ghost', 'Check status', () => void loadConversation(id, true)))
+      } else if (stopping && stopping.status === 'failed') {
+        errorHost.appendChild(errorLine(stopping.error, () => { delete state.stops[id]; drawFooter() }))
+      } else if (stopping && stopping.held) {
+        errorHost.appendChild(el('p', 'message-status queued', 'Stopped. ' + stopping.held + ' submitted message' + (stopping.held === 1 ? ' is' : 's are') + ' held in the queue.'))
+      }
       if (state.conversationError) {
         errorHost.appendChild(errorLine(state.conversationError, () => {
           state.conversationError = ''
@@ -2248,6 +2927,7 @@
     }
 
     const paintComposer = () => {
+      busy = messageRows(id).some(row => row.inflight)
       const conversation = state.conversation
       const summary = conversation ? conversation.summary : null
       const phase = summary ? summary.phase : 'idle'
@@ -2255,9 +2935,10 @@
       let label = 'Send'
       if (conversation && conversation.needsResume) label = 'Resume'
       else if (working) label = conversation && conversation.canSteer ? 'Steer' : 'Queue'
-      primary.textContent = busy ? '…' : label
+      const ambiguous = ambiguousMessage()
+      primary.textContent = busy ? 'Sending…' : ambiguous ? 'Check status' : label
       const empty = !input.value.trim() && !chatImages.length
-      primary.disabled = busy || (empty && label !== 'Resume')
+      primary.disabled = busy || !state.authReady || !conversation || (empty && label !== 'Resume' && !ambiguous)
       const takesImages = Boolean(conversation && conversation.canAttachImages)
       attach.hidden = !takesImages && !chatImages.length
       attach.disabled = busy || !takesImages || chatImages.length >= IMAGE_LIMIT
@@ -2266,11 +2947,26 @@
       imagesRefused = refused
       input.placeholder = label === 'Steer' ? 'Add to this turn' : label === 'Queue' ? 'Send after this turn' : 'Message'
       const stoppable = phase === 'running' || phase === 'starting' || phase === 'waiting_approval' || phase === 'waiting_input' || phase === 'interrupting'
-      stop.hidden = !stoppable
-      stop.disabled = busy || phase === 'interrupting'
+      const stopping = state.stops[id]
+      const pending = Boolean(stopping && stopping.status === 'pending')
+      stop.hidden = !stoppable && !pending && !busy
+      stop.disabled = Boolean(stopping && stopping.inflight)
+      stop.classList.toggle('pending', pending)
+      stop.setAttribute('aria-busy', pending ? 'true' : 'false')
+      stop.setAttribute('aria-label', pending ? 'Stopping this turn; tap again if it remains stuck' : 'Stop this turn')
+      // Retain the stop icon and a readable pending label while the result is still outstanding.
+      clear(stop)
+      stop.appendChild(icon(['M8.5 8.5h7v7h-7z'], 20))
+      if (pending) stop.appendChild(el('span', 'mic-status', 'Stopping…'))
     }
 
     const update = () => {
+      for (const row of messageRows(id)) if (row.clearDraft) {
+        if (input.value.trim() === row.text || (!input.value.trim() && row.images.length)) input.value = state.drafts[id] || ''
+        row.clearDraft = false
+        chatTray.paint()
+        grow()
+      }
       drawHeader()
       drawTimeline()
       drawFooter()
@@ -2287,6 +2983,9 @@
       root: root,
       update: update,
       destroy: () => {
+        destroyed = true
+        dictation.stop()
+        if (conversationRead) { conversationRead.abort(); conversationRead = null }
         stopWorking()
         state.conversationId = null
         state.conversation = null
@@ -2532,7 +3231,7 @@
       const images = state.shareImages || []
       if (!images.length) {
         body.appendChild(emptyNote('Nothing arrived', problem || 'Share the image to Conductor again. If this keeps happening, open Conductor once and wait for it to load, then share again.'))
-        body.appendChild(button('ghost wide', 'Back to sessions', () => go('#/')))
+        body.appendChild(button('ghost wide', 'Back', goBack))
         scroll.appendChild(body)
         return
       }
@@ -2726,27 +3425,14 @@
   const machineUsable = (machine, projectId) =>
     machine.status === 'online' && (machine.projectIds || []).indexOf(projectId) >= 0
 
-  /* How much of its weekly window each provider has left, from the usage data the phone already
-     receives. A provider with no reported window yet is assumed untouched, not exhausted. */
-  const usageRemainingByProvider = () => {
-    const remaining = new Map()
-    for (const window_ of (state.phone && state.phone.usage) || []) {
-      if (window_.kind !== 'weekly') continue
-      const left = 100 - window_.usedPercent
-      remaining.set(window_.provider, Math.min(remaining.has(window_.provider) ? remaining.get(window_.provider) : 100, left))
-    }
-    return remaining
+  const lastSuccessfulAgent = () => {
+    try { return JSON.parse(readStored(LAST_AGENT_KEY) || 'null') || {} } catch (error) { return {} }
   }
-
-  /* A phone task is usually a quick ask, so the pick is a mid-tier model - Sonnet, or GPT's
-     Terra/Sol tier - never the frontier one, which a phone default should not spend on its own. */
-  const FRONTIER_MODEL = /opus|astra|frontier/i
-  const MID_TIER_MODEL = /sonnet|terra|\bsol\b/i
-  const preferredModel = models => {
-    const affordable = models.filter(model => !FRONTIER_MODEL.test(model.label))
-    return affordable.filter(model => MID_TIER_MODEL.test(model.label))[0] ||
-      affordable.filter(model => model.isDefault)[0] || affordable[0] ||
-      models.filter(model => model.isDefault)[0] || models[0]
+  const preferredModel = (models, providerId) => {
+    const last = lastSuccessfulAgent()
+    return (last.provider === providerId && models.find(model => model.id === last.model)) ||
+      (providerId === 'claude' && models.find(model => /opus/i.test(model.id + ' ' + model.label))) ||
+      models.find(model => model.isDefault) || models[0]
   }
 
   /* The form is rebuilt from every fresh PhoneState, so it must forget any choice the desktop no
@@ -2767,14 +3453,16 @@
     }
     const providers = (phone.providers || []).filter(provider => provider.available)
     if (!providers.some(provider => provider.id === form.provider)) {
-      const remaining = usageRemainingByProvider()
-      const ranked = providers.slice().sort((a, b) => (remaining.has(b.id) ? remaining.get(b.id) : 100) - (remaining.has(a.id) ? remaining.get(a.id) : 100))
-      form.provider = ranked.length ? ranked[0].id : ''
+      const last = lastSuccessfulAgent()
+      const preferred = providers.find(provider => provider.id === last.provider && (provider.models || []).some(model => model.id === last.model)) ||
+        providers.find(provider => provider.id === 'claude' && (provider.models || []).length) ||
+        providers.find(provider => provider.id === 'codex' && (provider.models || []).length)
+      form.provider = preferred ? preferred.id : ''
     }
     const provider = providerById(form.provider)
     const models = provider ? provider.models || [] : []
     if (!models.some(model => model.id === form.model)) {
-      const preferred = preferredModel(models)
+      const preferred = preferredModel(models, form.provider)
       form.model = preferred ? preferred.id : ''
     }
     const model = models.filter(entry => entry.id === form.model)[0]
@@ -2789,7 +3477,7 @@
     const scroll = scroller()
     root.appendChild(header)
     root.appendChild(scroll)
-    clear(header).appendChild(fill(el('div', 'topbar-main'), [el('h1', 'topbar-title', 'New')]))
+    clear(header).appendChild(fill(el('div', 'topbar-main'), [el('h1', 'topbar-title', 'New task')]))
 
     let busy = false
 
@@ -2808,22 +3496,20 @@
       const model = models.filter(entry => entry.id === form.model)[0] || null
       const body = el('div', 'form')
 
-      const prompt = el('textarea', 'input prompt')
-      prompt.rows = 5
+      const prompt = el('textarea', 'input prompt new-task-prompt')
+      prompt.rows = 7
       prompt.placeholder = 'What should it do?'
       prompt.value = form.prompt
       prompt.addEventListener('input', () => { form.prompt = prompt.value; paint() })
-      body.appendChild(field('Prompt', prompt, 'Leave this empty to just open an idle tab.'))
+      const promptField = field('Prompt', prompt, 'Leave this empty to just open an idle tab.')
 
-      const summary = (project ? project.name : 'No project') + ' · ' + (provider ? provider.displayName : 'No agent') + (model ? ' · ' + model.label : '')
-      const settingsToggle = button('ghost wide settings-toggle', (form.settingsOpen ? 'Hide settings' : 'Settings') + ' · ' + summary,
+      const settingsToggle = button('ghost wide settings-toggle', form.settingsOpen ? 'Hide advanced settings' : 'Advanced settings',
         () => { form.settingsOpen = !form.settingsOpen; draw() })
-      body.appendChild(settingsToggle)
 
-      const settings = el('div', 'form')
+      const settings = el('div', 'form advanced-settings')
       settings.hidden = !form.settingsOpen
 
-      settings.appendChild(field('Project', select(
+      body.appendChild(field('Project', select(
         (phone.projects || []).map(entry => ({ value: entry.id, label: entry.name })),
         form.projectId,
         value => { form.projectId = value; form.workspaceId = ''; form.machineId = ''; draw() }
@@ -2846,17 +3532,18 @@
         'The task runs on that computer. This phone only watches it.'))
 
       const providers = (phone.providers || []).filter(entry => entry.available)
-      settings.appendChild(field('Agent', select(
-        providers.map(entry => ({ value: entry.id, label: entry.displayName })),
+      body.appendChild(field('Agent', select(
+        [{ value: '', label: 'Choose an agent', disabled: true }].concat(providers.map(entry => ({ value: entry.id, label: entry.displayName }))),
         form.provider,
         value => { form.provider = value; form.model = ''; form.effort = ''; draw() }
       )))
 
-      settings.appendChild(field('Model', select(
+      body.appendChild(field('Model', select(
         models.map(entry => ({ value: entry.id, label: entry.label })),
         form.model,
         value => { form.model = value; form.effort = ''; draw() }
       )))
+      body.appendChild(promptField)
 
       const efforts = model && model.effort ? model.effort : []
       if (efforts.length) {
@@ -2874,17 +3561,21 @@
       title.addEventListener('input', () => { form.title = title.value })
       settings.appendChild(field('Title', title))
 
+      body.appendChild(settingsToggle)
       body.appendChild(settings)
 
       const problem = el('p', 'pending-error')
-      problem.hidden = true
-      const start = button('primary wide', 'Start', async () => {
+      problem.textContent = form.startError || ''
+      problem.hidden = !form.startError
+      const start = button('primary wide new-task-primary', form.prompt.trim() ? 'Start task' : 'Open tab', async () => {
         if (busy) return
         busy = true
+        form.startError = ''
         problem.hidden = true
         start.textContent = 'Starting…'
         start.disabled = true
         try {
+          const submittedTitle = form.title, submittedPrompt = form.prompt
           const request = {
             projectId: form.projectId,
             workspaceId: form.workspaceId,
@@ -2896,17 +3587,19 @@
           if (form.title.trim()) request.title = form.title.trim()
           if (form.prompt.trim()) request.prompt = form.prompt.trim()
           const result = await api('/api/tabs/open', { method: 'POST', body: request })
-          form.title = ''
-          form.prompt = ''
+          writeStored(LAST_AGENT_KEY, JSON.stringify({ provider: request.provider, model: request.model }))
+          if (form.title === submittedTitle) form.title = ''
+          if (form.prompt === submittedPrompt) form.prompt = ''
           busy = false
           if (result && result.sessionId) go('#/session/' + encodeURIComponent(result.sessionId))
           else draw()
         } catch (error) {
           busy = false
+          form.startError = errorMessage(error)
           problem.textContent = errorMessage(error)
           problem.hidden = false
           start.disabled = false
-          start.textContent = 'Start'
+          start.textContent = form.prompt.trim() ? 'Start task' : 'Open tab'
         }
       })
       const reason = el('p', 'field-hint reason')
@@ -2919,6 +3612,7 @@
         else if (!form.provider) blocker = 'No agent is available on that computer.'
         else if (!form.model) blocker = 'Choose a model.'
         start.disabled = busy || Boolean(blocker)
+        if (!busy) start.textContent = form.prompt.trim() ? 'Start task' : 'Open tab'
         reason.textContent = blocker
         reason.hidden = !blocker
       }
@@ -2931,7 +3625,12 @@
     }
 
     draw()
-    return { key: 'new', root: root, update: draw }
+    return { key: 'new', root: root, update: () => {
+      if (busy) return
+      const active = document.activeElement
+      if (active && root.contains && root.contains(active) && ['INPUT', 'TEXTAREA', 'SELECT'].indexOf(active.tagName) >= 0) return
+      draw()
+    } }
   }
 
   // ------------------------------------------------------------------ system screen
@@ -3522,7 +4221,8 @@
       if (!alive) return
       /* The new note gets its own address without a rebuild, which would drop the keyboard. */
       if (self.key === 'idea:new' && saved.id && window.location.hash === '#/ideas' && window.history && window.history.replaceState) {
-        window.history.replaceState(null, '', window.location.pathname + window.location.search + '#/ideas/' + encodeURIComponent(saved.id))
+        navigationHash = '#/ideas/' + encodeURIComponent(saved.id)
+        window.history.replaceState(navigationState(navigationDepth), '', navigationUrl(navigationHash))
         /* render() compares keys, so the screen answers to its new address from now on. */
         self.key = 'idea:' + encodeURIComponent(saved.id)
       }
@@ -4160,33 +4860,55 @@
   /* Reads whether this phone has to unlock. A failure to ask is not "unlocked": the app simply
      carries on, and the first real call answers 423 if the lock is on. */
   const checkLock = async () => {
-    if (!state.token) return
+    if (!state.token) return false
     try {
       const status = await api('/api/lock/state')
       applyLockStatus(status)
+      return state.authReady && !state.locked
     } catch (error) {
-      /* Offline, most likely: the stream retries on its own, and a locked phone's stream is
-         answered 423, which asks again. */
-      if (!state.locked) connectStream()
+      // Unknown lock status is never permission to restore sensitive state.
+      if (error && error.name !== 'AbortError') {
+        state.streamProblem = 'Cannot check this phone’s access yet. Check the connection and try again.'
+        scheduleReconnect()
+        paintConnection()
+      }
+      return false
     }
   }
 
   const applyLockStatus = status => {
     state.lock = status && typeof status === 'object' ? status : null
+    if (!state.lock || typeof state.lock.configured !== 'boolean') return
     const mustUnlock = Boolean(state.lock && state.lock.configured && !state.lock.unlocked)
     if (mustUnlock) { markLocked(); return }
+    // A configured lock requires the in-memory unlock capability, even if another request
+    // reported an unlocked device. Reloads can never restore it from a saved PhoneState.
+    if (state.lock.configured && !state.unlockToken) { markLocked(); return }
+    state.authReady = true
+    if (state.lock.configured) clearStateCache()
+    else restorePhoneState()
     if (state.locked) { state.locked = false; render() }
+    render()
     if (!streamController && !streamTimer) connectStream()
+    void refreshPhoneState()
   }
 
   /* Everything read while unlocked goes, and every live connection closes with it. */
   const markLocked = () => {
     const wasLocked = state.locked
     state.locked = true
+    state.authReady = false
+    authEpoch += 1
+    abortReads()
+    clearStateCache()
+    stopDictation()
     state.unlockToken = null
     state.phone = null
     state.conversation = null
     state.metrics = null
+    state.me = null
+    state.messages = {}
+    state.stops = {}
     stopStream()
     if (!wasLocked || !screen || screen.key !== 'lock') render()
   }
@@ -4271,6 +4993,8 @@
         state.unlockToken = opened.unlockToken
         state.lock = Object.assign({}, state.lock || {}, { configured: true, unlocked: true, idleMs: opened.idleMs, backgroundMs: opened.backgroundMs, lockedOut: false, failures: 0, retryAt: null })
         state.locked = false
+        state.authReady = true
+        clearStateCache()
         lastActivityAt = Date.now()
         lastTouchSent = Date.now()
         digits = ''
@@ -4742,6 +5466,8 @@
     const savedFilter = readStored(FILTER_KEY)
     if (savedFilter && FILTERS.some(entry => entry.id === savedFilter)) state.filter = savedFilter
     takePairHash()
+    seedNavigation()
+    applyTheme(readStored(THEME_KEY) || 'system')
     applyViewport()
 
     /* Chrome on Android offers installation once it decides the app qualifies; keep the event so
@@ -4755,10 +5481,21 @@
       state.installPrompt = null
       state.offerInstall = false
     })
-    window.addEventListener('hashchange', () => render())
+    window.addEventListener('popstate', restoreNavigation)
+    window.addEventListener('hashchange', () => {
+      const hash = window.location.hash || '#/'
+      if (hash !== navigationHash) {
+        navigationDirection = 'push'
+        navigationDepth += 1
+        navigationHash = hash
+        if (window.history && window.history.replaceState) window.history.replaceState(navigationState(navigationDepth), '', navigationUrl(hash))
+      }
+      render()
+    })
     /* The last chance to save a half-written idea when the page is closed or swapped out. */
-    window.addEventListener('pagehide', () => { if (screen && screen.onPageHide) screen.onPageHide() })
-    window.addEventListener('online', () => { if (state.token) restartStream() })
+    window.addEventListener('pagehide', () => { stopDictation(); if (screen && screen.onPageHide) screen.onPageHide() })
+    window.addEventListener('online', () => { if (state.token) void refreshRuntime() })
+    window.addEventListener('offline', () => { state.streamProblem = 'This phone is offline.'; stopStream(); paintConnection() })
     window.addEventListener('resize', applyViewport)
     if (window.visualViewport) {
       window.visualViewport.addEventListener('resize', applyViewport)
@@ -4775,13 +5512,14 @@
       if (!visible || !state.token) return
       /* A phone that was asleep often keeps a stream object that is already dead, so a quiet
          connection counts as no connection the moment the owner looks at the screen again. */
-      if (!state.connected || Date.now() - lastEventAt > 20000) restartStream()
+      void refreshRuntime()
     })
     setInterval(() => {
       for (const fn of tickers) {
         try { fn() } catch (error) { /* a dead node is not worth a crash */ }
       }
       if (screen && screen.onSecond) screen.onSecond()
+      paintConnection()
       lockTick()
       /* A stream that has gone quiet is a stream the phone slept through. */
       if (state.connected && document.visibilityState === 'visible' && Date.now() - lastEventAt > STREAM_STALE_MS) restartStream()

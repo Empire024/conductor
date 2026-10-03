@@ -367,9 +367,17 @@ describe('driving a conversation', () => {
     expect(fix.remote.submit).toHaveBeenCalledWith('mirror-1', 'Faster', 'agents.steer', expect.anything())
     expect(fix.sessions.steer).not.toHaveBeenCalled()
     await fix.service.interrupt('mirror-1')
-    expect(fix.remote.interrupt).toHaveBeenCalledWith('mirror-1')
+    expect(fix.remote.interrupt).toHaveBeenCalledWith('mirror-1', false)
     const summary = fix.service.phoneState().sessions.find(session => session.id === 'mirror-1')
     expect(summary).toMatchObject({ machineId: 'empirium', machineName: 'Empirium' })
+  })
+
+  it('interrupts a local turn without expediting held prompts and reports their count', async () => {
+    const fix = fixture()
+    const prompt = { id: 'held-1', text: 'Next task', settings: projection('agent-1').settings, attachments: [] }
+    openConversation(fix, 'agent-1', { phase: 'running', queuedPrompts: [prompt], pendingSteering: [{ ...prompt, id: 'steer-1', runtimeId: 'rt-1', status: 'accepted' }] })
+    expect(await fix.service.interrupt('agent-1')).toEqual({ phase: 'running', held: 2 })
+    expect(fix.sessions.interrupt).toHaveBeenCalledWith('agent-1', false)
   })
 
   it('answers only a question that is still pending, with the runtime it belongs to', async () => {

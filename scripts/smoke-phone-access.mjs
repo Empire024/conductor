@@ -8,7 +8,7 @@ import assert from 'node:assert/strict'
 // Real Electron main/preload/renderer and the real HTTPS phone listener; only the provider
 // process is the synthetic Claude fixture. No model inference happens.
 const root = await mkdtemp(join(tmpdir(), 'conductor-phone-smoke-'))
-const output = resolve('artifacts/phone-access')
+const output = resolve('.conductor-scratch/phone-redesign/access')
 await mkdir(output, { recursive: true })
 const env = { ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_EMPTY_HISTORY: '1', CONDUCTOR_TEST_NODE_EXECUTABLE: process.execPath, CONDUCTOR_TEST_USER_DATA: join(root, 'profile'), CONDUCTOR_PROJECTS_ROOT: join(root, 'projects') }
 delete env.ELECTRON_RUN_AS_NODE; delete env.CONDUCTOR_LIVE_TESTS
@@ -53,7 +53,7 @@ try {
   const project = await page.evaluate(() => window.conductor.projects.create('Phone smoke'))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Phone smoke' }).click()
-  await expect(page.locator('.launcher-grid button').filter({ hasText: 'Claude' })).toBeVisible()
+  await expect(page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).filter({ hasNotText: 'Cloud' })).toBeVisible()
 
   let desktop = await page.evaluate(() => window.conductor.phone.state())
   assert.equal(desktop.listening, false)
@@ -152,6 +152,22 @@ try {
   const listed = await api(origin, '/api/state', { ca, token })
   assert.ok(listed.sessions.some(session => session.id === opened.sessionId && session.tabId === opened.tabId && session.state === 'done'))
   check('Machine load and runtimes are readable from the phone alongside the session list')
+
+  const limits = await api(origin, '/api/usage', { ca, token })
+  assert.ok(Array.isArray(limits.providers) && Array.isArray(limits.allowance))
+  const activity = await api(origin, '/api/activity', { ca, token })
+  assert.ok(activity.items.some(item => item.kind === 'approval' && item.sessionId === opened.sessionId && item.projectId === project.id), 'answered question is recorded and linked in Activity')
+  check('Usage uses the desktop report contract and Activity links the answered phone question to its project and tab')
+
+  await api(origin, '/api/sessions/' + opened.sessionId + '/message', { ca, token, body: { text: 'SYNTHETIC STEER START', mode: 'auto' } })
+  await until(() => api(origin, '/api/sessions/' + opened.sessionId, { ca, token }), conversation => conversation.summary.phase === 'running', 'a turn to interrupt')
+  await api(origin, '/api/sessions/' + opened.sessionId + '/message', { ca, token, body: { text: 'Keep this queued after Stop', mode: 'queue' } })
+  const stopped = await api(origin, '/api/sessions/' + opened.sessionId + '/interrupt', { ca, token, body: {} })
+  assert.equal(stopped.held, 1)
+  const held = await until(() => api(origin, '/api/sessions/' + opened.sessionId, { ca, token }), conversation => conversation.summary.phase !== 'running', 'provider interrupt confirmation')
+  assert.equal(held.queued.length, 1)
+  assert.equal(held.queued[0].text, 'Keep this queued after Stop')
+  check('Phone Stop reaches the provider interrupt and keeps the queued next turn held, matching desktop semantics')
 
   const revoked = await page.evaluate(id => window.conductor.phone.revoke(id), desktop.devices[0].id)
   assert.equal(revoked.devices.length, 0)

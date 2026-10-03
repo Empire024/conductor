@@ -12,7 +12,7 @@ import assert from 'node:assert/strict'
 // inference happens. Run after `npm.cmd run build`; screenshots and report.json go to
 // artifacts/swarm-2026-09-23/phone-app/.
 const root = await mkdtemp(join(tmpdir(), 'conductor-phone-shell-'))
-const output = resolve('artifacts/swarm-2026-09-23/phone-app')
+const output = resolve('.conductor-scratch/phone-redesign/shell')
 await mkdir(output, { recursive: true })
 const env = { ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_EMPTY_HISTORY: '1', CONDUCTOR_TEST_NODE_EXECUTABLE: process.execPath, CONDUCTOR_TEST_USER_DATA: join(root, 'profile'), CONDUCTOR_PROJECTS_ROOT: join(root, 'projects') }
 delete env.ELECTRON_RUN_AS_NODE; delete env.CONDUCTOR_LIVE_TESTS
@@ -45,7 +45,7 @@ const until = async (read, predicate, label, timeout = 20000) => {
     /* A read during a navigation can fail; that is just not yet. */
     value = await read().catch(() => undefined)
     if (predicate(value)) return value
-    if (Date.now() - started > timeout) throw new Error('Timed out waiting for ' + label + ': ' + JSON.stringify(value).slice(0, 600))
+    if (Date.now() - started > timeout) throw new Error('Timed out waiting for ' + label + ': ' + String(JSON.stringify(value)).slice(0, 600))
     await new Promise(resolve => setTimeout(resolve, 250))
   }
 }
@@ -108,14 +108,14 @@ try {
   assert.match(boot.headers['content-type'], /^text\/javascript/)
   assert.ok(boot.text.includes('ConductorBoot'), 'the real boot guard is served, not the placeholder')
   const worker = await call(origin, '/sw.js')
-  assert.ok(worker.text.includes("'conductor-phone-v3'") && worker.text.includes("'/boot.js'") && worker.text.includes("'/markdown.js'"))
+  assert.ok(worker.text.includes("'conductor-phone-v4'") && worker.text.includes("'/boot.js'") && worker.text.includes("'/markdown.js'"))
   const markdown = await call(origin, '/markdown.js')
   assert.equal(markdown.status, 200)
   assert.ok(markdown.text.includes('ConductorMarkdown'), 'the markdown renderer is served')
   const health = await call(origin, '/api/health')
   assert.equal(health.status, 200)
   assert.equal(health.json.ok, true)
-  check('The listener serves the boot guard before app.js, markdown.js, the v3 worker precaching them, and an unauthenticated /api/health')
+  check('The listener serves the boot guard before app.js, markdown.js, the v4 worker precaching them, and an unauthenticated /api/health')
 
   // ------------------------------------------------------------------ the phone, unpaired
   const opened = await openPhone('phone-shell')
@@ -176,11 +176,29 @@ try {
   await until(() => tab.run('document.querySelector(".code-input") && document.querySelector(".code-input").value'), value => value === code, 'the code filled in')
   await tab.shot('smoke-pair-filled')
   await tab.run('document.querySelector("form.pair-form").requestSubmit()')
-  await until(() => tab.run('Boolean(document.querySelector(".live-dot.live"))'), Boolean, 'the live session list')
+  await until(() => tab.run('Boolean(document.querySelector(".home-hero") && document.querySelector(".connection-banner")?.hidden)'), Boolean, 'the connected Home screen')
   desktop = await page.evaluate(() => window.conductor.phone.state())
   assert.equal(desktop.devices.length, 1)
   await tab.shot('smoke-sessions')
   check('#pair=CODE fills the code and pairing from the phone window reaches the live session list')
+
+  for (const hash of ['#/tabs', '#/attention', '#/new', '#/more', '#/usage', '#/activity', '#/ideas/list', '#/phone', '#diagnose']) {
+    await tab.go(hash)
+    await until(() => tab.run('location.hash'), value => value === hash, 'route ' + hash)
+    assert.equal(await tab.run('document.querySelector(".tabbar").hidden'), false, 'persistent Home on ' + hash)
+    assert.deepEqual(await tab.run('Array.from(document.querySelectorAll(".tabbar .tab-label")).map(n => n.textContent)'), ['Home', 'Tabs', 'Attention', 'New task', 'More'])
+    await tab.run('document.querySelector(".tabbar [data-tab=home]").click(); true')
+    await until(() => tab.run('location.hash'), value => value === '#/', 'Home from ' + hash)
+  }
+  check('Five persistent destinations and one-tap Home work across all primary and secondary screens')
+  await tab.run('history.back(); true')
+  await until(() => tab.run('history.state?.conductorPhone?.depth'), value => value === 0, 'native Back at Home to stay inside the app')
+  assert.equal(await tab.run('location.hash'), '#/')
+  await tab.go('#/more')
+  await until(() => tab.run('Boolean(document.querySelector(".appearance-options"))'), Boolean, 'More before native Back')
+  await tab.run('history.back(); true')
+  await until(() => tab.run('Boolean(document.querySelector(".home-hero"))'), Boolean, 'native Back to pop one app screen')
+  check('Native Back pops an app screen and the Home boundary stays inside the phone app')
 
   await tab.go('#/phone')
   await until(() => tab.text(), text => text.includes('Connection check'), 'the Phone screen')
@@ -216,10 +234,11 @@ try {
   if (visibility !== 'visible') await tab.run('localStorage.removeItem("conductor.phone.token"); true')
   await tab.go('#/')
   await tab.reload()
-  const offline = await until(() => tab.text(), text => /not answering|did not start/.test(text), 'the phone to say the computer is not answering', 45000)
+  const offline = await until(() => tab.text(), text => /not answering|did not start|Cannot check this phone/.test(text), 'the phone to explain the unavailable computer', 45000)
   assert.ok(offline.trim().length > 0)
+  assert.equal(await tab.run('Boolean(document.querySelector(".skeleton") || document.querySelector(".pair-form") || document.querySelector(".boot-card"))'), true, 'offline reload retains a safe recovery screen')
   await tab.shot('smoke-offline')
-  check('After the desktop stops listening, a reload of the phone shows "' + (offline.includes('did not start') ? 'did not start' : 'not answering') + '", not a blank page (' + (visibility === 'visible' ? 'paired session list' : 'pairing screen, window reported ' + visibility) + '; service worker in control: ' + controlled + ')')
+  check('After the desktop stops listening, reload shows an explained connection failure and safe recovery screen; service worker in control: ' + controlled)
 
   const phoneErrors = (await tab.consoleErrors()).filter(text => /Uncaught/.test(text))
   assert.deepEqual(phoneErrors, [], 'no uncaught error in the phone window')

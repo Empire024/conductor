@@ -431,6 +431,8 @@ export interface PhoneConversation {
   items: PhoneTimelineItem[]
   pending: PendingInteraction[]
   queued: Array<{ id: string; text: string }>
+  /** Bounded authoritative input receipts, including queued/steered messages not yet delivered. */
+  inputDeliveries?: Array<{ id: string; text: string; status: 'queued' | 'sending' | 'accepted' | 'delivered' | 'cancelled' | 'uncertain'; sequence: number }>
   truncated: boolean
   /** The provider accepts a message into the running turn (Steer); otherwise it queues. */
   canSteer: boolean

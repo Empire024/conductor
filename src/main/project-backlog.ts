@@ -221,12 +221,12 @@ export class ProjectBacklogs {
     if(edit.type==='add') {
       const existing=new Set(parseProjectTasks(text).map(task=>task.id))
       const added=parseProjectTasks(next).find(task=>!existing.has(task.id))
-      if(added)await this.record(projectId,added.id,'todo',undefined,actor)
+      if(added)await this.record(projectId,added.id,'todo',undefined,actor,added.title)
     }
     if(edit.type==='update' && before) {
       const status=edit.status??before.status
       const agentId=edit.agentId===undefined?before.agentId:(edit.agentId??undefined)
-      if(status!==before.status || agentId!==before.agentId)await this.record(projectId,before.id,status,agentId,actor)
+      if(status!==before.status || agentId!==before.agentId)await this.record(projectId,before.id,status,agentId,actor,edit.title ?? before.title)
     }
     return this.get(projectId,query)
   }
@@ -254,16 +254,16 @@ export class ProjectBacklogs {
     if(!changed.length)return history
     const commit=await this.head(projectId)
     // A checklist marker identifies the assignee, not who edited the file.
-    for(const task of changed)this.write(projectId,task.id,task.status,undefined,'file',commit,undefined,undefined,task.agentId)
+    for(const task of changed)this.write(projectId,task.id,task.status,undefined,'file',commit,undefined,undefined,task.agentId,task.title)
     return this.database.listProjectTaskActivity(projectId)
   }
-  private async record(projectId:string,taskId:string,status:ProjectTask['status'],assignedAgentId:string|undefined,actor?:ProjectTaskActor):Promise<void> {
+  private async record(projectId:string,taskId:string,status:ProjectTask['status'],assignedAgentId:string|undefined,actor?:ProjectTaskActor,title?:string):Promise<void> {
     const actingAgentId=actor?.actor==='agent'?actor.agentId:undefined
-    this.write(projectId,taskId,status,actingAgentId,actor?.actor ?? 'file',await this.head(projectId),actor?.sessionId,undefined,assignedAgentId)
+    this.write(projectId,taskId,status,actingAgentId,actor?.actor ?? 'file',await this.head(projectId),actor?.sessionId,undefined,assignedAgentId,title)
   }
-  private write(projectId:string,taskId:string,status:ProjectTask['status'],agentId:string|undefined,actor:'agent'|'you'|'file',commit?:string,sessionId?:string,known?:ProjectTaskOwner[],assignedAgentId?:string):void {
+  private write(projectId:string,taskId:string,status:ProjectTask['status'],agentId:string|undefined,actor:'agent'|'you'|'file',commit?:string,sessionId?:string,known?:ProjectTaskOwner[],assignedAgentId?:string,title?:string):void {
     const actingAgent=agentId?(known??this.owners(projectId)).find(owner=>owner.id===agentId):undefined
-    this.database.recordProjectTaskActivity({projectId,taskId,status,actor,agentId,assignedAgentId,commit,
+    this.database.recordProjectTaskActivity({projectId,taskId,title,status,actor,agentId,assignedAgentId,commit,
       agentTitle:actingAgent?.title,provider:actingAgent?.provider,
       sessionId:actingAgent?.sessionId ?? sessionId,
       workspace:actingAgent?.workspace ?? (sessionId?this.database.getSession(sessionId)?.name:undefined)})
