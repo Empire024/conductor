@@ -29,7 +29,9 @@
   const METRICS_INTERVAL_MS = 5000
   /* iOS suspends a backgrounded fetch stream without ending it; a silent minute means dead. */
   const STREAM_STALE_MS = 75000
-  const MAX_COMPOSER_LINES = 6
+  const MAX_COMPOSER_LINES = 5
+  /* The smallest on-screen keyboard is well over this; browser toolbars and rounding are under it. */
+  const KEYBOARD_MIN_HEIGHT = 120
   /* The unlock token rides on every call once the phone is unlocked (src/main/phone-lock.ts). */
   const UNLOCK_HEADER = 'X-Conductor-Unlock'
   const LOCK_TOUCH_MS = 20000
@@ -2041,11 +2043,33 @@
     const supported = Boolean(Recognition && window.isSecureContext)
     const node = button('composer-mic' + (supported ? '' : ' unsupported'), null, () => toggle())
     node.appendChild(icon(MIC_PATHS, 20))
+    /* One line under the composer, shown only while listening or after an attempt failed; the
+       keyboard fallback is offered with a failure, not before anyone has tried the mic. */
     const status = el('div', 'dictation-status')
-    const noteText = el('span', 'dictation-note', 'You can also use dictation on your keyboard, if available.')
+    status.hidden = true
+    const noteText = el('span', 'dictation-note', '')
     noteText.setAttribute('role', 'status')
+    const useKeyboard = button('ghost dictation-keyboard', 'Use keyboard', () => { stop(); hideNote(); input.focus() })
+    const dismiss = button('dictation-dismiss', '×', () => hideNote())
+    dismiss.setAttribute('aria-label', 'Dismiss')
     status.appendChild(noteText)
-    status.appendChild(button('ghost', 'Use keyboard', () => { stop(); input.focus() }))
+    status.appendChild(useKeyboard)
+    status.appendChild(dismiss)
+    const showNote = (text, failed) => {
+      noteText.textContent = text
+      noteText.title = failed ? text : ''
+      noteText.className = 'dictation-note' + (failed ? ' dictation-error' : '')
+      status.classList.toggle('error', failed)
+      useKeyboard.hidden = !failed
+      dismiss.hidden = !failed
+      status.hidden = false
+    }
+    const hideNote = () => {
+      status.hidden = true
+      status.classList.remove('error')
+      noteText.className = 'dictation-note'
+      noteText.textContent = ''
+    }
     let recognition = null
     let timer = null
     let started = false
@@ -2058,8 +2082,7 @@
       node.setAttribute('aria-label', !supported ? 'Dictation is not available in this browser' : listening ? 'Stop dictation' : 'Dictate')
     }
     const note = (title, body) => {
-      noteText.textContent = title + '. ' + body
-      noteText.className = 'dictation-note dictation-error'
+      showNote(title + '. ' + body, true)
       showToast({ kind: 'failed', title: title, body: body, url: null })
     }
     /* Every result event carries the whole utterance so far; rebuilding from all of it avoids the
@@ -2078,8 +2101,8 @@
       const caret = (before + lead + spoken).length
       try { input.setSelectionRange(caret, caret) } catch (error) { /* not focused; the value is what matters */ }
       onChange()
-      noteText.className = 'dictation-note' + (interim ? ' dictation-interim' : '')
-      noteText.textContent = interim ? 'Listening… words are still being recognised.' : 'Listening… tap the microphone to finish.'
+      showNote(interim ? 'Listening… words are still being recognised.' : 'Listening… tap the microphone to finish.', false)
+      if (interim) noteText.classList.add('dictation-interim')
     }
     /* The mic button stops and keeps the last words; sending, leaving or hiding the page drops
        whatever is still in flight, so a late result cannot refill a composer that was just sent. */
@@ -2103,10 +2126,8 @@
       if (timer) { clearTimeout(timer); timer = null }
       if (activeDictation === stop) activeDictation = null
       paint()
-      if (!noteText.className.includes('dictation-error')) {
-        noteText.className = 'dictation-note'
-        noteText.textContent = 'Dictation finished. You can also use dictation on your keyboard, if available.'
-      }
+      /* A finished dictation leaves its words in the field and nothing under it; a failure stays. */
+      if (!status.classList.contains('error')) hideNote()
     }
     const toggle = () => {
       if (recognition) { finish(); return }
@@ -2138,7 +2159,7 @@
         if (recognition !== current) return
         started = true
         if (timer) { clearTimeout(timer); timer = null }
-        noteText.textContent = 'Listening… tap the microphone to finish.'
+        showNote('Listening… tap the microphone to finish.', false)
       }
       current.onerror = event => {
         if (recognition !== current) return
@@ -2155,8 +2176,7 @@
       recognition = current
       activeDictation = stop
       paint()
-      noteText.className = 'dictation-note'
-      noteText.textContent = 'Starting dictation… allow microphone access if asked.'
+      showNote('Starting dictation… allow microphone access if asked.', false)
       // No awaited permission query or microphone preflight: start stays inside the mic tap.
         current.start()
         if (!started && recognition === current) timer = setTimeout(() => {
@@ -2668,12 +2688,16 @@
     footer.appendChild(composer)
     footer.appendChild(dictation.status)
 
-    const lineHeight = 21
+    /* One line to MAX_COMPOSER_LINES, then the field scrolls. The height is border-box, so the
+       border is added to the content-plus-padding scrollHeight (20px lines, 11px padding). */
+    const lineHeight = 20
     const grow = () => {
       input.style.height = 'auto'
-      const max = lineHeight * MAX_COMPOSER_LINES + 18
-      input.style.height = Math.min(input.scrollHeight, max) + 'px'
-      input.style.overflowY = input.scrollHeight > max ? 'auto' : 'hidden'
+      const border = (input.offsetHeight - input.clientHeight) || 0
+      const max = lineHeight * MAX_COMPOSER_LINES + 22 + border
+      const wanted = input.scrollHeight + border
+      input.style.height = Math.min(wanted, max) + 'px'
+      input.style.overflowY = wanted > max ? 'auto' : 'hidden'
     }
     input.addEventListener('input', () => {
       state.drafts[id] = input.value
@@ -5441,11 +5465,21 @@
        hide a bottom-pinned composer behind it. Safari also scrolls the layout viewport to bring a
        focused field into view, which drags a position:fixed shell along with it unless the shell
        is pulled back by exactly that offset. */
+    /* Only a keyboard (or a pinch zoom) leaves the visual viewport well short of the layout one.
+       Otherwise the shell is sized by CSS to the whole screen: a Home Screen app on iOS can report
+       a visual viewport shorter than the screen, which left a bare band under the tab bar. */
     const viewport = window.visualViewport
-    const height = viewport ? viewport.height : window.innerHeight
+    const root = document.documentElement
+    const layout = Math.max(window.innerHeight || 0, root.clientHeight || 0)
+    const shrunk = Boolean(viewport && layout - viewport.height > KEYBOARD_MIN_HEIGHT)
     const offset = viewport ? viewport.offsetTop : 0
-    document.documentElement.style.setProperty('--app-height', Math.round(height) + 'px')
-    document.documentElement.style.setProperty('--app-offset', Math.round(offset) + 'px')
+    if (shrunk) root.style.setProperty('--app-height', Math.round(viewport.height) + 'px')
+    else root.style.removeProperty('--app-height')
+    root.style.setProperty('--app-offset', Math.round(offset) + 'px')
+    /* While typing the tab bar steps aside and its home-indicator inset sits under the keyboard. */
+    const active = document.activeElement
+    const typing = Boolean(active && (active.tagName === 'TEXTAREA' || (active.tagName === 'INPUT' && !/^(button|checkbox|radio|submit|reset|file|range|color)$/i.test(active.type || '')) || active.isContentEditable))
+    root.classList.toggle('keyboard-open', shrunk && typing)
     if (window.scrollTo) window.scrollTo(0, 0)
   }
 

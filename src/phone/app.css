@@ -60,6 +60,9 @@ button { cursor: pointer; min-height: 44px; min-width: 44px; }
   flex-direction: column;
   overflow: hidden;
 }
+/* A Home Screen app has no toolbar that comes and goes, so it fills the screen even when the
+   browser reports a shorter viewport; the keyboard still sizes it through --app-height. */
+@media (display-mode: standalone) { .app { height: var(--app-height, max(100vh, 100dvh)); } }
 
 .screen {
   flex: 1 1 auto;
@@ -1622,9 +1625,15 @@ button:disabled { cursor: default; }
 .screen:has(+ .tabbar:not([hidden])) .footer { padding-bottom: 10px; }
 .screen:has(+ .tabbar:not([hidden])) .idea-bar { padding-bottom: 0; }
 .screen:has(+ .tabbar:not([hidden])) .terminal-keys { padding-bottom: 6px; }
-.composer { flex-wrap: wrap; }
-.composer-input { flex-basis: 100%; width: 100%; height: 44px; max-height: 144px; line-height: 20px; }
-.composer-send { margin-left: auto; min-width: 80px; }
+/* One row like a messaging app: [image] [field, 1-5 lines] [mic] [Stop while a turn runs]
+   [Steer/Send]. The buttons stay on the field's last line as it grows. */
+.composer { flex-wrap: nowrap; align-items: flex-end; gap: 6px; }
+.composer-input { flex: 1 1 auto; width: auto; min-width: 0; height: 44px; max-height: 124px; padding: 11px 12px; line-height: 20px; }
+.composer-input::placeholder { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.composer-send { min-width: 0; padding: 0 13px; white-space: nowrap; }
+/* While typing the tab bar steps aside; the keyboard covers the home indicator. */
+.keyboard-open .tabbar { display: none; }
+.keyboard-open .footer { padding-bottom: 8px; }
 .composer-mic.unsupported { color: var(--text-2); opacity: 1; border-style: dashed; }
 .composer-mic.listening { color: var(--danger); border-color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, var(--surface-1)); }
 @keyframes mic-pulse { 50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--danger) 12%, transparent); } }
@@ -1636,10 +1645,15 @@ button:disabled { cursor: default; }
 .message-status.failed { color: var(--danger); }
 .message-status button { min-height: 44px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); color: inherit; }
 .dictation-note, .dictation-status, .mic-status { margin: 0; font-size: 12px; color: var(--text-2); overflow-wrap: anywhere; }
-.dictation-status:empty { display: none; }
-.dictation-status.failed, .dictation-status.error { color: var(--danger); }
-.dictation-error { margin: 0; padding: 10px 12px; border-radius: 12px; border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border)); color: var(--danger); background: var(--surface-1); font-size: 13px; }
+/* One line: the full text is in the toast that comes with a failure and in the note's title. */
+.dictation-status { display: flex; align-items: center; gap: 4px; min-width: 0; margin-top: -2px; }
+.dictation-status.error { padding-left: 10px; border-radius: 12px; border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border)); background: color-mix(in srgb, var(--danger) 6%, var(--surface-1)); }
+.dictation-note { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; overflow-wrap: normal; }
+.dictation-status.failed, .dictation-status.error, .dictation-error { color: var(--danger); }
+.dictation-error { font-size: 12.5px; }
 .dictation-interim { color: var(--text-2); font-style: italic; }
+.dictation-keyboard { flex: 0 0 auto; min-height: 44px; padding: 0 10px; border: 0; background: none; color: var(--accent); font-size: 13px; font-weight: 600; white-space: nowrap; }
+.dictation-dismiss { flex: 0 0 auto; width: 44px; min-height: 44px; padding: 0; border: 0; background: none; color: var(--text-2); font-size: 20px; line-height: 1; }
 .image-add, .image-remove, .error-close, .idea-link, .idea-run-refresh, .terminal-open, .terminal-close, .terminal-key, .boot-strip-button { min-height: 44px; }
 .image-thumb { width: 88px; height: 88px; border-radius: 12px; }
 .image-remove { width: 44px; height: 44px; top: 0; right: 0; background: #01111fd9; color: #d6deeb; border-radius: 0 0 0 12px; }
@@ -1784,10 +1798,11 @@ button:disabled { cursor: default; }
 @media (min-width: 600px) {
   .project-grid, .project-cards, .home-projects { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .scroll:not(.timeline), .loading-content { padding-left: max(24px, env(safe-area-inset-left)); padding-right: max(24px, env(safe-area-inset-right)); }
-  .composer-input { flex-basis: auto; width: auto; }
 }
 @media (max-width: 360px) {
   .topbar-main { gap: 8px; }
+  .footer { padding-left: max(10px, env(safe-area-inset-left)); padding-right: max(10px, env(safe-area-inset-right)); }
+  .composer-send { padding: 0 10px; }
   .topbar-title { font-size: 17px; }
   .count { padding: 3px 5px; font-size: 10px; }
   .session-head { flex-wrap: wrap; gap: 3px 8px; }

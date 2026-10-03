@@ -317,8 +317,8 @@ describe('phone task section', () => {
 
 describe('phone keyboard viewport', () => {
   it('pulls the fixed shell back by the visual viewport offset, not only its height, and settles the caret', () => {
-    expect(appSource).toContain("document.documentElement.style.setProperty('--app-height'")
-    expect(appSource).toContain("document.documentElement.style.setProperty('--app-offset'")
+    expect(appSource).toContain("root.style.setProperty('--app-height'")
+    expect(appSource).toContain("root.style.setProperty('--app-offset'")
     expect(appSource).toContain('scrollCaretIntoView')
     expect(appSource).toContain("window.visualViewport.addEventListener('resize', applyViewport)")
     expect(appSource).toContain("window.visualViewport.addEventListener('scroll', applyViewport)")
@@ -327,6 +327,16 @@ describe('phone keyboard viewport', () => {
     const css = readFileSync(new URL('./app.css', import.meta.url), 'utf8')
     expect(css).toContain('height: var(--app-height, 100dvh)')
     expect(css).toContain('transform: translateY(var(--app-offset, 0px))')
+  })
+  it('sizes the shell from the visual viewport only while it is well short of the layout one', () => {
+    /* Otherwise CSS fills the screen: an iOS Home Screen app reporting a short visual viewport
+       left a bare band under the tab bar (owner iPhone, 2026-10-03). */
+    expect(appSource).toContain('layout - viewport.height > KEYBOARD_MIN_HEIGHT')
+    expect(appSource).toContain("root.style.removeProperty('--app-height')")
+    expect(appSource).toContain("root.classList.toggle('keyboard-open', shrunk && typing)")
+    const css = readFileSync(new URL('./app.css', import.meta.url), 'utf8')
+    expect(css).toContain('@media (display-mode: standalone) { .app { height: var(--app-height, max(100vh, 100dvh)); } }')
+    expect(css).toContain('.keyboard-open .tabbar { display: none; }')
   })
 })
 
@@ -400,7 +410,7 @@ const bootApp = (hash: string, respond: (call: AppCall) => unknown, options: { l
     readyState: 'complete',
     visibilityState: 'visible',
     body: new FakeNode('body'),
-    documentElement: { style: { setProperty: () => undefined } },
+    documentElement: { style: { setProperty: () => undefined, removeProperty: () => undefined }, classList: { toggle: () => false, add: () => undefined, remove: () => undefined, contains: () => false } },
     get activeElement() { return focusedNode },
     createElement: (tag: string) => (tag === 'canvas' ? fakeCanvas() : new FakeNode(tag)),
     createElementNS: (_ns: string, tag: string) => new FakeNode(tag),
@@ -1059,6 +1069,35 @@ describe('phone composer dictation', () => {
     FakeRecognition.last!.onerror!({ error: 'not-allowed' })
     FakeRecognition.last!.onend!()
     expect(page.toasts.textContent).toContain('Microphone is off for this page')
+  })
+
+  it('keeps one composer row and shows the keyboard fallback only after an attempt fails', async () => {
+    const page = bootApp('#/session/s1', conversationAnswer([]), { globals: { webkitSpeechRecognition: FakeRecognition } })
+    await settleAll()
+    const row = page.app.querySelector('composer')!
+    expect(row.children.map(node => node.className.split(' ')[0])).toEqual(['composer-attach', 'composer-input', 'composer-mic', 'composer-stop', 'composer-send'])
+    const status = page.app.querySelector('dictation-status')!
+    /* Nothing under the composer until the mic is used. */
+    expect(status.hidden).toBe(true)
+    mic(page).click()
+    expect(status.hidden).toBe(false)
+    expect(status.textContent).toContain('Starting dictation')
+    expect(page.app.querySelector('dictation-keyboard')!.hidden).toBe(true)
+    FakeRecognition.last!.hear([['done', true]])
+    mic(page).click()
+    FakeRecognition.last!.onend!()
+    /* A dictation that simply finished leaves its words and no note. */
+    expect(composer(page).value).toBe('done')
+    expect(status.hidden).toBe(true)
+    mic(page).click()
+    FakeRecognition.last!.onerror!({ error: 'network' })
+    expect(status.hidden).toBe(false)
+    expect(status.classList.contains('error')).toBe(true)
+    expect(status.textContent).toContain('Speech service connection failed')
+    expect(page.app.querySelector('dictation-keyboard')!.hidden).toBe(false)
+    page.app.querySelector('dictation-dismiss')!.click()
+    expect(status.hidden).toBe(true)
+    expect(composer(page).value).toBe('done')
   })
 
   it('without speech recognition the button is dimmed and points at the keyboard microphone', async () => {
