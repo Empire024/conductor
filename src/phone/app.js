@@ -758,6 +758,7 @@
     if (hash.indexOf('#/share') === 0) return { name: 'share', key: 'share' }
     if (hash.indexOf('#/new') === 0) return { name: 'new', key: 'new' }
     if (hash.indexOf('#/system') === 0) return { name: 'system', key: 'system' }
+    if (hash.indexOf('#/login') === 0) return { name: 'login', key: 'login' }
     if (hash.indexOf('#/phone') === 0) return { name: 'phone', key: 'phone' }
     if (hash.indexOf('#/terminal') === 0) return { name: 'terminal', key: 'terminal' }
     if (hash.indexOf('#diagnose') === 0) return { name: 'diagnose', key: 'diagnose' }
@@ -887,6 +888,7 @@
     if (route.name === 'idea-runs') return ideaRunsScreen()
     if (route.name === 'new') return newTaskScreen()
     if (route.name === 'system') return systemScreen()
+    if (route.name === 'login') return loginScreen()
     if (route.name === 'phone') return phoneScreen()
     if (route.name === 'diagnose') return diagnoseScreen()
     if (route.name === 'trust') return trustScreen()
@@ -1654,9 +1656,101 @@
     }
     writeStored(THEME_KEY, theme)
   }
+
+  /* Logging a provider back in from the phone (src/main/claude-login.ts). The computer runs the
+     CLI's own login; this screen shows its sign-in link, takes the one code the page gives and
+     says how it went. No token ever comes here. */
+  const LOGIN_POLL_MS = 2000
+  const LOGIN_RUNNING = ['starting', 'awaiting-code', 'awaiting-device', 'verifying']
+  const providerName = provider => provider === 'codex' ? 'Codex' : 'Claude'
+  const loginScreen = () => {
+    const view = overviewScreen('Log in', 'login')
+    let data = null, problem = '', busy = false, timer = null, destroyed = false, code = ''
+    const load = async () => {
+      try { data = await api('/api/login'); problem = '' } catch (error) { const message = errorMessage(error); if (message) problem = message }
+      if (!destroyed) draw()
+    }
+    const act = async (path, body) => {
+      if (busy) return
+      busy = true; problem = ''
+      draw()
+      try { await api(path, { method: 'POST', body: body }) } catch (error) { problem = errorMessage(error) }
+      busy = false
+      await load()
+    }
+    const draw = () => {
+      const body = view.body
+      const focused = document.activeElement && document.activeElement.classList && document.activeElement.classList.contains('login-code-input')
+      if (focused) return
+      clear(body)
+      if (!data) { body.appendChild(emptyNote(problem ? 'Could not read the login state.' : 'Reading…', problem || null)); return }
+      for (const outage of data.outages || []) {
+        const card = el('section', 'card login-outage')
+        card.appendChild(el('h2', 'card-title', providerName(outage.provider) + ' login expired'))
+        card.appendChild(el('p', 'card-note', 'Since ' + dayTime(outage.since) + '. ' + outage.tabs + (outage.tabs === 1 ? ' tab waits' : ' tabs wait') + ' and resume once you are logged in.'))
+        body.appendChild(card)
+      }
+      const flow = data.flow
+      const running = flow && LOGIN_RUNNING.indexOf(flow.phase) >= 0
+      if (flow) {
+        const card = el('section', 'card login-flow')
+        card.dataset.phase = flow.phase
+        card.appendChild(el('h2', 'card-title', flow.mode === 'setup-token' ? 'Long-lived Claude token' : providerName(flow.provider) + ' login'))
+        if (flow.message) card.appendChild(el('p', 'card-note login-message', flow.message))
+        if (flow.url && running) {
+          const link = el('a', 'primary login-link', flow.mode === 'device' ? 'Open the sign-in page' : '1. Open the sign-in page')
+          link.href = flow.url
+          link.target = '_blank'
+          link.rel = 'noopener noreferrer'
+          card.appendChild(link)
+        }
+        if (flow.userCode && running) {
+          card.appendChild(el('p', 'card-note', 'Enter this code on that page:'))
+          card.appendChild(el('code', 'login-user-code', flow.userCode))
+        }
+        if (flow.phase === 'awaiting-code' && !flow.codeUsed) {
+          card.appendChild(el('p', 'card-note', '2. Sign in, copy the code the page shows and paste it here.'))
+          const input = el('input', 'login-code-input')
+          input.type = 'text'
+          input.autocomplete = 'off'
+          input.autocapitalize = 'off'
+          input.spellcheck = false
+          input.placeholder = 'Code from the sign-in page'
+          input.setAttribute('aria-label', 'Code from the sign-in page')
+          input.value = code
+          input.addEventListener('input', () => { code = input.value })
+          input.addEventListener('blur', () => setTimeout(draw, 0))
+          card.appendChild(input)
+          card.appendChild(button('primary login-submit', busy ? 'Sending…' : 'Continue', () => {
+            const value = code.trim()
+            if (!value) return
+            code = ''
+            void act('/api/login/code', { id: flow.id, code: value })
+          }))
+        }
+        if (running) card.appendChild(button('ghost login-cancel', 'Cancel', () => void act('/api/login/cancel', { id: flow.id })))
+        body.appendChild(card)
+      }
+      if (!running) {
+        const claudeDown = (data.outages || []).some(outage => outage.provider === 'claude')
+        const codexDown = (data.outages || []).some(outage => outage.provider === 'codex')
+        body.appendChild(button((claudeDown || !codexDown) ? 'primary login-start' : 'ghost login-start', 'Log in to Claude', () => void act('/api/login/start', { provider: 'claude', mode: 'login' })))
+        body.appendChild(button('ghost login-token', 'Set up a long-lived Claude token', () => void act('/api/login/start', { provider: 'claude', mode: 'setup-token' })))
+        body.appendChild(el('p', 'card-note', 'A long-lived token lasts a year and never needs a refresh, so the Claude login cannot expire under Conductor again. It stays on the computer.'))
+        body.appendChild(button(codexDown ? 'primary login-codex' : 'ghost login-codex', 'Log in to Codex', () => void act('/api/login/start', { provider: 'codex', mode: 'device' })))
+      }
+      if (problem) body.appendChild(el('p', 'muted-note login-problem', problem))
+    }
+    const start = () => { if (!timer) { timer = setInterval(() => { void load() }, LOGIN_POLL_MS); void load() } }
+    const pause = () => { if (timer) { clearInterval(timer); timer = null } }
+    draw()
+    start()
+    return { key: view.key, root: view.root, update: draw, destroy: () => { destroyed = true; pause() }, onVisibility: visible => { if (visible) start(); else pause() } }
+  }
+
   const moreScreen = () => {
     const view = overviewScreen('More', 'more')
-    for (const [title, hash] of [['Project tasks', '#/tasks'], ['Ideas', '#/ideas/list'], ['Idea runs', '#/idea-runs'], ['Usage', '#/usage'], ['Activity', '#/activity'], ['System', '#/system'], ['Terminal', '#/terminal'], ['Phone & security', '#/phone'], ['Connection help', '#diagnose']]) {
+    for (const [title, hash] of [['Project tasks', '#/tasks'], ['Log in', '#/login'], ['Ideas', '#/ideas/list'], ['Idea runs', '#/idea-runs'], ['Usage', '#/usage'], ['Activity', '#/activity'], ['System', '#/system'], ['Terminal', '#/terminal'], ['Phone & security', '#/phone'], ['Connection help', '#diagnose']]) {
       const row = button('more-row', null, () => visit(hash))
       row.appendChild(fill(el('span', 'more-row-main'), [el('span', 'more-row-title', title)]))
       row.appendChild(el('span', 'chev', '›'))
@@ -1897,7 +1991,20 @@
     reach.appendChild(el('span', 'reach-banner-link', 'Connection check ›'))
     reach.hidden = true
     const drawReach = () => { reach.hidden = !unreachableTooLong() }
+    const login = button('reach-banner login-banner', null, () => visit('#/login'))
+    login.hidden = true
+    if (route.name === 'attention') {
+      void api('/api/login').then(data => {
+        const lost = (data && data.outages) || []
+        if (!lost.length) return
+        clear(login)
+        login.appendChild(el('span', 'reach-banner-text', lost.map(outage => providerName(outage.provider)).join(' and ') + ' login expired.'))
+        login.appendChild(el('span', 'reach-banner-link', 'Log in ›'))
+        login.hidden = false
+      }, () => {})
+    }
     root.appendChild(header)
+    root.appendChild(login)
     root.appendChild(reach)
     root.appendChild(scroll)
 

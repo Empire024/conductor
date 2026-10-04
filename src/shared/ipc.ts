@@ -69,6 +69,7 @@ export interface FileSearchOptions { showHidden?: boolean; activeProjectId?: str
 
 export interface ConductorBridge {
   claudeFullAuto: import('./claude-full-auto').ClaudeFullAutoBridge
+  providerLogin: import('./claude-login').ProviderLoginBridge
   sessionArchive: import('./session-archive').SessionArchiveBridge
   agentControl: import('./agent-control').AgentControlBridge
   /** Every closed tab per workspace, and the "opened by" line (src/shared/tab-archive.ts). */

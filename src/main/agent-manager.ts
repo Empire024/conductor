@@ -28,6 +28,7 @@ import { StructuredSessions } from './structured-sessions'
 import { TurnBriefings } from './turn-briefing'
 import { anonymousConversations } from './local-models/anonymous'
 import { baseMachineFacts, describeMachine, detectMachine } from './machine-policy'
+import { claudeTokenEnvironment } from './claude-login'
 
 export { parseUsageLimitReset } from './usage-limit'
 
@@ -690,7 +691,7 @@ export class AgentManager {
         rows: 34,
         cwd: spec.cwd,
         useConptyDll: globalThis.process.platform === 'win32',
-        env: { ...providerEnvironment(globalThis.process.env), TERM: 'xterm-256color', COLORTERM: 'truecolor' } as Record<
+        env: { ...(spec.provider === 'claude' ? claudeTokenEnvironment(providerEnvironment(globalThis.process.env)) : providerEnvironment(globalThis.process.env)), TERM: 'xterm-256color', COLORTERM: 'truecolor' } as Record<
           string,
           string
         >

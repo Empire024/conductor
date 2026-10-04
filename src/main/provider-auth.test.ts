@@ -26,14 +26,14 @@ describe('recognizing a lost provider login', () => {
   })
 
   it('names the exact fix in the recorded error and the alert', () => {
-    expect(authExpiredMessage('claude', 'Failed to authenticate')).toMatch(/^Claude login expired: run `claude \/login`/)
-    expect(authExpiredMessage('codex', '401')).toMatch(/^Codex login expired: run `codex login`/)
+    expect(authExpiredMessage('claude', 'Failed to authenticate')).toMatch(/^Claude login expired: tap Log in on the phone or in Settings > Runtimes, or run `claude auth login`/)
+    expect(authExpiredMessage('codex', '401')).toMatch(/^Codex login expired: tap Log in on the phone or in Settings > Runtimes, or run `codex login`/)
     const alert = outageAlert({ provider: 'claude', since: '2026-10-01T08:38:49.074Z', message: 'Failed to authenticate', alertedAt: null, tabs: [
       { id: 'a', title: 'Worker', wizard: false, failedAt: '2026-10-01T08:40:00.000Z' },
       { id: 'w', title: 'Wizard', wizard: true, failedAt: '2026-10-01T08:38:49.074Z' }
     ] })
     expect(alert.title).toBe('Claude login expired')
-    expect(alert.body).toContain('`claude /login`')
+    expect(alert.body).toContain('`claude auth login`')
     expect(alert.body).toContain('wizard "Wizard"')
     expect(resumeMessage('claude', 'T1', 'T2')).toMatch(/expired at T1 and was restored at T2.*timers.*re-arm/s)
   })
@@ -66,7 +66,7 @@ describe('ProviderAuthMonitor', () => {
     expect(h.monitor.noteFailure('claude', { id: 'wizard', title: 'Wizard', wizard: true }, 'Failed to authenticate')).toBe(false)
     expect(h.monitor.noteFailure('claude', { id: 'worker', title: 'Worker', wizard: false }, 'Failed to authenticate')).toBe(false)
     expect(h.alerts).toHaveLength(1)
-    expect(h.alerts[0]!.body).toContain('`claude /login`')
+    expect(h.alerts[0]!.body).toContain('`claude auth login`')
     expect(h.monitor.status()[0]!.tabs.map(tab => tab.id)).toEqual(['worker', 'wizard'])
     // Another provider's outage is its own.
     expect(h.monitor.noteFailure('codex', { id: 'codex-tab', title: 'Codex', wizard: false }, '401')).toBe(true)
@@ -167,5 +167,54 @@ describe('ProviderAuthMonitor', () => {
     await vi.advanceTimersByTimeAsync(180_000)
     expect(h.resumed).toHaveLength(1)
     h.monitor.dispose()
+  })
+
+  it('a refused long-lived token is its own alert, and the normal login is tried once without a rewrite', async () => {
+    const h = harness({ loggedIn: true, stamp: 'mtime-1' })
+    h.monitor.noteFailure('claude', { id: 'worker', title: 'Worker', wizard: false }, 'API Error: 401 authentication_error', { source: 'token' })
+    expect(h.alerts).toHaveLength(1)
+    expect(h.alerts[0]!.title).toBe('Claude long-lived token rejected')
+    expect(h.alerts[0]!.body).toMatch(/stopped using it and falls back to the normal Claude login/)
+    expect(h.monitor.status()[0]!.source).toBe('token')
+    // The first check only takes the baseline stamp; the next one resumes on the fallback.
+    await vi.advanceTimersByTimeAsync(180_000)
+    await vi.advanceTimersByTimeAsync(180_000)
+    expect(h.resumed.map(entry => entry.tab.id)).toEqual(['worker'])
+    h.monitor.dispose()
+  })
+
+  it('a login through Conductor resumes at once on one logged-in probe, and the alert result is kept', async () => {
+    const h = harness({ loggedIn: false, stamp: 'mtime-1' })
+    h.monitor.noteFailure('claude', { id: 'worker', title: 'Worker', wizard: false }, 'Failed to authenticate')
+    expect(await h.monitor.loginRestored('claude')).toBe(false)
+    h.probe.loggedIn = true
+    expect(await h.monitor.loginRestored('claude')).toBe(true)
+    expect(h.resumed.map(entry => entry.tab.id)).toEqual(['worker'])
+    expect(await h.monitor.loginRestored('claude')).toBe(false)
+    h.monitor.dispose()
+  })
+
+  it('records what the alert reported on the persisted outage', async () => {
+    vi.useFakeTimers()
+    const persisted: Array<AuthOutage | null> = []
+    const closed: Array<AuthOutage & { restoredAt: string }> = []
+    let loggedIn = false
+    const monitor = new ProviderAuthMonitor({
+      probe: async () => ({ loggedIn, stamp: 'mtime-1' }),
+      alert: async () => 'desktop: toast shown; phone: pushed to 1 phone; 0 open phone streams',
+      resume: async () => 'sent',
+      persist: (_provider, outage) => { persisted.push(outage ? JSON.parse(JSON.stringify(outage)) as AuthOutage : null) },
+      closed: outage => { closed.push(outage) }
+    })
+    monitor.noteFailure('claude', { id: 'worker', title: 'Worker', wizard: false }, 'Failed to authenticate')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(monitor.status()[0]!.alertResult).toBe('desktop: toast shown; phone: pushed to 1 phone; 0 open phone streams')
+    expect(persisted.at(-1)?.alertResult).toContain('pushed to 1 phone')
+    // Once the login is back the open outage is cleared, and the closed one is kept as evidence.
+    loggedIn = true
+    expect(await monitor.loginRestored('claude')).toBe(true)
+    expect(persisted.at(-1)).toBeNull()
+    expect(closed).toEqual([expect.objectContaining({ provider: 'claude', alertResult: expect.stringContaining('pushed to 1 phone'), restoredAt: expect.any(String) })])
+    monitor.dispose()
   })
 })

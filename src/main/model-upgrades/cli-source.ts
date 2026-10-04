@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import { plainCliVersion, runVersion } from '../cli-versions'
@@ -133,21 +133,56 @@ function authFiles(provider: UpgradeProvider, environment: NodeJS.ProcessEnv, ho
   return { variable: 'CLAUDE_CONFIG_DIR', files: [[join(claudeHome, '.credentials.json'), '.credentials.json']] }
 }
 
+/** A scratch home's sign-in must not be able to refresh. Both CLIs rotate their OAuth refresh
+ *  token: a copy that refreshes spends the token the owner's own file still holds, the refreshed
+ *  pair is deleted with the scratch home, and the owner's next refresh fails ("OAuth session
+ *  expired and could not be refreshed", docs/verification/2026-10-04-claude-logout.md). The CLI's
+ *  own cross-process refresh lock cannot see a copy in another config home. So the copy keeps the
+ *  access token and drops the refresh token; null when the access token is about to expire (a
+ *  CLI would try to refresh it) or the file is not one Conductor can strip safely. */
+export const SCRATCH_SIGN_IN_MARGIN_MS = 15 * 60_000
+export function scratchSignIn(provider: UpgradeProvider, raw: string, now = Date.now()): string | null {
+  let parsed: Record<string, unknown>
+  try { parsed = JSON.parse(raw) as Record<string, unknown> } catch { return null }
+  if (!parsed || typeof parsed !== 'object') return null
+  if (provider === 'claude') {
+    const oauth = parsed.claudeAiOauth as Record<string, unknown> | undefined
+    if (!oauth || typeof oauth.accessToken !== 'string') return null
+    if (typeof oauth.expiresAt !== 'number' || oauth.expiresAt - now < SCRATCH_SIGN_IN_MARGIN_MS) return null
+    const { refreshToken: _refresh, refreshTokenExpiresAt: _refreshExpiry, ...kept } = oauth
+    return JSON.stringify({ claudeAiOauth: kept })
+  }
+  const tokens = parsed.tokens as Record<string, unknown> | null | undefined
+  if (!tokens) return typeof parsed.OPENAI_API_KEY === 'string' && parsed.OPENAI_API_KEY ? JSON.stringify(parsed) : null
+  if (typeof tokens.access_token !== 'string') return null
+  // An empty refresh token fails a refresh instead of rotating the owner's; a fresh last_refresh
+  // keeps Codex from refreshing proactively on start.
+  return JSON.stringify({ ...parsed, tokens: { ...tokens, refresh_token: '' }, last_refresh: new Date(now).toISOString() })
+}
+
 export interface CatalogProbe { version: string | null; models: CatalogModel[] }
 
 /**
  * What `executable` offers this account: the latest-models `cli-catalogs.mjs` probe (initialize
  * and model/list; never a turn) run against it with a scratch config home that holds only a copy of
- * the sign-in file, so the owner's config, history and MCP servers are neither read nor touched.
+ * the sign-in file, so the owner's config, history and MCP servers are neither read nor touched. The
+ * copy can never refresh (scratchSignIn); with a long-lived Claude token in the environment
+ * (CLAUDE_CODE_OAUTH_TOKEN) nothing is copied at all.
  */
-export async function probeCatalog(options: { provider: UpgradeProvider; executable: string; script: string; workDirectory: string; environment?: NodeJS.ProcessEnv; home?: string; timeoutMs?: number }): Promise<CatalogProbe> {
+export async function probeCatalog(options: { provider: UpgradeProvider; executable: string; script: string; workDirectory: string; environment?: NodeJS.ProcessEnv; home?: string; timeoutMs?: number; now?: number }): Promise<CatalogProbe> {
   const environment = options.environment ?? process.env
   const scratch = join(options.workDirectory, `probe-${options.provider}-${process.pid}-${Date.now()}`)
   const configHome = join(scratch, 'home')
   mkdirSync(configHome, { recursive: true })
   try {
     const auth = authFiles(options.provider, environment, options.home ?? homedir())
-    for (const [from, to] of auth.files) if (existsSync(from) && statSync(from).isFile()) copyFileSync(from, join(configHome, to))
+    const tokenInEnvironment = options.provider === 'claude' && Boolean(environment.CLAUDE_CODE_OAUTH_TOKEN?.trim())
+    if (!tokenInEnvironment) for (const [from, to] of auth.files) {
+      if (!existsSync(from) || !statSync(from).isFile()) continue
+      const copy = scratchSignIn(options.provider, readFileSync(from, 'utf8'), options.now)
+      if (copy === null) throw new Error(`the ${options.provider} sign-in is due for a refresh; the catalog probe waits for the next check rather than refresh a copy of it`)
+      writeFileSync(join(configHome, to), copy, { mode: 0o600 })
+    }
     const scriptPath = join(scratch, 'cli-catalogs.mjs')
     writeFileSync(scriptPath, options.script)
     const node = nodeCommand()

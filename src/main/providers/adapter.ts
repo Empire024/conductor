@@ -85,6 +85,9 @@ export interface ProviderAdapter {
   applyPermissionRules?(): Promise<'applied' | 'unsupported'>
   /** Reconcile a changed host policy with a live Claude process. A process launched without the
    *  bypass capability reports restart-pending so its manager can resume it at a safe boundary. */
+  /** Claude: whether this process was started with Conductor's long-lived token or the CLI's own
+   *  login (claude-login.ts); undefined when it is not known (a process continued across a restart). */
+  authEnvironment?(): 'token' | 'login' | undefined
   refreshClaudeFullAutoPolicy?(settings?: SessionSettings): Promise<{ status: 'confirmed' | 'restart-pending' | 'blocked' | 'unchanged'; error?: string }>
   /** Fold the runtime's own transcript into its durable task state, keeping the same logical
    *  conversation (the local runtime; native CLIs compact themselves). Null when there is

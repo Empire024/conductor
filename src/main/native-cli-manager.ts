@@ -6,6 +6,7 @@ import type { SessionSettings, StructuredProvider } from '../shared/structured-a
 import type { StructuredSessions } from './structured-sessions'
 import type { ConductorDatabase } from './database'
 import { providerEnvironment } from './provider-environment'
+import { claudeTokenEnvironment } from './claude-login'
 
 export function nativeCliArgs(provider: StructuredProvider, nativeId: string, settings: SessionSettings, fresh = false, claudeFullAutoAuthorized = false): string[] {
   if (!/^[a-zA-Z0-9_-]{1,160}$/.test(nativeId)) throw new Error('Invalid native conversation ID')
@@ -101,7 +102,7 @@ export class NativeCliManager {
       const args = nativeCliArgs(handoff.spec.provider as StructuredProvider, handoff.nativeSessionId, handoff.settings, handoff.fresh, authorized)
       const child = pty.spawn(executable, offline ? [join(process.cwd(), 'scripts/fixtures/native-cli.cjs'), handoff.nativeSessionId] : args, {
         name: 'xterm-256color', cols: 100, rows: 30, cwd: handoff.spec.cwd, useConptyDll: process.platform === 'win32',
-        env: { ...providerEnvironment(), CONDUCTOR_AGENT_ID: id, CONDUCTOR_TASK_FILE: 'feature-list.md', ...(offline ? { ELECTRON_RUN_AS_NODE: '1' } : {}), TERM: 'xterm-256color', COLORTERM: 'truecolor' } as Record<string, string>
+        env: { ...(handoff.spec.provider === 'claude' ? claudeTokenEnvironment(providerEnvironment()) : providerEnvironment()), CONDUCTOR_AGENT_ID: id, CONDUCTOR_TASK_FILE: 'feature-list.md', ...(offline ? { ELECTRON_RUN_AS_NODE: '1' } : {}), TERM: 'xterm-256color', COLORTERM: 'truecolor' } as Record<string, string>
       })
       let resolveStopped!: () => void
       const stopped = new Promise<void>((resolve) => { resolveStopped = resolve })

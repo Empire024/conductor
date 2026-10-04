@@ -7,7 +7,7 @@ export const SETTINGS_SECTIONS = [
   { id: 'phone', title: 'Phone', description: 'Set up phone access and connect your phone to this PC.', keywords: 'phone access iphone android tailscale qr certificate https notifications pairing devices setup' },
   { id: 'notifications', title: 'Notifications', description: 'See which "needs you" moments were sent and which were held back.', keywords: 'needs you attention log grace period push alerts approvals questions refusals denials routed around reviewer wizard' },
   { id: 'updates', title: 'Updates', description: 'Check for updates and choose which builds you receive.', keywords: 'installed app updates local test builds folder github releases version check now' },
-  { id: 'runtimes', title: 'Runtimes', description: 'Check the coding tools and Claude Full Auto authorization on this PC.', keywords: 'frontier runtimes provider cli path claude codex grok xai gemini deepseek docs install full auto permissions guarded authorization bypass' },
+  { id: 'runtimes', title: 'Runtimes', description: 'Check the coding tools, their login and Claude Full Auto authorization on this PC.', keywords: 'frontier runtimes provider cli path claude codex grok xai gemini deepseek docs install full auto permissions guarded authorization bypass login logged out sign in long-lived token setup-token oauth' },
   { id: 'debug', title: 'Debug', description: 'Capture local events to help troubleshoot a problem.', keywords: 'debug tools logging console warnings errors issue reports' }
 ] as const
 

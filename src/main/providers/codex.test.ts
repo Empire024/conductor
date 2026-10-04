@@ -275,7 +275,7 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
     await waitFor(() => events.some(event => event.data.type === 'session' && event.data.phase === 'failed'))
     const errors = events.filter(event => event.data.type === 'error').map(event => event.data)
     expect(errors.length).toBeGreaterThan(0)
-    for (const error of errors) expect(error).toMatchObject({ code: 'provider_auth_expired', message: expect.stringContaining('Codex login expired: run `codex login`') })
+    for (const error of errors) expect(error).toMatchObject({ code: 'provider_auth_expired', message: expect.stringContaining('Codex login expired: tap Log in on the phone or in Settings > Runtimes, or run `codex login`') })
   })
 
   it('explains a Codex Windows sandbox setup failure once instead of leaving bare failed commands', async () => {

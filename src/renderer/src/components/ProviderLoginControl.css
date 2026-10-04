@@ -1,0 +1,16 @@
+.provider-login { display: grid; gap: 8px; }
+.provider-login-detail { margin: 0; color: var(--muted, #8a8f98); font-size: 12px; }
+.provider-login-outage { margin: 0; color: var(--danger); font-size: 12px; }
+.provider-login-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.provider-login button { flex: none; white-space: nowrap; padding: 5px 12px; border: 1px solid var(--border); border-radius: 5px; font-size: 12px; background: transparent; color: var(--text); cursor: pointer; }
+.provider-login button.primary { border-color: var(--accent); background: var(--accent); color: #10140c; font-weight: 650; }
+.provider-login button.link { padding: 0; border: 0; color: var(--accent); text-decoration: underline; }
+.provider-login button:disabled { opacity: .5; cursor: default; }
+.provider-login-flow { display: grid; justify-items: start; gap: 6px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; }
+.provider-login-flow strong { font-size: 12px; }
+.provider-login-flow p { margin: 0; font-size: 12px; }
+.provider-login-flow form { display: flex; gap: 6px; width: 100%; }
+.provider-login-flow input { flex: 1; min-width: 0; padding: 4px 8px; border: 1px solid var(--border); border-radius: 5px; background: transparent; color: var(--text); font-family: var(--mono, monospace); font-size: 12px; }
+.provider-login-code { font-size: 16px; letter-spacing: 0.08em; }
+.provider-login-explain summary { font-size: 12px; cursor: pointer; }
+.provider-login-explain p { font-size: 12px; color: var(--muted, #8a8f98); }

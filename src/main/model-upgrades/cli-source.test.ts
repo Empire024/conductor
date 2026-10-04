@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { LATEST_MODELS_BUILTIN } from '../schedule-builtins/latest-models'
 import { CliVersionStore } from '../cli-versions'
-import { findPackagedExecutable, installScratchCli, latestVersion, probeCatalog, pruneScratch } from './cli-source'
+import { findPackagedExecutable, installScratchCli, latestVersion, probeCatalog, pruneScratch, scratchSignIn } from './cli-source'
 
 const FAKE_NPM = resolve('scripts/fixtures/fake-npm.mjs')
 const SCRIPT = LATEST_MODELS_BUILTIN.scripts.find(script => script.name === 'cli-catalogs')!.content
@@ -84,7 +84,7 @@ describe('cli-source', () => {
     const codex = await installScratchCli(root, 'codex', '0.160.0', { registry, environment })
     const home = join(directory, 'home')
     mkdirSync(join(home, '.codex'), { recursive: true })
-    writeFileSync(join(home, '.codex', 'auth.json'), '{"fake":true}')
+    writeFileSync(join(home, '.codex', 'auth.json'), JSON.stringify({ tokens: { access_token: 'fake-access', refresh_token: 'fake-refresh', id_token: 'fake-id' }, last_refresh: '2026-09-01T00:00:00Z' }))
     const probe = await probeCatalog({ provider: 'codex', executable: codex.executable, script: SCRIPT, workDirectory: join(directory, 'work'), environment: { ...environment, CODEX_HOME: '' }, home })
     expect(probe.version).toBe('0.160.0')
     expect(probe.models).toEqual([
@@ -96,4 +96,32 @@ describe('cli-source', () => {
     expect(claudeProbe.models.map(model => model.id)).toEqual(['claude-opus-5-6', 'default'])
     expect(existsSync(join(directory, 'work'))).toBe(true)
   }, 60_000)
+
+  it('gives a scratch home a sign-in that cannot refresh, and none when it is due for a refresh', () => {
+    const now = Date.parse('2026-10-04T12:00:00Z')
+    const claude = { claudeAiOauth: { accessToken: 'a', refreshToken: 'r', expiresAt: now + 60 * 60_000, refreshTokenExpiresAt: now + 9e9, scopes: ['user:inference'] }, mcpOAuth: { server: { refreshToken: 'm' } } }
+    const copy = JSON.parse(scratchSignIn('claude', JSON.stringify(claude), now)!)
+    expect(copy).toEqual({ claudeAiOauth: { accessToken: 'a', expiresAt: now + 60 * 60_000, scopes: ['user:inference'] } })
+    // Within the margin a CLI would refresh the copy and spend the owner's refresh token.
+    expect(scratchSignIn('claude', JSON.stringify({ claudeAiOauth: { ...claude.claudeAiOauth, expiresAt: now + 10 * 60_000 } }), now)).toBeNull()
+    expect(scratchSignIn('claude', JSON.stringify({ claudeAiOauth: { ...claude.claudeAiOauth, expiresAt: now - 1 } }), now)).toBeNull()
+    expect(scratchSignIn('claude', 'not json', now)).toBeNull()
+    const codex = JSON.parse(scratchSignIn('codex', JSON.stringify({ OPENAI_API_KEY: null, tokens: { access_token: 'a', refresh_token: 'r', id_token: 'i', account_id: 'x' }, last_refresh: '2026-09-01T00:00:00Z' }), now)!)
+    expect(codex.tokens).toEqual({ access_token: 'a', refresh_token: '', id_token: 'i', account_id: 'x' })
+    expect(codex.last_refresh).toBe('2026-10-04T12:00:00.000Z')
+    expect(JSON.parse(scratchSignIn('codex', JSON.stringify({ OPENAI_API_KEY: 'sk-x', tokens: null }), now)!)).toEqual({ OPENAI_API_KEY: 'sk-x', tokens: null })
+  })
+
+  it('copies no sign-in at all when a long-lived Claude token is in the environment, and refuses a sign-in due for a refresh', async () => {
+    const home = join(directory, 'home-token')
+    mkdirSync(join(home, '.claude'), { recursive: true })
+    const now = Date.now()
+    writeFileSync(join(home, '.claude', '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'a', refreshToken: 'r', expiresAt: now + 60_000 } }))
+    const executable = join(directory, 'missing-claude')
+    await expect(probeCatalog({ provider: 'claude', executable, script: 'process.exit(1)', workDirectory: join(directory, 'work-token'), environment: { ...process.env, CLAUDE_CONFIG_DIR: '' }, home, now }))
+      .rejects.toThrow(/due for a refresh/)
+    // With the token the stale file is never read; the probe fails only on the fake script.
+    await expect(probeCatalog({ provider: 'claude', executable, script: 'process.exit(1)', workDirectory: join(directory, 'work-token'), environment: { ...process.env, CLAUDE_CONFIG_DIR: '', CLAUDE_CODE_OAUTH_TOKEN: 'fake-long-lived' }, home, now }))
+      .rejects.toThrow(/printed no catalog/)
+  })
 })

@@ -14,6 +14,7 @@ import type { LocalUpdateBuildService } from '../local-update-build'
 import { installScratchCli, latestVersion, npmRegistry, CLI_PACKAGES, probeCatalog, pruneScratch, readCliVersion } from './cli-source'
 import { ModelUpgradeService, type InstallAppResult, type ModelUpgradePorts } from './service'
 import type { BetterModel } from './better'
+import { claudeTokenEnvironment } from '../claude-login'
 
 export const PROMOTED_SETTING = 'model-upgrades:promoted'
 
@@ -89,7 +90,8 @@ export function createModelUpgrades(wiring: ModelUpgradeWiring): ModelUpgradeSer
     latestVersion: provider => latestVersion(CLI_PACKAGES[provider], npmRegistry()),
     installScratch: (provider, version) => installScratchCli(scratch, provider, version),
     pruneScratch: keep => pruneScratch(scratch, keep),
-    probe: (provider, executable) => probeCatalog({ provider, executable, script: wiring.catalogScript, workDirectory: join(root, 'probes') }),
+    // A long-lived Claude token goes in through the environment, so no sign-in file is copied.
+    probe: (provider, executable) => probeCatalog({ provider, executable, script: wiring.catalogScript, workDirectory: join(root, 'probes'), ...(provider === 'claude' ? { environment: claudeTokenEnvironment(process.env) } : {}) }),
     picks: (provider, catalog) => [...new Set([
       promotedModel(provider),
       catalog.find(model => model.isDefault && model.id !== 'default')?.id ?? null,

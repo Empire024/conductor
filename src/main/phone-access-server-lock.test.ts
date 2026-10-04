@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { createProviderLogin, registerProviderLoginPhone } from './claude-login-wiring'
 import { request as httpsRequest, type RequestOptions } from 'node:https'
 import type { IncomingMessage } from 'node:http'
 import type { RuntimeEnsureResult, TerminalSpec } from '../shared/models'
@@ -268,5 +271,76 @@ describe('the phone terminal on the listener', () => {
     const lines = audit.mock.calls.map(entry => String(entry[0])).filter(line => line.startsWith('phone terminal:'))
     expect(lines).toHaveLength(1)
     expect(lines[0]).toMatch(/device "iPhone" .* on MAIN in Conductor \/ main; .*; phone locked; 8 bytes typed$/)
+  })
+})
+
+describe('logging a provider in from the phone (/api/login)', () => {
+  const TOKEN = 'sk-ant-oat01-' + 'Q'.repeat(60)
+  const URL_TEXT = 'https://claude.com/cai/oauth/authorize?code=true&client_id=c&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&state=s'
+
+  async function loginFixture() {
+    const { service, port, ca, token, deviceId } = await fixture()
+    const spawned: Array<{ args: string[]; written: string[]; print(text: string): void; end(code: number): void }> = []
+    const userData = mkdtempSync(join(tmpdir(), 'conductor-login-phone-'))
+    cleanup.push(() => rmSync(userData, { recursive: true, force: true }))
+    const login = createProviderLogin({
+      vault: new MemoryVault(), settings: new MapStore(), userData, environment: { PATH: 'x' },
+      executable: () => 'claude.exe', providerAuth: () => undefined, broadcast: () => undefined,
+      spawn: (_file, args) => {
+        let data: (text: string) => void = () => undefined, exit: (event: { exitCode: number }) => void = () => undefined
+        const entry = { args, written: [] as string[], print: (text: string) => data(text), end: (code: number) => exit({ exitCode: code }) }
+        spawned.push(entry)
+        return { onData: listener => { data = listener }, onExit: listener => { exit = listener }, write: text => { entry.written.push(text) }, kill: () => undefined }
+      }
+    })
+    cleanup.push(() => login.dispose())
+    cleanup.push(registerProviderLoginPhone(() => login))
+    return { service, port, ca, token, deviceId, login, spawned }
+  }
+
+  it('answers only a paired phone, and only once it is unlocked when a code is set', { timeout: 30_000 }, async () => {
+    const { service, port, ca, token, spawned } = await loginFixture()
+    expect((await call(port, ca, '/api/login')).status).toBe(401)
+    expect((await call(port, ca, '/api/login/start', { method: 'POST', token: 'forged', body: { provider: 'claude', mode: 'login' } })).status).toBe(401)
+    await service.lock.setCode('482915')
+    expect((await call(port, ca, '/api/login/start', { method: 'POST', token, body: { provider: 'claude', mode: 'login' } })).status).toBe(423)
+    expect(spawned).toHaveLength(0)
+    const { unlockToken } = JSON.parse((await call(port, ca, '/api/lock/unlock', { method: 'POST', token, body: { code: '482915' } })).body) as { unlockToken: string }
+    const state = await call(port, ca, '/api/login', { token, unlock: unlockToken })
+    expect(state.status).toBe(200)
+    expect(JSON.parse(state.body)).toMatchObject({ token: { set: false }, flow: null, outages: [] })
+    expect((await call(port, ca, '/api/login/start', { method: 'POST', token, unlock: unlockToken, body: { provider: 'claude', mode: 'login' } })).status).toBe(200)
+    expect(spawned).toHaveLength(1)
+  })
+
+  it('relays the sign-in link and one code, and never sends a token to the phone', { timeout: 30_000 }, async () => {
+    const { port, ca, token, login, spawned } = await loginFixture()
+    const started = JSON.parse((await call(port, ca, '/api/login/start', { method: 'POST', token, body: { provider: 'claude', mode: 'setup-token' } })).body) as { id: string }
+    spawned[0]!.print(`Browser didn't open? Use the url below to sign in ${URL_TEXT}\r\nPaste code here if prompted > `)
+    const waiting = JSON.parse((await call(port, ca, '/api/login', { token })).body) as { flow: { phase: string; url: string } }
+    expect(waiting.flow).toMatchObject({ phase: 'awaiting-code', url: new URL(URL_TEXT).toString() })
+    const sent = await call(port, ca, '/api/login/code', { method: 'POST', token, body: { id: started.id, code: 'phone-code-1234#state' } })
+    expect(sent.status).toBe(200)
+    const again = await call(port, ca, '/api/login/code', { method: 'POST', token, body: { id: started.id, code: 'phone-code-1234#state' } })
+    expect(again.status).toBe(409)
+    await new Promise(resolve => setTimeout(resolve, 350))
+    expect(spawned[0]!.written).toEqual(['phone-code-1234#state', '\r'])
+    spawned[0]!.print(`Your OAuth token (valid for 1 year):\r\n${TOKEN}\r\n`)
+    expect(login.store.token()).toBe(TOKEN)
+    const done = await call(port, ca, '/api/login', { token })
+    expect(JSON.parse(done.body)).toMatchObject({ token: { set: true, active: true }, flow: { phase: 'succeeded' } })
+    expect(done.body).not.toContain(TOKEN)
+    expect(sent.body + again.body).not.toContain(TOKEN)
+  })
+
+  it('rate-limits starts per phone with 429', { timeout: 30_000 }, async () => {
+    const { port, ca, token } = await loginFixture()
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const started = JSON.parse((await call(port, ca, '/api/login/start', { method: 'POST', token, body: { provider: 'claude', mode: 'login' } })).body) as { id: string }
+      expect((await call(port, ca, '/api/login/cancel', { method: 'POST', token, body: { id: started.id } })).status).toBe(200)
+    }
+    const limited = await call(port, ca, '/api/login/start', { method: 'POST', token, body: { provider: 'claude', mode: 'login' } })
+    expect(limited.status).toBe(429)
+    expect(JSON.parse(limited.body).error).toMatch(/Too many login attempts/)
   })
 })

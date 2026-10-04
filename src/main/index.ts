@@ -132,6 +132,8 @@ import { ensureTrayIconFile } from './tray-icon'
 import { PhoneAccessService } from './phone-access'
 import { PhoneProjectTasks } from './phone-project-tasks'
 import { PhoneAccessServer, requestTailscaleCertificate } from './phone-access-server'
+import { createProviderLogin, loginCliOverride, registerProviderLoginIpc, registerProviderLoginPhone, spawnLoginPty, type ProviderLogin } from './claude-login-wiring'
+import { claudeTokenEnvironment } from './claude-login'
 import { registerPhoneAccessIpc } from './phone-access-ipc'
 import { phoneAuditWriter } from './phone-lock'
 import { StoredSecretVault } from './secret-store'
@@ -218,6 +220,9 @@ let agentControlServer: AgentControlServer | undefined
 let remoteControl: RemoteControlService | undefined
 let phoneAccess: PhoneAccessService | undefined
 let providerAuth: ProviderAuthMonitor | undefined
+let providerLogin: ProviderLogin | undefined
+let disposeProviderLoginIpc: (() => void) | undefined
+let disposeProviderLoginPhone: (() => void) | undefined
 let phoneServer: PhoneAccessServer | undefined
 let disposePhoneIpc: (() => void) | undefined
 let disposePhoneBroadcast: (() => void) | undefined
@@ -2737,6 +2742,8 @@ const registerIpc = (): void => {
   if (ideasRegistration) disposeIdeasIpc = ideasRegistration.registerIpc(event => trustedStructured(event))
   if (ideaRunsRegistration) disposeIdeaRunsIpc = ideaRunsRegistration.registerIpc(event => trustedStructured(event))
   registerPermissionGrantsIpc(() => permissionGrants?.grants, event => trustedStructured(event))
+  // Provider login and the long-lived Claude token (src/main/claude-login.ts): trusted UI only, never app control.
+  disposeProviderLoginIpc = registerProviderLoginIpc(ipcMain, () => providerLogin, event => trustedStructured(event))
   registerClaudeFullAutoIpc(ipcMain, claudeFullAuto, event => trustedStructured(event), () => {
     const cli = agents.nativeCli.claudeFullAutoTabs().map(tab => ({ ...tab, runtime: 'cli' as const }))
     const cliIds = new Set(cli.map(tab => tab.agentSessionId))
@@ -3037,24 +3044,47 @@ app.whenReady().then(async () => {
     probe: async provider => {
       const executable = agents.listProviders().find(entry => entry.id === provider)?.executable
       if (!executable) throw new Error(`no ${provider} CLI found`)
-      return provider === 'claude' ? probeClaudeAuth(executable) : probeCodexAuth(executable)
+      // With a long-lived token the probe sees what a new tab would get (authMethod oauth_token).
+      return provider === 'claude' ? probeClaudeAuth(executable, claudeTokenEnvironment(process.env)) : probeCodexAuth(executable)
     },
     alert: async (_outage, { title, body }) => {
       // A test profile never puts a notification over the owner's desktop.
       if (process.env.CONDUCTOR_TEST_USER_DATA) appendFileSync(join(app.getPath('userData'), TEST_TOAST_FILE), `${JSON.stringify({ at: new Date().toISOString(), title, body })}\n`)
       else if (Notification.isSupported()) new Notification({ title, body }).show()
-      const phone = phoneAccess ? await phoneAccess.announce({ id: randomUUID(), kind: 'attention', sessionId: null, title, body, at: new Date().toISOString(), url: '/#/' }) : 'Phone access is not running.'
-      console.log(`Login alert: ${title} (phone: ${phone})`)
+      // The phone alert opens the Log in screen (claude-login.ts): the owner can sign in from there.
+      const phone = phoneAccess ? await phoneAccess.announce({ id: randomUUID(), kind: 'attention', sessionId: null, title, body: `${body} Tap to log in from this phone.`, at: new Date().toISOString(), url: '/#/login' }) : 'Phone access is not running.'
+      const desktop = process.env.CONDUCTOR_TEST_USER_DATA ? 'test toast file' : Notification.isSupported() ? 'toast shown' : 'notifications unsupported'
+      console.log(`Login alert: ${title} (desktop: ${desktop}; phone: ${phone})`)
+      return `${new Date().toISOString()} desktop: ${desktop}; phone: ${phone}`
     },
     // Only a conversation that still has its tab: a closed one stays as the owner left it.
     resume: async (tab, message) => openAgentTabs().some(open => open.resourceId === tab.id) ? agents.structured.resumeAfterLogin(tab.id, message) : 'closed',
     persist: (provider, outage) => database.setSetting(authOutageKey(provider), outage ? JSON.stringify(outage) : ''),
+    closed: outage => database.setSetting(`providerAuth.lastOutage.${outage.provider}`, JSON.stringify(outage)),
     restore: () => (['claude', 'codex'] as const).flatMap(provider => {
       try { const raw = database.getSetting(authOutageKey(provider)); return raw ? [JSON.parse(raw) as AuthOutage] : [] } catch { return [] }
     }),
     log: message => console.log(`[provider-auth] ${message}`)
   })
-  agents.structured.onAuthStop(stop => { if (isAuthProvider(stop.spec.provider)) providerAuth?.noteFailure(stop.spec.provider, { id: stop.spec.id, title: stop.title, wizard: stop.wizard, failedAt: stop.at }, stop.message) })
+  agents.structured.onAuthStop(stop => {
+    if (!isAuthProvider(stop.spec.provider)) return
+    // A turn that ran on the long-lived token and was refused: stop handing the token out first,
+    // so the probe and the resumed tab fall back to the normal login.
+    if (stop.authSource === 'token') providerLogin?.tokenRejected(stop.message)
+    providerAuth?.noteFailure(stop.spec.provider, { id: stop.spec.id, title: stop.title, wizard: stop.wizard, failedAt: stop.at }, stop.message, stop.authSource ? { source: stop.authSource } : {})
+  })
+  // Logging in from Settings or the phone, and the long-lived Claude token (src/main/claude-login.ts).
+  providerLogin = createProviderLogin({
+    vault: new StoredSecretVault(database, safeStorageCipher),
+    settings: database,
+    userData: app.getPath('userData'),
+    executable: provider => loginCliOverride(provider, app.isPackaged) ?? agents.listProviders().find(entry => entry.id === provider)?.executable ?? null,
+    providerAuth: () => providerAuth,
+    spawn: spawnLoginPty,
+    broadcast: state => { for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('provider-login:changed', state) },
+    log: message => console.log(`[provider-login] ${message}`)
+  })
+  disposeProviderLoginPhone = registerProviderLoginPhone(() => providerLogin)
   // Finished coworkers close themselves, and a settled CLI is released after the owner's idle
   // timeout (src/main/coworker-autoclose.ts). A test launch may shorten the timeout to seconds.
   const autoCloseOverride = !app.isPackaged && process.env.CONDUCTOR_TEST_USER_DATA ? Number(process.env.CONDUCTOR_TEST_COWORKER_AUTOCLOSE_MS) || undefined : undefined
@@ -3373,6 +3403,9 @@ app.on('will-quit', () => {
   void remoteJobs?.shutdown(0)
   void remoteControl?.dispose().catch(error => console.warn('Remote control did not shut down cleanly', error))
   disposePhoneIpc?.()
+  disposeProviderLoginIpc?.()
+  disposeProviderLoginPhone?.()
+  providerLogin?.dispose()
   disposePhoneBroadcast?.()
   phoneAccess?.dispose()
   void phoneServer?.dispose().catch(error => console.warn('Phone access did not shut down cleanly', error))

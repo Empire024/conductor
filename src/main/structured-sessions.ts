@@ -14,6 +14,7 @@ import type { ConductorDatabase } from './database'
 import { AgentArtifacts, workspacePath } from './agent-artifacts'
 import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './providers/adapter'
 import { createProviderAdapter } from './providers/factory'
+import { claudeTokenActive } from './claude-login'
 import type { RuntimeDetachment } from './providers/adapter'
 import { settled } from './providers/adapter-state'
 import { validateLiveTurn } from './live-test-policy'
@@ -84,6 +85,8 @@ interface LiveSession {
   limitStop?: string
   /** The lost-login error of the turn under way; announced through onAuthStop once it settles. */
   authStop?: string
+  /** Which login the failed turn used (claude-login.ts), when the adapter knows. */
+  authStopSource?: 'token' | 'login'
   currentTurn?: { text: string; settings: SessionSettings; attachments: ContextAttachment[]; origin?: PromptOrigin; fallbackAttempted: boolean }
   refusalFallback?: { text: string; settings: SessionSettings; attachments: ContextAttachment[]; origin?: PromptOrigin; model: string; notice: string }
 }
@@ -91,7 +94,7 @@ type Factory = (provider: StructuredProvider, options: AdapterOptions) => Provid
 /** A turn that ended on the provider's usage limit (onLimitStop). continues: Conductor sends it "continue" at resumeAt. */
 export interface UsageLimitStop { spec: AgentSpec; message: string; resumeAt: string | null; continues: boolean }
 /** A turn that failed because the provider CLI lost its login (onAuthStop, provider-auth.ts). */
-export interface AuthStop { spec: AgentSpec; title: string; message: string; at: string; wizard: boolean }
+export interface AuthStop { spec: AgentSpec; title: string; message: string; at: string; wizard: boolean; authSource?: 'token' | 'login' }
 /** What resumeAfterLogin did: sent the message, found the turn busy, found the conversation no
  *  longer stopped on the login (the owner got there first), or found it gone. */
 export type LoginResumeResult = 'sent' | 'busy' | 'recovered' | 'closed' | 'failed'
@@ -374,6 +377,13 @@ export class StructuredSessions {
     if (active.has(state.phase)) return 'busy'
     if (!stoppedOnLogin(state.items)) return 'recovered'
     const live = this.get(id)
+    // A Claude process keeps the environment it started with: one started with a token that was
+    // since rejected or removed (or set) restarts on its native session before it continues.
+    const want = claudeTokenActive() ? 'token' : 'login'
+    const have = live.adapter?.authEnvironment?.()
+    if (spec.provider === 'claude' && live.adapter && state.nativeSessionId && (have ? have !== want : want === 'token')) {
+      try { await this.reconnect(live) } catch (error) { this.emit(live, { data: { type: 'notice', message: `The Claude process could not be restarted with the current login: ${error instanceof Error ? error.message : String(error)}` } }) }
+    }
     this.emit(live, { data: { type: 'notice', message: 'Login restored; Conductor asked this conversation to continue.' } })
     this.flush()
     try {
@@ -1767,7 +1777,7 @@ export class StructuredSessions {
     if (data.type === 'error') {
       // Before noteUsageLimit, which restates a phase already settled and so announces it.
       // A lost login is neither a usage limit nor a refusal: it is announced once the turn settles.
-      if (data.code === PROVIDER_AUTH_EXPIRED) live.authStop = data.message
+      if (data.code === PROVIDER_AUTH_EXPIRED) { live.authStop = data.message; live.authStopSource = data.authSource }
       if (!live.limitStop && data.code !== PROVIDER_SAFEGUARD_REFUSAL && data.code !== PROVIDER_AUTH_EXPIRED && (data.code === PROVIDER_USAGE_LIMIT || isUsageLimitMessage(data.message))) live.limitStop = data.message
       if (data.code !== PROVIDER_AUTH_EXPIRED) this.noteUsageLimit(live, data.message)
       if (data.code === PROVIDER_SAFEGUARD_REFUSAL) this.noteSafeguardRefusal(live)
@@ -1782,8 +1792,9 @@ export class StructuredSessions {
     // A turn that failed on a lost login is announced once it settles (2026-10-01: a wizard stopped
     // on an expired OAuth session sat dead for 18.5 h because nothing said so).
     if (data.type === 'session' && live.authStop && !active.has(data.phase)) {
-      const stop: AuthStop = { spec: live.spec, title: state.title || live.spec.title || 'Conversation', message: live.authStop, at: new Date().toISOString(), wizard: live.spec.provider !== 'local' && wizardActive(state.settings, live.spec.provider) }
+      const stop: AuthStop = { spec: live.spec, title: state.title || live.spec.title || 'Conversation', message: live.authStop, at: new Date().toISOString(), wizard: live.spec.provider !== 'local' && wizardActive(state.settings, live.spec.provider), ...(live.authStopSource ? { authSource: live.authStopSource } : {}) }
       live.authStop = undefined
+      live.authStopSource = undefined
       queueMicrotask(() => { for (const listener of this.authStopListeners) try { listener(stop) } catch { /* a listener never breaks the event pipeline */ } })
     }
     if (data.type === 'session' && data.phase && active.has(state.phase) && !active.has(data.phase) && this.turnSettledListeners.size) {

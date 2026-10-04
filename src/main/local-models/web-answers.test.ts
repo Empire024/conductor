@@ -122,6 +122,11 @@ describe('a local model answering like any other model', () => {
   })
 
   it('opens the best results itself when the model answers from search results alone (VR9a: 0 pages read in 10)', async () => {
+    // The fixture's release (2026-08-05) is ranked against today: from 2026-10-04 on, the two pages
+    // swap places. The day the case was written keeps it about reading, not about the calendar.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-09-28T12:00:00Z'))
+    cleanup.push(() => vi.useRealTimers())
     const { requests, run, tools } = await session((sent, index) => [
       call('s', 'web_search', { query: 'latest stable python', limit: 1 }),
       answer('The latest version is not provided in the untrusted web search results.'),

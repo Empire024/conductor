@@ -37,8 +37,8 @@ export const isAuthFailureMessage = (text: string): boolean => AUTH_FAILURE.some
 const LABEL: Record<AuthProvider, string> = { claude: 'Claude', codex: 'Codex' }
 /** The exact fix, as the owner types it. */
 export const LOGIN_FIX: Record<AuthProvider, string> = {
-  claude: 'run `claude /login` (or `claude auth login`) in a terminal',
-  codex: 'run `codex login` in a terminal'
+  claude: 'tap Log in on the phone or in Settings > Runtimes, or run `claude auth login` in a terminal',
+  codex: 'tap Log in on the phone or in Settings > Runtimes, or run `codex login` in a terminal'
 }
 /** The error a turn that failed on a lost login records: what happened and the fix, then the CLI's own words. */
 export const authExpiredMessage = (provider: AuthProvider, detail: string): string => {
@@ -49,7 +49,7 @@ export const authExpiredMessage = (provider: AuthProvider, detail: string): stri
 /** One free probe of a CLI's login: no model call, no tokens. `stamp` changes whenever the stored
  *  credentials are rewritten (a new login, or a refresh another process managed); null when the
  *  credentials live where a file time cannot see them (a keychain). */
-export interface AuthProbeResult { loggedIn: boolean; stamp: string | null; detail?: string }
+export interface AuthProbeResult { loggedIn: boolean; stamp: string | null; detail?: string; source?: 'token' | 'login' }
 
 export interface AuthOutageTab { id: string; title: string; wizard: boolean; failedAt: string }
 export interface AuthOutage {
@@ -63,17 +63,25 @@ export interface AuthOutage {
   baseline?: string | null
   lastProbeAt?: string
   lastAttemptAt?: string
+  /** 'token': Conductor's long-lived Claude token was refused (claude-login.ts); Conductor stopped
+   *  injecting it, so the normal login is tried once without waiting for a credentials rewrite. */
+  source?: 'token' | 'login'
+  /** What the alert reported (desktop toast, phone push), so an outage leaves evidence. */
+  alertResult?: string
 }
 export type AuthResumeResult = 'sent' | 'busy' | 'recovered' | 'closed' | 'failed'
 
 export interface ProviderAuthMonitorDeps {
   probe(provider: AuthProvider): Promise<AuthProbeResult>
   /** One owner alert per outage (desktop notification, phone push). */
-  alert(outage: AuthOutage, text: { title: string; body: string }): void | Promise<void>
+  alert(outage: AuthOutage, text: { title: string; body: string }): void | string | Promise<void | string>
   /** Send the continue message to one tab that failed on the outage. */
   resume(tab: AuthOutageTab, message: string, outage: AuthOutage): Promise<AuthResumeResult>
   /** Persist (or clear, with null) an open outage, so a restart keeps probing for it. */
   persist?(provider: AuthProvider, outage: AuthOutage | null): void
+  /** An outage that just closed, with when the login came back: kept as evidence after the open
+   *  outage itself is cleared. */
+  closed?(outage: AuthOutage & { restoredAt: string }): void
   restore?(): AuthOutage[]
   log?(message: string): void
   now?(): number
@@ -93,6 +101,10 @@ const iso = (ms: number): string => new Date(ms).toISOString()
 /** The alert text for an outage: what stopped, which tabs wait, and the fix. */
 export function outageAlert(outage: AuthOutage): { title: string; body: string } {
   const label = LABEL[outage.provider]
+  if (outage.source === 'token') return {
+    title: 'Claude long-lived token rejected',
+    body: `The long-lived Claude token Conductor stored was refused at ${outage.since}. Conductor stopped using it and falls back to the normal Claude login. Set up a new token in Settings > Runtimes, or remove it there. (${outage.message.replace(/s+/g, ' ').trim().slice(0, 200)})`
+  }
   const wizards = outage.tabs.filter(tab => tab.wizard)
   const waiting = outage.tabs.length === 1 ? `"${outage.tabs[0]!.title}"${outage.tabs[0]!.wizard ? ' (wizard)' : ''} is stopped`
     : `${outage.tabs.length} tabs are stopped${wizards.length ? `, including wizard "${wizards[0]!.title}"` : ''}`
@@ -138,16 +150,18 @@ export class ProviderAuthMonitor {
   status(): AuthOutage[] { return [...this.outages.values()].map(outage => ({ ...outage, tabs: [...outage.tabs] })) }
 
   /** A turn failed on a lost login. Returns whether this call raised the outage's one alert. */
-  noteFailure(provider: AuthProvider, tab: Omit<AuthOutageTab, 'failedAt'> & { failedAt?: string }, message: string): boolean {
+  noteFailure(provider: AuthProvider, tab: Omit<AuthOutageTab, 'failedAt'> & { failedAt?: string }, message: string, options: { source?: 'token' | 'login' } = {}): boolean {
     if (this.disposed) return false
     const at = tab.failedAt ?? iso(this.now())
     let outage = this.outages.get(provider)
     let alerted = false
+    // A refused token is its own story: the owner hears that the token, not the login, failed.
+    if (outage && options.source === 'token' && outage.source !== 'token') { outage.source = 'token'; outage.alertedAt = null; outage.lastAttemptAt = undefined }
     if (!outage) {
       const relapse = this.restored.get(provider)
       const same = relapse && this.now() - relapse.at < (this.deps.relapseMs ?? RELAPSE_MS)
       // A relapse keeps its alert and its last attempt, so a blind retry waits its full window.
-      const opened: AuthOutage = { provider, since: at, message, tabs: [], alertedAt: same ? relapse.alertedAt : null, ...(same ? { lastAttemptAt: iso(relapse.at) } : {}) }
+      const opened: AuthOutage = { provider, since: at, message, tabs: [], alertedAt: same && options.source !== 'token' ? relapse.alertedAt : null, ...(same && options.source !== 'token' ? { lastAttemptAt: iso(relapse.at) } : {}), ...(options.source ? { source: options.source } : {}) }
       outage = opened
       this.outages.set(provider, opened)
       this.restored.delete(provider)
@@ -164,8 +178,12 @@ export class ProviderAuthMonitor {
       alerted = true
       const text = outageAlert(outage)
       this.log(`${text.title}: ${text.body}`)
-      try { void Promise.resolve(this.deps.alert(outage, text)).catch(error => this.log(`Login alert failed: ${error instanceof Error ? error.message : String(error)}`)) }
-      catch (error) { this.log(`Login alert failed: ${error instanceof Error ? error.message : String(error)}`) }
+      const alerting = outage
+      const record = (result: string): void => { alerting.alertResult = result.slice(0, 500); if (this.outages.get(provider) === alerting) this.save(provider) }
+      try {
+        void Promise.resolve(this.deps.alert(outage, text)).then(result => { if (typeof result === 'string') record(result) },
+          error => { const failed = `Login alert failed: ${error instanceof Error ? error.message : String(error)}`; this.log(failed); record(failed) })
+      } catch (error) { const failed = `Login alert failed: ${error instanceof Error ? error.message : String(error)}`; this.log(failed); record(failed) }
     }
     this.save(provider)
     this.schedule(provider)
@@ -210,8 +228,25 @@ export class ProviderAuthMonitor {
       if (!result.loggedIn) { this.save(provider); return false }
       const rewritten = result.stamp !== null && result.stamp !== outage.baseline
       const blind = result.stamp === null && (!outage.lastAttemptAt || now - Date.parse(outage.lastAttemptAt) >= (this.deps.blindRetryMs ?? BLIND_RETRY_MS))
-      if (!rewritten && !blind) { this.save(provider); return false }
+      // The refused token is no longer handed out: the normal login gets one try at once.
+      const fallback = outage.source === 'token' && !outage.lastAttemptAt
+      if (!rewritten && !blind && !fallback) { this.save(provider); return false }
       await this.resumeAll(outage, now)
+      return true
+    } finally { this.checking.delete(provider) }
+  }
+
+  /** The owner just logged in through Conductor (claude-login.ts), or set a long-lived token: the
+   *  login is known to be fresh, so one probe that says logged in is enough to resume. */
+  async loginRestored(provider: AuthProvider): Promise<boolean> {
+    const outage = this.outages.get(provider)
+    if (!outage || this.disposed || this.checking.has(provider)) return false
+    this.checking.add(provider)
+    try {
+      let result: AuthProbeResult
+      try { result = await this.deps.probe(provider) } catch (error) { this.log(`${LABEL[provider]} login probe failed: ${error instanceof Error ? error.message : String(error)}`); return false }
+      if (this.outages.get(provider) !== outage || !result.loggedIn) return false
+      await this.resumeAll(outage, this.now())
       return true
     } finally { this.checking.delete(provider) }
   }
@@ -221,6 +256,7 @@ export class ProviderAuthMonitor {
     outage.lastAttemptAt = restoredAt
     this.outages.delete(provider)
     this.restored.set(provider, { at: now, alertedAt: outage.alertedAt })
+    try { this.deps.closed?.({ ...outage, tabs: [...outage.tabs], restoredAt }) } catch { /* evidence only */ }
     const timer = this.timers.get(provider)
     if (timer) clearTimeout(timer)
     this.timers.delete(provider)
@@ -265,7 +301,10 @@ export async function probeClaudeAuth(executable: string, env: NodeJS.ProcessEnv
   const loggedIn = typeof parsed.loggedIn === 'boolean' ? parsed.loggedIn : result.code === 0 && /logged in/i.test(result.stdout) && !/not logged in/i.test(result.stdout)
   const directory = typeof parsed.configDirectory === 'string' ? parsed.configDirectory : env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
   // The status names the account; only the method is kept.
-  return { loggedIn, stamp: mtime(join(directory, '.credentials.json')), detail: typeof parsed.authMethod === 'string' ? parsed.authMethod : result.stderr.trim().slice(0, 300) }
+  // authMethod 'oauth_token' is CLAUDE_CODE_OAUTH_TOKEN (claude-login.ts); the CLI does not validate
+  // it here, so a refused token shows only as a failed turn.
+  const source = parsed.authMethod === 'oauth_token' ? 'token' as const : loggedIn ? 'login' as const : undefined
+  return { loggedIn, stamp: mtime(join(directory, '.credentials.json')), detail: typeof parsed.authMethod === 'string' ? parsed.authMethod : result.stderr.trim().slice(0, 300), ...(source ? { source } : {}) }
 }
 
 /** `codex login status` exits 0 with "Logged in using …"; the stamp is auth.json's time. */

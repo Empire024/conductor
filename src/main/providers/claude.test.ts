@@ -6,6 +6,7 @@ import { ClaudeAdapter, CLAUDE_COMPATIBILITY, claudeCompatibility, claudeHookHea
 import { JsonLineDecoder, JsonLineTransport, type TransportOptions } from './transport'
 import { SteeringUnavailableError, type AdapterOptions } from './adapter'
 import { resolve, join } from 'node:path'
+import { setClaudeTokenSource } from '../claude-login'
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 
@@ -67,7 +68,7 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     expired.transport.receive({ type: 'assistant', uuid: 'synthetic-auth', parent_tool_use_id: null, error: 'authentication_failed', message: { id: 'synthetic-auth-message', model: '<synthetic>', role: 'assistant', content: [{ type: 'text', text: 'Failed to authenticate: OAuth session expired and could not be refreshed' }], usage: { input_tokens: 0, output_tokens: 0 } } })
     expired.transport.receive({ type: 'result', subtype: 'success', is_error: true, terminal_reason: 'api_error', api_error_status: null, result: 'Failed to authenticate: OAuth session expired and could not be refreshed', usage: {} })
     const error = expired.events.find(event => event.data.type === 'error')?.data
-    expect(error).toMatchObject({ type: 'error', code: 'provider_auth_expired', message: expect.stringMatching(/^Claude login expired: run `claude \/login`/) })
+    expect(error).toMatchObject({ type: 'error', code: 'provider_auth_expired', authSource: 'login', message: expect.stringMatching(/^Claude login expired: tap Log in on the phone/) })
     expect(error).toMatchObject({ message: expect.stringContaining('OAuth session expired') })
     expect(expired.events.filter(event => event.data.type === 'session').at(-1)?.data).toMatchObject({ phase: 'failed' })
 
@@ -82,6 +83,26 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     await ordinary.adapter.start(); await ordinary.adapter.submit('Work', settings)
     ordinary.transport.receive({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'API Error: 500 overloaded', usage: {} })
     expect(ordinary.events.find(event => event.data.type === 'error')?.data).not.toHaveProperty('code')
+  })
+
+  it('starts the CLI with the long-lived token when one is active and says which login a refused turn used', async () => {
+    const token = 'sk-ant-oat01-' + 'x'.repeat(40)
+    setClaudeTokenSource(() => token)
+    try {
+      const f = fixture({ environment: { PATH: 'p' } })
+      await f.adapter.start()
+      expect(f.transport.options.environment).toEqual({ PATH: 'p', CLAUDE_CODE_OAUTH_TOKEN: token })
+      expect(f.adapter.authEnvironment()).toBe('token')
+      await f.adapter.submit('Work', settings)
+      f.transport.receive({ type: 'result', subtype: 'success', is_error: true, result: 'API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"Invalid bearer token"}}', usage: {} })
+      expect(f.events.find(event => event.data.type === 'error')?.data).toMatchObject({ code: 'provider_auth_expired', authSource: 'token' })
+      // The token never reaches an event a window or phone hears.
+      expect(JSON.stringify(f.events)).not.toContain(token)
+    } finally { setClaudeTokenSource(null) }
+    const plain = fixture({ environment: { PATH: 'p' } })
+    await plain.adapter.start()
+    expect(plain.transport.options.environment).toEqual({ PATH: 'p' })
+    expect(plain.adapter.authEnvironment()).toBe('login')
   })
 
   it('isolates a host reviewer before startup and refuses a resumed reviewer', async () => {

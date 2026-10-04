@@ -2012,6 +2012,25 @@ describe('a provider login lost mid-conversation (logged-out-alert)', () => {
     expect(f.current.submissions).toHaveLength(2)
   })
 
+  it('says which login a refused turn used, and restarts a process started with a token that is no longer handed out', async () => {
+    const f = fixture()
+    f.manager.ensure(f.spec)
+    const stops: AuthStop[] = []
+    f.manager.onAuthStop(stop => stops.push(stop))
+    await f.manager.submit(f.spec.id, 'Work', settings)
+    const before = f.current
+    Object.assign(before, { authEnvironment: () => 'token' as const })
+    before.emit({ data: { type: 'error', message: expired, code: PROVIDER_AUTH_EXPIRED, authSource: 'token' } })
+    before.emit({ data: { type: 'session', phase: 'failed' } })
+    await settle()
+    expect(stops[0]).toMatchObject({ authSource: 'token' })
+    // No token is active now (it was rejected): the CLI restarts on its native session first.
+    expect(await f.manager.resumeAfterLogin(f.spec.id, 'Your Claude login was restored')).toBe('sent')
+    expect(f.current).not.toBe(before)
+    expect(before.disposed).toBe(true)
+    expect(f.current.submissions.at(-1)?.text).toContain('login was restored')
+  })
+
   it('leaves a conversation the owner already continued by hand', async () => {
     const f = fixture()
     await f.manager.submit(f.spec.id, 'Long running work', settings)

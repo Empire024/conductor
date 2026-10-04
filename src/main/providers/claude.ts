@@ -9,6 +9,7 @@ import { currentRuntimeHost, JsonLineTransport, type HostedRuntimeHandle, type T
 import { privateConfigFile, relayMcpConfigs, relaysMcp, removeConfigFiles } from '../runtime-host/relay-config'
 import { PROVIDER_AUTH_EXPIRED, PROVIDER_SAFEGUARD_REFUSAL, settingsForRuntime } from '../../shared/structured-agent'
 import { authExpiredMessage, isAuthFailureMessage } from '../provider-auth'
+import { claudeTokenEnvironment, usesClaudeToken } from '../claude-login'
 import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, classifierOutageMessage, classifierOutagePayload, classifierOutageStoppedTurn, hookDenialReason, isClassifierOutage, parseAutoModeDenialReason, type DenialGrantRequest } from '../../shared/auto-mode-denial'
 import { callMatchesRule, describeGrantRequest, nativeGrantRules } from '../../shared/permission-grants'
 import { BROWSER_MCP_SERVER_NAME, BROWSER_TOOLS } from '../../shared/browser-mcp'
@@ -400,9 +401,20 @@ export class ClaudeAdapter implements ProviderAdapter {
     }
   }
 
+  /** Which login this process was started with: the long-lived token Conductor injects
+   *  (claude-login.ts) or the CLI's own login; unknown for a process continued across a restart. */
+  private authSource?: 'token' | 'login'
+  authEnvironment(): 'token' | 'login' | undefined { return this.authSource }
+  private launchEnvironment(attach?: HostedRuntimeHandle): NodeJS.ProcessEnv | undefined {
+    if (attach) { this.authSource = undefined; return this.options.environment }
+    const environment = claudeTokenEnvironment(this.options.environment ?? process.env)
+    this.authSource = usesClaudeToken(environment) ? 'token' : 'login'
+    return environment
+  }
+
   private createTransport(args: string[], attach?: HostedRuntimeHandle): Transport {
     return (this.dependencies.createTransport ?? ((options) => new JsonLineTransport(options)))({
-      executable: this.options.executable, args, cwd: this.options.cwd, environment: this.options.environment, ...(attach ? { attach } : {}),
+      executable: this.options.executable, args, cwd: this.options.cwd, environment: this.launchEnvironment(attach), ...(attach ? { attach } : {}),
       onMessage: (message) => { this.receiving++; void this.receive(message).catch((error: unknown) => this.fail(error)).finally(() => { this.receiving-- }) },
       onStderr: (text) => this.emit({ data: { type: 'notice', message: 'Claude process diagnostic', payload: { stderr: text } }, native: { method: 'stderr' } }),
       onError: (error) => this.fail(error),
@@ -992,7 +1004,7 @@ export class ClaudeAdapter implements ProviderAdapter {
         const error = this.visibleText(array(message.errors).map(display).join('\n')) || resultText || string(message.subtype) || 'Claude turn failed'
         // A lost login fails every turn until the owner logs in again: its own code, so the host
         // alerts once and resumes the conversation when the login is back (provider-auth.ts).
-        if (!safeguardRefusal(error) && (authFailure !== undefined || isAuthFailureMessage(error))) this.emit({ data: { type: 'error', message: authExpiredMessage('claude', authFailure ?? error), code: PROVIDER_AUTH_EXPIRED } })
+        if (!safeguardRefusal(error) && (authFailure !== undefined || isAuthFailureMessage(error))) this.emit({ data: { type: 'error', message: authExpiredMessage('claude', authFailure ?? error), code: PROVIDER_AUTH_EXPIRED, ...(this.authSource ? { authSource: this.authSource } : {}) } })
         else this.emit({ data: { type: 'error', message: error, ...(safeguardRefusal(error) ? { code: PROVIDER_SAFEGUARD_REFUSAL } : {}) } })
       }
       for (const [id, tool] of this.tools) if (!tool.detached && ['preparing', 'running', 'awaiting_approval'].includes(tool.status)) this.updateTool(id, { status: this.stopRequested ? 'interrupted' : 'failed' })

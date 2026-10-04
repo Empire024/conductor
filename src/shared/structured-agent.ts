@@ -182,7 +182,7 @@ export type AgentEventData =
   | { type: 'interaction'; interaction: PendingInteraction }
   | { type: 'plan'; steps: Array<{ text: string; status: 'pending' | 'in_progress' | 'completed' }>; explanation?: string }
   | { type: 'usage'; inputTokens?: number; outputTokens?: number; cachedTokens?: number; cacheCreationTokens?: number; reasoningTokens?: number; totalTokens?: number; costUsd?: number; scope?: 'session' | 'turn' | 'message'; source: 'provider' | 'estimate'; limits?: Json }
-  | { type: 'error'; message: string; code?: string }
+  | { type: 'error'; message: string; code?: string; authSource?: 'token' | 'login' }
   | { type: 'notice'; message: string; payload?: Json; outputArtifactId?: string }
   /** `detached` marks background work that deliberately outlives the turn that started it.
    *  `model`/`effort`/`modelProvider` are only present when the provider actually reports them for
