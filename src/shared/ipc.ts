@@ -1,6 +1,7 @@
 import type { UsageCapScope, UsageCapSetting, UsageCapSnapshot } from './usage-accounting'
 import type { WeeklyModelUsageReport } from './weekly-model-usage'
 import type { ProviderAllowanceRow } from './provider-allowance'
+import type { AllowanceWeekReport } from './usage-weeks'
 import type { AlwaysOnState, LoginItemState } from './always-on'
 import type {
   AppSettings,
@@ -282,6 +283,8 @@ export interface ConductorBridge {
     weekly(): Promise<WeeklyModelUsageReport>
     /** Recently used cloud providers' reported weekly and short-window percentages (no provider call). */
     limits(): Promise<ProviderAllowanceRow[]>
+    /** Each provider weekly window: used up or left unused, with tokens recorded in it (usage-weeks.ts). */
+    allowanceWeeks(weeks?: number): Promise<AllowanceWeekReport>
     /** Fires when any conversation reports its provider allowance. */
     onLimitsChanged(callback: () => void): () => void
   }

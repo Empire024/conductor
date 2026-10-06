@@ -1774,9 +1774,12 @@
     view.body.appendChild(options)
     return { key: view.key, root: view.root }
   }
-  const remoteOverview = (title, key, path, drawData) => {
+  /* `extraPath` is a second read on the same cadence (Usage's weekly report) that fails on its own:
+     its result or error reaches drawData as { data, problem, busy } and never breaks the screen. */
+  const remoteOverview = (title, key, path, drawData, extraPath) => {
     const view = overviewScreen(title, key)
     let destroyed = false, busy = false, data = null, problem = '', lastLoad = 0
+    const extra = { data: null, problem: '', busy: false }
     const draw = () => {
       beginTicks()
       clear(view.body)
@@ -1784,16 +1787,20 @@
       refresh.disabled = busy
       view.body.appendChild(refresh)
       if (problem) view.body.appendChild(el('p', 'pending-error', problem))
-      if (data) drawData(view.body, data)
+      if (data) drawData(view.body, data, extra)
       else view.body.appendChild(emptyNote(busy ? 'Reading ' + title.toLowerCase() + '…' : 'No data available yet.'))
     }
     const load = async () => {
       if (busy || destroyed) return
       lastLoad = Date.now()
-      busy = true; problem = ''; draw()
+      busy = true; problem = ''; extra.busy = Boolean(extraPath); draw()
+      const side = extraPath ? api(extraPath).then(
+        result => { if (!destroyed) { extra.data = result; extra.problem = '' } },
+        error => { if (!destroyed) extra.problem = errorMessage(error) || extra.problem }
+      ) : null
       try { const result = await api(path); if (!destroyed) data = result }
       catch (error) { if (!destroyed) problem = errorMessage(error) }
-      finally { busy = false; if (!destroyed) draw() }
+      finally { await side; busy = false; extra.busy = false; if (!destroyed) draw() }
     }
     void load()
     return { key: view.key, root: view.root, destroy: () => { destroyed = true }, onVisibility: visible => { if (visible) void load() }, onSecond: () => { if (document.visibilityState !== 'hidden' && Date.now() - lastLoad >= 15000) void load() } }
@@ -1805,7 +1812,7 @@
     for (const item of items) host.appendChild(activityCard(item))
     if (data.hasMore) host.appendChild(el('p', 'card-note', 'Showing the latest activity in this window. Older records remain on the computer.'))
   })
-  const usageScreen = () => remoteOverview('Usage', 'usage', '/api/usage', (host, data) => {
+  const usageScreen = () => remoteOverview('Usage', 'usage', '/api/usage', (host, data, weekly) => {
     host.appendChild(el('p', 'card-note', 'Provider-reported allowance. Unknown or expired windows do not imply unused quota.'))
     for (const id of ['claude', 'codex', 'grok']) {
       const report = (data.providers || []).find(row => row.provider === id)
@@ -1832,7 +1839,115 @@
       for (const unknown of report ? report.unknown || [] : []) card.appendChild(el('p', 'card-note', unknown))
       host.appendChild(card)
     }
-  })
+    weeklySection(host, weekly)
+  }, '/api/usage/weekly')
+
+  // ------------------------------------------------------------------ weekly allowance report
+
+  /* A model-scoped bucket names its model unless its label already does ("Fable weekly"). */
+  const weeklyBucketLabel = week => {
+    const label = week.label || week.bucket || 'Weekly'
+    const model = week.scope === 'model' && week.models && week.models.length ? week.models[week.models.length - 1] : ''
+    return model && label.toLowerCase().indexOf(model.toLowerCase()) < 0 ? model + ' ' + label.toLowerCase() : label
+  }
+  /* GET /api/usage/weekly is an AllowanceWeekReport (src/shared/usage-weeks.ts): rows newest first
+     per provider bucket, each 'closed', 'current' or 'no-data'. One card per bucket, one row per week. */
+  const ISO_TIME = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?Z/g
+  const shortDate = value => {
+    const at = parseTime(value)
+    return at === null ? '' : new Date(at).toLocaleDateString([], { month: 'short', day: 'numeric' })
+  }
+  const weekMoment = value => {
+    const at = parseTime(value)
+    return at === null ? '' : new Date(at).toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+  }
+  const readableNote = text => String(text || '').replace(ISO_TIME, iso => weekMoment(iso) || iso)
+  const compactNumber = value => {
+    const number = Math.max(0, Number(value) || 0)
+    try { return new Intl.NumberFormat([], { notation: 'compact', maximumFractionDigits: 1 }).format(number) } catch (error) { return formatNumber(number) }
+  }
+  const formatCost = usd => '≈ $' + (usd >= 100 ? Math.round(usd).toLocaleString() : usd.toFixed(2))
+  const weekRange = week => {
+    const start = shortDate(week.startsAt), end = shortDate(week.endsAt)
+    if (start && end) return start + ' – ' + end
+    if (start) return 'Since ' + start
+    if (end) return 'Until ' + end
+    return 'Dates unknown'
+  }
+  const weekVerdictLine = week => {
+    if (week.status === 'no-data') return readableNote((week.notes || [])[0] || 'No readings in this stretch.')
+    if (week.usedUp) return week.usedUpAt ? 'Used up on ' + weekMoment(week.usedUpAt) : 'Used up'
+    if (week.status === 'current') {
+      const sofar = Math.round(Number(week.finalPercent) || 0) + '% so far'
+      const projection = week.projection
+      if (!projection) return sofar + ' · too early to project'
+      const runsOut = parseTime(projection.usedUpAt)
+      if (runsOut !== null && runsOut > Date.now()) return sofar + ' · on pace to run out ' + new Date(runsOut).toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' })
+      return sofar + ' · on pace for ' + Math.round(Number(projection.percentAtReset) || 0) + '% at reset'
+    }
+    const unused = Math.round(Number(week.unusedPercent) || 0) + '% left unused'
+    return week.coverage === 'partial' && week.lastReadingAt ? unused + ' (last reading ' + relativeTime(week.lastReadingAt) + ')' : unused
+  }
+  const weekTokensLine = tokens => {
+    const processed = Number(tokens.processedTokens) || Number(tokens.totalTokens) || 0
+    const top = (tokens.models || []).filter(row => row && row.model).sort((a, b) => (Number(b.processedTokens) || Number(b.totalTokens) || 0) - (Number(a.processedTokens) || Number(a.totalTokens) || 0))[0]
+    return dotRow([
+      compactNumber(processed) + ' tokens',
+      typeof tokens.costUsd === 'number' ? formatCost(tokens.costUsd) : '',
+      top ? top.model : ''
+    ])
+  }
+  const weekRow = week => {
+    const row = el('div', 'weekly-row' + (week.status === 'current' ? ' current' : '') + (week.status === 'no-data' ? ' no-data' : '') + (week.usedUp ? ' used-up' : ''))
+    const head = el('div', 'weekly-row-head')
+    head.appendChild(el('span', 'weekly-range', (week.status === 'current' ? 'This week · ' : '') + weekRange(week)))
+    const peak = typeof week.peakPercent === 'number' ? Math.max(0, Math.min(100, week.peakPercent)) : null
+    head.appendChild(el('span', 'weekly-status', week.status === 'no-data' ? 'No readings' : week.status === 'current' ? 'In progress' : peak === null ? '' : Math.round(peak) + '% peak'))
+    row.appendChild(head)
+    const bar = el('div', 'bar weekly-bar' + (peak === null ? ' weekly-bar-empty' : ''))
+    bar.setAttribute('role', 'img')
+    bar.setAttribute('aria-label', peak === null ? 'No readings' : Math.round(peak) + '% of the weekly allowance used at peak')
+    if (peak !== null) {
+      const fillBar = el('div', 'bar-fill' + (week.usedUp || peak >= 100 ? ' hot' : ''))
+      fillBar.style.width = peak + '%'
+      bar.appendChild(fillBar)
+    }
+    row.appendChild(bar)
+    row.appendChild(el('p', 'weekly-verdict', weekVerdictLine(week)))
+    if (week.tokens) row.appendChild(el('p', 'card-note weekly-tokens', weekTokensLine(week.tokens)))
+    const notes = (week.notes || []).slice(week.status === 'no-data' ? 1 : 0)
+    for (const note of notes.slice(0, 2)) row.appendChild(el('p', 'weekly-note', readableNote(note)))
+    return row
+  }
+  const weeklySection = (host, weekly) => {
+    host.appendChild(sectionHead('Weekly'))
+    const report = weekly && weekly.data
+    if (weekly && weekly.problem) host.appendChild(el('p', 'card-note warn weekly-problem', 'Weekly report unavailable: ' + weekly.problem))
+    if (!report) {
+      if (!weekly || !weekly.problem) host.appendChild(el('p', 'card-note', weekly && weekly.busy ? 'Reading the weekly report…' : 'No weekly report yet.'))
+      return
+    }
+    host.appendChild(el('p', 'card-note', 'Each provider week, split at the reset time it reported: used up, or how much was left.'))
+    const groups = new Map()
+    for (const week of Array.isArray(report.weeks) ? report.weeks : []) {
+      if (!week || !week.provider) continue
+      const key = week.provider + '\u0000' + week.bucket
+      if (!groups.has(key)) groups.set(key, [])
+      groups.get(key).push(week)
+    }
+    if (!groups.size) host.appendChild(el('p', 'card-note', 'No weekly readings recorded yet.'))
+    for (const weeks of groups.values()) {
+      const first = weeks[0]
+      const card = el('section', 'card weekly-card')
+      card.appendChild(el('h2', 'card-title', providerWord(first.provider) + ' · ' + weeklyBucketLabel(first)))
+      if (first.scope === 'model' && first.models && first.models.length) card.appendChild(el('p', 'card-note', first.models.join(', ')))
+      for (const week of weeks) card.appendChild(weekRow(week))
+      if (weeks.some(week => week.tokens && typeof week.tokens.costUsd === 'number')) card.appendChild(el('p', 'card-note', 'Cost is the provider CLI’s API-price estimate, not a charge.'))
+      host.appendChild(card)
+    }
+    for (const line of Array.isArray(report.unknown) ? report.unknown : []) host.appendChild(el('p', 'card-note', line))
+    if (report.recordedSince) host.appendChild(el('p', 'card-note', 'Recorded since ' + shortDate(report.recordedSince)))
+  }
 
   const matchesFilter = session => {
     if (state.filter === 'all') return true

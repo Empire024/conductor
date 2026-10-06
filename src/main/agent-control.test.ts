@@ -25,6 +25,7 @@ import { COWORKER_OPENED_PREFIX, CoworkerAutoClose } from './coworker-autoclose'
 import { CoworkerRecovery } from './coworker-recovery'
 import { encodeRestartInitiator, encodeRestartRequest, parseRestartRequest, RESTART_INITIATOR_KEY, RESTART_REQUEST_KEY, takeRestartInitiator } from './restart-initiator'
 import type { SupervisorOverview } from './supervisor-overview'
+import { UsageWeeksService } from './usage-weeks'
 
 const dispose: Array<() => void> = []
 afterEach(() => { for (const close of dispose.splice(0).reverse()) close(); vi.unstubAllEnvs(); vi.useRealTimers() })
@@ -2408,6 +2409,28 @@ describe('control catalog and dispatch repairs', () => {
     // Every report tells the windows once a second at most, so the strip re-reads without polling.
     await new Promise(resolve => setTimeout(resolve, 1100))
     expect(f.broadcast.mock.calls.filter(([channel]) => channel === 'usage:limits-changed')).toHaveLength(1)
+  })
+
+  it('usage.weekly reports each provider weekly window from the readings live turns record, zero-turn, and validates its arguments', async () => {
+    const f = fixture()
+    const control = new AgentControl({ ...f.deps, usageWeeks: new UsageWeeksService(f.database.structured.usageWeeks, f.database.structured) })
+    const inAWeek = Math.floor(Date.now() / 1000) + 6 * 86400
+    const claude = await control.call(f.scope, 'tabs.open', { provider: 'claude', model: 'claude-synthetic', effort: 'low' }) as AgentControlTab
+    await control.call(f.scope, 'agents.submit', { agentSessionId: claude.resourceId, prompt: 'One turn' })
+    const emit = f.submissions.find(submission => submission.provider === 'claude')!.options.emit
+    emit({ itemId: 'usage:account-rate-limits', data: { type: 'usage', source: 'provider', limits: { rateLimits: { seven_day: { usedPercent: 37, windowDurationMins: 10080, resetsAt: inAWeek } } } } })
+    const submitted = f.submissions.length
+    const report = await control.call(f.scope, 'usage.weekly', { provider: 'claude', weeks: 4 }) as import('../shared/usage-weeks').AllowanceWeekReport
+    expect(f.submissions).toHaveLength(submitted)
+    expect(report.weeks).toEqual([expect.objectContaining({ provider: 'claude', bucket: 'seven_day', status: 'current', finalPercent: 37, endsAt: new Date(inAWeek * 1000).toISOString() })])
+    expect(report.unknown).toEqual([])
+    expect((await control.call(f.scope, 'usage.weekly') as import('../shared/usage-weeks').AllowanceWeekReport).unknown.join(' ')).toMatch(/Codex has not reported.*Grok does not report/)
+    await expect(control.call(f.scope, 'usage.weekly', { provider: 'openai' })).rejects.toThrow(/provider/)
+    await expect(control.call(f.scope, 'usage.weekly', { weeks: 0 })).rejects.toThrow(/weeks/)
+    await expect(control.call(f.scope, 'usage.weekly', { window: 'all' })).rejects.toThrow(/accepts only provider, weeks/)
+    expect(JSON.stringify(await control.call(f.scope, 'tools.list'))).toContain('usage.weekly')
+    // Not wired (an older host): the refusal says what to read instead.
+    await expect(f.control.call(f.scope, 'usage.weekly')).rejects.toThrow(/usage.limits/)
   })
 
   it('dispatches a local model read-only without a sandbox mode it does not have, and keeps its writes refused', async () => {

@@ -46,6 +46,9 @@ export interface WeeklyModelUsage extends Partial<Record<TokenField, number>> {
   conversations: number
   reports: number
   estimated: boolean
+  /** Sum of the cost reports the provider made for this model; absent when it made none. */
+  costUsd?: number
+  costEstimated?: boolean
 }
 
 export interface WeeklyModelUsageReport {
@@ -135,6 +138,8 @@ export function summarizeWeeklyModelUsage(conversations: WeeklyUsageConversation
     const turns = new Map<string, Sample>()
     const messages = new Map<string, Map<string, Sample>>()
     const latest = new Map<string, Sample>()
+    const costs = new Map<string, { provider: StructuredProvider; model: string | null; cost: number; estimated: boolean }>()
+    const cumulativeCost = new Map<string, number>()
 
     for (const event of events) {
       const at = Date.parse(event.timestamp)
@@ -148,6 +153,19 @@ export function summarizeWeeklyModelUsage(conversations: WeeklyUsageConversation
       if (changedModel) model = changedModel
       if (event.data.type !== 'usage') continue
       if (event.parentId) { nestedReportsExcluded += 1; continue }
+      const cost = finite(event.data.costUsd)
+      if (cost !== undefined) {
+        // A session-scoped cost is a cumulative counter like its tokens; a turn's cost is one report
+        // that later snapshots of the same item replace.
+        const estimated = event.data.source === 'estimate'
+        if (event.data.scope === 'session') {
+          const before = cumulativeCost.get(counterKey)
+          cumulativeCost.set(counterKey, cost)
+          const declaredStart = Date.parse(conversation.runtimeStarts?.[event.runtimeId] ?? '')
+          const delta = before !== undefined ? (cost >= before ? cost - before : cost) : Number.isFinite(declaredStart) && declaredStart >= sinceMs && !conversation.truncated ? cost : undefined
+          if (at >= sinceMs && delta) costs.set(JSON.stringify([counterKey, event.sequence]), { provider, model, cost: delta, estimated })
+        } else if (at >= sinceMs) costs.set(JSON.stringify([event.runtimeId, event.itemId ?? event.id]), { provider, model, cost, estimated })
+      }
       const sample: Sample = { sessionId: conversation.sessionId, provider, model, at, source: event.data.source, values: values(event.data), runtimeId: event.runtimeId, counterKey }
       if (!Object.keys(sample.values).length) continue
       if (event.data.scope === 'session') {
@@ -190,6 +208,14 @@ export function summarizeWeeklyModelUsage(conversations: WeeklyUsageConversation
     }
     for (const sample of turns.values()) if (!isCovered(sample)) { addSample(totals, sample); used = true }
     for (const sample of latest.values()) if (!isCovered(sample)) { addSample(totals, sample); used = true }
+    for (const { provider, model, cost, estimated } of costs.values()) {
+      const key = JSON.stringify([provider, model])
+      const entry = totals.get(key) ?? { row: { provider, model, conversations: 0, reports: 0, estimated: false }, sessions: new Set<string>() }
+      entry.row.costUsd = (entry.row.costUsd ?? 0) + cost
+      entry.row.costEstimated ||= estimated
+      entry.sessions.add(conversation.sessionId)
+      totals.set(key, entry)
+    }
     if (used) conversationsWithUsage += 1
   }
 

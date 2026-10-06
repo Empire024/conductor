@@ -10,6 +10,7 @@ import { createSerialPoller, currentTurnStartedAt, durationLabel, processTracker
 import { VIEWING_LABEL, viewingDescription } from '../../../shared/project-activity'
 import './ProcessDashboardPane.css'
 import { WeeklyUsage } from '../components/WeeklyUsage'
+import { WeeklyAllowance } from '../components/WeeklyAllowance'
 import { latestControlAction } from '../../../shared/control-activity'
 
 interface ProcessFacts {
@@ -178,6 +179,7 @@ export function ProcessDashboardPane({ project }: { project: ProjectRecord }): R
     </section>
 
     <WeeklyUsage />
+    <WeeklyAllowance />
     {error && <p className="pd-error" role="alert">{error}</p>}
     <div className="pd-table" role="table" aria-label="Project runtimes">
       <div className="pd-table-head" role="row"><span>Runtime</span><span>State</span><span>Progress</span><span>Usage</span><span>Activity</span><span /></div>

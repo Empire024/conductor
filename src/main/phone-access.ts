@@ -28,6 +28,7 @@ import { anonymousConversations } from './local-models/anonymous'
 import type { WeeklyModelUsageReport } from '../shared/weekly-model-usage'
 import type { AccountLimitsReport } from '../shared/usage-accounting'
 import type { ProviderAllowanceRow } from '../shared/provider-allowance'
+import type { AllowanceWeekReport } from '../shared/usage-weeks'
 import type { PhoneActivityPage } from '../shared/phone-activity'
 
 const SETTINGS_KEY = 'phone-access.settings'
@@ -179,6 +180,7 @@ export interface PhoneAccessDependencies {
   projectTasks?: PhoneProjectTasks
   weeklyUsage?: { read(): WeeklyModelUsageReport }
   usage?(): { providers: AccountLimitsReport[]; allowance: ProviderAllowanceRow[] }
+  usageWeekly?(): Promise<AllowanceWeekReport>
   activity?(before?: string): PhoneActivityPage
   providers(): AgentProviderInfo[]
   machines(): MachineDescriptor[]
@@ -916,6 +918,7 @@ export class PhoneAccessService {
   }
 
   usage() { return this.deps.usage?.() ?? { providers: [], allowance: [] } }
+  async usageWeekly(): Promise<AllowanceWeekReport> { return await this.deps.usageWeekly?.() ?? { generatedAt: new Date(this.now()).toISOString(), recordedSince: null, weeks: [], unknown: ['The weekly allowance report is not connected.'] } }
   activity(before?: string) { return this.deps.activity?.(before) ?? { items: [], hasMore: false, since: new Date(this.now() - 7 * 86400000).toISOString() } }
 
   /* ----------------------------------------------------------------------- *

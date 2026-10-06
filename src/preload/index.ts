@@ -372,6 +372,7 @@ const bridge: ConductorBridge = {
   usage: {
     weekly: () => ipcRenderer.invoke('usage:weekly'),
     limits: () => ipcRenderer.invoke('usage:limits'),
+    allowanceWeeks: (weeks) => ipcRenderer.invoke('usage:allowance-weeks', weeks),
     onLimitsChanged: (callback) => subscribe('usage:limits-changed', () => callback())
   },
   activity: {

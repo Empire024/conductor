@@ -40,6 +40,7 @@ import type { LocalUpdateBuildService } from './local-update-build'
 import { readLocalUpdateOffer } from './local-update-offer'
 import { supervisorTab, type SupervisorOverview } from './supervisor-overview'
 import type { SavingsSummary } from './local-assist/contract'
+import type { AllowanceWeekReport } from '../shared/usage-weeks'
 import type { DeliveryRequester, DeliveryRun, RepositoryStatus } from '../shared/delivery'
 import { LOCAL_CONNECTION, LOCAL_MACHINE_ID, type MachineDescriptor } from '../shared/remote-control'
 import { createApprovalRouting } from './approval-review-routing'
@@ -298,6 +299,7 @@ const toolSignatures = {
   'git.ship.status': '({runId?,waitSeconds?}) — your own most recent delivery in this project (the project\'s latest, with a note, if you have none); runId reads any of the project\'s last 10 runs, queued, running or finished: each stage (log only for a failed stage, last 15 lines; a running test stage gives passedFiles, failedFiles and failing lines so far, another running stage its last 15 lines), commit, release tag and error, and status:"queued" with behind and position while it waits its turn; waitSeconds (max ' + SHIP_WAIT_SECONDS + MCP_WAIT_NOTE + ', capped with waitCapped in the result) long-polls until the run settles',
   'local.servers': '() — the local model (llama.cpp) servers running on this machine: model, pid, port, start time, whether this Conductor started them, and which conversations of this project use each and whether one is mid-turn. The machine holds one at a time; this is where to look before starting or stopping one',
   'local.stop': '({model?,pid?,force?}) — stop one running local model server this Conductor started, named by model or pid (both from local.servers), in one call. Refused while a turn is using it unless force:true, which asks the owner first (a wizard tab is the owner) and fails that turn; a server Conductor did not start is never stopped. The next local turn starts its server again',
+  'usage.weekly': '({provider?, weeks?}) — zero-turn weekly allowance report, so you can see before dispatching whether a provider’s weekly allowance is being used or left on the table: one row per provider window (split by the provider’s own reported reset, not calendar weeks; Claude seven_day and Fable weekly, Codex weekly), newest first, weeks (default 8, max 52) closed or current windows per bucket. Each row: status closed|current|no-data, startsAt/endsAt, peakPercent, finalPercent (last reading before the reset), usedUp and usedUpAt, unusedPercent, coverage complete|partial|none with notes (a stretch without readings is said to have none; nothing is interpolated), the current window’s projection at its pace so far, and tokens: processed/total tokens and cost Conductor recorded per model in that window (cost only where the provider reported one). Also recordedSince (earliest reading held) and unknown providers (Grok reports no allowance)',
   'usage.limits': '({provider?}) — zero-turn read of the newest account allowance each provider reported: per provider and bucket (Claude five_hour, seven_day and model windows such as Fable weekly; Codex primary/secondary per limit bucket with its credits), usedPercent, resetsAt, windowMinutes, observedAt with its age and the conversation that reported it. A window whose resetsAt has passed says state "reset" (its current use is unknown until the provider reports again); a provider that reported nothing, or does not report an allowance at all (Grok), says status "unknown" and why. Figures are the provider’s own; nothing is estimated. Also carries localSavings: the conductor-local MCP tools\' (run_and_summarize, local_ask, summarize_file) measured frontier-token savings over the last 7 days — calls, modelCalls, localInputTokens/localOutputTokens and tokensSaved — or null where local assist is not wired',
   'loops.list': '() — validated .conductor/loops/*.md definitions in this project, with version, triggers, inputs, budget and step count',
   'loops.get': '({id}) — one validated logic loop including its instructions and exact model/effort/action steps',
@@ -460,6 +462,8 @@ export interface AgentControlDependencies {
   /** conductor-local MCP tools (src/main/local-assist/wiring.ts); plugged in with
    *  AgentControl.setLocalAssist, so construction order does not matter. */
   localAssist?: { savings(days?: number): SavingsSummary }
+  /** Weekly allowance report (usage-weeks.ts): one row per provider window with tokens recorded in it. */
+  usageWeeks?: { report(options: { provider?: StructuredProvider; weeks?: number }): Promise<AllowanceWeekReport> }
   /** Owner permission grants (src/main/permission-grants); plugged in with setPermissionGrants. */
   permissionGrants?: PermissionGrants
   /** Finished coworkers closing themselves (src/main/coworker-autoclose.ts); plugged in with
@@ -1932,6 +1936,13 @@ export class AgentControl {
         providers: sessions.usageLimits(args.provider as StructuredProvider | undefined).map(report => ({ ...report, windows: report.windows.map(window => ({ ...window, source: window.source.projectId === scope.projectId ? { agentSessionId: window.source.agentSessionId } : { otherProject: true } })) })),
         localSavings: this.deps.localAssist?.savings() ?? null
       }
+    }
+    if (method === 'usage.weekly') {
+      validateArgs(method, args, ['provider', 'weeks'])
+      if (args.provider !== undefined && !['claude', 'codex', 'grok'].includes(args.provider as string)) throw new Error('provider must be claude, codex or grok')
+      if (args.weeks !== undefined && (typeof args.weeks !== 'number' || !Number.isInteger(args.weeks) || args.weeks < 1 || args.weeks > 52)) throw new Error('weeks must be a whole number from 1 to 52')
+      if (!this.deps.usageWeeks) throw new Error('usage.weekly is not wired in this Conductor build; read usage.limits for the current week')
+      return this.deps.usageWeeks.report({ ...(args.provider ? { provider: args.provider as StructuredProvider } : {}), ...(typeof args.weeks === 'number' ? { weeks: args.weeks } : {}) })
     }
     if (method === 'local.servers' || method === 'local.stop') return this.localServers(scope, source, method, args)
     if (scope.owner && !scope.projectId) throw new Error(`${method} needs a project: none is open in this Conductor yet. Register one with projects.open({path}) and pass its id as scope.projectId`)

@@ -436,6 +436,7 @@ export class PhoneAccessServer {
       { method: 'GET', path: '/api/stream', sample: '/api/stream', run: ctx => { this.stream(ctx); return STREAMED } },
       { method: 'GET', path: '/api/metrics', sample: '/api/metrics', run: () => service.metrics() },
       { method: 'GET', path: '/api/usage', sample: '/api/usage', run: () => service.usage() },
+      { method: 'GET', path: '/api/usage/weekly', sample: '/api/usage/weekly', run: () => service.usageWeekly() },
       { method: 'GET', path: '/api/activity', sample: '/api/activity', run: ctx => service.activity(ctx.query.get('before') ?? undefined) },
       { method: 'POST', path: '/api/tabs/open', sample: '/api/tabs/open', run: ctx => service.openTab(ctx.body as never) },
       { method: 'GET', path: projectTasks, sample: '/api/projects/project-a/tasks', run: ctx => service.listProjectTasks(ctx.params[0]!, { offset: ctx.query.get('offset') ?? undefined, limit: ctx.query.get('limit') ?? undefined }) },

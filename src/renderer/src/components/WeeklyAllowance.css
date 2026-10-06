@@ -1,0 +1,29 @@
+.weekly-allowance { padding: 10px 14px; color: var(--text-2); font-size: 11px; }
+.weekly-allowance-heading { display: flex; gap: 8px; align-items: baseline; }
+.weekly-allowance-heading > span { color: var(--text); font-weight: 600; }
+.weekly-allowance-heading strong { font-weight: 400; color: var(--text-3); }
+.weekly-allowance-heading small { margin-left: auto; color: var(--danger); }
+.weekly-allowance-list section { margin-top: 8px; }
+.weekly-allowance-list h4 { margin: 0 0 4px; font-size: 11px; font-weight: 600; color: var(--text); }
+.weekly-allowance-row { display: grid; grid-template-columns: minmax(120px, 150px) minmax(120px, 1fr) minmax(180px, 2fr) minmax(110px, 1fr); gap: 10px; align-items: center; padding: 3px 0; border-top: 1px solid var(--border-soft); }
+.weekly-allowance-dates { display: flex; gap: 6px; white-space: nowrap; }
+.weekly-allowance-dates b { color: var(--accent); font-weight: 600; }
+.weekly-allowance-bar { position: relative; height: 8px; border-radius: 4px; background: var(--border-soft); }
+.weekly-allowance-bar i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px; }
+.weekly-allowance-bar i.peak { background: var(--accent-muted); }
+.weekly-allowance-bar i.projected { background: transparent; border: 1px dashed var(--text-3); box-sizing: border-box; }
+.weekly-allowance-bar small { position: absolute; right: -2px; top: -1px; transform: translateX(100%); font-size: 9px; color: var(--text-3); padding-left: 4px; }
+.weekly-allowance-row.used-up .weekly-allowance-bar i.peak { background: var(--danger); }
+.weekly-allowance-row.current .weekly-allowance-bar i.peak { background: var(--blue); }
+.weekly-allowance-row.none .weekly-allowance-bar { background: transparent; border: 1px dashed var(--border); box-sizing: border-box; }
+.weekly-allowance-row .weekly-allowance-bar { margin-right: 28px; }
+.weekly-allowance-verdict { color: var(--text); }
+.weekly-allowance-row.used-up .weekly-allowance-verdict { color: var(--danger); }
+.weekly-allowance-row.none .weekly-allowance-verdict { color: var(--text-3); }
+.weekly-allowance-verdict em, .weekly-allowance-spend em { margin-left: 6px; font-style: normal; font-size: 9px; color: var(--text-3); border: 1px solid var(--border); border-radius: 3px; padding: 0 3px; }
+.weekly-allowance-spend { color: var(--text-2); white-space: nowrap; text-align: right; }
+.weekly-allowance-note, .weekly-allowance-empty { margin: 6px 0 0; color: var(--text-3); font-size: 10px; }
+@media (max-width: 720px) {
+  .weekly-allowance-row { grid-template-columns: 1fr 1fr; }
+  .weekly-allowance-verdict, .weekly-allowance-spend { grid-column: span 1; text-align: left; }
+}

@@ -14,6 +14,7 @@ import { setRuntimeHost } from './providers/transport'
 import { ConversationHistory, registerConversationHistoryIpc } from './conversation-history'
 import { guardLayoutSave } from './layout-save-guard'
 import { WeeklyUsageSummaryService } from './weekly-usage-summary'
+import { UsageWeeksService } from './usage-weeks'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { promises as fs, readFileSync, appendFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
@@ -174,6 +175,7 @@ const systemMetrics = new SystemMetricsSampler({
   appMetrics: () => app.getAppMetrics().map(metric => ({ pid: metric.pid, type: metric.type, cpuPercent: metric.cpu.percentCPUUsage, memoryBytes: (metric.memory.workingSetSize ?? 0) * 1024 }))
 })
 let weeklyUsage: WeeklyUsageSummaryService
+let usageWeeks: UsageWeeksService
 let database: ConductorDatabase
 let terminals: TerminalManager
 let agents: AgentManager
@@ -2478,6 +2480,7 @@ const registerIpc = (): void => {
     const report = await weeklyUsage.readAsync(), saved = localAssist?.savings(report.days)
     return saved ? { ...report, localSavings: { tokensSaved: saved.tokensSaved, calls: saved.calls, modelCalls: saved.modelCalls, localInputTokens: saved.localInputTokens, localOutputTokens: saved.localOutputTokens } } : report
   })
+  ipcMain.handle('usage:allowance-weeks', (_event, weeks?: number) => usageWeeks.report({ weeks: typeof weeks === 'number' ? weeks : 8 }))
   ipcMain.handle('activity:projects', () => projectActivitySnapshot())
   // A smoke run has to be able to show the chip a machine it is not on: an idle host, then a
   // loaded one. The fixture is re-read per call so one launch can walk through both.
@@ -2780,6 +2783,7 @@ app.whenReady().then(async () => {
     failsafe: () => phoneAccess ? { phoneEnabled: phoneAccess.getSettings().enabled, lockConfigured: phoneAccess.lock.configured() } : null
   })
   weeklyUsage = new WeeklyUsageSummaryService(database)
+  usageWeeks = new UsageWeeksService(database.structured.usageWeeks, database.structured)
   database.reconcileInterruptedRuntimes()
   // v1 could mistake Codex's "usage limit resets available" credit notice for
   // an exhausted quota. Clear those persisted waits once; a genuinely limited
@@ -2946,7 +2950,7 @@ app.whenReady().then(async () => {
     broadcast: (channel, payload) => { for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send(channel, payload) },
     log: message => console.warn(message)
   })
-  const control: AgentControl = agentControlCore = new AgentControl({ database, sessions: agents.structured, modelUpgrades,
+  const control: AgentControl = agentControlCore = new AgentControl({ database, sessions: agents.structured, modelUpgrades, usageWeeks,
     // A test launch may lower the context bound at which a relay rolls to a fresh session.
     relayContextTokens: !app.isPackaged && process.env.CONDUCTOR_TEST_USER_DATA ? Number(process.env.CONDUCTOR_TEST_RELAY_CONTEXT_TOKENS) || undefined : undefined,
     orchestration, collaboration, backlogs: projectBacklogs,
@@ -3275,6 +3279,7 @@ app.whenReady().then(async () => {
     importImage: async (cwd, name, bytes) => { const attachment = await importPromptImage(cwd, name, bytes); invalidateProjectFiles(cwd); return attachment },
     weeklyUsage,
     usage: () => ({ providers: agents.structured.usageLimits(), allowance: agents.structured.providerAllowance() }),
+    usageWeekly: () => usageWeeks.report({ weeks: 8 }),
     activity: before => database.phoneActivity(before),
     projectTasks: new PhoneProjectTasks({
       backlogs: projectBacklogs,

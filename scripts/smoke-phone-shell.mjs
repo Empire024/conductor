@@ -50,6 +50,27 @@ const until = async (read, predicate, label, timeout = 20000) => {
   }
 }
 
+/** A fixture AllowanceWeekReport (src/shared/usage-weeks.ts) around `now`: Claude seven_day with a
+    current week, a used-up week, a partial 31%-unused week and a stretch without readings; one Codex week. */
+const weeklyFixture = now => {
+  const DAY = 86_400_000, at = offset => new Date(now + offset).toISOString()
+  const base = { scope: 'provider', windowMinutes: 10_080, readings: 24, firstReadingAt: at(-20 * DAY), usedUp: false, usedUpAt: null, unusedPercent: null, coverage: 'complete', notes: [] }
+  const claude = { ...base, provider: 'claude', bucket: 'seven_day', label: 'Weekly' }
+  const tokens = (processed, costUsd) => ({ models: [{ model: 'claude-opus-5-5', processedTokens: processed, conversations: 6, estimated: true }], processedTokens: processed, totalTokens: processed, costUsd, costEstimated: true, complete: true, notes: [] })
+  return {
+    generatedAt: at(0),
+    recordedSince: at(-31 * DAY),
+    unknown: ['Grok reports no weekly allowance.'],
+    weeks: [
+      { ...claude, status: 'current', startsAt: at(-3 * DAY), endsAt: at(4 * DAY), lastReadingAt: at(-3_600_000), peakPercent: 42, finalPercent: 42, projection: { percentAtReset: 98, usedUpAt: null, basis: '42% in 3 d 0 h' }, tokens: tokens(18_400_000, 21.37) },
+      { ...claude, status: 'closed', startsAt: at(-10 * DAY), endsAt: at(-3 * DAY), lastReadingAt: at(-3.1 * DAY), peakPercent: 100, finalPercent: 100, usedUp: true, usedUpAt: at(-4.6 * DAY), unusedPercent: 0, tokens: tokens(52_900_000, 64.8) },
+      { ...claude, status: 'closed', startsAt: at(-17 * DAY), endsAt: at(-10 * DAY), lastReadingAt: at(-11.2 * DAY), peakPercent: 69, finalPercent: 69, unusedPercent: 31, coverage: 'partial', notes: ['Last reading 1 d 4 h before the reset; use after it is not known.', 'No readings from ' + at(-15 * DAY) + ' to ' + at(-12.5 * DAY) + '.'], tokens: tokens(30_100_000, 37.05) },
+      { ...claude, status: 'no-data', startsAt: at(-24 * DAY), endsAt: at(-17 * DAY), readings: 0, firstReadingAt: null, lastReadingAt: null, peakPercent: null, finalPercent: null, coverage: 'none', notes: ['No readings from ' + at(-24 * DAY) + ' to ' + at(-17 * DAY) + '; use in this stretch is unknown.'] },
+      { ...base, provider: 'codex', bucket: 'codex:primary', label: 'Weekly', status: 'closed', startsAt: at(-9 * DAY), endsAt: at(-2 * DAY), lastReadingAt: at(-2.05 * DAY), peakPercent: 88, finalPercent: 88, unusedPercent: 12, tokens: { models: [{ model: 'gpt-6.1-sol', processedTokens: 9_700_000, conversations: 3, estimated: false }], processedTokens: 9_700_000, totalTokens: 9_700_000, costUsd: null, costEstimated: false, complete: true, notes: [] } }
+    ]
+  }
+}
+
 const formatCode = raw => { const letters = String(raw).toUpperCase().replace(/[^A-Z0-9]/g, ''); return letters.length > 4 ? letters.slice(0, 4) + '-' + letters.slice(4) : letters }
 
 /* A phone-sized window in its own session, parked left of every display like the app's own windows
@@ -199,6 +220,41 @@ try {
   await tab.run('history.back(); true')
   await until(() => tab.run('Boolean(document.querySelector(".home-hero"))'), Boolean, 'native Back to pop one app screen')
   check('Native Back pops an app screen and the Home boundary stays inside the phone app')
+
+  // ------------------------------------------------------------------ Usage: the weekly allowance report
+  /* The offline profile has no allowance readings, so the phone's own fetch answers
+     /api/usage/weekly with a fixture AllowanceWeekReport; /api/usage stays the real one. */
+  const weeklyOutput = resolve('.conductor-scratch/usage-weekly')
+  await mkdir(weeklyOutput, { recursive: true })
+  await tab.run(`(() => {
+    const fixture = ${JSON.stringify(weeklyFixture(Date.now()))}
+    window.__smokeRealFetch = window.__smokeRealFetch || window.fetch
+    window.fetch = (path, options) => path === '/api/usage/weekly'
+      ? Promise.resolve(new Response(JSON.stringify(fixture), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      : window.__smokeRealFetch(path, options)
+    return true
+  })()`)
+  const savedTheme = await tab.run('document.documentElement.getAttribute("data-theme")')
+  const sizePhone = (width, height) => app.evaluate(({ BrowserWindow }, { id, width, height }) => { BrowserWindow.fromId(id).setContentSize(width, height) }, { id: opened.id, width, height })
+  await tab.go('#/usage')
+  await until(() => tab.run('document.querySelectorAll(".weekly-card").length'), value => value === 2, 'the weekly allowance cards')
+  const weeklyText = await tab.text()
+  for (const expected of ['Claude · Weekly', 'Codex · Weekly', 'This week', '42% so far', 'on pace', 'Used up on', '31% left unused (last reading', '12% left unused', 'No readings', '≈ $', 'Cost is the provider CLI', 'Recorded since']) assert.ok(weeklyText.includes(expected), 'weekly report shows ' + expected)
+  for (const [width, height] of [[390, 1500], [320, 1700]]) {
+    await sizePhone(width, height)
+    for (const theme of ['dark', 'light']) {
+      await tab.run(`document.documentElement.setAttribute('data-theme', ${JSON.stringify(theme)}); Array.from(document.querySelectorAll('.section-head')).find(node => node.textContent.trim() === 'Weekly').scrollIntoView(); true`)
+      await new Promise(resolve => setTimeout(resolve, 300))
+      const overflow = await tab.run(`(() => { const scroll = document.querySelector('.weekly-card').closest('.scroll') || document.scrollingElement; return { inner: innerWidth, scroll: scroll.scrollWidth - scroll.clientWidth, cards: Array.from(document.querySelectorAll('.weekly-card, .weekly-row')).filter(node => node.scrollWidth > node.clientWidth + 1 || node.getBoundingClientRect().right > innerWidth + 1).length } })()`)
+      assert.equal(overflow.inner, width, 'phone window is ' + width + ' px wide')
+      assert.ok(overflow.scroll <= 1 && overflow.cards === 0, 'no horizontal overflow at ' + width + ' px: ' + JSON.stringify(overflow))
+      const png = await app.evaluate(async ({ BrowserWindow }, id) => (await BrowserWindow.fromId(id).webContents.capturePage()).toPNG().toString('base64'), opened.id)
+      await writeFile(join(weeklyOutput, `phone-weekly-${theme}${width === 320 ? '-320' : ''}.png`), Buffer.from(png, 'base64'))
+    }
+  }
+  await tab.run(`document.documentElement.setAttribute('data-theme', ${JSON.stringify(savedTheme || 'system')}); window.fetch = window.__smokeRealFetch; true`)
+  await sizePhone(390, 844)
+  check('Usage shows the weekly allowance report (used up, left unused, projection, no readings, cost) without horizontal overflow at 390 and 320 px, light and dark')
 
   await tab.go('#/phone')
   await until(() => tab.text(), text => text.includes('Connection check'), 'the Phone screen')

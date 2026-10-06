@@ -1469,9 +1469,12 @@ export class StructuredSessions {
       if (!next) return
       this.accountLimitRecord = next
       this.database.setSetting(ACCOUNT_LIMITS_KEY, JSON.stringify(next))
-      const history = recordAllowanceHistory(this.allowanceHistory(), describeAccountLimits(next, live.spec.provider as StructuredProvider))
+      const described = describeAccountLimits(next, live.spec.provider as StructuredProvider)
+      const history = recordAllowanceHistory(this.allowanceHistory(), described)
       if (history) { this.allowanceHistoryRecord = history; this.database.setSetting(ALLOWANCE_HISTORY_KEY, JSON.stringify(history)) }
       this.announceAllowance()
+      // The weekly report's readings (usage-weeks-store.ts): a new row only when a weekly window moved.
+      this.database.structured.usageWeeks?.record(described)
     } catch { /* A usage record never breaks the event pipeline it observes. */ }
   }
   private allowanceHistoryRecord?: AllowanceHistory

@@ -1,6 +1,7 @@
 import { recoverClaudeMessageDuplicates } from '../shared/claude-message-recovery'
 import { randomUUID } from 'node:crypto'
 import { PhoneActivityStore, activityReceipt } from './phone-activity'
+import { UsageWeeksStore } from './usage-weeks-store'
 import { mkdirSync, readFileSync, renameSync, writeFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
@@ -146,7 +147,8 @@ const ACCOUNTING_COLUMNS = `event_kind,sequence,event_at AS timestamp,
   json_extract(event_json,'$.data.phase') AS phase, ${SESSION_MODEL} AS model,
   json_extract(event_json,'$.data.inputTokens') AS inputTokens, json_extract(event_json,'$.data.outputTokens') AS outputTokens,
   json_extract(event_json,'$.data.cachedTokens') AS cachedTokens, json_extract(event_json,'$.data.cacheCreationTokens') AS cacheCreationTokens,
-  json_extract(event_json,'$.data.reasoningTokens') AS reasoningTokens, json_extract(event_json,'$.data.totalTokens') AS totalTokens`
+  json_extract(event_json,'$.data.reasoningTokens') AS reasoningTokens, json_extract(event_json,'$.data.totalTokens') AS totalTokens,
+  json_extract(event_json,'$.data.costUsd') AS costUsd`
 const TOKEN_FIELDS = ['inputTokens', 'outputTokens', 'cachedTokens', 'cacheCreationTokens', 'reasoningTokens', 'totalTokens'] as const
 const text = (value: unknown): string | undefined => typeof value === 'string' && value ? value : undefined
 function usageEvent(row: Record<string, unknown>, data: AgentEventData): WeeklyUsageEvent {
@@ -181,8 +183,10 @@ export class StructuredAgentStore {
   private artifactWalk?: { names: string[]; next: number }
   readonly artifactDirectory: string
   readonly activity: PhoneActivityStore
+  readonly usageWeeks: UsageWeeksStore
   constructor(private db: DatabaseSync, dataDirectory: string) {
     this.activity = new PhoneActivityStore(db)
+    this.usageWeeks = new UsageWeeksStore(db)
     this.artifactDirectory = join(dataDirectory, 'agent-artifacts')
     mkdirSync(this.artifactDirectory, { recursive: true, mode: 0o700 })
     this.artifactBytes = readdirSync(this.artifactDirectory).filter(name => /^[a-f0-9-]+\.(json|txt)$/.test(name)).reduce((sum, name) => sum + statSync(join(this.artifactDirectory, name)).size, 0)
@@ -571,6 +575,7 @@ export class StructuredAgentStore {
           const value = row[field]
           if (typeof value === 'number' && Number.isFinite(value)) data[field] = value
         }
+        if (typeof row.costUsd === 'number' && Number.isFinite(row.costUsd)) data.costUsd = row.costUsd
         events.push(usageEvent(row, data))
         continue
       }
@@ -590,6 +595,21 @@ export class StructuredAgentStore {
     let model: string | undefined
     try { const spec = JSON.parse(session.spec_json) as { model?: unknown }; if (typeof spec.model === 'string') model = spec.model } catch { /* malformed legacy spec: session events may still name it */ }
     return { sessionId, provider: session.provider, ...(model ? { model } : {}), events, runtimeStarts, truncated: (first?.sequence ?? 1) > 1 }
+  }
+  /** Conversation ids with their provider, so a per-provider read skips the others unread. */
+  usageSessionProviders(): Array<{ id: string; provider: StructuredProvider }> {
+    return this.db.prepare('SELECT id, provider FROM structured_sessions ORDER BY rowid').all() as Array<{ id: string; provider: StructuredProvider }>
+  }
+  /** One conversation's provider-reported allowance payloads since `from`, oldest first: a range
+   *  scan of the accounting index, projecting only the `limits` subtree (usage-weeks.ts backfill). */
+  allowanceObservations(sessionId: string, from: string): Array<{ at: string; limits: string }> {
+    return this.db.prepare(`
+      SELECT event_at AS at, json_extract(event_json,'$.data.limits') AS limits FROM structured_events
+      WHERE session_id=? AND event_kind IN ('usage','session') AND event_at>=? AND event_kind='usage'
+        AND json_extract(event_json,'$.data.source')='provider' AND json_extract(event_json,'$.parentId') IS NULL
+        AND (json_extract(event_json,'$.data.limits.rateLimits') IS NOT NULL OR json_extract(event_json,'$.data.limits.rateLimitsByLimitId') IS NOT NULL)
+      ORDER BY sequence
+    `).all(sessionId, from) as Array<{ at: string; limits: string }>
   }
   /** How many top-level usage reports this conversation has projected in this run. */
   usageMark(sessionId: string): number { return this.usageReports.get(sessionId) ?? 0 }
