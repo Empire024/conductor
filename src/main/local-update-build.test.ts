@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -44,7 +44,9 @@ describe('local update builds', () => {
   })
   // app.update({commit, smoke}): an exact commit in its own clean worktree, then its smokes.
   const repository = (): { root: string; candidates: string; feed: string; git: (...args: string[]) => string } => {
-    const base = mkdtempSync(join(tmpdir(), 'local-update-candidate-'))
+    // By its long name: git names worktrees that way, and the hosted runner's temp folder arrives as
+    // C:UsersRUNNER~1, so a short-named expectation would never equal the path the build reports.
+    const base = realpathSync.native(mkdtempSync(join(tmpdir(), 'local-update-candidate-')))
     roots.push(base)
     const root = join(base, 'conductor'), candidates = join(base, 'candidates'), feed = join(base, 'feed')
     mkdirSync(join(root, 'scripts'), { recursive: true })
