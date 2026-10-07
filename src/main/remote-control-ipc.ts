@@ -624,15 +624,24 @@ export class RemoteControlService {
     const connection = this.client.get(machineId)
     if (!connection) throw new RemoteAccessError('This machine is not paired with that one.', 404)
     if (connection.detached) throw new RemoteAccessError(`You are using this computer independently of ${connection.machineName}. Attach to it first.`, 409, 'detached')
-    // Named either way the renderer names it: by this computer's own id for the project, or - for
-    // a project that lives on that host - by the host's id, which is the one its origin records.
-    const project = this.deps.database.getProject(projectId)
-      ?? this.deps.database.listProjects().find(entry => entry.remote?.machineId === machineId && entry.remote.remoteProjectId === projectId)
-    if (!project) throw new RemoteAccessError('This project is not registered on this machine.', 404)
+    const project = this.findProject(machineId, projectId)
     this.requirePlacedOn(project, machineId, connection.machineName)
     const remoteProjectId = connection.projectGrants.find(entry => entry.localProjectId === project.id)?.remoteProjectId ?? project.remote?.remoteProjectId
     if (!remoteProjectId) throw new RemoteAccessError(`${connection.machineName} is not sharing that project any more.`, 409)
     return { localProjectId: project.id, remoteProjectId, machineName: connection.machineName }
+  }
+
+  /**
+   * A project here, named either way the renderer names it: by this computer's own id for the row,
+   * or - for a project that lives on that host - by the host's id, which is the one its origin
+   * records and the one the launcher sends. Every remote path resolves through this, so a tab, a
+   * terminal and a file in the same "Remote: MAIN" project can never disagree about which it is.
+   */
+  private findProject(machineId: string, projectId: string): ProjectRecord {
+    const project = this.deps.database.getProject(projectId)
+      ?? this.deps.database.listProjects().find(entry => entry.remote?.machineId === machineId && entry.remote.remoteProjectId === projectId)
+    if (!project) throw new RemoteAccessError('This project is not in this computer\'s project list.', 404)
+    return project
   }
 
   /** A terminal request from the renderer, named the way the host needs it named. */
@@ -1069,13 +1078,12 @@ export class RemoteControlService {
   async openRemote(machineId: string, request: { projectId: string; sessionId: string; provider?: string; model?: string; effort?: string; title?: string }): Promise<{ tabId: string; agentSessionId?: string; machineName: string; remoteProjectId: string; remoteSessionId: string; remoteCwd: string }> {
     const connection = this.client.get(machineId)
     if (!connection) throw new RemoteAccessError('This machine is not paired with that one.', 404)
-    const localProject = this.deps.database.getProject(request.projectId)
-    if (!localProject) throw new RemoteAccessError('This project is not registered on this machine.', 404)
+    const localProject = this.findProject(machineId, request.projectId)
     this.requirePlacedOn(localProject, machineId, connection.machineName)
     const local = projectSummary(localProject)
     if (!local.identity) throw new RemoteAccessError(local.identityError || 'Conductor cannot read this project identity, so it will not place work elsewhere.', 409)
     const advertised = await this.refreshRemoteProjects(machineId)
-    const grant = this.client.get(machineId)?.projectGrants.find(entry => entry.localProjectId === request.projectId)
+    const grant = this.client.get(machineId)?.projectGrants.find(entry => entry.localProjectId === localProject.id)
     const observed = advertised.find(entry => entry.id === grant?.remoteProjectId)
     const placement = checkRemoteProjectPlacement({
       grant,
@@ -1106,8 +1114,7 @@ export class RemoteControlService {
    * collide in this store.
    */
   async openRemoteTab(request: { machineId: string; projectId: string; sessionId: string; provider?: string; model?: string; effort?: string; title?: string }): Promise<{ localSessionId: string; machineId: string; machineName: string }> {
-    const project = this.deps.database.getProject(request.projectId)
-    if (!project) throw new RemoteAccessError('This project is not registered on this machine.', 404)
+    const project = this.findProject(request.machineId, request.projectId)
     // Only a provider this store can journal may be mirrored; anything else would bind a tab to a
     // conversation the local projection cannot represent. A local model qualifies: the weights and
     // the llama.cpp servers stay on the machine that has them, and this one only mirrors the
@@ -1120,7 +1127,7 @@ export class RemoteControlService {
     this.mirror.bind({
       localSessionId,
       machineId: request.machineId,
-      projectId: request.projectId,
+      projectId: project.id,
       workspaceId: request.sessionId,
       provider,
       cwd: opened.remoteCwd,
