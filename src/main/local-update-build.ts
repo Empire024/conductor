@@ -1,5 +1,5 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
-import { createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync } from 'node:fs'
+import { createWriteStream, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync } from 'node:fs'
 import { basename, delimiter, dirname, join, resolve } from 'node:path'
 import { lowerSpawned } from './background-priority'
 import { RestorePointStore } from './restore-points'
@@ -107,8 +107,12 @@ function git(cwd: string, args: string[]): string {
   return execFileSync('git', ['-c', `safe.directory=${cwd.replaceAll('\\', '/')}`, ...args], { cwd, encoding: 'utf8', windowsHide: true, timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }).trim()
 }
 
+/** A path as the disk names it: git lists worktrees by their long names, while a temp folder can
+ *  come in as an 8.3 short name (C:\Users\RUNNER~1 on the hosted runner) for the same folder. */
+const realPath = (path: string): string => { try { return realpathSync.native(path) } catch { return resolve(path) } }
+
 const samePath = (a: string, b: string): boolean => {
-  const left = resolve(a), right = resolve(b)
+  const left = realPath(a), right = realPath(b)
   return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right
 }
 
