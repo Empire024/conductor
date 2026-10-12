@@ -4,7 +4,7 @@ import type { SessionProjection, TimelineItem } from '../shared/structured-agent
 
 const item = (sequence: number, data: TimelineItem['data'], parentId?: string): TimelineItem => ({ id: `i${sequence}`, runtimeId: 'r', sequence, timestamp: new Date(Date.UTC(2026, 8, 29, 23, sequence)).toISOString(), data, ...(parentId ? { parentId } : {}) })
 const state = (items: TimelineItem[], extra: Partial<SessionProjection> = {}): SessionProjection => ({ sessionId: 's', runtimeId: 'r', phase: 'completed', sequence: items.length, items, settings: {} as SessionProjection['settings'], title: 'T', archived: false, truncated: false, ...extra })
-const base = { agentSessionId: 'agent_a', tabId: 'tab_a', title: 'Haftheme wizard', projectId: 'p', project: 'Haftheme', workspaceId: 'w', provider: 'claude', phase: 'completed', backgroundTasks: 0, wizard: true, controller: null, lastActivityAt: null }
+const base = { agentSessionId: 'agent_a', tabId: 'tab_a', title: 'Haftheme wizard', projectId: 'p', project: 'Haftheme', workspaceId: 'w', provider: 'claude', phase: 'completed', backgroundTasks: 0, wizard: true, controller: null, successor: null, lastActivityAt: null }
 
 describe('supervisorTab', () => {
   it('carries the refusal text and recipient of a rejected send_message, the last top-level answer and the wait with its deadline', () => {

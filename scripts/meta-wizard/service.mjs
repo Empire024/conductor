@@ -52,11 +52,25 @@ export function createService({
     try { await call(credential, 'tools.list', { brief: true }, { timeoutMs: timings.probeTimeoutMs }); return 'ok' } catch (error) { return error?.code ?? 'error' }
   }
 
-  async function alert(title, body, credential) {
+  /** An owner alert: a toast, and a phone push that opens `agentSessionId` (the conversation it
+   *  is about) when tapped. A Conductor older than that argument refuses the key, and then the
+   *  push goes without it rather than not at all. */
+  async function alert(title, body, credential, agentSessionId = null) {
     const toasted = await toast(title, body).catch(error => `toast failed: ${error.message}`)
     let phone = 'app not answering'
-    if (credential) { try { phone = (await call(credential, 'supervisor.alert', { title, body }, { timeoutMs: 20_000 }))?.delivered ?? 'sent' } catch (error) { phone = `phone alert failed: ${error.message}` } }
-    await journal.write('alert', { title, body, toast: toasted, phone })
+    if (credential) {
+      const push = args => call(credential, 'supervisor.alert', args, { timeoutMs: 20_000 })
+      try {
+        let result
+        try { result = await push({ title, body, ...(agentSessionId ? { agentSessionId } : {}) }) }
+        catch (error) {
+          if (!agentSessionId || !/agentSessionId/.test(error?.message ?? '')) throw error
+          result = await push({ title, body })
+        }
+        phone = result?.delivered ?? 'sent'
+      } catch (error) { phone = `phone alert failed: ${error.message}` }
+    }
+    await journal.write('alert', { title, body, ...(agentSessionId ? { agentSessionId } : {}), toast: toasted, phone })
   }
 
   /** Starts Conductor and waits for a new pid that answers app control. */
@@ -134,7 +148,7 @@ export function createService({
         await journal.write('steer', { ...entry, delivery: result?.delivery ?? null })
       } catch (error) { await journal.write('steer-failed', { ...entry, error: error.message }) }
     }
-    for (const item of planned.alerts) dryRun ? await journal.write('planned-alert', item) : await alert(item.title, item.body, credential)
+    for (const item of planned.alerts) dryRun ? await journal.write('planned-alert', item) : await alert(item.title, item.body, credential, item.agentSessionId ?? null)
     const open = judged.findings.map(finding => ({ kind: finding.kind, fingerprint: finding.fingerprint, target: finding.target ? `${finding.target.title} (${finding.target.agentSessionId})` : null }))
     const signature = open.map(finding => finding.fingerprint).sort().join('\n')
     if (signature !== (state.openSignature ?? '')) await journal.write('findings', { open, partial: Boolean(view.partial) })

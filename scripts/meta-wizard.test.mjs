@@ -58,6 +58,19 @@ describe('detect: other stalls', () => {
     assert.deepEqual(kinds(detect(waiting, {}, T0 + 2 * MIN)), ['await-deadline->w'])
   })
 
+  it('a tab that handed itself off is left to its successor, and an awaited tab that did is described through its successor', () => {
+    // The Coordinator of 2026-10-12: it declared a wait, continued in a successor, and its stale
+    // record was steered about (forwarded to the successor) twice, then reported stuck hourly.
+    const retired = tab('coord', { successor: 'coord2', awaiting: { agents: ['g'], since: iso(-70 * MIN), deadline: iso(-30 * MIN), reason: 'worker G' }, lastActivityAt: iso(-60 * MIN) })
+    assert.deepEqual(kinds(detect({ tabs: [retired, tab('coord2', { phase: 'running' })] }, {}, T0)), [])
+    assert.deepEqual(kinds(detect({ tabs: [tab('old', { successor: 'new', limitResumeAt: iso(-6 * MIN) }), tab('new')] }, {}, T0)), [], 'nor is a retired tab told its limit reset')
+    // The successor's own wait, on a worker that handed itself off, is judged and described on the live tabs.
+    const waiter = tab('coord2', { awaiting: { agents: ['g'], since: iso(-70 * MIN), deadline: iso(-5 * MIN), reason: null } })
+    const result = detect({ tabs: [retired, waiter, tab('g', { successor: 'g2' }), tab('g2', { lastAnswer: 'Milestone B rendered' })] }, {}, T0)
+    assert.deepEqual(kinds(result), ['await-deadline->coord2'])
+    assert.match(result.findings[0].facts, /"g2" \(g2\) \(continuing g, which handed itself off\).*last answer: "Milestone B rendered"/)
+  })
+
   it('does not call a wait quiet while an awaited tab works, waits itself or runs background tasks, and restarts the clock when it moves', () => {
     const base = tab('w', { awaiting: { agents: ['a', 'b'], since: iso(-5 * MIN), deadline: iso(55 * MIN), reason: null } })
     for (const b of [tab('b', { phase: 'running' }), tab('b', { backgroundTasks: 1, phase: 'viewing' }), tab('b', { awaiting: { agents: ['x'], since: iso(0), deadline: null, reason: null } })]) {
@@ -113,12 +126,15 @@ describe('detect: other stalls', () => {
 describe('plan', () => {
   const finding = (id, fingerprint = `f:${id}`) => ({ kind: 'await-quiet', fingerprint, target: tab(id), facts: `facts about ${id}` })
 
-  it('steers a fact once, repeats it once after steerRepeatMs, then alerts the owner instead', () => {
+  it('steers a fact once, repeats it once after steerRepeatMs, then alerts the owner once, naming the tab', () => {
     let ledger = {}
-    const at = [T0, T0 + 5 * MIN, T0 + 16 * MIN, T0 + 32 * MIN, T0 + 34 * MIN]
+    const at = [T0, T0 + 5 * MIN, T0 + 16 * MIN, T0 + 32 * MIN, T0 + 34 * MIN, T0 + 95 * MIN, T0 + 12 * 60 * MIN, T0 + 32 * MIN + TIMINGS.alertRepeatMs]
     const results = at.map(now => { const result = plan([finding('a')], ledger, now); ledger = result.ledger; return result })
-    assert.deepEqual(results.map(r => r.steers.length), [1, 0, 1, 0, 0])
-    assert.deepEqual(results.map(r => r.alerts.map(alert => alert.key)), [[], [], [], ['stuck:f:a'], []])
+    assert.deepEqual(results.map(r => r.steers.length), [1, 0, 1, 0, 0, 0, 0, 0])
+    // The owner's phone got fifteen hourly pushes about one stuck tab on 2026-10-12: an unchanged
+    // condition is told once, and again after a day.
+    assert.deepEqual(results.map(r => r.alerts.map(alert => alert.key)), [[], [], [], ['stuck:f:a'], [], [], [], ['stuck:f:a']])
+    assert.equal(results[3].alerts[0].agentSessionId, 'a', 'the alert names the tab, so a tap on the phone opens it')
   })
 
   it('a tab that acted after the steer is neither steered again nor reported stuck', () => {
@@ -141,12 +157,15 @@ describe('plan', () => {
     assert.deepEqual(result.alerts.map(alert => alert.key), ['steer-cap'])
   })
 
-  it('deduplicates owner alerts for an hour', () => {
-    const fence = { kind: 'denial-fence', fingerprint: 'x', target: null, alert: { key: 'k', title: 't', body: 'b' } }
+  it('an alert whose condition stays is told once a day; one whose condition went away and came back is new', () => {
+    const fence = { kind: 'denial-fence', fingerprint: 'x', target: null, alert: { key: 'k', title: 't', body: 'b', agentSessionId: 'fenced' } }
     const first = plan([fence], {}, T0)
-    assert.equal(first.alerts.length, 1)
-    assert.equal(plan([{ ...fence, fingerprint: 'y' }], first.ledger, T0 + 30 * MIN).alerts.length, 0)
-    assert.equal(plan([{ ...fence, fingerprint: 'y' }], first.ledger, T0 + 61 * MIN).alerts.length, 1)
+    assert.deepEqual(first.alerts.map(alert => [alert.key, alert.agentSessionId]), [['k', 'fenced']])
+    assert.equal(plan([{ ...fence, fingerprint: 'y' }], first.ledger, T0 + 61 * MIN).alerts.length, 0, 'the same condition an hour later')
+    assert.equal(plan([{ ...fence, fingerprint: 'y' }], first.ledger, T0 + TIMINGS.alertRepeatMs).alerts.length, 1, 'still there a day later')
+    const lifted = plan([], first.ledger, T0 + 30 * MIN)
+    assert.deepEqual(lifted.ledger.alerted, {}, 'a condition that is gone is forgotten')
+    assert.equal(plan([fence], lifted.ledger, T0 + 40 * MIN).alerts.length, 1, 'fenced again: a new alert')
   })
 })
 
@@ -279,6 +298,40 @@ describe('service tick', () => {
       // Steered once: the next tick says nothing more.
       await service.tick()
       assert.equal(calls.filter(call => call.method === 'agents.steer').length, 1)
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  it('a phone alert names the tab it is about, and goes without it to a Conductor that refuses the argument', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'meta-wizard-alert-'))
+    try {
+      const calls = []
+      await writeFile(join(root, 'control-owner.json'), JSON.stringify({ version: 1, endpoint: 'http://127.0.0.1:5555/control', token: 'ab', pid: 1, startedAt: iso(-3_600_000) }))
+      await mkdir(join(root, 'recovery'), { recursive: true })
+      await writeFile(join(root, 'recovery', 'armed.json'), JSON.stringify({ kind: 'running', appPid: 1, at: iso(-3_600_000), launch: { exe: 'C:\\Conductor.exe', args: [] } }))
+      // Steered twice already about this wait: this tick escalates to the owner.
+      const fingerprint = `await-deadline:w:${iso(-70 * MIN)}`
+      await mkdir(join(root, 'meta-wizard'), { recursive: true })
+      await writeFile(join(root, 'meta-wizard', 'state.json'), JSON.stringify({ version: 1, lastPid: 1, ledger: { steered: { [fingerprint]: { at: T0 - 20 * MIN, count: 2 } } } }))
+      const waiter = tab('w', { awaiting: { agents: ['c'], since: iso(-70 * MIN), deadline: iso(-10 * MIN), reason: null }, lastActivityAt: iso(-60 * MIN) })
+      const controlCall = async (credential, method, args) => {
+        calls.push({ method, args })
+        if (method === 'tools.list') return {}
+        if (method === 'supervisor.overview') return { observedAt: iso(0), pid: 1, updates: null, localBuild: null, tabs: [waiter, tab('c')] }
+        if (method === 'supervisor.alert') {
+          if (args.agentSessionId) throw new Error('supervisor.alert accepts only title, body; agentSessionId is not an argument.')
+          return { delivered: 'pushed to 2 phones' }
+        }
+        throw new Error(method)
+      }
+      const service = createService({ userData: root, testProfile: true, deps: { now: () => T0, controlCall, pidAlive: () => true, toast: async () => 'ok', sleep: async () => {} } })
+      await service.tick()
+      const pushes = calls.filter(call => call.method === 'supervisor.alert').map(call => call.args)
+      assert.deepEqual(pushes.map(args => [args.title, args.agentSessionId ?? null]), [['Conductor: w is stuck', 'w'], ['Conductor: w is stuck', null]], 'tried with the tab, then without for the older app')
+      const journal = (await readFile(join(root, 'meta-wizard', 'journal.jsonl'), 'utf8')).split('\n').filter(Boolean).map(line => JSON.parse(line))
+      assert.deepEqual(journal.filter(entry => entry.event === 'alert').map(entry => [entry.agentSessionId, entry.phone]), [['w', 'pushed to 2 phones']])
+      // Told once: the next tick says nothing more.
+      await service.tick()
+      assert.equal(calls.filter(call => call.method === 'supervisor.alert').length, 2)
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 })

@@ -351,7 +351,7 @@ export interface AgentControlHost {
    *  the work a quit or restart would ask the owner about now, or null when it would go ahead. */
   stopConfirmation?: { pending(): PendingStopConfirmation | null; answer(stopWork: boolean): PendingStopConfirmation | null; wouldAsk?(): PendingStopConfirmation['running'] | null }
   /** supervisor.alert: push one owner alert to the paired phones; says what happened. */
-  alertOwner?(alert: { title: string; body: string }): Promise<string>
+  alertOwner?(alert: { title: string; body: string; agentSessionId?: string }): Promise<string>
 }
 
 /** The agentSessionId an owner-credential call carries. No conversation has this id. */
@@ -372,7 +372,7 @@ const ownerMethods = new Set(Object.keys(ownerSignatures))
 /** The meta-wizard's methods (docs/meta-wizard.md): the owner credential only, never a wizard tab. */
 const supervisorSignatures: Record<string, string> = {
   'supervisor.overview': '() — owner credential only: every agent tab of every project in one read (phase, wizard, controller, declared wait with its deadline, last tool with a refusal text, last answer, usage-limit reset, pending cards) plus the app update state and the newest local build with its builder',
-  'supervisor.alert': '({title,body}) — owner credential only: push an alert to the owner\'s paired phones; returns what was delivered'
+  'supervisor.alert': '({title,body,agentSessionId?}) — owner credential only: push an alert to the owner\'s paired phones; agentSessionId names the conversation it is about, so a tap on the phone opens that tab instead of the home screen; returns what was delivered'
 }
 const supervisorMethods = new Set(Object.keys(supervisorSignatures))
 /** The owner's authority, from either source: the credential file, or a wizard conversation. */
@@ -2923,9 +2923,12 @@ export class AgentControl {
   private async supervisor(method: string, args: Args): Promise<unknown> {
     const { database, host, localUpdates } = this.deps
     if (method === 'supervisor.alert') {
-      validateArgs(method, args, ['title', 'body'])
+      validateArgs(method, args, ['title', 'body', 'agentSessionId'])
       if (!host?.alertOwner) throw new Error('Phone alerts are unavailable in this Conductor')
-      return { delivered: await host.alertOwner({ title: text(args, 'title', 120), body: text(args, 'body', 1000) }) }
+      // The conversation the alert is about: a tap on the phone opens it rather than the home screen.
+      const about = args.agentSessionId === undefined ? undefined : text(args, 'agentSessionId', 200)
+      if (about !== undefined && !database.structured.snapshot(about)) throw new Error(`agentSessionId ${about} names no conversation; leave it out to alert without a tab to open`)
+      return { delivered: await host.alertOwner({ title: text(args, 'title', 120), body: text(args, 'body', 1000), ...(about ? { agentSessionId: about } : {}) }) }
     }
     validateArgs(method, args, [])
     const tabs: SupervisorOverview['tabs'] = []
@@ -2941,10 +2944,16 @@ export class AgentControl {
         const lastEvent = state?.sequence ? database.structured.events(id, state.sequence - 1)[0] : undefined
         const { phase, backgroundTasks } = this.background(id, state)
         let awaiting = null
-        try { awaiting = ledger?.record(id) ?? null } catch { /* unreadable wait record */ }
+        // The record alone is not a wait: one left behind by a conversation that handed itself
+        // off, was taken over or was stopped by the owner is void (AwaitingResults.fact), and
+        // the agents are those still owed. The meta-wizard steered a retired Coordinator about
+        // its predecessor's stale record for fifteen hours on 2026-10-12.
+        try { awaiting = ledger?.record(id) && ledger.fact(id) ? ledger.record(id) : null } catch { /* unreadable wait record */ }
+        const successor = this.successorOf(project.id, id)
         tabs.push(supervisorTab({
           agentSessionId: id, tabId: tab.id, title: tab.title, projectId: project.id, project: project.name, workspaceId: workspace.id, provider, phase, backgroundTasks,
           wizard: wizardActive(state?.settings, provider ?? undefined), controller: this.linkFor(id)?.controllerAgentSessionId ?? null,
+          successor: successor !== id ? successor : null,
           lastActivityAt: lastEvent?.timestamp ?? null
         }, state, awaiting))
       }

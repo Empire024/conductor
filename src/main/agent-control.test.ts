@@ -1923,12 +1923,22 @@ describe('the owner control credential', () => {
     const overview = await control.call(owner, 'supervisor.overview', {}) as SupervisorOverview
     expect(overview).toMatchObject({ pid: 4242, version: '1.0.0', localBuild: null })
     expect(overview.tabs.map(tab => tab.agentSessionId)).toEqual(['controller', 'worker'])
-    expect(overview.tabs[0]).toMatchObject({ title: 'Controller', projectId: f.project.id, project: 'Control project', workspaceId: f.workspace.id, wizard: false, controller: null, awaiting: { agents: ['worker'], deadline: '2026-09-30T01:00:00.000Z', reason: 'wait for the worker' }, pending: { owner: 0, reviewer: 0 } })
+    expect(overview.tabs[0]).toMatchObject({ title: 'Controller', projectId: f.project.id, project: 'Control project', workspaceId: f.workspace.id, wizard: false, controller: null, successor: null, awaiting: { agents: ['worker'], deadline: '2026-09-30T01:00:00.000Z', reason: 'wait for the worker' }, pending: { owner: 0, reviewer: 0 } })
     expect(await control.call(owner, 'supervisor.alert', { title: 'Conductor is down', body: 'details' })).toEqual({ delivered: 'pushed to 1 phone; 0 open phone streams' })
     expect(alertOwner).toHaveBeenCalledWith({ title: 'Conductor is down', body: 'details' })
+    // An alert about a conversation names it, so a tap on the phone opens that tab (2026-10-12: every tap landed on Home).
+    expect(await control.call(owner, 'supervisor.alert', { title: 'Worker is stuck', body: 'details', agentSessionId: worker.id })).toEqual({ delivered: 'pushed to 1 phone; 0 open phone streams' })
+    expect(alertOwner).toHaveBeenLastCalledWith({ title: 'Worker is stuck', body: 'details', agentSessionId: worker.id })
+    await expect(control.call(owner, 'supervisor.alert', { title: 't', body: 'b', agentSessionId: 'nobody' })).rejects.toThrow(/names no conversation/)
     await expect(control.call(f.scope, 'supervisor.overview', {})).rejects.toThrow(/only the owner's own control credential/)
     await expect(control.call(f.scope, 'supervisor.alert', { title: 't', body: 'b' })).rejects.toThrow(/only the owner's own control credential/)
     await expect(control.call(owner, 'supervisor.alert', { title: 't' })).rejects.toThrow()
+    // A conversation whose work was taken over is retired: its leftover wait record is no wait
+    // (the meta-wizard nagged a retired Coordinator about one for fifteen hours), and its successor is named.
+    control.awaiting().declare(worker.id, ['controller'], 'wait for the controller', undefined, {}, '2026-09-30T01:00:00.000Z')
+    expect((await control.call(owner, 'supervisor.overview', {}) as SupervisorOverview).tabs[1]).toMatchObject({ agentSessionId: 'worker', successor: null, awaiting: { agents: ['controller'], reason: 'wait for the controller' } })
+    await control.call(f.scope, 'agents.supersede', { agentSessionId: worker.id, by: f.scope.agentSessionId, reason: 'The controller took the work over' })
+    expect((await control.call(owner, 'supervisor.overview', {}) as SupervisorOverview).tabs[1]).toMatchObject({ agentSessionId: 'worker', successor: f.scope.agentSessionId, awaiting: null })
   })
 
   it('answers the owner-only app methods through the host hooks, and refuses them to conversations', async () => {

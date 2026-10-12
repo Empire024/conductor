@@ -91,9 +91,20 @@ this is the owner's supervisor and not a peer.
 When it cannot fix something itself (Conductor will not come back, the crash-loop guard tripped,
 a project is fenced by a denial, a stall survived two steers): a Windows toast (Conductor's
 AppUserModelID, never a window) and, when the app answers, a phone push through
-`supervisor.alert({title, body})`, the paired-phone path (its VAPID key lives in the OS vault only the
-running app reads, so a phone push needs the app up). A test profile writes
-`meta-wizard/toasts.jsonl` instead of showing a toast. Alerts are deduplicated for an hour.
+`supervisor.alert({title, body, agentSessionId?})`, the paired-phone path (its VAPID key lives in
+the OS vault only the running app reads, so a phone push needs the app up). An alert about a tab
+names it, so tapping the push on the phone opens that conversation rather than the home screen
+(a Conductor older than the argument refuses it, and the push then goes without it). A test
+profile writes `meta-wizard/toasts.jsonl` instead of showing a toast.
+
+An alert names one condition and is sent once. While the condition persists it is repeated after
+a day (`alertRepeatMs`); once it went away and came back it is a new alert. The owner's phone
+received fifteen hourly pushes about one tab on 2026-10-12: a Coordinator that had handed itself
+off to a successor, whose stale wait record `supervisor.overview` still reported as a wait, and
+whose steers Conductor forwarded to the successor, so the retired tab was never seen to act. The
+overview now reports a wait only where `AwaitingResults.fact` sees one and names each tab's
+`successor`; the detectors leave a retired tab to its successor (they judge, steer and describe
+the newest open successor instead) and never repeat an unchanged alert within the day.
 
 ## Journal and status
 

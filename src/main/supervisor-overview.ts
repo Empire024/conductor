@@ -20,6 +20,11 @@ export interface SupervisorTab {
   wizard: boolean
   /** The conversation that controls this one (its dispatcher), or null. */
   controller: string | null
+  /** The newest open conversation that continued this one (agents.handoff successor:true,
+   *  agents.supersede), or null. A tab with a successor is retired: its waits, steers and
+   *  reports belong to the successor, and it never acts again on its own. */
+  successor: string | null
+  /** Its live wait, if it is waiting now: none for a retired, taken-over or owner-stopped tab. */
   awaiting: { agents: string[]; since: string; deadline: string | null; reason: string | null } | null
   /** The newest tool call; output only for a refused or failed one, target for a message. */
   lastTool: { name: string; status: string; at: string; output?: string; target?: string } | null

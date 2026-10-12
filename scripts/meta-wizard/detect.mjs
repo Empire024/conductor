@@ -21,7 +21,7 @@ export const TIMINGS = {
   steerCooldownMs: 600_000,
   steerRepeatMs: 900_000,
   maxSteersPerHour: 20,
-  alertDedupMs: 3_600_000,
+  alertRepeatMs: 86_400_000,
   restartWindowMs: 1_800_000,
   maxRestarts: 3,
   standDownMs: 1_800_000
@@ -41,16 +41,30 @@ const ms = iso => { const value = Date.parse(iso ?? ''); return Number.isFinite(
 const clip = (text, limit) => { const line = String(text ?? '').replace(/\s+/g, ' ').trim(); return line.length > limit ? line.slice(0, limit) + '…' : line }
 const name = tab => `"${tab.title || 'a conversation'}" (${tab.agentSessionId})`
 
-/** One line about a conversation someone waits on: its phase, refusal and last answer. */
+/** One line about a conversation someone waits on: its phase, refusal and last answer. `tab` is
+ *  the conversation carrying that work now; when `id` handed itself off, that is its successor. */
 export function describe(tab, id) {
   if (!tab) return `- ${id}: tab closed`
+  const continued = tab.agentSessionId !== id ? ` (continuing ${id}, which handed itself off)` : ''
   const refused = tab.lastTool?.status === 'rejected' ? `; its last tool ${tab.lastTool.name} was REFUSED${tab.lastTool.output ? `: "${clip(tab.lastTool.output, 300)}"` : ''}` : ''
   const limit = tab.limitResumeAt ? `, usage limit until ${tab.limitResumeAt}` : ''
   const answer = tab.lastAnswer ? `; last answer: "${clip(tab.lastAnswer, 300)}"` : ''
-  return `- ${name(tab)}${tab.project ? ` in ${tab.project}` : ''}: ${tab.phase ?? 'unknown'}${limit}${refused}${answer}`
+  return `- ${name(tab)}${continued}${tab.project ? ` in ${tab.project}` : ''}: ${tab.phase ?? 'unknown'}${limit}${refused}${answer}`
 }
 
 const quiet = tab => !tab || (SETTLED.has(tab.phase) && !tab.backgroundTasks && !tab.awaiting)
+
+/**
+ * The conversation carrying `id`'s work now. One that handed itself off (agents.handoff
+ * successor:true, agents.supersede) is retired: Conductor forwards its messages to the successor,
+ * and only the successor acts, so a steer at the retired tab is never seen to be acted on. The
+ * Coordinator of 2026-10-12 was steered twice that way and then reported stuck fifteen times.
+ */
+const liveIn = byId => id => {
+  let tab = byId.get(id)
+  for (let hops = 0; tab?.successor && byId.has(tab.successor) && tab.successor !== tab.agentSessionId && hops < 64; hops++) tab = byId.get(tab.successor)
+  return tab
+}
 
 /**
  * Findings for one overview. Each finding: {kind, fingerprint, target (the tab to steer, or null),
@@ -60,15 +74,17 @@ const quiet = tab => !tab || (SETTLED.has(tab.phase) && !tab.backgroundTasks && 
 export function detect(overview, memory = {}, now = Date.now(), timings = TIMINGS) {
   const tabs = overview?.tabs ?? []
   const byId = new Map(tabs.map(tab => [tab.agentSessionId, tab]))
+  const live = liveIn(byId)
   const findings = []
   const next = { quietSince: {}, updateSeen: memory.updateSeen ?? null }
 
   // 1. Waits: a passed deadline the app did not act on, an overdue wait with no deadline, or
-  //    everyone awaited gone quiet without messaging.
+  //    everyone awaited gone quiet without messaging. A retired waiter's wait is its successor's
+  //    to declare afresh; the successor's own wait is judged on its own tab.
   for (const waiter of tabs) {
     const wait = waiter.awaiting
-    if (!wait || !SETTLED.has(waiter.phase)) continue
-    const awaited = wait.agents.map(id => ({ id, tab: byId.get(id) }))
+    if (!wait || !SETTLED.has(waiter.phase) || waiter.successor) continue
+    const awaited = wait.agents.map(id => ({ id, tab: live(id) }))
     const lines = awaited.map(({ id, tab }) => describe(tab, id)).join('\n')
     const why = wait.reason ? ` (${clip(wait.reason, 200)})` : ''
     const deadline = ms(wait.deadline)
@@ -106,8 +122,8 @@ export function detect(overview, memory = {}, now = Date.now(), timings = TIMING
     for (const tab of tabs) if (tab.awaiting?.agents.includes(sender.agentSessionId)) recipients.add(tab.agentSessionId)
     recipients.delete(sender.agentSessionId)
     for (const id of recipients) {
-      const target = byId.get(id)
-      if (!target) continue
+      const target = live(id)
+      if (!target || target.agentSessionId === sender.agentSessionId) continue
       findings.push({ kind: 'message-refused', fingerprint: `message-refused:${sender.agentSessionId}:${tool.at}:${id}`, target,
         facts: `${name(sender)}${sender.project ? ` in ${sender.project}` : ''} tried to ${/report$/.test(tool.name) ? 'report' : 'send a message'} to you at ${tool.at} and the call was REFUSED, so it never arrived: "${clip(tool.output || 'refused by its runtime', 400)}".\n${describe(sender, sender.agentSessionId)}` })
     }
@@ -118,13 +134,13 @@ export function detect(overview, memory = {}, now = Date.now(), timings = TIMING
     const project = senders[0].project || projectId
     findings.push({ kind: 'denial-fence', fingerprint: `denial-fence:${projectId}:${senders.map(tab => `${tab.agentSessionId}@${tab.lastTool.at}`).join(',')}`, target: null,
       facts: `A durable approval denial is refusing tools in project ${project}: ${senders.map(tab => `${name(tab)} ${tab.lastTool.name} at ${tab.lastTool.at}`).join('; ')}.`,
-      alert: { key: `denial-fence:${projectId}`, title: `Conductor: ${project} is fenced by a denial`, body: `A durable approval denial is refusing tools in ${project} (${senders.map(tab => tab.title).join(', ')}). Only you can lift it: open the tab and review the denied card.` } })
+      alert: { key: `denial-fence:${projectId}`, title: `Conductor: ${project} is fenced by a denial`, body: `A durable approval denial is refusing tools in ${project} (${senders.map(tab => tab.title).join(', ')}). Only you can lift it: open the tab and review the denied card.`, agentSessionId: senders[0].agentSessionId } })
   }
 
   // 4. A coworker that stopped while its controller has not acted since.
   for (const coworker of tabs) {
-    const controller = coworker.controller ? byId.get(coworker.controller) : undefined
-    if (!controller || !quiet(coworker) || !SETTLED.has(controller.phase) || controller.awaiting) continue
+    const controller = coworker.controller ? live(coworker.controller) : undefined
+    if (!controller || coworker.successor || !quiet(coworker) || !SETTLED.has(controller.phase) || controller.awaiting) continue
     const stopped = ms(coworker.lastActivityAt), acted = ms(controller.lastActivityAt)
     if (stopped === null || (acted !== null && acted >= stopped) || now - stopped < timings.coworkerIdleMs) continue
     findings.push({ kind: 'coworker-idle', fingerprint: `coworker-idle:${coworker.agentSessionId}:${coworker.lastActivityAt}`, target: controller,
@@ -137,8 +153,8 @@ export function detect(overview, memory = {}, now = Date.now(), timings = TIMING
     const seen = next.updateSeen?.version === updates.availableVersion ? next.updateSeen : { version: updates.availableVersion, since: now }
     next.updateSeen = seen
     if (now - seen.since >= timings.updateHeldMs) {
-      const builder = overview.localBuild?.builder ? byId.get(overview.localBuild.builder) : undefined
-      const targets = builder ? [builder] : tabs.filter(tab => tab.wizard)
+      const builder = overview.localBuild?.builder ? live(overview.localBuild.builder) : undefined
+      const targets = builder ? [builder] : tabs.filter(tab => tab.wizard && !tab.successor)
       const blockers = updates.installBlockers?.length ? ` The install waits for: ${updates.installBlockers.map(tab => `${tab.title} (${tab.id})`).join(', ')}.` : ''
       const facts = `Update ${updates.availableVersion}${overview.localBuild?.commit ? ` (commit ${String(overview.localBuild.commit).slice(0, 12)})` : ''} is downloaded${updates.source === 'local' ? ' and verified' : ''} and has not been installed for ${Math.round((now - seen.since) / 60_000)} minutes.${blockers}${updates.installWhenIdle ? ' It is queued to install when idle.' : ''} Install it with app.update.install({}) once no tab is mid-turn, or tell the owner why it must wait.`
       for (const target of targets) findings.push({ kind: 'update-held', fingerprint: `update-held:${updates.availableVersion}:${target.agentSessionId}`, target, facts, persistent: true })
@@ -149,7 +165,7 @@ export function detect(overview, memory = {}, now = Date.now(), timings = TIMING
   // 6. A usage limit that reset while the conversation still sits stopped.
   for (const tab of tabs) {
     const reset = ms(tab.limitResumeAt)
-    if (reset === null || now < reset + timings.limitGraceMs || !SETTLED.has(tab.phase) || tab.awaiting || tab.pending?.owner) continue
+    if (reset === null || tab.successor || now < reset + timings.limitGraceMs || !SETTLED.has(tab.phase) || tab.awaiting || tab.pending?.owner) continue
     findings.push({ kind: 'limit-reset', fingerprint: `limit-reset:${tab.agentSessionId}:${tab.limitResumeAt}`, target: tab, prompt: `${HEADER} Your provider usage limit reset at ${tab.limitResumeAt}. Continue where you left off.` })
   }
 
@@ -166,7 +182,7 @@ export function resumeTargets(snapshot, overview, restart) {
   const targets = []
   for (const before of snapshot ?? []) {
     const tab = byId.get(before.agentSessionId)
-    if (!tab || !SETTLED.has(tab.phase) || tab.pending?.owner) continue
+    if (!tab || tab.successor || !SETTLED.has(tab.phase) || tab.pending?.owner) continue
     const acted = ms(tab.lastActivityAt)
     if (acted !== null && acted > startedAt) continue
     targets.push({ kind: 'resume', fingerprint: `resume:${tab.agentSessionId}:${restart.pid}`, target: tab,
@@ -187,7 +203,11 @@ export const steerPrompt = finding => finding.prompt ?? `${HEADER} ${finding.fac
  * steerRepeatMs without the tab having acted since, it is steered once more, and after that it goes
  * to the owner (a held update escalates even when its builder acted). A tab hears at most
  * one steer per steerCooldownMs (the others wait for the next tick) and the supervisor sends at
- * most maxSteersPerHour. Returns the plan and the updated ledger.
+ * most maxSteersPerHour. An alert names one condition and is sent once; while the condition
+ * persists it is repeated after alertRepeatMs (a day), and once the condition went away and
+ * came back it is new again. The owner's phone received fifteen hourly pushes about one stuck
+ * tab on 2026-10-12. Each alert carries the conversation it is about, so a tap opens that tab.
+ * Returns the plan and the updated ledger.
  */
 export function plan(findings, ledger = {}, now = Date.now(), timings = TIMINGS) {
   const steered = { ...(ledger.steered ?? {}) }
@@ -195,20 +215,23 @@ export function plan(findings, ledger = {}, now = Date.now(), timings = TIMINGS)
   const alerted = { ...(ledger.alerted ?? {}) }
   let recent = (ledger.recentSteers ?? []).filter(at => now - at < 3_600_000)
   const steers = [], alerts = []
-  const alert = (key, title, body) => {
-    if (alerted[key] !== undefined && now - alerted[key] < timings.alertDedupMs) return
+  const wanted = new Set()
+  let capped = false
+  const alert = (key, title, body, agentSessionId = null) => {
+    wanted.add(key)
+    if (alerted[key] !== undefined && now - alerted[key] < timings.alertRepeatMs) return
     alerted[key] = now
-    alerts.push({ key, title, body })
+    alerts.push({ key, title, body, agentSessionId })
   }
   for (const finding of findings) {
-    if (finding.alert) alert(finding.alert.key, finding.alert.title, finding.alert.body)
+    if (finding.alert) alert(finding.alert.key, finding.alert.title, finding.alert.body, finding.alert.agentSessionId ?? null)
     const target = finding.target
     if (!target) continue
     const record = steered[finding.fingerprint]
     // The tab acted after hearing it: its call now, not a stall (a held update keeps escalating).
     if (record && !finding.persistent && (ms(target.lastActivityAt) ?? 0) > record.at) continue
     if (record && now - record.at < timings.steerRepeatMs) continue
-    if (record && record.count >= 2) { alert(`stuck:${finding.fingerprint}`, `Conductor: ${target.title || 'a tab'} is stuck`, `${finding.kind}: steered twice and still stuck. ${clip(finding.facts ?? finding.prompt, 300)}`); continue }
+    if (record && record.count >= 2) { alert(`stuck:${finding.fingerprint}`, `Conductor: ${target.title || 'a tab'} is stuck`, `${finding.kind}: steered twice and still stuck. ${clip(finding.facts ?? finding.prompt, 300)}`, target.agentSessionId); continue }
     // Two facts about one tab in the same tick travel in one message.
     const joined = steers.find(steer => steer.target.agentSessionId === target.agentSessionId)
     if (joined) {
@@ -218,7 +241,7 @@ export function plan(findings, ledger = {}, now = Date.now(), timings = TIMINGS)
       continue
     }
     if (lastSteer[target.agentSessionId] !== undefined && now - lastSteer[target.agentSessionId] < timings.steerCooldownMs) continue
-    if (recent.length >= timings.maxSteersPerHour) { alert('steer-cap', 'Conductor: meta-wizard steer cap reached', `${recent.length} steers in the last hour; more findings are waiting (journal: meta-wizard/journal.jsonl).`); break }
+    if (recent.length >= timings.maxSteersPerHour) { alert('steer-cap', 'Conductor: meta-wizard steer cap reached', `${recent.length} steers in the last hour; more findings are waiting (journal: meta-wizard/journal.jsonl).`); capped = true; break }
     steers.push({ target, findings: [finding] })
     steered[finding.fingerprint] = { at: now, count: (record?.count ?? 0) + 1 }
     lastSteer[target.agentSessionId] = now
@@ -229,9 +252,10 @@ export function plan(findings, ledger = {}, now = Date.now(), timings = TIMINGS)
     steer.fingerprints = steer.findings.map(finding => finding.fingerprint)
     steer.prompt = steer.findings.length === 1 ? steerPrompt(steer.findings[0]) : `${HEADER} ${steer.findings.map(finding => finding.facts).join('\n\n')}\n${FOOTER}`
   }
-  // Forget facts older than a day.
+  // Forget facts older than a day, and alerts whose condition is gone (they alert anew if it
+  // returns). A tick the steer cap cut short did not look at every condition, so it forgets none.
   for (const [key, value] of Object.entries(steered)) if (now - value.at > 86_400_000) delete steered[key]
-  for (const [key, at] of Object.entries(alerted)) if (now - at > 86_400_000) delete alerted[key]
+  if (!capped) for (const key of Object.keys(alerted)) if (!wanted.has(key)) delete alerted[key]
   for (const [key, at] of Object.entries(lastSteer)) if (now - at > 86_400_000) delete lastSteer[key]
   return { steers, alerts, ledger: { steered, lastSteer, alerted, recentSteers: recent } }
 }
