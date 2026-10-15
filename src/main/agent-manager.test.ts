@@ -7,6 +7,8 @@ describe('Codex model catalog', () => {
       'default',
       'gpt-6.1-sol',
       'gpt-6-astra',
+      'gpt-6-sol',
+      'gpt-6-luna',
       'gpt-5.6-sol',
       'gpt-5.6-terra',
       'gpt-5.6-luna'
@@ -16,7 +18,7 @@ describe('Codex model catalog', () => {
   it('labels the static catalog with the display names the CLI itself reports', () => {
     // model/list on codex-cli 0.159.1 (2026-09-30) says GPT-6.1-Sol, GPT-6-Astra, GPT-5.6-Sol, ...; the composer
     // shows a discovered label verbatim, so the pre-discovery label must read the same.
-    expect(CODEX_MODELS.map((model) => model.label)).toEqual(['Default for account', 'GPT-6.1-Sol', 'GPT-6-Astra', 'GPT-5.6-Sol', 'GPT-5.6-Terra', 'GPT-5.6-Luna'])
+    expect(CODEX_MODELS.map((model) => model.label)).toEqual(['Default for account', 'GPT-6.1-Sol', 'GPT-6-Astra', 'GPT-6-Sol', 'GPT-6-Luna', 'GPT-5.6-Sol', 'GPT-5.6-Terra', 'GPT-5.6-Luna'])
   })
 
   it('offers the full reasoning ladder the installed CLI advertises, including max and ultra', () => {
@@ -29,5 +31,10 @@ describe('Claude model catalog', () => {
   it('mirrors the ids Claude Code advertises: the 1M Opus entry, Fable, Sonnet and Haiku', () => {
     expect(CLAUDE_MODELS.map((model) => model.id)).toEqual(['default', 'opus[1m]', 'claude-fable-5-1', 'sonnet', 'haiku'])
     expect(CLAUDE_MODELS.some((model) => model.id === 'opus')).toBe(false)
+  })
+
+  it('labels the aliases with the models they resolve to today (Sonnet 5.5, Haiku 5.5)', () => {
+    expect(CLAUDE_MODELS.find((model) => model.id === 'sonnet')?.label).toBe('Claude Sonnet 5.5')
+    expect(CLAUDE_MODELS.find((model) => model.id === 'haiku')?.label).toBe('Claude Haiku 5.5')
   })
 })

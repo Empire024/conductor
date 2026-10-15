@@ -38,7 +38,7 @@ Model ids resolve from what callers actually write (`resolveModel`, `src/main/co
 | haiku | `haiku` (Claude) |
 | sol 6.1 | `gpt-6.1-sol` (Codex; the stack's Codex pick, needs codex-cli 0.159) |
 | astra | `gpt-6-astra` (Codex) |
-| sol | `gpt-5.6-sol` (Codex) |
+| sol 6 | `gpt-6-sol` (Codex; `gpt-5.6-sol` is the generation before. A bare "sol" names several models and is refused) |
 
 ## Tool surface
 

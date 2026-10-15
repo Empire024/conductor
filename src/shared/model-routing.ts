@@ -18,6 +18,10 @@ export function capabilityRank(provider: AgentProviderId, modelId: string): 0 | 
   // GPT-6.1 Sol is the frontier workhorse ("near-Astra performance at a lower cost", codex-cli 0.159.1
   // model/list); the owner prefers it over Astra, so it ranks with the frontier despite its tier name.
   if (/gpt-6\.1-sol/.test(id)) return 3
+  // Fable is Anthropic's top tier, but deliberately not ranked frontier: the owner wants no Fable
+  // spend by default, so capability-first picks (the router's prior, Auto Fixer, model upgrade
+  // offers) never prefer it to Opus. It stays selectable and wizard-eligible (structured-agent.ts).
+  if (/fable/.test(id)) return 2
   // Tier names first: a generation prefix (gpt-6) says nothing about the tier within it.
   if (/astra|opus/.test(id)) return 3
   if (/terra|sonnet/.test(id)) return 2

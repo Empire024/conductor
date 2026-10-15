@@ -38,6 +38,9 @@ describe('projectTaskWeightDefaults', () => {
   it('suggests the Claude model id the runtime offers, opus[1m], not the bare alias', () => {
     expect(projectTaskWeightDefaults.claude.heavy.model).toBe('opus[1m]')
   })
+  it('suggests the newest Codex generation at every weight: GPT-6.1 Sol, GPT-6 Sol, GPT-6 Luna', () => {
+    expect(projectTaskWeights.map(weight => projectTaskWeightDefaults.codex[weight].model)).toEqual(['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna'])
+  })
   it('never suggests the same model for heavy and light work', () => {
     const weights: ProjectTaskWeight[] = ['heavy', 'medium', 'light']
     for (const provider of ['codex', 'claude'] as const) {

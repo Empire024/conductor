@@ -58,6 +58,36 @@ describe('linked pass (D1)', () => {
     expect(store.observations({ provider: 'claude', model: 'opus[1m]' }, 'priceInputPerMTok')).toHaveLength(2)
   })
 
+  it('never gives a versioned key an older family, and withdraws an earlier link when the CLI names a newer version', () => {
+    const { registry } = setup()
+    registry.applyBatch(linkedBatch(registry.list(), AT)!)
+    expect(registry.get({ provider: 'claude', model: 'haiku' })).toMatchObject({ family: 'claude-haiku-4.5', contextTokens: 200_000 })
+    // The CLI now resolves `haiku` to Haiku 5.5, which OpenRouter does not list yet.
+    const RUNTIME: SourceRef = { kind: 'cli', name: 'runtime:claude' }, later = '2026-09-29T00:00:00.000Z'
+    registry.applyBatch({ source: RUNTIME, fetchedAt: later, complete: false, benchmarks: [], observations: [
+      { key: { provider: 'claude', model: 'haiku' }, field: 'displayName', value: 'Haiku 5.5', source: RUNTIME, observedAt: later },
+      { key: { provider: 'claude', model: 'haiku' }, field: 'family', value: 'claude-haiku-5.5', source: RUNTIME, observedAt: later }
+    ] })
+    registry.applyBatch(linkedBatch(registry.list(), later)!)
+    expect(registry.get({ provider: 'claude', model: 'haiku' })).toMatchObject({ family: 'claude-haiku-5.5', contextTokens: null, pricing: null, toolUse: null })
+    // Once OpenRouter lists it, the key links to its own family.
+    registry.applyBatch(mapOpenRouter({ data: [...OPENROUTER.data, { id: 'anthropic/claude-haiku-5.5', name: 'Anthropic: Claude Haiku 5.5', context_length: 1_000_000, pricing: { prompt: '0.0000001', completion: '0.0000005' } }] }, '2026-09-30T00:00:00.000Z'))
+    registry.applyBatch(linkedBatch(registry.list(), '2026-09-30T00:00:00.000Z')!)
+    expect(registry.get({ provider: 'claude', model: 'haiku' })).toMatchObject({ family: 'claude-haiku-5.5', contextTokens: 1_000_000, pricing: { inputPerMTok: 0.1, outputPerMTok: 0.5 } })
+  })
+
+  it('moves an unversioned alias it linked itself on to a newer family of the tier', () => {
+    const { registry } = setup()
+    registry.applyBatch(linkedBatch(registry.list(), AT)!)
+    expect(registry.get({ provider: 'claude', model: 'haiku' })!.family).toBe('claude-haiku-4.5')
+    const later = '2026-09-30T00:00:00.000Z'
+    registry.applyBatch(mapOpenRouter({ data: [...OPENROUTER.data, { id: 'anthropic/claude-haiku-5.5', name: 'Anthropic: Claude Haiku 5.5', context_length: 1_000_000, pricing: { prompt: '0.0000001', completion: '0.0000005' } }] }, later))
+    registry.applyBatch(linkedBatch(registry.list(), later)!)
+    expect(registry.get({ provider: 'claude', model: 'haiku' })).toMatchObject({ family: 'claude-haiku-5.5', contextTokens: 1_000_000 })
+    // A Codex key keeps its own family from its id, whoever recorded it.
+    expect(registry.get({ provider: 'codex', model: 'gpt-5.6-sol' })).toMatchObject({ family: 'gpt-5.6-sol', contextTokens: 400_000 })
+  })
+
   it('has nothing to link without aggregator records', () => {
     const store = new ModelIntelligenceStore(':memory:'), registry = new ModelRegistry(store)
     expect(linkedBatch(registry.list(), AT)).toBeNull()

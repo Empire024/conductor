@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameS
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { CLOUD_EFFORTS, CLOUD_MODELS, MAX_CLOUD_PROMPT_CHARS, type CloudFetchResult, type CloudRunSummary, type CloudTranscriptEntry, type CloudUsage } from '../../shared/cloud'
+import { CLOUD_EFFORTS, CLOUD_MODELS, isCloudModel, MAX_CLOUD_PROMPT_CHARS, type CloudFetchResult, type CloudRunSummary, type CloudTranscriptEntry, type CloudUsage } from '../../shared/cloud'
 import { TerminalScreen } from './screen'
 
 /** The part of node-pty this uses, so tests can drive a fake. */
@@ -235,7 +235,7 @@ export class CloudRuns {
   start(input: { projectId: string; workspaceId: string; cwd: string; prompt: unknown; model?: unknown; effort?: unknown; ref?: unknown; title?: unknown; startedBy: string }): CloudRunSummary {
     const prompt = text(input.prompt, 'prompt', MAX_CLOUD_PROMPT_CHARS)
     const model = input.model === undefined ? CLOUD_MODELS.find(entry => entry.isDefault)!.id : text(input.model, 'model', 80)
-    if (!CLOUD_MODELS.some(entry => entry.id === model)) throw new Error(`Choose a cloud model from models.list: ${CLOUD_MODELS.map(entry => entry.id).join(', ')}`)
+    if (!isCloudModel(model)) throw new Error(`Choose a cloud model from models.list: ${CLOUD_MODELS.map(entry => entry.id).join(', ')}`)
     const effort = input.effort === undefined || input.effort === 'auto' ? null : text(input.effort, 'effort', 20)
     if (effort && !(CLOUD_EFFORTS as readonly string[]).includes(effort)) throw new Error(`effort must be one of ${CLOUD_EFFORTS.join(', ')}`)
     const ref = input.ref === undefined ? null : text(input.ref, 'ref', 200)

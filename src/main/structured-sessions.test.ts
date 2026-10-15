@@ -972,7 +972,8 @@ describe('queued messages and native CLI handoff', () => {
 
   it.each([
     ['claude', 'claude-fable-5-1', 'opus[1m]', 'Fable refused this turn; continuing on Opus 5.5'],
-    ['codex', 'gpt-6-astra', 'gpt-5.6-sol', 'Astra refused this turn; continuing on Sol']
+    ['codex', 'gpt-6-astra', 'gpt-6.1-sol', 'Astra refused this turn; continuing on GPT-6.1 Sol'],
+    ['claude', 'opus[1m]', 'sonnet', 'Opus 5.5 refused this turn; continuing on Sonnet 5.5']
   ] as const)('continues one refused %s turn once on the next model', async (provider, model, fallback, notice) => {
     const f = fixture(provider)
     await f.manager.submit(f.spec.id, 'Safe ordinary request', { ...settings, model })

@@ -180,8 +180,8 @@ const batchOrigin = (batch: QueuedPrompt[]): PromptOrigin | undefined => {
 
 const fallbackAfterRefusal = (provider: StructuredProvider, model: string): { model: string; notice: string } | null => {
   if (provider === 'claude' && /fable/i.test(model)) return { model: 'opus[1m]', notice: 'Fable refused this turn; continuing on Opus 5.5' }
-  if (provider === 'claude' && /opus/i.test(model)) return { model: 'sonnet', notice: 'Opus 5.5 refused this turn; continuing on Sonnet 5' }
-  if (provider === 'codex' && /astra/i.test(model)) return { model: 'gpt-5.6-sol', notice: 'Astra refused this turn; continuing on Sol' }
+  if (provider === 'claude' && /opus/i.test(model)) return { model: 'sonnet', notice: 'Opus 5.5 refused this turn; continuing on Sonnet 5.5' }
+  if (provider === 'codex' && /astra/i.test(model)) return { model: 'gpt-6.1-sol', notice: 'Astra refused this turn; continuing on GPT-6.1 Sol' }
   return null
 }
 

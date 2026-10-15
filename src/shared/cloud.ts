@@ -71,13 +71,18 @@ export interface CloudRunSummary {
 
 export interface CloudModel { id: string; label: string; isDefault?: boolean }
 
-/** Full names, so a later alias change never silently moves a run to another model. */
+/** Full names, so a later alias change never silently moves a run to another model. The newest
+ *  model of each tier is offered; Opus is the default (the owner wants no Fable spend by default). */
 export const CLOUD_MODELS: CloudModel[] = [
   { id: 'claude-opus-5-5', label: 'Claude Opus 5.5 (cloud)', isDefault: true },
-  { id: 'claude-sonnet-5', label: 'Claude Sonnet 5 (cloud)' },
-  { id: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5 (cloud)' },
+  { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5 (cloud)' },
+  { id: 'claude-haiku-5-5', label: 'Claude Haiku 5.5 (cloud)' },
   { id: 'claude-fable-5-1', label: 'Claude Fable 5.1 (cloud)' }
 ]
+/** Ids an earlier CLOUD_MODELS offered: no longer listed, still accepted exactly as written, so a
+ *  saved roster entry, schedule or caller naming one keeps starting on that very model. */
+export const LEGACY_CLOUD_MODELS: readonly string[] = ['claude-sonnet-5', 'claude-haiku-4-5-20251001']
+export const isCloudModel = (id: string): boolean => CLOUD_MODELS.some(entry => entry.id === id) || LEGACY_CLOUD_MODELS.includes(id)
 export const CLOUD_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
 export const MAX_CLOUD_PROMPT_CHARS = 20_000
 

@@ -1,4 +1,5 @@
 import type { FieldObservation, IngestionBatch, ModelKey, RegistryField, RegistryRecord, RegistryValue, SourceRef } from '../../../shared/model-routing'
+import { familyOf } from '../registry'
 
 /**
  * The linked pass (D1): CLI keys (`claude/opus[1m]`, `codex/gpt-5.6-sol`) are what the router
@@ -21,13 +22,18 @@ const newer = (a: string, b: string): boolean => {
 }
 
 /** The family a CLI key stands for: its own when an aggregator record shares it, else for a Claude
- *  alias the newest family of its tier among the aggregator records. */
+ *  alias without a version the newest family of its tier among the aggregator records. A key that
+ *  already names a version the aggregator does not list (Haiku 5.5 before OpenRouter has it) is
+ *  not linked: Haiku 4.5's 200k context and prices are not Haiku 5.5's. A family this pass itself
+ *  gave an alias is not the alias's own (its name decides again), so it moves on to a newer family. */
 export function linkedFamily(record: RegistryRecord, families: ReadonlySet<string>): string | null {
-  if (record.family && families.has(record.family)) return record.family
+  const own = record.provenance.family?.source.name === LINKED_SOURCE.name ? familyOf(record.key.model, record.displayName) : record.family
+  if (own && families.has(own)) return own
   if (record.key.provider !== 'claude') return null
   const name = `${record.key.model} ${record.displayName}`.toLowerCase()
   const tier = /\bdefault\b/.test(name) ? 'opus' : CLAUDE_TIERS.find(candidate => name.includes(candidate))
   if (!tier) return null
+  if (own && /^claude-[a-z]+-\d/.test(own)) return null
   let best: string | null = null
   for (const family of families) if (new RegExp(`^claude-${tier}-\\d`).test(family) && (!best || newer(family, best))) best = family
   return best
@@ -48,7 +54,8 @@ function fieldOf(record: RegistryRecord, field: RegistryField): RegistryValue {
   }
 }
 
-/** Pure: one incomplete batch linking every CLI key that has a family match, or null when none does. */
+/** Pure: one incomplete batch linking every CLI key that has a family match (and withdrawing an
+ *  earlier link's facts from a key that lost its match), or null when there is nothing to say. */
 export function linkedBatch(records: RegistryRecord[], fetchedAt: string): IngestionBatch | null {
   const byFamily = new Map<string, RegistryRecord[]>()
   for (const record of records) if (record.key.provider === 'openrouter' && record.family && record.status !== 'retired') byFamily.set(record.family, [...byFamily.get(record.family) ?? [], record])
@@ -57,8 +64,13 @@ export function linkedBatch(records: RegistryRecord[], fetchedAt: string): Inges
     if (!CLI_PROVIDERS.has(record.key.provider) || record.status === 'retired') continue
     const family = linkedFamily(record, families)
     const source = family ? pick(byFamily.get(family)!) : undefined
-    if (!family || !source) continue
     const key: ModelKey = record.key
+    if (!family || !source) {
+      // No longer linked (its CLI now names a version the aggregator lacks): withdraw what an earlier
+      // link copied, so the old family's facts stop standing in for this model's.
+      for (const field of ['family', ...COPIED] as RegistryField[]) if (record.provenance[field]?.source.name === LINKED_SOURCE.name) observations.push({ key, field, value: null, source: LINKED_SOURCE, observedAt: fetchedAt })
+      continue
+    }
     const add = (field: RegistryField, value: RegistryValue): void => { if (value !== null) observations.push({ key, field, value, source: LINKED_SOURCE, observedAt: fetchedAt }) }
     add('family', family)
     for (const field of COPIED) add(field, fieldOf(source, field))

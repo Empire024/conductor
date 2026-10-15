@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { CloudRunSummary } from '../../shared/cloud'
+import { CLOUD_MODELS, isCloudModel, type CloudRunSummary } from '../../shared/cloud'
 import { CloudRuns, clientEnv, cloudArgs, findResult, parseTranscript, readCreateLog, type CloudExec, type CloudGit, type CloudPty, type CloudSpawn } from './runs'
 
 const fixture = join(process.cwd(), 'scripts/fixtures/cloud-cli.cjs')
@@ -86,6 +86,13 @@ describe('cloud runs', () => {
     expect(cloudArgs({ prompt: 'Add a note', model: 'claude-sonnet-5', effort: 'high', ref: 'main', title: 'Note' }, 'x.log'))
       .toEqual(['--cloud', 'Add a note', '--model', 'claude-sonnet-5', '--effort', 'high', '--ref', 'main', '--name', 'Note', '--debug-file', 'x.log'])
     expect(cloudArgs({ prompt: 'p', model: 'claude-opus-5-5', effort: null, ref: null, title: 't' }, 'd')).not.toContain('--effort')
+  })
+
+  it('offers the newest model of each tier, Opus by default, and still accepts ids it offered before', () => {
+    expect(CLOUD_MODELS.map(model => model.id)).toEqual(['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5-1'])
+    expect(CLOUD_MODELS.find(model => model.isDefault)?.id).toBe('claude-opus-5-5')
+    for (const id of ['claude-sonnet-5', 'claude-haiku-4-5-20251001', 'claude-haiku-5-5']) expect(isCloudModel(id)).toBe(true)
+    expect(isCloudModel('claude-haiku-4-5')).toBe(false)
   })
 
   it('refuses models, efforts and refs it cannot pass on', () => {
