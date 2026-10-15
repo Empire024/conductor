@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AlertCircle, ArrowDown, ArrowUp, Ban, Bot, Check, ChevronDown, ChevronRight, Circle, ExternalLink, GitBranch, GitCommitHorizontal, Github, LoaderCircle, RefreshCw, Rocket, SkipForward, User, X } from 'lucide-react'
 import type { ProjectRecord } from '../../../shared/models'
+import { RemoteOnlyPane } from './RemoteOnlyPane'
+import { projectHostName } from '../layout/machine-placement'
 import { DELIVERY_STAGES, type DeliveryBridge, type DeliveryRun, type DeliveryStage, type DeliveryStageId, type RepositoryFile, type RepositoryStatus } from '../../../shared/delivery'
 
 // The bridge is wired into ConductorBridge by the main session; reading it through this accessor
@@ -295,7 +297,13 @@ export function SourceControlView(props: SourceControlViewProps): React.JSX.Elem
 
 /* The live pane: reads the host, follows delivery events, and owns the draft. */
 
+/** Delivery runs on the machine that holds the working copy; a remote project says which one. */
 export function SourceControlPane({ project }: { project: ProjectRecord }): React.JSX.Element {
+  if (project.remote?.machineId) return <RemoteOnlyPane kind="source-control" machineName={projectHostName(project)} />
+  return <LocalSourceControlPane project={project} />
+}
+
+function LocalSourceControlPane({ project }: { project: ProjectRecord }): React.JSX.Element {
   const [status, setStatus] = useState<RepositoryStatus | null>(null)
   const [run, setRun] = useState<DeliveryRun | null>(null)
   const [message, setMessage] = useState('')

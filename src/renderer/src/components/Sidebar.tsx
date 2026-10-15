@@ -47,6 +47,7 @@ import { WorkspaceSidebarPanel } from './WorkspaceSidebarPanel'
 import { WorkspaceSessionMenu } from './WorkspaceSessionMenu'
 import type { MachineDescriptor } from '../../../shared/remote-control'
 import { remoteProjectBadge } from './execution-target'
+import { offeredForRemoteProject } from '../../../shared/remote-project-support'
 import type { ExplorerOpenMode, WorkspaceSidebarMode } from './workspace-sidebar-types'
 
 interface SidebarProps {
@@ -558,8 +559,9 @@ ${project.path} (on ${project.remote!.machineName})` : project.path}
             <>
               <div className="context-menu-label">{menu.project.name}</div>
               <button onClick={() => beginProjectRename(menu.project)}><Pencil size={14} /> Rename project</button>
-              <button onClick={() => { setMenu(null); props.onRevealProject(menu.project.path) }}><FolderOpen size={14} /> Show in File Explorer</button>
-              <button onClick={() => { const id = menu.project.id; setMenu(null); props.onMoveProject(id) }}><MoveRight size={14} /> Move project…</button>
+              {/* A project on a paired machine has no folder on this disk to show or move. */}
+              {(!menu.project.remote || offeredForRemoteProject('projects:reveal')) && <button onClick={() => { setMenu(null); props.onRevealProject(menu.project.path) }}><FolderOpen size={14} /> Show in File Explorer</button>}
+              {(!menu.project.remote || offeredForRemoteProject('projects:move')) && <button onClick={() => { const id = menu.project.id; setMenu(null); props.onMoveProject(id) }}><MoveRight size={14} /> Move project…</button>}
               <div />
               <button className="danger" onClick={() => { setConfirmingRemoval(menu.project); setMenu(null) }}><Trash2 size={14} /> Remove from Conductor</button>
             </>

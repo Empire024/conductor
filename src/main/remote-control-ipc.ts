@@ -21,6 +21,9 @@ import type { ConductorDatabase } from './database'
 import { GitHubAuth, GITHUB_SCOPES } from './github-auth'
 import { MachineProbeSchedule, describeMachines, machineBriefing, tabMachineId } from './machines'
 import { projectSummary } from './project-identity'
+import { findProjectRecord, routeProject } from './project-scope'
+import { RemoteProjectActions, type RemoteProjectTarget } from './remote-project-actions'
+import type { SourceControlStatus } from '../shared/source-control'
 import type { ProjectBacklogs } from './project-backlog'
 import { DIRECT_PROBE_TIMEOUT_MS, RemoteControlClient, type RemoteCallOptions } from './remote-control-client'
 import { RemoteControlHost } from './remote-control-host'
@@ -73,6 +76,10 @@ export interface RemoteControlServiceDependencies {
    * kind of project as one made here - folder, backlog, watchers and all.
    */
   createProject?(name: string): Promise<ProjectRecord>
+  /** This machine's own project rename, served to a paired machine as `projects.rename`. */
+  renameProject?(projectId: string, name: string): Promise<unknown>
+  /** This machine's repository links behind the task list, served as `tasks.sourceControl`. */
+  sourceControl?: { setEnabled(projectId: string, enabled: boolean): void; describe(projectId: string): Promise<SourceControlStatus> }
 }
 
 const MACHINE_NAME_SETTING = 'remote-control.machineName'
@@ -235,6 +242,8 @@ export class RemoteControlService {
   readonly relayHost: RelayHost
   readonly client: RemoteControlClient
   readonly files: RemoteFiles
+  /** Task list, rename and the rest of a "Remote: MAIN" project's own actions, done on its host. */
+  readonly projectActions: RemoteProjectActions
   readonly resources: RemoteFileResourceServer
   readonly mirror: RemoteSessionMirror
   readonly tailscale: TailscaleService
@@ -303,7 +312,9 @@ export class RemoteControlService {
       terminals: deps.terminals, services: this.services,
       providers: () => deps.providers().map(provider => ({ id: provider.id, available: provider.available, models: provider.models })),
       ui: deps.ui, fileChanged: deps.fileChanged, machineName: () => this.machineName(),
-      ...(deps.createProject ? { createProject: (name: string) => deps.createProject!(name) } : {})
+      ...(deps.createProject ? { createProject: (name: string) => deps.createProject!(name) } : {}),
+      ...(deps.renameProject ? { renameProject: (projectId: string, name: string) => deps.renameProject!(projectId, name) } : {}),
+      ...(deps.sourceControl ? { sourceControl: deps.sourceControl } : {})
     })
     this.server = new RemoteControlServer({
       peers: this.peers, host: this.host, store, vault,
@@ -426,6 +437,12 @@ export class RemoteControlService {
         const project = deps.database.getProject(projectId)
         return project ? projectSummary(project) : null
       }
+    })
+    this.projectActions = new RemoteProjectActions({
+      resolve: projectId => this.remoteProjectTarget(projectId),
+      call: (machineId, method, args) => this.client.call(machineId, method, args),
+      adopt: (target, summary) => this.adoptRemoteProject(target.machineId, target.machineName, summary),
+      changed: (_target, what) => { if (what === 'project') this.publishProjects() }
     })
     this.resources = new RemoteFileResourceServer({ files: this.files, chooseDownloadPath: deps.chooseRemoteDownloadPath })
     this.mirror = new RemoteSessionMirror({
@@ -638,10 +655,21 @@ export class RemoteControlService {
    * terminal and a file in the same "Remote: MAIN" project can never disagree about which it is.
    */
   private findProject(machineId: string, projectId: string): ProjectRecord {
-    const project = this.deps.database.getProject(projectId)
-      ?? this.deps.database.listProjects().find(entry => entry.remote?.machineId === machineId && entry.remote.remoteProjectId === projectId)
+    const project = findProjectRecord(this.deps.database, projectId, machineId)
     if (!project) throw new RemoteAccessError('This project is not in this computer\'s project list.', 404)
     return project
+  }
+
+  /**
+   * The host and both ids for a project that lives on a paired machine, named by either id and
+   * without the caller having to know which machine that is. What every forwarded project action
+   * (`projectActions`) resolves through; a project of this computer's is refused here, because its
+   * work is never sent anywhere.
+   */
+  remoteProjectTarget(projectId: string): RemoteProjectTarget {
+    const route = routeProject(this.deps.database, projectId)
+    if (route.kind === 'local') throw new RemoteAccessError(`“${route.project.name}” is a project on this computer, so its work runs here.`, 409)
+    return { ...this.resolveRemoteProject(route.machineId, route.project.id), machineId: route.machineId }
   }
 
   /** A terminal request from the renderer, named the way the host needs it named. */

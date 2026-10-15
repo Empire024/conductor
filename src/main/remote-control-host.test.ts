@@ -65,6 +65,7 @@ function fixture(extra: Partial<RemoteControlHostDependencies> = {}) {
     // What the real RemotePeers does once a project has been created for this peer: grants it and
     // hands back the summary the host answers with. Null is "this machine would not share it".
     shareProject: vi.fn((_subject: RemotePeerRecord, projectId: string) => MADE.find(entry => entry.id === projectId) ?? null),
+    reshareProject: vi.fn(),
     record: vi.fn()
   } as unknown as RemotePeers
   const database = {
@@ -96,6 +97,7 @@ function fixture(extra: Partial<RemoteControlHostDependencies> = {}) {
   return {
     host, call, refusal, opened, updated, sessions,
     shareProject: peers.shareProject as unknown as ReturnType<typeof vi.fn>,
+    reshareProject: (peers as unknown as { reshareProject: ReturnType<typeof vi.fn> }).reshareProject,
     revoke: () => { currentAuthority = false; authorityRevision++ },
     cycleAuthority: () => { authorityRevision++ }
   }
@@ -531,4 +533,108 @@ describe('the one door to a shell on this machine', () => {
       .toMatch(/not shared with this machine/)
   })
 
+})
+
+/**
+ * The task list pane and the project rename of a "Remote: MAIN" project, carried out here. These
+ * are the methods the laptop's project actions forward (remote-project-actions.ts); each one is
+ * held to the same grant as the file methods, and none of them lets a peer widen what it touches.
+ */
+describe('the task list and rename a paired machine forwards here', () => {
+  const board = { projectId: 'shared-project', path: 'feature-list.md', revision: 'rev-2', tasks: [], owners: [], sourceControl: { projectId: 'shared-project', available: false, enabled: false } }
+
+  it('applies the pane\'s own edit, rebuilt field by field, and answers the requested page', async () => {
+    const edit = vi.fn(async () => board)
+    const fileChanged = vi.fn()
+    fix = fixture({ backlogs: { get: vi.fn(), edit } as unknown as ProjectBacklogs, fileChanged })
+    await expect(fix.call('tasks.edit', {
+      projectId: 'shared-project', revision: 'rev-1',
+      edit: { type: 'update', id: 'one', status: 'done', priority: 'high', smuggled: '../../etc', path: 'C:/elsewhere' },
+      query: { offset: 0, limit: 20, includeDone: true, path: 'ignored' }
+    })).resolves.toEqual(board)
+    expect(edit).toHaveBeenCalledWith('shared-project', 'rev-1', { type: 'update', id: 'one', status: 'done', priority: 'high' }, { actor: 'you' }, { includeDone: true, includeArchived: false, offset: 0, limit: 20 })
+    expect(fileChanged).toHaveBeenCalledWith({ projectId: 'shared-project', path: 'feature-list.md' })
+    await fix.call('tasks.edit', { projectId: 'shared-project', revision: 'rev-2', edit: { type: 'remove', id: 'two' } })
+    expect(edit).toHaveBeenLastCalledWith('shared-project', 'rev-2', { type: 'remove', id: 'two' }, { actor: 'you' }, undefined)
+  })
+
+  it('refuses a malformed edit before the task file is touched', async () => {
+    const edit = vi.fn(async () => board)
+    fix = fixture({ backlogs: { get: vi.fn(), edit } as unknown as ProjectBacklogs })
+    for (const bad of [
+      { type: 'rewrite', id: 'one' },
+      { type: 'add', title: 'x', kind: 'exploit' },
+      { type: 'update', id: 'one', status: 'deleted' },
+      { type: 'update', id: 'one', agentId: { toString: 'x' } },
+      { type: 'update', id: '' },
+      'add'
+    ]) expect(await fix.refusal('tasks.edit', { projectId: 'shared-project', revision: 'rev-1', edit: bad })).not.toBe('ALLOWED')
+    expect(edit).not.toHaveBeenCalled()
+  })
+
+  it('refuses every forwarded task and rename method for a project that was never shared', async () => {
+    const renameProject = vi.fn(async () => undefined)
+    const sourceControl = { setEnabled: vi.fn(), describe: vi.fn(async () => board.sourceControl) }
+    const backlogs = { get: vi.fn(), edit: vi.fn(), changes: vi.fn() }
+    fix = fixture({ backlogs: backlogs as unknown as ProjectBacklogs, renameProject, sourceControl })
+    for (const [method, args] of [
+      ['tasks.edit', { revision: 'rev-1', edit: { type: 'remove', id: 'one' } }],
+      ['tasks.changes', { taskId: 'one' }],
+      ['tasks.sourceControl', { enabled: true }],
+      ['projects.rename', { name: 'Taken' }]
+    ] as const) {
+      expect(await fix.refusal(method, { ...args, projectId: 'private-project' })).toMatch(/not shared/)
+    }
+    expect(renameProject).not.toHaveBeenCalled()
+    expect(sourceControl.setEnabled).not.toHaveBeenCalled()
+    expect(backlogs.edit).not.toHaveBeenCalled()
+    expect(backlogs.changes).not.toHaveBeenCalled()
+  })
+
+  it('lets a revoked grant win over an edit, a rename and a repository toggle', async () => {
+    const renameProject = vi.fn(async () => undefined)
+    const sourceControl = { setEnabled: vi.fn(), describe: vi.fn(async () => board.sourceControl) }
+    const backlogs = { get: vi.fn(), edit: vi.fn(async () => board), changes: vi.fn() }
+    fix = fixture({ backlogs: backlogs as unknown as ProjectBacklogs, renameProject, sourceControl })
+    fix.revoke()
+    expect(await fix.refusal('tasks.edit', { projectId: 'shared-project', revision: 'rev-1', edit: { type: 'remove', id: 'one' } })).toMatch(/Remote access changed/)
+    expect(await fix.refusal('projects.rename', { projectId: 'shared-project', name: 'Renamed' })).toMatch(/Remote access changed/)
+    expect(await fix.refusal('tasks.sourceControl', { projectId: 'shared-project', enabled: true })).toMatch(/Remote access changed/)
+    expect(backlogs.edit).not.toHaveBeenCalled()
+    expect(renameProject).not.toHaveBeenCalled()
+    expect(sourceControl.setEnabled).not.toHaveBeenCalled()
+  })
+
+  it('reads a task\'s changes and toggles repository links for the granted project only', async () => {
+    const changes = { taskId: 'one', commits: [], files: [] }
+    const backlogs = { get: vi.fn(), edit: vi.fn(), changes: vi.fn(async () => changes) }
+    const sourceControl = { setEnabled: vi.fn(), describe: vi.fn(async () => ({ ...board.sourceControl, enabled: true })) }
+    fix = fixture({ backlogs: backlogs as unknown as ProjectBacklogs, sourceControl })
+    await expect(fix.call('tasks.changes', { projectId: 'shared-project', taskId: 'one' })).resolves.toBe(changes)
+    expect(backlogs.changes).toHaveBeenCalledWith('shared-project', 'one')
+    await expect(fix.call('tasks.sourceControl', { projectId: 'shared-project', enabled: true })).resolves.toMatchObject({ enabled: true })
+    expect(sourceControl.setEnabled).toHaveBeenCalledWith('shared-project', true)
+    expect(await fix.refusal('tasks.sourceControl', { projectId: 'shared-project', enabled: 'yes' })).toMatch(/Say whether/)
+  })
+
+  it('renames the shared folder through this machine\'s own rename and confirms the move for the asking machine only', async () => {
+    const renameProject = vi.fn(async () => undefined)
+    fix = fixture({ renameProject })
+    await expect(fix.call('projects.rename', { projectId: 'shared-project', name: 'Renamed' })).resolves.toMatchObject({ id: 'shared-project' })
+    expect(renameProject).toHaveBeenCalledWith('shared-project', 'Renamed')
+    expect(fix.reshareProject).toHaveBeenCalledTimes(1)
+    expect(fix.reshareProject).toHaveBeenCalledWith('peer-1', 'shared-project')
+    expect(await fix.refusal('projects.rename', { projectId: 'shared-project', name: '' })).not.toBe('ALLOWED')
+  })
+
+  it('is refused outright on a machine that wired neither rename nor repository links', async () => {
+    expect(await fix.refusal('projects.rename', { projectId: 'shared-project', name: 'Renamed' })).toMatch(/cannot rename/)
+    expect(await fix.refusal('tasks.sourceControl', { projectId: 'shared-project', enabled: true })).toMatch(/cannot link/)
+    expect(fix.reshareProject).not.toHaveBeenCalled()
+  })
+
+  it('lists the forwarded methods, so an older controller can tell what this host serves', async () => {
+    const listed = await fix.call('tools.list', {}) as Record<string, string>
+    expect(Object.keys(listed)).toEqual(expect.arrayContaining(['tasks.edit', 'tasks.changes', 'tasks.sourceControl', 'projects.rename']))
+  })
 })

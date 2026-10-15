@@ -2,11 +2,12 @@ import { useEffect, useRef, useState } from 'react'
 import { ImagePlus, LoaderCircle } from 'lucide-react'
 import type { ContextAttachment } from '../../../shared/structured-agent'
 
-export function PromptImageUpload({ projectId, disabled, onAttach, onError }: {projectId:string; disabled:boolean; onAttach(images:ContextAttachment[]):void; onError(message:string):void}): React.JSX.Element {
+export function PromptImageUpload({ projectId, disabled, unavailable, onAttach, onError }: {projectId:string; disabled:boolean; /** Why images cannot be attached here at all, said when someone tries. */ unavailable?:string; onAttach(images:ContextAttachment[]):void; onError(message:string):void}): React.JSX.Element {
   const host=useRef<HTMLSpanElement>(null), input=useRef<HTMLInputElement>(null)
   const [busy,setBusy]=useState(false)
   const pending=useRef(false)
   const upload=async (files:File[]):Promise<void> => {
+    if(unavailable && files.length) { onError(unavailable); return }
     if(disabled || pending.current || !files.length) return
     const added:ContextAttachment[]=[]
     pending.current=true; setBusy(true)
@@ -24,22 +25,22 @@ export function PromptImageUpload({ projectId, disabled, onAttach, onError }: {p
     if(!form) return
     const paste=(event:ClipboardEvent):void=> {
       const files=Array.from(event.clipboardData?.files ?? []).filter(file=>file.type.startsWith('image/'))
-      if(!files.length || disabled) return
+      if(!files.length || (disabled && !unavailable)) return
       event.preventDefault(); void upload(files)
     }
     const drop=(event:DragEvent):void=> {
       const files=Array.from(event.dataTransfer?.files ?? [])
       if(!files.length) return
       event.preventDefault(); event.stopPropagation()
-      if(disabled) return
+      if(disabled && !unavailable) return
       void upload(files)
     }
     const over=(event:DragEvent):void=>{if(event.dataTransfer?.types.includes('Files'))event.preventDefault()}
     form.addEventListener('paste',paste);form.addEventListener('drop',drop);form.addEventListener('dragover',over)
     return()=>{form.removeEventListener('paste',paste);form.removeEventListener('drop',drop);form.removeEventListener('dragover',over)}
-  },[projectId,disabled,onAttach,onError])
+  },[projectId,disabled,unavailable,onAttach,onError])
   return <span ref={host} className="sa-image-upload"><input ref={input} type="file" hidden accept="image/png,image/jpeg,image/gif,image/webp" multiple aria-label="Choose prompt images" onChange={event=>{void upload(Array.from(event.target.files??[]));event.target.value=''}} />
-    <button type="button" aria-label="Upload images" title="Upload images, paste a screenshot, or drop images here" disabled={disabled || busy} onClick={()=>input.current?.click()}>{busy ? <LoaderCircle size={14} className="spin"/> : <ImagePlus size={14}/>}</button>
+    <button type="button" aria-label="Upload images" title={unavailable ?? 'Upload images, paste a screenshot, or drop images here'} disabled={unavailable ? true : disabled || busy} onClick={()=>input.current?.click()}>{busy ? <LoaderCircle size={14} className="spin"/> : <ImagePlus size={14}/>}</button>
   </span>
 }
 

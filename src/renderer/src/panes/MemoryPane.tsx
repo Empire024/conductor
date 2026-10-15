@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Bot, Brain, Check, ExternalLink, Lightbulb, Pencil, Plus, Scale, Search, Sparkles, Trash2, UserRound, X } from 'lucide-react'
 import { MEMORY_KINDS } from '../../../shared/models'
 import type { AgentMemory, MemoryKind, MemoryPruneCandidate, ProjectRecord, UpdateMemoryInput } from '../../../shared/models'
+import { RemoteOnlyPane } from '../components/RemoteOnlyPane'
+import { projectHostName } from '../layout/machine-placement'
 
 /** Every menu, grouping and heading below is built from MEMORY_KINDS, so a new kind arrives
  *  in the pane the moment it is added to the shared list rather than being invisible here. */
@@ -116,7 +118,17 @@ function MemoryEditor({ memory, onCancel, onSaved }: { memory: AgentMemory; onCa
   )
 }
 
+/**
+ * Memory is written by the agents that worked on a working copy and is read on that machine, so a
+ * project that lives on a paired machine says so here instead of asking this computer for memory
+ * it refuses to read (see src/shared/remote-project-support.ts).
+ */
 export function MemoryPane({ project }: { project: ProjectRecord }): React.JSX.Element {
+  if (project.remote?.machineId) return <RemoteOnlyPane kind="memory" machineName={projectHostName(project)} />
+  return <LocalMemoryPane project={project} />
+}
+
+function LocalMemoryPane({ project }: { project: ProjectRecord }): React.JSX.Element {
   const [memories, setMemories] = useState<AgentMemory[]>([])
   const [candidates, setCandidates] = useState<MemoryPruneCandidate[] | null>(null)
   const [query, setQuery] = useState('')

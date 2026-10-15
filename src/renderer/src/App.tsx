@@ -67,6 +67,9 @@ import {
 import { LOCAL_MODELS } from '../../shared/local-models'
 import { createPaneTab } from './panes/pane-factory'
 import { MemoryPane } from './panes/MemoryPane'
+import { RemoteOnlyPane } from './components/RemoteOnlyPane'
+import { projectHostName } from './layout/machine-placement'
+import { cleanIpcError } from './ipc-errors'
 import { ProcessDashboardPane } from './panes/ProcessDashboardPane'
 import { SourceControlPane } from './components/SourceControlPane'
 import { OrchestrationHub } from './components/OrchestrationHub'
@@ -804,11 +807,12 @@ export function App(): React.JSX.Element {
     const current = projects.find((item) => item.id === projectId)
     if (!current || current.name === name.trim()) return
     try {
+      // A project that lives on a paired machine is renamed there; the row comes back from it.
       const renamed = await window.conductor.projects.rename(projectId, name)
       setProjects((items) => items.map((item) => item.id === renamed.id ? renamed : item))
-      setToast(`Renamed project to ${renamed.name}`)
+      setToast(renamed.remote ? `Renamed project to ${renamed.name} on ${renamed.remote.machineName || 'that machine'}` : `Renamed project to ${renamed.name}`)
     } catch (reason) {
-      setToast(reason instanceof Error ? reason.message : String(reason))
+      setToast(cleanIpcError(reason))
     }
   }
 
@@ -1792,9 +1796,9 @@ export function App(): React.JSX.Element {
                         : utilityPanel === 'processes'
                           ? <ProcessDashboardPane project={activeProject} />
                           : utilityPanel === 'schedules'
-                            ? <SchedulesPane projectId={activeProject.id} />
+                            ? activeProject.remote?.machineId ? <RemoteOnlyPane kind="schedules" machineName={projectHostName(activeProject)} /> : <SchedulesPane projectId={activeProject.id} />
                           : utilityPanel === 'production'
-                            ? <ProductionPane projectId={activeProject.id} />
+                            ? activeProject.remote?.machineId ? <RemoteOnlyPane kind="production" machineName={projectHostName(activeProject)} /> : <ProductionPane projectId={activeProject.id} />
                           : utilityPanel === 'source-control'
                             ? <SourceControlPane key={activeProject.id} project={activeProject} />
                           : <OrchestrationHub

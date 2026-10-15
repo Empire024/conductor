@@ -127,7 +127,14 @@ export function WorkspaceFiles({ projects, projectId, workspaceId, showHiddenFil
     window.dispatchEvent(new CustomEvent('conductor:browser-files', { detail: state.files.filter((file) => file.mode === 'browser') }))
   }, [state, workspaceId])
   useEffect(() => {
-    const receive = (event: Event): void => open((event as CustomEvent<OpenWorkspaceFile>).detail)
+    const receive = (event: Event): void => {
+      const detail = (event as CustomEvent<OpenWorkspaceFile>).detail
+      // Callers such as the task list's "feature-list.md" button name only the project. For a
+      // project on a paired machine the file is on that machine, never this computer's disk.
+      const host = isRemoteFileMachine(detail.machineId) ? undefined
+        : projects.find((item) => item.id === detail.projectId || item.remote?.remoteProjectId === detail.projectId)?.remote?.machineId
+      open(host ? { ...detail, machineId: host } : detail)
+    }
     const pathChanged = (): void => setState(loadWorkspaceFiles(workspaceId))
     const agentFile = (event: Event): void => {
       const detail = (event as CustomEvent<{ cwd: string; projectId?: string; machineId?: string; path: string; mode: 'browser' | 'external'; line?: number }>).detail

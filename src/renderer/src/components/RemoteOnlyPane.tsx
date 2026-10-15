@@ -12,15 +12,21 @@ import type { PaneKind } from '../../../shared/models'
  * says which machine the project is on, and does nothing.
  */
 
-const WHAT: Partial<Record<PaneKind, { title: string; because: string }>> = {
+/** The workspace drawers that, like the panes below, are views of this computer's own state. */
+export type RemoteOnlyUtility = 'schedules' | 'production' | 'source-control'
+
+const WHAT: Partial<Record<PaneKind | RemoteOnlyUtility, { title: string; because: string }>> = {
   diff: { title: 'Changes and diffs', because: 'Git runs where the working copy is.' },
   memory: { title: 'Memory', because: 'Memory is written by the agents that worked on that copy, and is read there.' },
   routine: { title: 'Routines', because: 'A routine runs commands, which happens on the machine that holds the project.' },
   logs: { title: 'Logs', because: 'These are this computer’s own logs.' },
+  schedules: { title: 'Scheduled tasks', because: 'A schedule runs on the machine that holds the project, at that machine’s times.' },
+  production: { title: 'Production', because: 'Production environments are registered and checked on the machine that holds the project.' },
+  'source-control': { title: 'Source control', because: 'Git and delivery run where the working copy is.' },
   preview: { title: 'Preview', because: 'A preview reads the file from this computer’s disk. Open the file in the editor instead, which goes through the host.' }
 }
 
-export function RemoteOnlyPane({ kind, machineName }: { kind: PaneKind; machineName: string }): React.JSX.Element {
+export function RemoteOnlyPane({ kind, machineName }: { kind: PaneKind | RemoteOnlyUtility; machineName: string }): React.JSX.Element {
   const what = WHAT[kind] ?? { title: kind, because: 'It reads this computer’s own state.' }
   return (
     <div className="coming-pane remote-only-pane">

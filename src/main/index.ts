@@ -125,7 +125,8 @@ import { registerIdeas, type IdeasRegistration } from './ideas/register'
 import { registerIdeaRuns, type IdeaRunsRegistration } from './idea-runs/register'
 import { normalizeNewFileExtension, normalizeThemeSettings } from './app-settings'
 import { isProjectRoot, resolveWithinProject, safeEntryName } from './project-paths'
-import { isRemoteProject, localProject, requireLocalProject } from './project-scope'
+import { findProjectRecord, isRemoteProject, localProject, RemoteProjectError, requireLocalProject } from './project-scope'
+import type { RemoteProjectActions } from './remote-project-actions'
 import { electronTray, installHostLifecycle, type HostLifecycleController } from './host-lifecycle'
 import { LoginItem } from './login-item'
 import { localReadiness } from './machine-readiness'
@@ -1496,6 +1497,45 @@ const addLocalProject = async (name: string): Promise<ProjectRecord> => {
  * each of the two dozen handlers above it: a handler added later inherits the guard instead of
  * being one review away from quietly reading this disk for MAIN's project. See project-scope.ts.
  */
+/**
+ * The host-side actions for a project that lives on a paired machine, or null for a project of this
+ * computer's (which the caller then serves itself). Accepts either id for the project. A remote
+ * project with remote control not running is refused with the feature named, never served locally.
+ */
+const remoteProjectActions = (projectId: unknown, feature: string): RemoteProjectActions | null => {
+  const project = findProjectRecord(database, projectId)
+  if (!project?.remote?.machineId) return null
+  const machineName = project.remote.machineName || 'the other machine'
+  if (!remoteControl) throw new RemoteProjectError(machineName, feature, `This project lives on ${machineName}, and remote control is not running on this computer yet. Try again in a moment.`)
+  return remoteControl.projectActions
+}
+
+/**
+ * This computer's own project rename: the folder, its shells and agents, and the row. It is also
+ * what a paired machine's `projects.rename` runs, so a rename from the laptop is the same rename.
+ */
+const renameLocalProject = async (projectId: string, requestedName: string): Promise<ProjectRecord> => {
+  const project = localProject(database, projectId, 'Renaming the project folder')
+  const name = safeEntryName(requestedName)
+  const source = resolve(project.path)
+  const target = join(dirname(source), name)
+  if (target === source) return project
+
+  if (target.toLowerCase() !== source.toLowerCase() && await folderExists(target)) {
+    throw new Error(`A folder named ${name} already exists`)
+  }
+
+  terminals.killProject(project.id)
+  agents.killProject(project.id)
+  await fs.rename(source, target)
+  try {
+    return database.updateProjectLocation(project.id, target, name)
+  } catch (error) {
+    await fs.rename(target, source).catch(() => undefined)
+    throw error
+  }
+}
+
 const resolveProjectPath = (projectId: string, requested = '', feature = 'Files'): string => {
   const project = localProject(database, projectId, feature)
   return resolveWithinProject(project.path, requested)
@@ -1798,14 +1838,15 @@ const registerIpc = (): void => {
     event.returnValue = getAppSettings()
   })
   // The backlog is a file in the project folder and source control is git in it, so both belong to
-  // the machine that holds the working copy. The renderer routes a remote project's tasks to the
-  // host instead; reaching here with one is the mistake these guards make loud.
-  ipcMain.handle('project-tasks:dispatch-options', (event, projectId) => { trustedStructured(event); requireLocalProject(database, projectId, 'The task list'); return projectTaskDispatcher.options(projectId) })
-  ipcMain.handle('project-tasks:dispatch', (event, projectId, revision, request) => { trustedStructured(event); requireLocalProject(database, projectId, 'Dispatching a task'); return projectTaskDispatcher.dispatch(projectId, revision, request) })
-  ipcMain.handle('project-tasks:get', (event, projectId: string, query?: ProjectTaskListQuery) => { trustedStructured(event); requireLocalProject(database, projectId, 'The task list'); return projectBacklogs.get(projectId, query) })
-  ipcMain.handle('project-tasks:edit', async (event, projectId, revision, edit, query?: ProjectTaskListQuery) => { trustedStructured(event); const project = localProject(database, projectId, 'Editing the task list'); const result = await projectBacklogs.edit(projectId, revision, edit, { actor: 'you' }, query); invalidateProjectFiles(project.path); return result })
-  ipcMain.handle('project-tasks:set-source-control', (event, projectId: string, enabled: boolean) => { trustedStructured(event); requireLocalProject(database, projectId, 'Source control'); sourceControl.setEnabled(projectId, enabled === true); return sourceControl.describe(projectId) })
-  ipcMain.handle('project-tasks:changes', (event, projectId: string, taskId: string) => { trustedStructured(event); requireLocalProject(database, projectId, 'Reviewing changes'); return projectBacklogs.changes(projectId, taskId) })
+  // the machine that holds the working copy. A project that lives on a paired machine is served by
+  // that machine (remote-project-actions.ts); a local one by this one, and the guards below stay as
+  // the backstop for anything that reaches local work with a remote id.
+  ipcMain.handle('project-tasks:dispatch-options', (event, projectId) => { trustedStructured(event); const remote = remoteProjectActions(projectId, 'The task list'); if (remote) return remote.dispatchOptions(projectId); return projectTaskDispatcher.options(localProject(database, projectId, 'The task list').id) })
+  ipcMain.handle('project-tasks:dispatch', (event, projectId, revision, request) => { trustedStructured(event); const remote = remoteProjectActions(projectId, 'Dispatching a task'); if (remote) return remote.dispatch(projectId); return projectTaskDispatcher.dispatch(localProject(database, projectId, 'Dispatching a task').id, revision, request) })
+  ipcMain.handle('project-tasks:get', (event, projectId: string, query?: ProjectTaskListQuery) => { trustedStructured(event); const remote = remoteProjectActions(projectId, 'The task list'); if (remote) return remote.tasks(projectId, query); return projectBacklogs.get(localProject(database, projectId, 'The task list').id, query) })
+  ipcMain.handle('project-tasks:edit', async (event, projectId, revision, edit, query?: ProjectTaskListQuery) => { trustedStructured(event); const remote = remoteProjectActions(projectId, 'Editing the task list'); if (remote) return remote.editTask(projectId, revision, edit, query); const project = localProject(database, projectId, 'Editing the task list'); const result = await projectBacklogs.edit(project.id, revision, edit, { actor: 'you' }, query); invalidateProjectFiles(project.path); return result })
+  ipcMain.handle('project-tasks:set-source-control', (event, projectId: string, enabled: boolean) => { trustedStructured(event); const remote = remoteProjectActions(projectId, 'Source control'); if (remote) return remote.setSourceControl(projectId, enabled === true); const project = localProject(database, projectId, 'Source control'); sourceControl.setEnabled(project.id, enabled === true); return sourceControl.describe(project.id) })
+  ipcMain.handle('project-tasks:changes', (event, projectId: string, taskId: string) => { trustedStructured(event); const remote = remoteProjectActions(projectId, 'Reviewing changes'); if (remote) return remote.taskChanges(projectId, taskId); return projectBacklogs.changes(localProject(database, projectId, 'Reviewing changes').id, taskId) })
   disposeScheduleIpc = registerScheduleIpc({ store: schedules, runner: scheduleRunner,
     agents: projectId => scheduledTasks.agents(projectId), openConversation: (projectId, id, title) => scheduledTasks.openConversation(projectId, id, title),
     assignScripts: (projectId, schedule) => scheduledTasks.assignScripts(projectId, schedule), changed: projectId => scheduledTasks.control.changed(projectId),
@@ -1835,9 +1876,11 @@ const registerIpc = (): void => {
     return registerProjectFolder(result.filePaths[0])
   })
   ipcMain.handle('projects:create', async (_event, name: string) => addLocalProject(name))
-  ipcMain.handle('projects:remove', (_event, projectId: string) => {
-    const project = database.getProject(projectId)
+  ipcMain.handle('projects:remove', (_event, requestedId: string) => {
+    // Either id: a project that lives on a paired machine may be named by that machine's id for it.
+    const project = findProjectRecord(database, requestedId)
     if (!project) return
+    const projectId = project.id
     terminals.killProject(projectId)
     agents.killProject(projectId)
     browserViews?.releaseProject(projectId)
@@ -1883,25 +1926,11 @@ const registerIpc = (): void => {
     return database.updateProjectPath(projectId, target)
   })
   ipcMain.handle('projects:rename', async (_event, projectId: string, requestedName: string) => {
-    const project = localProject(database, projectId, 'Renaming the project folder')
-    const name = safeEntryName(requestedName)
-    const source = resolve(project.path)
-    const target = join(dirname(source), name)
-    if (target === source) return project
-
-    if (target.toLowerCase() !== source.toLowerCase() && await folderExists(target)) {
-      throw new Error(`A folder named ${name} already exists`)
-    }
-
-    terminals.killProject(projectId)
-    agents.killProject(projectId)
-    await fs.rename(source, target)
-    try {
-      return database.updateProjectLocation(projectId, target, name)
-    } catch (error) {
-      await fs.rename(target, source).catch(() => undefined)
-      throw error
-    }
+    // A project that lives on a paired machine is renamed there, folder and all, as the owner
+    // renaming it on that machine would; this computer's row follows the host's answer.
+    const remote = remoteProjectActions(projectId, 'Renaming the project folder')
+    if (remote) return remote.rename(projectId, String(requestedName ?? ''))
+    return renameLocalProject(projectId, requestedName)
   })
   ipcMain.handle('projects:reveal', (_event, path: string) => shell.showItemInFolder(path))
 
@@ -2892,6 +2921,9 @@ app.whenReady().then(async () => {
     // What a paired machine's "New project on this machine" actually runs. It is this machine's
     // own project creation, so the folder lands where this machine's owner said projects go.
     createProject: name => addLocalProject(name),
+    // And its own rename and repository links, for a paired machine's task list and rename.
+    renameProject: (projectId, name) => renameLocalProject(projectId, name),
+    sourceControl,
     chooseRemoteDownloadPath: async description => {
       const options: Electron.SaveDialogOptions = {
         title: `Save ${basename(description.file.path)}`,

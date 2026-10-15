@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ProjectRecord } from '../shared/models'
-import { RemoteProjectError, isRemoteProject, localProject, requireLocalProject, requireLocalProjectIfGiven } from './project-scope'
+import { RemoteProjectError, findProjectRecord, isRemoteProject, localProject, requireLocalProject, requireLocalProjectIfGiven, routeProject } from './project-scope'
 
 const at = '2026-09-16T00:00:00.000Z'
 const local: ProjectRecord = { id: 'here', name: 'Conductor', path: 'C:/Claude/conductor', createdAt: at, updatedAt: at }
@@ -57,5 +57,36 @@ describe('scoping a project to the computer that owns it', () => {
   it('still names somewhere when the host name was never recorded', () => {
     const nameless = { getProject: (): ProjectRecord => ({ ...remote, remote: { machineId: 'm', machineName: '', remoteProjectId: 'p', path: 'C:/x' } }) }
     expect(() => localProject(nameless, 'there', 'Git')).toThrow('This project lives on the other machine. Git runs there; it is not available from this computer yet.')
+  })
+})
+
+describe('naming a project by either of its ids', () => {
+  const rows = [local, remote]
+  const both = { getProject: (id: string): ProjectRecord | null => rows.find(row => row.id === id) ?? null, listProjects: () => rows }
+
+  it('finds an adopted project by the host id its origin records, as well as by its row id', () => {
+    expect(findProjectRecord(both, 'there')).toBe(remote)
+    expect(findProjectRecord(both, 'project_9')).toBe(remote)
+    expect(findProjectRecord(both, 'project_9', 'main-box')).toBe(remote)
+    expect(findProjectRecord(both, 'project_9', 'another-box')).toBeNull()
+    expect(findProjectRecord(both, '')).toBeNull()
+    expect(findProjectRecord(both, 42)).toBeNull()
+  })
+
+  it('refuses a host id it cannot attribute to one machine rather than guessing', () => {
+    const twin: ProjectRecord = { ...remote, id: 'twin', remote: { ...remote.remote!, machineId: 'other-box', machineName: 'OTHER' } }
+    const ambiguous = { getProject: (id: string) => [local, remote, twin].find(row => row.id === id) ?? null, listProjects: () => [local, remote, twin] }
+    expect(findProjectRecord(ambiguous, 'project_9')).toBeNull()
+    expect(findProjectRecord(ambiguous, 'project_9', 'other-box')).toBe(twin)
+  })
+
+  it('routes a remote project to its host with both ids, and a local one here', () => {
+    expect(routeProject(both, 'project_9')).toEqual({ kind: 'remote', project: remote, machineId: 'main-box', machineName: 'MAIN', remoteProjectId: 'project_9' })
+    expect(routeProject(both, 'here')).toEqual({ kind: 'local', project: local })
+    expect(() => routeProject(both, 'nowhere')).toThrow('Project not found')
+  })
+
+  it('refuses local work named by the host id as "that runs on MAIN", not as a missing project', () => {
+    expect(() => localProject(both, 'project_9', 'Git')).toThrow('This project lives on MAIN. Git runs there; it is not available from this computer yet.')
   })
 })

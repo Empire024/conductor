@@ -16,7 +16,12 @@
 
 import type { ProjectRecord } from '../shared/models'
 
-/** Thrown instead of doing local work for a project that lives on another machine. */
+/**
+ * Thrown instead of doing local work for a project that lives on another machine. Features that
+ * the host does serve (tasks, renaming, files, terminals, tabs, previews) are forwarded to it before
+ * any guard is reached; the features that still meet this error are the ones listed as `local`
+ * in src/shared/remote-project-support.ts, and the renderer does not offer them for such a project.
+ */
 export class RemoteProjectError extends Error {
   /** Marks the error across the IPC boundary, where only `name` and `message` survive. */
   readonly code = 'remote-project'
@@ -33,6 +38,51 @@ export class RemoteProjectError extends Error {
 /** The smallest shape `localProject` needs, so tests and callers never build a whole Database. */
 export interface ProjectLookup {
   getProject(id: string): ProjectRecord | null
+  /**
+   * Every row, so a project that lives on a paired machine can also be found by that machine's own
+   * id for it. Optional only so a lookup that never sees an adopted row stays one function.
+   */
+  listProjects?(): ProjectRecord[]
+}
+
+/**
+ * A project row here, named either way the renderer names it.
+ *
+ * A project adopted from a paired machine has two ids: this computer's row id, and the host's own
+ * id for it, which its origin records and which every surface that talks to the host (launcher,
+ * file tree, terminals, previews) sends. Each main-process entry point used to accept only the row
+ * id, so a host id reaching one of them read as "this project does not exist" - the class of
+ * failure behind "Error invoking remote method" all over a "Remote: MAIN" project. This is the one
+ * resolver every project-scoped path goes through, so no two of them can disagree about which
+ * project an id means.
+ *
+ * `machineId` narrows a host id to that machine's rows. Without it a host id that two paired
+ * machines happen to share resolves to nothing rather than to a guess.
+ */
+export function findProjectRecord(lookup: ProjectLookup, projectId: unknown, machineId?: string): ProjectRecord | null {
+  if (typeof projectId !== 'string' || !projectId) return null
+  const own = lookup.getProject(projectId)
+  if (own) return own
+  const adopted = (lookup.listProjects?.() ?? []).filter(entry =>
+    entry.remote?.remoteProjectId === projectId && (!machineId || entry.remote.machineId === machineId))
+  return adopted.length === 1 ? adopted[0]! : null
+}
+
+/** Where a project's work happens: on this computer, or on the paired machine whose disk holds it. */
+export type ProjectRoute =
+  | { kind: 'local'; project: ProjectRecord }
+  | { kind: 'remote'; project: ProjectRecord; machineId: string; machineName: string; remoteProjectId: string }
+
+/**
+ * The route for a project, by either of its ids. A remote route carries this computer's row (whose
+ * id every local binding is kept under) and the host's id (the only one the host understands).
+ */
+export function routeProject(lookup: ProjectLookup, projectId: unknown): ProjectRoute {
+  const project = findProjectRecord(lookup, projectId)
+  if (!project) throw new Error('Project not found')
+  const origin = project.remote
+  if (!origin?.machineId) return { kind: 'local', project }
+  return { kind: 'remote', project, machineId: origin.machineId, machineName: origin.machineName || 'the other machine', remoteProjectId: origin.remoteProjectId }
 }
 
 /** True when this project's files, terminals, agents and tasks all live on another machine. */
@@ -57,7 +107,8 @@ export function remoteProjectMessage(machineName: string, feature: string): stri
  * wants to distinguish them can.
  */
 export function localProject(lookup: ProjectLookup, projectId: string, feature = 'That'): ProjectRecord {
-  const record = lookup.getProject(projectId)
+  // Either id: a host id must be refused as "that runs on MAIN", not reported as a missing project.
+  const record = findProjectRecord(lookup, projectId)
   if (!record) throw new Error('Project not found')
   if (isRemoteProject(record)) {
     const machineName = record.remote!.machineName || 'the other machine'

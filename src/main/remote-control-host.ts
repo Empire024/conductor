@@ -7,7 +7,8 @@ import { conductorUri } from '../shared/agent-control'
 import { makeId, type AgentSpec, type LayoutNode, type PaneTab } from '../shared/models'
 import type { InteractionResponse, PromptDispatchAuthority, PromptOrigin, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import { LOCAL_MACHINE_ID, type RemotePeerRecord } from '../shared/remote-control'
-import { PROJECT_TASK_MAX_LENGTH, projectTaskKinds, projectTaskPriorities, projectTaskWeights, type ProjectTaskKind, type ProjectTaskPriority, type ProjectTaskWeight } from '../shared/project-backlog'
+import { PROJECT_TASK_MAX_LENGTH, projectTaskKinds, projectTaskPriorities, projectTaskWeights, type ProjectTaskEdit, type ProjectTaskKind, type ProjectTaskListQuery, type ProjectTaskPriority, type ProjectTaskStatus, type ProjectTaskWeight } from '../shared/project-backlog'
+import type { SourceControlStatus } from '../shared/source-control'
 import { workspacePath } from './agent-artifacts'
 import type { ConductorDatabase } from './database'
 import { writeEditorFile } from './editor-files'
@@ -62,6 +63,7 @@ export const remoteToolSignatures = {
   'machine.describe': '() — this machine, the projects it shares with you and the tabs it is running',
   'projects.list': '() — only the projects this machine shared with you',
   'projects.create': '({name}) — creates a project folder on this machine, in its own projects folder, and shares it with you',
+  'projects.rename': '({projectId,name}) — renames a shared project folder on this machine, as its owner renaming it here would',
   'workspaces.list': '({projectId})',
   'tabs.list': '({projectId,sessionId})',
   'tabs.open': '({projectId,sessionId,kind?,provider?,model?,effort?,title?,permission?}) — opens a visible tab on this machine',
@@ -91,6 +93,9 @@ export const remoteToolSignatures = {
   'tasks.list': '({projectId})',
   'tasks.create': '({projectId,revision,title,kind,priority?,weight?})',
   'tasks.update': '({projectId,revision,id,status?,title?,priority?})',
+  'tasks.edit': '({projectId,revision,edit,query?}) — the task list pane\'s own add/update/remove edit; answers the board',
+  'tasks.changes': '({projectId,taskId}) — what the repository changed while that task was open',
+  'tasks.sourceControl': '({projectId,enabled}) — links the task list to this machine\'s repository, or stops',
   // A shell on this machine runs as this machine's user. docs/multi-device.md says what that
   // means; these methods are the only door to it, and every one of them goes through the grant.
   'terminals.list': '({projectId,sessionId}) — shells this machine is running in that workspace',
@@ -123,6 +128,64 @@ export interface RemoteControlHostDependencies {
    * half-served, because a project row with no folder behind it is worse than no project.
    */
   createProject?(name: string): Promise<{ id: string }>
+  /**
+   * Renames a project folder on this machine exactly as the owner's own rename does (it stops that
+   * project's shells and agents first). Without it `projects.rename` is refused.
+   */
+  renameProject?(projectId: string, name: string): Promise<unknown>
+  /** The repository link behind the task list, for `tasks.sourceControl`. */
+  sourceControl?: { setEnabled(projectId: string, enabled: boolean): void; describe(projectId: string): Promise<SourceControlStatus> }
+}
+
+/** A task-list page request, from only the fields a page is made of. */
+const taskQuery = (args: Args): ProjectTaskListQuery | undefined => {
+  if (!['query', 'kind', 'includeDone', 'includeArchived', 'offset', 'limit'].some(key => key in args)) return undefined
+  return {
+    ...(typeof args.query === 'string' ? { query: args.query.slice(0, 300) } : {}),
+    ...(typeof args.kind === 'string' && (args.kind === 'all' || projectTaskKinds.includes(args.kind as ProjectTaskKind)) ? { kind: args.kind as ProjectTaskKind | 'all' } : {}),
+    includeDone: args.includeDone === true,
+    includeArchived: args.includeArchived === true,
+    ...(Number.isSafeInteger(args.offset) && Number(args.offset) >= 0 ? { offset: Number(args.offset) } : {}),
+    ...(Number.isSafeInteger(args.limit) && Number(args.limit) > 0 ? { limit: Math.min(Number(args.limit), 500) } : {})
+  }
+}
+
+/**
+ * The one edit shape the task list pane sends, rebuilt field by field so nothing else a peer puts
+ * in the object reaches the backlog. An agent id can only name an agent of this machine's own
+ * project; the backlog itself refuses one that is not.
+ */
+const taskEdit = (raw: unknown): ProjectTaskEdit => {
+  const edit = (raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}) as Args
+  const optional = <T extends string>(key: string, allowed: readonly string[], label: string): T | undefined => {
+    if (edit[key] === undefined) return undefined
+    if (!allowed.includes(String(edit[key]))) throw new RemoteAccessError(`Invalid task ${label}.`, 400)
+    return edit[key] as T
+  }
+  if (edit.type === 'add') {
+    const kind = optional<ProjectTaskKind>('kind', projectTaskKinds, 'kind')
+    if (!kind) throw new RemoteAccessError('Invalid task kind.', 400)
+    const priority = optional<ProjectTaskPriority>('priority', projectTaskPriorities, 'priority')
+    const weight = optional<ProjectTaskWeight>('weight', projectTaskWeights, 'weight')
+    return { type: 'add', title: text(edit, 'title', PROJECT_TASK_MAX_LENGTH), kind, ...(priority ? { priority } : {}), ...(weight ? { weight } : {}) }
+  }
+  if (edit.type === 'update') {
+    const kind = optional<ProjectTaskKind>('kind', projectTaskKinds, 'kind')
+    const status = optional<ProjectTaskStatus>('status', ['todo', 'doing', 'done'], 'status')
+    const priority = optional<ProjectTaskPriority>('priority', projectTaskPriorities, 'priority')
+    const weight = optional<ProjectTaskWeight>('weight', projectTaskWeights, 'weight')
+    if (edit.agentId !== undefined && edit.agentId !== null && (typeof edit.agentId !== 'string' || !edit.agentId || edit.agentId.length > 160)) {
+      throw new RemoteAccessError('Invalid task agent.', 400)
+    }
+    return {
+      type: 'update', id: text(edit, 'id', 160),
+      ...(edit.title === undefined ? {} : { title: text(edit, 'title', PROJECT_TASK_MAX_LENGTH) }),
+      ...(kind ? { kind } : {}), ...(status ? { status } : {}), ...(priority ? { priority } : {}), ...(weight ? { weight } : {}),
+      ...(edit.agentId === undefined ? {} : { agentId: edit.agentId as string | null })
+    }
+  }
+  if (edit.type === 'remove') return { type: 'remove', id: text(edit, 'id', 160) }
+  throw new RemoteAccessError('Invalid task edit.', 400)
 }
 
 /** Serves one authenticated peer's calls against this machine's own projects. */
@@ -323,6 +386,22 @@ export class RemoteControlHost {
       if (!shared) throw new RemoteAccessError('This machine created the project but could not share it back.', 500)
       return shared
     }
+    /*
+     * The owner renaming, from their other computer, a project that lives here. It is this
+     * machine's own rename - same folder rules, same shells and agents stopped first - and it is
+     * confirmed for the asking machine afterwards: the folder moving is what the owner asked for,
+     * so the grant follows it instead of locking that machine out of the project it just renamed.
+     */
+    if (method === 'projects.rename') {
+      const rename = this.deps.renameProject
+      if (!rename) throw new RemoteAccessError('This machine cannot rename projects for a paired machine.', 501)
+      const project = this.deps.peers.requireCurrentProject(peer, args.projectId)
+      await rename(project.id, text(args, 'name', 120))
+      this.deps.peers.reshareProject(peer.id, project.id)
+      const renamed = this.deps.peers.sharedProjects(peer).find(entry => entry.id === project.id)
+      if (!renamed) throw new RemoteAccessError('This machine renamed the project but could not share it back.', 500)
+      return renamed
+    }
     if (method === 'workspaces.list') {
       const project = this.deps.peers.requireProject(peer, args.projectId)
       return database.listSessions(project.id).map(workspace => ({ id: workspace.id, name: workspace.name, projectId: workspace.projectId }))
@@ -431,9 +510,30 @@ export class RemoteControlHost {
       return this.terminals.call(peer, method, args)
     }
     if (method === 'tasks.list') {
-      const projectId=this.deps.peers.requireProject(peer,args.projectId).id
-      if(!['query','kind','includeDone','includeArchived','offset','limit'].some(key=>key in args))return backlogs.get(projectId)
-      return backlogs.get(projectId,{...(typeof args.query==='string'?{query:args.query}:{}),...(typeof args.kind==='string'?{kind:args.kind as ProjectTaskKind}:{}),includeDone:args.includeDone===true,includeArchived:args.includeArchived===true,...(typeof args.offset==='number'?{offset:args.offset}:{}),...(typeof args.limit==='number'?{limit:args.limit}:{})})
+      const projectId = this.deps.peers.requireProject(peer, args.projectId).id
+      const query = taskQuery(args)
+      return query ? backlogs.get(projectId, query) : backlogs.get(projectId)
+    }
+    if (method === 'tasks.edit') {
+      const project = this.deps.peers.requireCurrentProject(peer, args.projectId)
+      const edit = taskEdit(args.edit)
+      const query = taskQuery((args.query && typeof args.query === 'object' && !Array.isArray(args.query) ? args.query : {}) as Args)
+      const updated = await backlogs.edit(project.id, text(args, 'revision', 100), edit, { actor: 'you' }, query)
+      invalidateProjectFiles(project.path)
+      this.deps.fileChanged({ projectId: project.id, path: 'feature-list.md' })
+      return updated
+    }
+    if (method === 'tasks.changes') {
+      const project = this.deps.peers.requireProject(peer, args.projectId)
+      return backlogs.changes(project.id, text(args, 'taskId', 160))
+    }
+    if (method === 'tasks.sourceControl') {
+      const sourceControl = this.deps.sourceControl
+      if (!sourceControl) throw new RemoteAccessError('This machine cannot link a task list to its repository for a paired machine.', 501)
+      const project = this.deps.peers.requireCurrentProject(peer, args.projectId)
+      if (typeof args.enabled !== 'boolean') throw new RemoteAccessError('Say whether to link the repository.', 400)
+      sourceControl.setEnabled(project.id, args.enabled)
+      return sourceControl.describe(project.id)
     }
     if (method === 'tasks.create') {
       const project = this.deps.peers.requireProject(peer, args.projectId)
