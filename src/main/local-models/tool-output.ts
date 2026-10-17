@@ -83,6 +83,9 @@ export function shapeToolOutput(name: string, input: Record<string, unknown>, ra
   }
   if (name === 'run_command') {
     const command = typeof input.command === 'string' ? input.command : ''
+    // A command refused before it ran has no test report or diff to extract: shaped as one, the
+    // refusal (the sandbox is down, say) reached the model as an empty result.
+    if (/^(?:\[Conductor[^\n]*\]\n)*(?:denied|not run|error):/.test(raw)) { const shaped = headAndTail(raw, policy.commandChars); return { text: shaped.text, excludedChars: shaped.excluded, kind: 'command' } }
     if (DIFF_COMMAND.test(command)) { const shaped = shapeDiffOutput(raw, policy.commandChars); return { text: shaped.text, excludedChars: shaped.excluded, kind: 'diff' } }
     if (detectsTestRun(command)) { const shaped = shapeTestOutput(raw, policy.testReportChars); return { text: shaped.text, excludedChars: shaped.excluded, kind: 'test' } }
     const shaped = headAndTail(raw, policy.commandChars)

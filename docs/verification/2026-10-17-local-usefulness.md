@@ -244,4 +244,71 @@ CPU decider untouched.
 ### What remains
 
 Step 5 is now done for the three models worth comparing. Open improvement areas: 5, 6, 9, 10 (none
-blocks the item).
+blocks the item). All four were then fixed in the local agent harness; see below.
+
+## Follow-up: improvement areas 5, 6, 9 and 10 fixed (local-model-followups-20261017)
+
+All four are deterministic changes to the local agent loop (`src/main/local-models/agent.ts`) and its
+tools. No model was started or downloaded. Unit and stub-server tests cover them; no live model re-run
+was done.
+
+- **Area 5, merging per-file results in the head.**
+  - `calculate` takes `paths`, a list of 2-12 CSV/TSV files with the same columns. A list sent as
+    `path` counts as `paths` too.
+  - One call returns the total per group across every file, the grand total, and each file's own
+    numbers so the merge can be checked. An average is taken over all rows, never as an average of
+    the per-file averages.
+  - The tool description and the calc hint tell the model to make one call over all the files.
+  - Number provenance: when a numbers turn answers with figures that no `calculate` call returned and
+    that appear nowhere in the owner's words or this turn's tool results (dates, years and single
+    digits are ignored), the answer is checked once.
+    - When the turn holds per-file `calculate` calls over the same column, grouping and operation
+      (Ornith's T4 run), **Conductor runs the several-files `calculate` itself**. It withdraws the
+      hand-merged answer and asks for the answer again from the merged result.
+    - Otherwise the model gets one nudge, and the next round offers only `calculate`.
+  - Files: `calculate.ts` (`aggregateFiles`), `tools.ts`, `agent.ts` (`strayNumbers`,
+    `mergeableCalcs`).
+- **Area 6, run_command retried while Docker is down.**
+  - `run_command` now returns `unavailable` when the sandbox cannot run anything: no sandbox, or a
+    `SandboxUnavailableError` from starting or execing the container (Docker Desktop not running).
+  - On the first such result the model is told once that the environment is down, not its command,
+    and that no form of `run_command` will run this message. The note tells it to edit with the file
+    tools, and that a contract's check is Conductor's to run. **`run_command` is no longer offered
+    for the rest of the message.**
+  - A call made anyway is answered without trying again. A third such call ends the turn as
+    stagnation.
+  - A service the commands need being down is caught the same way (`serviceDown`: Docker daemon
+    socket, `ECONNREFUSED`, `connection refused`, `could not connect to server`; ports and addresses
+    are normalized):
+    - the second command that fails on the same line gets the note;
+    - the third turns `run_command` off.
+  - Found on the way and fixed: a test or diff command refused before it ran was shaped as a test
+    report, so the refusal reached the model as an **empty** tool result. A refusal now keeps its
+    text (`tool-output.ts`).
+  - Files: `tools.ts`, `agent.ts` (`environmentDownNote`, `serviceDown`), `tool-output.ts`.
+- **Area 9, "which pages did you open" started a new search.**
+  - `asksAboutOwnReads` (`web-intent.ts`) recognizes questions about the conversation's own reads:
+    which pages, reviews, sources or links it opened, read or used, and where it got a figure.
+  - Such a question in a conversation that used the web (or that asks about web pages) is not a web
+    question: it gets no forced search.
+  - Its first round offers no tools, and the message carries a record built from the transcript
+    itself (`webReadHistory`, `readsRecord`). The record lists:
+    - the pages opened and read;
+    - the pages that failed to open, with the reason;
+    - the searches run, noting that a listed result was not read.
+  - A conversation with no web history keeps its tools for "where did you get that number".
+- **Area 10, answers from search snippets alone did not say so.**
+  - When a web turn ends with no page read but did search, the answer gets a deterministic note
+    (`snippetDisclosure`), like the sources line:
+    - "all N pages tried failed to load, so this answer rests only on search-result snippets", or
+    - "no page was opened for this answer…".
+  - No note is added when the answer already says it rests on snippets.
+
+Tests: `src/main/local-models/local-followups.test.ts` (13 tests: unit tests plus stub-server agent
+runs for each area, including the T4-style hand-merge, Docker down with an edit task, a model that
+keeps calling `run_command`, three commands refused by a database port, the reviews follow-up, and
+every page failing) and `calculate.test.ts` (several files together). `npm run typecheck` is clean
+for these files. `src/main/local-models` + `src/main/local-assist`: 588/588 passed.
+
+Not done: a live re-run of T4, T5 and the research follow-up on Ornith and Qwen 3.5 9B to measure the
+effect. That needs the model server and a smoke slot, one at a time.

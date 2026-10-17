@@ -77,6 +77,26 @@ export function wantsWeb(instruction: string, knowledgeYear = LOCAL_KNOWLEDGE_YE
   return CHANGEABLE.some(pattern => pattern.test(text))
 }
 
+const READ_OBJECTS = '(?:pages?|sites?|websites?|links?|urls?|sources?|articles?|reviews?|results?|ones?)'
+const READ_VERBS = '(?:open(?:ed)?|read|visit(?:ed)?|use[ds]?|look(?:ed)? at|check(?:ed)?|cite[ds]?|click(?:ed)?(?: on)?|fetch(?:ed)?|get|got|base[ds]? (?:it|that|this|your answer) on)'
+/** A question about this conversation's own reads: which pages it opened, where an answer came
+ *  from. "Which of those reviews did you open" carries "reviews", so it read as a fresh research
+ *  question, and both 9B models started an unrelated web search instead of answering from what
+ *  they had read (2026-10-17 held-out web run). The answer is in the conversation's own record. */
+const OWN_READS: RegExp[] = [
+  new RegExp(`\\b(?:which|what)\\b(?: (?:of )?(?:those|these|the|your|that|this))?(?: \\w+){0,2}? ${READ_OBJECTS} (?:did|do|have|had) you(?: actually| really| even)? ${READ_VERBS}\\b`, 'i'),
+  new RegExp(`\\b(?:which|what) (?:did|do|have|had) you(?: actually| really| even)? ${READ_VERBS}\\b`, 'i'),
+  new RegExp(`\\bdid you(?: actually| really| even)? (?:open|read|visit|click|fetch|look at)\\b[^?.]{0,60}\\b(?:${READ_OBJECTS.slice(3, -1)}|it|them|that|those|these)\\b`, 'i'),
+  /\bwhere did you (?:get|find|read|see) (?:that|this|it|those|these|the (?:info(?:rmation)?|numbers?|figures?|facts?|answer))\b/i,
+  /\b(?:what|which) (?:were|are) (?:your|the) sources\b/i,
+  /\b(?:list|name|show|give)(?: me)? (?:your|the) (?:sources|links|pages) (?:you (?:used|opened|read|cited)|for (?:that|this|it|your answer))\b/i
+]
+
+export const asksAboutOwnReads = (instruction: string): boolean => {
+  const text = instruction.replace(/\s+/g, ' ').trim()
+  return text.length <= 300 && OWN_READS.some(pattern => pattern.test(text))
+}
+
 /** Whether the message asks for something time-relative, so a search built from it needs the
  *  date: "this weekend" means nothing to a search engine without the year. */
 export const timeRelative = (instruction: string): boolean => TIME_RELATIVE.test(instruction)

@@ -165,9 +165,59 @@ const AGGREGATES: Aggregate[] = ['sum', 'average', 'min', 'max', 'count']
 
 export interface TableRequest { path: string; column?: string; groupBy?: string; op?: string }
 
+/** One file's numbers for a request: every value used, per group, and the rows skipped. */
+interface TableValues { op: Aggregate; what: string; column: string; group?: string; groups: Map<string, number[]>; all: number[]; skipped: number[]; hint?: string }
+
+const reduceValues = (op: Aggregate, values: number[]): number => op === 'count' ? values.length : op === 'sum' ? values.reduce((a, b) => a + b, 0) : op === 'average' ? values.reduce((a, b) => a + b, 0) / values.length : op === 'min' ? Math.min(...values) : Math.max(...values)
+
 /** Totals one column of a delimited file, per group when group_by names a column. `file` is the
  *  resolved path; `label` is how the result names it. */
 export async function aggregateFile(file: string, label: string, request: TableRequest): Promise<string> {
+  const table = await tableValues(file, label, request)
+  const lines = [`${table.what}${table.group !== undefined ? ` by ${table.group}` : ''} in ${label} (${table.all.length} rows used${skippedNote(table.skipped)})`]
+  for (const [key, values] of table.groups) lines.push(`${key} = ${formatNumber(reduceValues(table.op, values))}`)
+  lines.push(`${table.group !== undefined ? 'all rows' : table.what} = ${formatNumber(reduceValues(table.op, table.all))}`)
+  if (table.hint) lines.push(table.hint)
+  lines.push('These numbers are exact; copy them as they are.')
+  return lines.join('\n')
+}
+
+const skippedNote = (skipped: number[]): string => skipped.length ? `, ${skipped.length} skipped as not numbers: lines ${skipped.slice(0, 8).join(', ')}${skipped.length > 8 ? ', ...' : ''}` : ''
+
+export const MAX_FILES = 12
+
+/** The same column of several files totalled together: one result per group across all of them,
+ *  the grand total, and each file's own total. A 9B model that totalled each file right with
+ *  calculate still merged the per-file results in its head and got a person's hours wrong (Ornith,
+ *  2026-10-17 usefulness run: Ana 88.5 for 87.5); here the merge is computed from every row. An
+ *  average is over all rows, never an average of the files' averages. */
+export async function aggregateFiles(files: Array<{ file: string; label: string }>, request: Omit<TableRequest, 'path'>): Promise<string> {
+  if (files.length < 2 || files.length > MAX_FILES) throw new CalculationError(`paths must list 2 to ${MAX_FILES} files; for one file use path`)
+  const tables: Array<{ label: string; table: TableValues }> = []
+  for (const { file, label } of files) tables.push({ label, table: await tableValues(file, label, { ...request, path: label }) })
+  const first = tables[0]!.table
+  const groups = new Map<string, number[]>()
+  for (const { table } of tables) for (const [key, values] of table.groups) {
+    if (!groups.has(key) && groups.size >= MAX_GROUPS) throw new CalculationError(`more than ${MAX_GROUPS} groups in ${request.groupBy} across these files; group by a coarser column`)
+    groups.set(key, [...(groups.get(key) ?? []), ...values])
+  }
+  const all = tables.flatMap(({ table }) => table.all)
+  const skipped = tables.reduce((sum, { table }) => sum + table.skipped.length, 0)
+  const lines = [`${first.what}${first.group !== undefined ? ` by ${first.group}` : ''} across ${tables.length} files together (${tables.map(item => item.label).join(', ')}; ${all.length} rows used${skipped ? `, ${skipped} skipped as not numbers` : ''})`]
+  for (const [key, values] of groups) lines.push(`${key} = ${formatNumber(reduceValues(first.op, values))}`)
+  lines.push(`${first.group !== undefined ? 'all rows' : first.what} = ${formatNumber(reduceValues(first.op, all))}`)
+  // Each file's own numbers, so the merge can be checked: per group while that stays short.
+  const perGroup = first.group !== undefined && groups.size * tables.length <= 60
+  lines.push('Per file:')
+  for (const { label, table } of tables) {
+    const parts = perGroup ? [...table.groups].map(([key, values]) => `${key} ${formatNumber(reduceValues(first.op, values))}`) : []
+    lines.push(`  ${label}: ${parts.length ? `${parts.join(', ')}; ` : ''}all rows ${formatNumber(reduceValues(first.op, table.all))}${skippedNote(table.skipped)}`)
+  }
+  lines.push('These numbers are exact and already merged across the files; copy them as they are and do not add them up again.')
+  return lines.join('\n')
+}
+
+async function tableValues(file: string, label: string, request: TableRequest): Promise<TableValues> {
   const info = await stat(file)
   if (!info.isFile()) throw new CalculationError(`${label} is not a file`)
   if (info.size > MAX_FILE_BYTES) throw new CalculationError(`${label} is larger than 8 MiB`)
@@ -208,18 +258,14 @@ export async function aggregateFile(file: string, label: string, request: TableR
     if (!groups.has(key) && groups.size >= MAX_GROUPS) throw new CalculationError(`more than ${MAX_GROUPS} groups in ${request.groupBy}; group by a coarser column`)
     groups.set(key, [...(groups.get(key) ?? []), value])
   })
-  const reduce = (values: number[]): number => op === 'count' ? values.length : op === 'sum' ? values.reduce((a, b) => a + b, 0) : op === 'average' ? values.reduce((a, b) => a + b, 0) / values.length : op === 'min' ? Math.min(...values) : Math.max(...values)
   const what = op === 'count' ? 'row count' : `${op} of ${header[column]}`
-  const lines = [`${what}${group !== undefined ? ` by ${header[group]}` : ''} in ${label} (${all.length} rows used${skipped.length ? `, ${skipped.length} skipped as not numbers: lines ${skipped.slice(0, 8).join(', ')}${skipped.length > 8 ? ', ...' : ''}` : ''})`]
   if (!all.length) throw new CalculationError(`no row of ${label} has a number in ${header[column]}`)
-  for (const [key, values] of groups) lines.push(`${key} = ${formatNumber(reduce(values))}`)
-  lines.push(`${group !== undefined ? 'all rows' : what} = ${formatNumber(reduce(all))}`)
+  let hint: string | undefined
   if (group === undefined) {
     const text = header.map((_, index) => index).filter(index => index !== column && numericShare(index) < 0.5)
-    if (text.length) lines.push(`(For one result per ${header[text[0]!]}, call again with group_by "${header[text[0]!]}".)`)
+    if (text.length) hint = `(For one result per ${header[text[0]!]}, call again with group_by "${header[text[0]!]}".)`
   }
-  lines.push('These numbers are exact; copy them as they are.')
-  return lines.join('\n')
+  return { op, what, column: header[column]!, ...(group !== undefined ? { group: header[group]! } : {}), groups, all, skipped, ...(hint ? { hint } : {}) }
 }
 
 const GRAND_TOTAL = /^(?:all[ _]rows|all[ _]labels|all|totals?|grand[ _]total|sum|overall(?:[ _]total)?)$/

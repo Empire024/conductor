@@ -72,7 +72,7 @@ describe('calculate: exact arithmetic for a local model', () => {
   it('refuses what it cannot do with a reason the model can act on, and never leaves the workspace', async () => {
     const root = workspace({ 'jan.csv': jan })
     expect((await tool(root, { path: 'jan.csv', column: 'price' })).output).toBe('failed: column "price" is not a column of jan.csv; its columns are category, amount')
-    expect((await tool(root, {})).output).toMatch(/^denied: Give exactly one of path, combine, expressions or expression/)
+    expect((await tool(root, {})).output).toMatch(/^denied: Give exactly one of path, paths, combine, expressions or expression/)
     // Two forms at once: the file wins and the result says what was ignored (VR9a: a coworker sent
     // expression and combine six times, each refused).
     const both = await tool(root, { expression: '1+1', path: 'jan.csv', column: 'amount', group_by: 'category' })
@@ -116,5 +116,26 @@ describe('calculate: exact arithmetic for a local model', () => {
     expect(toolSpecs(false).map(spec => spec.function.name)).toContain('calculate')
     expect(toolSpecs(false, false, undefined, 'coding').map(spec => spec.function.name)).not.toContain('calculate')
     expect(JSON.stringify(toolSpecs(false, true).find(spec => spec.function.name === 'conductor'))).toContain('merge their numbers with calculate')
+  })
+  // 2026-10-17 usefulness run: Ornith totalled each timesheet right and merged the files in its
+  // head (one person's hours off). One call over every file gives the merged numbers themselves.
+  it('totals several files together: per group across all of them, the grand total, and each file', async () => {
+    const root = workspace({ 'jan.csv': jan, 'feb.csv': feb })
+    const merged = await tool(root, { paths: ['jan.csv', 'feb.csv'], column: 'amount', group_by: 'category' })
+    expect(merged.failed).toBe(false)
+    expect(merged.output).toContain('sum of amount by category across 2 files together (jan.csv, feb.csv; 16 rows used)')
+    for (const line of ['rent = 1900', 'groceries = 625.6', 'transport = 186.5', 'utilities = 250', 'fun = 200.5', 'all rows = 3162.6']) expect(merged.output).toContain(`\n${line}\n`)
+    expect(merged.output).toContain('  jan.csv: rent 950, groceries 350.8, transport 86.5, utilities 118.25, fun 45; all rows 1550.55')
+    expect(merged.output).toContain('  feb.csv: rent 950, groceries 274.8, utilities 131.75, transport 100, fun 155.5; all rows 1612.05')
+    expect(merged.output).toContain('do not add them up again')
+    // An average is over every row of every file, not an average of the two files' averages.
+    expect((await tool(root, { paths: ['jan.csv', 'feb.csv'], column: 'amount', op: 'average' })).output).toContain('\naverage of amount = 197.6625\n')
+    // A list sent as path is the same call; one file listed twice is that file alone.
+    expect((await tool(root, { path: ['jan.csv', 'feb.csv'], column: 'amount', group_by: 'category' })).output).toContain('\nrent = 1900\n')
+    expect((await tool(root, { paths: ['jan.csv', 'jan.csv'], column: 'amount' })).output).toContain('in jan.csv (8 rows used)')
+    // A file that is not there is said as such, and nothing is computed.
+    expect((await tool(root, { paths: ['jan.csv', 'mar.csv'], column: 'amount' })).output).toMatch(/^failed: there is no file "mar\.csv" in the workspace/)
+    expect((await tool(root, { paths: 'jan.csv, feb.csv', column: 'amount' })).output).toContain('across 2 files together')
+    expect(JSON.stringify(toolSpecs(false).find(spec => spec.function.name === 'calculate'))).toContain('never add per-file results yourself')
   })
 })

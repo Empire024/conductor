@@ -21,7 +21,7 @@ import { LOCAL_COWORKER_BRIEF, mentionsConductorControl, splitLocalPrompt, witho
 import { MemoryResultStore, type LocalResultStore } from './result-artifacts.ts'
 import { CONDUCTOR_NOTE, cappedStatus, conductorNoteGuard, stripConductorNotes } from './visible-text.ts'
 import { promptDate, templateKwargs } from './templates.ts'
-import { askedDay, closedQuestion, datedQuery, timeRelative, wantsWeb } from './web-intent.ts'
+import { askedDay, asksAboutOwnReads, closedQuestion, datedQuery, timeRelative, wantsWeb } from './web-intent.ts'
 import { PAGE_HEADER, SEARCH_HEADER } from './web.ts'
 
 /** The whole agent loop for a local model. Conductor stays the orchestrator: llama.cpp only
@@ -387,7 +387,21 @@ interface RunLedger {
   forceCalc?: boolean
   /** agents.report found no controlling conversation: nobody opened this one. */
   noController?: boolean
+  /** What executes commands is down this message (Docker not running, no sandbox, or a service
+   *  every command needs refusing connections): the reason. run_command is no longer offered, and
+   *  a call to it anyway is answered without running; `sandboxRefusals` counts those. */
+  sandboxDown?: string
+  sandboxRefusals?: number
+  /** Failed commands by the unreachable-service line they printed (serviceDown). */
+  serviceFailures?: Record<string, number>
+  /** Successful single-file calculate calls this message, for merging them when the answer adds
+   *  their results up in the model's head; whether the answer's numbers were checked against the
+   *  calculate results (numberProvenance), once a message. */
+  fileCalcs?: FileCalc[]
+  provenanceChecked?: boolean
 }
+
+interface FileCalc { path: string; column?: string; group_by?: string; op?: string }
 
 /** Whether a message asks for something current or online (web-intent.ts). Such a message
  *  carries a one-line hint and its first round is a forced web search. */
@@ -421,7 +435,7 @@ export const wantsMath = (instruction: string): boolean => { const text = instru
  *  run: ben 32.75 for 32.5). With two or more reports received, these words ask for a merge. */
 const MERGE_CUES = /\b(?:over|across|for) (?:both|the two|all(?: the)?|each of the) \w+|\b(?:together|combined|in all|how many \w+ (?:did|does|do) each)\b/i
 export const wantsMerge = (instruction: string, reports: number): boolean => reports >= 2 && (MATH_CUES.test(instruction) || MERGE_CUES.test(instruction)) && !MATH_CODE.test(instruction) && !DISPATCH.test(instruction)
-export const CALC_HINT = '[Conductor: this message asks for numbers to be worked out. Compute every one of them with the calculate tool (a CSV file: path, column and group_by; results from reports: combine, with the full text of each report; other numbers: expressions) and answer with the numbers it returns, not with code or estimates.]'
+export const CALC_HINT = '[Conductor: this message asks for numbers to be worked out. Compute every one of them with the calculate tool (a CSV file: path, column and group_by; several CSV files together: paths, column and group_by, one call for all of them, never per-file results added up yourself; results from reports: combine, with the full text of each report; other numbers: expressions) and answer with the numbers it returns, not with code or estimates.]'
 const hasNumbers = (text: string): boolean => /\d/.test(text.replace(/https?:\/\/\S+/g, ''))
 
 const NO_CONTROLLER = 'not sent: no conversation opened this one, so there is nobody to report to. Do not call agents.report again; give your answer to the owner as plain text now.'
@@ -719,6 +733,116 @@ export function citeComputed(answer: string, output: string | undefined): string
   const values = results.flatMap(line => [...line.matchAll(/= (-?\d+(?:\.\d+)?)/g)].map(match => match[1]!))
   if (!values.length || values.every(value => answer.includes(value))) return ''
   return `\n\nComputed with calculate:\n${results.join('\n')}`
+}
+
+/** The numbers a text states, normalized (no thousands commas, no trailing .0): only those with
+ *  two or more digits or a decimal part, since single digits are everywhere, and no dates or
+ *  years, which are not results. */
+const statedNumbers = (text: string): string[] => [...new Set((text
+  .replace(/\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?\b/g, ' ')
+  .replace(/\b\d{1,2}:\d{2}\b/g, ' ')
+  .match(/(?<![\w.])-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|(?<![\w.])-?\d+(?:\.\d+)?/g) ?? [])
+  .map(value => value.replace(/,/g, '').replace(/^-/, '').replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, ''))
+  .filter(value => (value.replace('.', '').length >= 2 || value.includes('.')) && !/^(?:19|20)\d\d$/.test(value)))]
+
+/** Numbers an answer states that no calculate call returned and nothing the message received holds
+ *  (the owner's words, the tool results): worked out in the model's head. Ornith totalled each
+ *  timesheet right with calculate and then merged the three files by hand (Ana 88.5 for 87.5), in
+ *  the 2026-10-17 usefulness run. */
+export function strayNumbers(answer: string, computed: string[], received: string): string[] {
+  const known = new Set([...computed, received].flatMap(statedNumbers))
+  return statedNumbers(answer).filter(value => !known.has(value))
+}
+
+/** Per-file calculate calls that one several-files call can replace: two or more files totalled
+ *  over the same column, grouping and operation (the newest such set). */
+export function mergeableCalcs(calcs: readonly FileCalc[]): { paths: string[]; column?: string; group_by?: string; op?: string } | undefined {
+  const sets = new Map<string, { paths: string[]; column?: string; group_by?: string; op?: string }>()
+  for (const calc of calcs) {
+    const key = JSON.stringify([calc.column?.toLowerCase(), calc.group_by?.toLowerCase(), (calc.op ?? 'sum').toLowerCase()])
+    const set = sets.get(key) ?? { paths: [], ...(calc.column !== undefined ? { column: calc.column } : {}), ...(calc.group_by !== undefined ? { group_by: calc.group_by } : {}), ...(calc.op !== undefined ? { op: calc.op } : {}) }
+    if (!set.paths.includes(calc.path)) set.paths.push(calc.path)
+    sets.delete(key)
+    sets.set(key, set)
+  }
+  return [...sets.values()].reverse().find(set => set.paths.length >= 2)
+}
+
+/** The line of a failed command that says a service it needs is not running or not reachable: a
+ *  Docker daemon, a database, a local server. The same line from two commands means the
+ *  environment is missing it, not that the command was wrong. */
+export function serviceDown(output: string): string | undefined {
+  const line = output.split('\n').find(text => /cannot connect to the docker daemon|is the docker daemon running|docker(?: desktop)? (?:daemon |engine )?is not running|error during connect|ECONNREFUSED|connection refused|could not connect to (?:the )?server|no such file or directory.{0,40}\.sock\b|failed to connect to .{1,80} port \d+|service unavailable/i.test(text))
+  if (!line) return undefined
+  // Ports, pids and addresses vary between attempts; the service does not.
+  return line.trim().replace(/\b\d{1,3}(?:\.\d{1,3}){3}\b|\b\d{2,}\b/g, 'N').slice(0, 200)
+}
+
+/** What a model is told once commands cannot run: the environment is down, not its command, so it
+ *  does the rest with the tools it has instead of trying run_command in another form. Without
+ *  Docker, Dolphin spent a whole turn on run_command and never made the edit, and Ornith five
+ *  calls (2026-10-17 usefulness run). */
+export function environmentDownNote(reason: string, acceptance?: string): string {
+  return `[Conductor] Commands cannot run on this machine right now: ${reason}. This is the environment, not your command: no form of run_command (command, code or script) will run for the rest of this message, so it is no longer offered. Do not try it again. ${acceptance
+    ? `Make the change with edit_file, apply_edits or write_file; the task's check (${acceptance}) is Conductor's to run, not yours.`
+    : 'Do what the task needs with the file tools (read_file, search, edit_file, apply_edits, write_file) and calculate, and say in your answer which command could not be run, so the owner can run it.'}`
+}
+
+/** One web call of the conversation, from its own transcript. */
+export interface WebRead { kind: 'read' | 'search'; target: string; opened: boolean; reason?: string }
+
+const FAILED_RESULT = /^(?:error|denied|failed|not run|left out|interrupted)\b/i
+
+/** Every page this conversation asked to open, whether it opened, and every search it ran, from
+ *  the transcript itself (the calls and their results), in order and without repeats. */
+export function webReadHistory(messages: readonly ChatMessage[]): WebRead[] {
+  const results = new Map<string, string>()
+  for (const message of messages) if (message.role === 'tool' && message.tool_call_id) results.set(message.tool_call_id, message.content)
+  const history: WebRead[] = []
+  for (const message of messages) {
+    if (message.role !== 'assistant') continue
+    for (const call of message.tool_calls ?? []) {
+      if (call.function.name !== 'web_read' && call.function.name !== 'web_search') continue
+      const args = parseArguments(call.function.arguments)
+      const target = String((call.function.name === 'web_read' ? args.url : args.query) ?? '').trim()
+      const result = results.get(call.id)
+      if (!target || result === undefined || /^Already read above/.test(result)) continue
+      const kind = call.function.name === 'web_read' ? 'read' : 'search'
+      const opened = !FAILED_RESULT.test(result.trim())
+      const prior = history.find(item => item.kind === kind && (kind === 'read' ? sameLink(item.target, target) : item.target === target))
+      if (prior) { if (opened && !prior.opened) { prior.opened = true; delete prior.reason }; continue }
+      history.push({ kind, target, opened, ...(opened ? {} : { reason: result.trim().split('\n')[0]!.replace(/^(?:error|denied|failed): /i, '').slice(0, 140) }) })
+    }
+  }
+  return history
+}
+
+/** The record a question about the conversation's own reads is answered from (asksAboutOwnReads). */
+export function readsRecord(history: readonly WebRead[]): string {
+  const opened = history.filter(item => item.kind === 'read' && item.opened)
+  const failed = history.filter(item => item.kind === 'read' && !item.opened)
+  const searches = history.filter(item => item.kind === 'search')
+  if (!opened.length && !failed.length && !searches.length) return '[Conductor: this message asks about this conversation\'s own web reads. Record: this conversation has opened no web page and run no search. Say so; do not search now.]'
+  return [
+    '[Conductor: this message asks about this conversation\'s own web reads. Answer from this record of what actually ran; do not search again.',
+    `Pages opened and read: ${opened.length ? opened.map(item => item.target).join(' ; ') : 'none'}.`,
+    failed.length ? `Pages that failed to open, so they were not read: ${failed.map(item => `${item.target} (${item.reason})`).join(' ; ')}.` : '',
+    searches.length ? `Searches run: ${searches.map(item => `"${item.target}"`).join(' ; ')}. A search result that is not in the pages opened above was only listed, not read.` : '',
+    ']'
+  ].filter(Boolean).join(' ').replace(' ]', ']')
+}
+
+/** The line an answer gets when no page it tried to open loaded and it can only rest on search
+ *  result snippets: on 3 of 12 held-out questions every web_read failed, and the answers did not
+ *  say what they stood on (2026-10-17). Empty when a page was read, nothing was searched, or the
+ *  answer already says so. */
+export function snippetDisclosure(answer: string, pages: readonly string[], failed: readonly string[], searches: number): string {
+  if (pages.length || !searches) return ''
+  if (/\bsnippets?\b|\bsearch results? (?:alone|only)\b|\b(?:could not|couldn't|cannot|can't|failed to|did not|didn't) (?:open|load|read)\b[^.\n]{0,40}\bpages?\b/i.test(answer)) return ''
+  const tried = new Set(failed).size
+  return tried
+    ? `\n\nNote: ${tried === 1 ? 'the one page tried' : `all ${tried} pages tried`} failed to load, so this answer rests only on search-result snippets, not on any page read in full.`
+    : '\n\nNote: no page was opened for this answer, so it rests only on search-result snippets, not on any page read in full.'
 }
 
 /** A turn paused for a restart: the run's own record, saved beside the durable task state. With
@@ -1134,13 +1258,20 @@ export class LocalAgentSession {
     // The hint rides in front of the owner's words, which stay the last thing the model reads.
     const instruction = prompt === undefined ? '' : withoutCoworkerBrief(splitLocalPrompt(prompt).instruction)
     const ordinary = prompt !== undefined && this.scope === 'full' && !isFileProcessingTask(instruction)
-    const hinted = ordinary && wantsWeb(instruction)
-    const mathHinted = ordinary && (wantsMath(instruction) || wantsMerge(instruction, this.recentReports().length))
-    const hints = [hinted ? WEB_HINT : '', mathHinted ? CALC_HINT : ''].filter(Boolean)
+    // "Which of those reviews did you open" is about this conversation, not the web: it is answered,
+    // with no tools, from the record of what was opened (both 9B models searched again instead).
+    // A conversation that never used the web asks "where did you get that number" about its files.
+    const reads = ordinary && asksAboutOwnReads(instruction) ? webReadHistory(this.messages) : []
+    const aboutReads = ordinary && asksAboutOwnReads(instruction) && (reads.length > 0 || wantsWeb(instruction))
+    const hinted = ordinary && !aboutReads && wantsWeb(instruction)
+    const mathHinted = ordinary && !aboutReads && (wantsMath(instruction) || wantsMerge(instruction, this.recentReports().length))
+    const hints = [aboutReads ? readsRecord(reads) : '', hinted ? WEB_HINT : '', mathHinted ? CALC_HINT : ''].filter(Boolean)
     // A new message: the pages and result lists read for earlier ones keep only their opening, so
     // an 8B model does not answer this question with a figure from the last one (FX42 runs).
     if (prompt !== undefined) this.messages = this.messages.map(message => message.role === 'tool' && message.content.length > EARLIER_WEB_CHARS && (message.content.includes(PAGE_HEADER) || message.content.includes(SEARCH_HEADER)) ? { ...message, content: `${message.content.slice(0, EARLIER_WEB_CHARS)}\n[The rest of this page, read for an earlier question, is left out.]` } : message)
     if (prompt !== undefined) this.messages.push({ role: 'user', content: hints.length ? `${hints.join('\n')}\n\n${prompt}` : prompt })
+    // Where this message's own exchange starts: what it received is what an answer may quote.
+    const turnStart = prompt !== undefined ? this.messages.length - 1 : 0
     const state = prompt === undefined ? this.taskState! : this.beginTurn(prompt)
     const execution = state.execution!
     this.processed = resumed?.processing.processed
@@ -1173,7 +1304,7 @@ export class LocalAgentSession {
     // History, a definition, a conversion: answered from what the model knows, so its first round
     // offers no tools (VR9a: Dolphin searched the Berlin Wall and "checked" 72 °F with calculate).
     // Not once the conversation has worked in the workspace: a follow-up there may need a file.
-    let toolFree = ordinary && !hinted && !mathHinted && closedQuestion(instruction) && !this.messages.some(message => message.role === 'assistant' && message.tool_calls?.some(call => !['web_search', 'web_read', 'calculate'].includes(call.function.name)))
+    let toolFree = aboutReads || ordinary && !hinted && !mathHinted && closedQuestion(instruction) && !this.messages.some(message => message.role === 'assistant' && message.tool_calls?.some(call => !['web_search', 'web_read', 'calculate'].includes(call.function.name)))
     // Two pages: the first result alone was an index page, or a price page drawn by script with no
     // price in it (a parked run of VR9a's questions: 2 of 5 right from one page each).
     const pagesWanted = 2
@@ -1190,7 +1321,8 @@ export class LocalAgentSession {
     const requestCeiling = this.policy.task.maxRequests
     try {
     while (ledger.requests < requestCeiling) {
-      tools = this.tools()
+      // With commands unable to run this message, run_command is not offered at all.
+      tools = this.tools().filter(tool => !(ledger.sandboxDown && tool.function.name === 'run_command'))
       overheadTokens = Math.ceil(JSON.stringify(tools).length / 3)
       if (signal?.aborted) return this.finish(ledger, events, finalText, 'interrupted', 'The turn was stopped.')
       const exhausted = this.exhausted(execution)
@@ -1424,8 +1556,40 @@ export class LocalAgentSession {
           ledger.calcNudged = true
           ledger.forceCalc = true
           events.notice?.('The answer has numbers the model did not compute; asking it once to work them out with the calculate tool.')
-          this.messages.push({ role: 'user', content: '[Conductor] Before answering, compute the numbers with a tool: you have not called calculate, and numbers worked out in your head or code in their place are not an answer. Call calculate now (a CSV file: path, column, group_by; results from reports: combine, with the full text of each report; other numbers: expressions), then answer with the exact numbers it returns, as plain text.' })
+          this.messages.push({ role: 'user', content: '[Conductor] Before answering, compute the numbers with a tool: you have not called calculate, and numbers worked out in your head or code in their place are not an answer. Call calculate now (a CSV file: path, column, group_by; several CSV files together: paths, column, group_by; results from reports: combine, with the full text of each report; other numbers: expressions), then answer with the exact numbers it returns, as plain text.' })
           continue
+        }
+        // Numbers in the answer that no calculate call returned: merged or added up in the model's
+        // head. Checked once a message. Per-file totals that one call over all the files replaces
+        // are merged by Conductor; otherwise the model is asked once to compute them.
+        if (mathHinted && ledger.calculated && !ledger.provenanceChecked && !ledger.dispatched) {
+          ledger.provenanceChecked = true
+          const received = [instruction, ...this.messages.slice(turnStart).filter(message => message.role === 'tool').map(message => message.content)].join('\n')
+          const stray = strayNumbers(completion.content, Object.values(ledger.computed ?? {}), received)
+          const merge = stray.length ? mergeableCalcs(ledger.fileCalcs ?? []) : undefined
+          if (merge) {
+            events.textWithdraw?.()
+            finalText = ''
+            if (this.messages.at(-1)?.role === 'assistant' && !this.messages.at(-1)?.tool_calls) this.messages.pop()
+            const id = `conductor-merge-${ledger.requests}`
+            const argumentsText = JSON.stringify(merge)
+            events.notice?.(`The answer merged per-file results by hand (${stray.slice(0, 4).join(', ')} came from no calculation); Conductor totalled ${merge.paths.length} files together with calculate.`)
+            events.toolStart?.({ id, name: 'calculate', input: argumentsText })
+            const started = Date.now()
+            const outcome = await runTool('calculate', argumentsText, { taskId: this.taskId, workspace: this.options.workspace, readOnly: this.options.readOnly, grants: this.grants, scope: this.scope, sandbox: this.options.sandbox, timeoutSec: this.options.timeoutSec, signal })
+            events.toolEnd?.({ id, name: 'calculate', output: outcome.output, failed: outcome.failed, durationMs: Date.now() - started })
+            this.messages.push({ role: 'assistant', content: '', tool_calls: [{ id, type: 'function', function: { name: 'calculate', arguments: argumentsText } }] })
+            this.messages.push({ role: 'tool', tool_call_id: id, content: boundedToolResult(outcome.output) })
+            if (!outcome.failed) { ledger.calculation = outcome.output; (ledger.computed ??= {})[fingerprint(argumentsText)] = outcome.output }
+            this.messages.push({ role: 'user', content: `[Conductor] Your answer had numbers no calculate call returned (${stray.slice(0, 6).join(', ')}): per-file results added up by hand. Conductor totalled the files together above. Answer again with exactly those merged numbers; do not add anything up yourself.` })
+            continue
+          }
+          if (stray.length) {
+            ledger.forceCalc = true
+            events.notice?.(`The answer has numbers no calculation returned (${stray.slice(0, 4).join(', ')}); asking the model once to compute them with calculate.`)
+            this.messages.push({ role: 'user', content: `[Conductor] Your answer has numbers that no calculate call returned: ${stray.slice(0, 6).join(', ')}. Do not add up, merge or average results in your head. Compute them with calculate (several CSV files together: paths, column, group_by; results to merge: combine; other numbers: expressions), then answer with the exact numbers it returns.` })
+            continue
+          }
         }
         const claim = unverifiedClaim(completion.content, ledger.evidence)
         if (claim) {
@@ -1436,6 +1600,8 @@ export class LocalAgentSession {
           events.notice?.('The answer reached the local output token limit and may be cut off; ask for the rest if it is.')
           return this.finish(ledger, events, finalText, 'output_limit', `The answer reached the ${reserve}-token output limit and may be cut off.`)
         }
+        const snippets = snippetDisclosure(finalText, ledger.webSources ?? [], ledger.readFailed ?? [], ledger.searches ?? 0)
+        if (snippets) { events.text?.(snippets); finalText += snippets }
         const sources = citeSources(finalText, ledger.webSources ?? [], ledger.searchLinks ?? [])
         if (sources) { events.text?.(sources); finalText += sources }
         const computed = citeComputed(finalText, ledger.calculation)
@@ -1559,6 +1725,12 @@ export class LocalAgentSession {
           } else if (call.name === 'web_read' && (ledger.readFailed ?? []).includes(String(parseArguments(call.arguments).url ?? ''))) {
             // Dolphin retried a made-up 404 link four times, spending the message's web budget (FX42 run).
             outcome={output:`not run: ${String(parseArguments(call.arguments).url)} already failed for this message, and it would fail again. Open a different result from the search, or answer from the pages you read.`,failed:true,paths:[]}
+          } else if (call.name === 'run_command' && ledger.sandboxDown) {
+            // Not offered any more, and called anyway (a call written from memory): not tried again,
+            // and a model that keeps at it ends the turn rather than spending it there.
+            ledger.sandboxRefusals = (ledger.sandboxRefusals ?? 0) + 1
+            outcome = { output: `not run: ${environmentDownNote(ledger.sandboxDown, this.options.contract?.acceptance?.command)}`, failed: true, paths: [] }
+            if (ledger.sandboxRefusals >= 3) stagnationStop = `The model kept calling run_command after commands were reported unable to run on this machine (${ledger.sandboxDown}).`
           } else if (call.name === 'process_files' && this.processing) {
             const args=parseArguments(call.arguments)
             const run = await processingRequest(this.options.workspace,this.taskId,args,/payment|invoice|bank/i.test(execution.objective),this.resultStore)
@@ -1598,7 +1770,31 @@ export class LocalAgentSession {
             // price "right now"). Its text is withheld and it counts as unread, so another page opens.
             const stale = hinted && call.name === 'web_read' && !outcome.failed ? stalePage(String(parseArguments(call.arguments).url ?? ''), ledger.searchHits ?? [], instruction, new Date(), outcome.output) : undefined
             if (stale) outcome = { output: stale, failed: true, paths: [] }
-            if (call.name === 'calculate' && !outcome.failed) { ledger.calculated = true; ledger.calculation = outcome.output; (ledger.computed ??= {})[fingerprint(call.arguments)] = outcome.output }
+            if (call.name === 'calculate' && !outcome.failed) {
+              ledger.calculated = true; ledger.calculation = outcome.output; (ledger.computed ??= {})[fingerprint(call.arguments)] = outcome.output
+              const calcArgs = parseArguments(call.arguments)
+              const named = (key: string): string | undefined => typeof calcArgs[key] === 'string' ? calcArgs[key] as string : undefined
+              if (named('path')) (ledger.fileCalcs ??= []).push({ path: named('path')!, ...(named('column') ? { column: named('column') } : {}), ...(named('group_by') ? { group_by: named('group_by') } : {}), ...(named('op') ? { op: named('op') } : {}) })
+            }
+            // Commands cannot run at all (Docker down, no sandbox): said once as the environment
+            // being down, and run_command is withdrawn for the rest of the message.
+            if (call.name === 'run_command' && outcome.unavailable && !ledger.sandboxDown) {
+              ledger.sandboxDown = outcome.unavailable
+              events.notice?.(`Commands cannot run on this machine right now (${outcome.unavailable}); run_command is off for the rest of this message and the model was told to carry on without it.`)
+              outcome = { ...outcome, output: `${outcome.output}\n${environmentDownNote(outcome.unavailable, this.options.contract?.acceptance?.command)}` }
+            }
+            // A service the commands need is not running: the same unreachable-service line from a
+            // second command is the environment, and a third ends the commands for this message.
+            const down = call.name === 'run_command' && outcome.failed && !outcome.unavailable ? serviceDown(outcome.output) : undefined
+            if (down && !ledger.sandboxDown) {
+              const failures = ledger.serviceFailures ??= {}
+              const seen = failures[down] = (failures[down] ?? 0) + 1
+              if (seen >= 3) {
+                ledger.sandboxDown = `a service the commands need is not reachable (${down})`
+                events.notice?.(`Three commands failed on the same unreachable service; run_command is off for the rest of this message.`)
+                outcome = { ...outcome, output: `${outcome.output}\n${environmentDownNote(ledger.sandboxDown, this.options.contract?.acceptance?.command)}` }
+              } else if (seen === 2) outcome = { ...outcome, output: `${outcome.output}\n[Conductor] This is the second command to fail because a service it needs is not running or not reachable from the sandbox (${down}). That is the environment, not your command, and retrying in another form will fail the same way. Do not run commands that need it; carry on with what does not, and say in your answer what could not be run.` }
+            }
             if (merged) outcome = { ...outcome, output: merged + outcome.output }
             if (call.name === 'conductor' && !outcome.failed && reportText(call.arguments) !== undefined) ledger.reported = true
             // Nobody opened this conversation. Said plainly, and not asked of app control again: a

@@ -10,7 +10,7 @@ import { brokeredGitPush, mentionsGitPush } from './git-push.ts'
 import type { DockerSandbox } from './sandbox.ts'
 import { SandboxPolicyError, SandboxUnavailableError, assertNoPackageInstall } from './sandbox.ts'
 import { readPublicWeb, searchPublicWeb } from './web.ts'
-import { aggregateFile, calculateExpressions, CalculationError, combineReports } from './calculate.ts'
+import { aggregateFile, aggregateFiles, calculateExpressions, CalculationError, combineReports, MAX_FILES } from './calculate.ts'
 import { isSecretPath, resolveInWorkspace, resolveWritablePath, SecretPathError, WorkspaceBoundaryError } from './workspace.ts'
 import { pathAllowed, type TaskContract } from './completion.ts'
 import { canonicalRelative } from '../canonical-path.ts'
@@ -116,7 +116,7 @@ export function toolSpecs(readOnly: boolean, control = false, grants: LocalGrant
 /** Exact arithmetic (calculate.ts): a formula, several labelled formulas, or the totals of a
  *  delimited workspace file. Read-only, in process, no sandbox: offered to every full-scope
  *  conversation, since a small model that adds in its head gets money wrong. */
-const CALCULATE_SPEC: ToolSpec = { type: 'function', function: { name: 'calculate', description: 'Exact arithmetic on YOUR numbers. Never add, subtract or average numbers in your head and never answer with code instead of numbers: call this and copy the numbers it returns. Give exactly ONE of: path, a CSV/TSV file in the workspace, with column (the number column), optional group_by (a category column, for one result per category) and op (sum, average, min, max, count; default sum), which reads every row of the file itself; combine, a list with the full text of each report to merge (label = value pairs, one report per list item), which returns the total per label across the reports and the change from the first to the last; expressions, an object of label: formula for several results at once; or expression, one formula (numbers, + - * / ^ %, parentheses, sum, avg, min, max, round).', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Workspace-relative CSV or TSV file' }, column: { type: 'string', description: 'Header of the number column' }, group_by: { type: 'string', description: 'Header of the category column' }, op: { type: 'string', enum: ['sum', 'average', 'min', 'max', 'count'] }, combine: { type: 'array', items: { type: 'string' }, description: 'The full text of each report, copied: ["<text of report 1>", "<text of report 2>"]' }, expressions: { type: 'object', description: '{"<label>": "<formula with your numbers>"}' }, expression: { type: 'string', description: 'One formula with your numbers' } } } } }
+const CALCULATE_SPEC: ToolSpec = { type: 'function', function: { name: 'calculate', description: 'Exact arithmetic on YOUR numbers. Never add, subtract or average numbers in your head and never answer with code instead of numbers: call this and copy the numbers it returns. Give exactly ONE of: path, a CSV/TSV file in the workspace (or paths, a list of several such files with the same columns, totalled together into one result per category plus the total of each file: use it whenever the question spans several files, never add per-file results yourself), with column (the number column), optional group_by (a category column, for one result per category) and op (sum, average, min, max, count; default sum), which reads every row of the file itself; combine, a list with the full text of each report to merge (label = value pairs, one report per list item), which returns the total per label across the reports and the change from the first to the last; expressions, an object of label: formula for several results at once; or expression, one formula (numbers, + - * / ^ %, parentheses, sum, avg, min, max, round).', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Workspace-relative CSV or TSV file' }, paths: { type: 'array', items: { type: 'string' }, description: 'Several workspace-relative CSV or TSV files to total together' }, column: { type: 'string', description: 'Header of the number column' }, group_by: { type: 'string', description: 'Header of the category column' }, op: { type: 'string', enum: ['sum', 'average', 'min', 'max', 'count'] }, combine: { type: 'array', items: { type: 'string' }, description: 'The full text of each report, copied: ["<text of report 1>", "<text of report 2>"]' }, expressions: { type: 'object', description: '{"<label>": "<formula with your numbers>"}' }, expression: { type: 'string', description: 'One formula with your numbers' } } } } }
 
 function writeSpecs(grants: LocalGrants): ToolSpec[] {
   return [
@@ -150,7 +150,16 @@ export interface ToolContext {
   afterTool?(paths: string[], success: boolean): Promise<void>
 }
 
-export interface ToolOutcome { output: string; failed: boolean; paths: string[]; exitCode?: number; evidence?: LocalFileEvidence }
+export interface ToolOutcome {
+  output: string; failed: boolean; paths: string[]; exitCode?: number; evidence?: LocalFileEvidence
+  /** run_command could not run at all because what executes commands is down (Docker not running,
+   *  no sandbox): the reason. No other form of the call would run either. */
+  unavailable?: string
+}
+
+/** A run_command refused because the sandbox cannot run anything, said as the environment being
+ *  down rather than as a refusal of this call. */
+const sandboxDown = (reason: string): ToolOutcome => ({ output: `denied: ${reason}`, failed: true, paths: [], unavailable: reason })
 
 /** When a call names more than one of a tool's alternative forms, keeps the first of `order` it
  *  named and drops the rest, and returns the note that says so; '' when it named at most one. A
@@ -250,24 +259,40 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
       // a page from; fewer than SEARCH_RESULTS_FLOOR is raised to it.
       case 'web_search': return { output: await searchPublicWeb(text(args.query, 'query'), context.signal, Math.max(SEARCH_RESULTS_FLOOR, args.limit === undefined ? 10 : integer(args.limit, 10)), { news: Boolean(context.webFocus) }), failed: false, paths: [] }
       case 'calculate': {
-        const note = oneForm(args, ['path', 'combine', 'expressions', 'expression'])
-        const forms = ['expression', 'expressions', 'path', 'combine'].filter(key => args[key] !== undefined)
+        // A list given as path is the several-files form.
+        if (Array.isArray(args.path) && args.paths === undefined) { args.paths = args.path; delete args.path }
+        const note = oneForm(args, ['paths', 'path', 'combine', 'expressions', 'expression'])
+        const forms = ['expression', 'expressions', 'path', 'paths', 'combine'].filter(key => args[key] !== undefined)
         if (note) {
           const outcome = await runTool(name, JSON.stringify(args), context)
           return { ...outcome, output: note + outcome.output }
         }
-        if (forms.length !== 1) throw new ToolPolicyError(`Give exactly one of path, combine, expressions or expression (this call had ${forms.length ? forms.join(' and ') : 'none of them'}). Nothing was computed. Shapes: {"path":"<file>.csv","column":"<number column>","group_by":"<category column>"}, {"combine":["<text of report 1>","<text of report 2>"]}, {"expressions":{"<label>":"<formula>"}}.`)
+        if (forms.length !== 1) throw new ToolPolicyError(`Give exactly one of path, paths, combine, expressions or expression (this call had ${forms.length ? forms.join(' and ') : 'none of them'}). Nothing was computed. Shapes: {"path":"<file>.csv","column":"<number column>","group_by":"<category column>"}, {"paths":["<a>.csv","<b>.csv"],"column":"<number column>","group_by":"<category column>"}, {"combine":["<text of report 1>","<text of report 2>"]}, {"expressions":{"<label>":"<formula>"}}.`)
         try {
           if (forms[0] === 'combine') return { output: combineReports(args.combine), failed: false, paths: [] }
-          if (forms[0] !== 'path') return { output: calculateExpressions(args.expression, args.expressions), failed: false, paths: [] }
-          const named = text(args.path, 'path')
+          if (forms[0] !== 'path' && forms[0] !== 'paths') return { output: calculateExpressions(args.expression, args.expressions), failed: false, paths: [] }
           // Said as what it is: a raw ENOENT on a path the model made up read as the owner's data missing.
-          const { path, relative: rel } = await resolveInWorkspace(context.workspace, named).catch((error: unknown) => {
+          const resolveData = (named: string): Promise<{ path: string; relative: string }> => resolveInWorkspace(context.workspace, named).catch((error: unknown) => {
             if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') throw new CalculationError(`there is no file "${named.slice(0, 120)}" in the workspace, so nothing was computed. Use a file the owner named or list_files showed; if the task has no data file, compute nothing and answer from what you have.`)
             throw error
           })
           const optional = (key: string): string | undefined => args[key] === undefined || args[key] === null ? undefined : String(args[key])
-          return { output: await aggregateFile(path, rel, { path: rel, column: optional('column'), groupBy: optional('group_by'), op: optional('op') }), failed: false, paths: [path] }
+          const request = { column: optional('column'), groupBy: optional('group_by'), op: optional('op') }
+          if (forms[0] === 'paths') {
+            let named = args.paths
+            if (typeof named === 'string') { const listed = named; try { named = JSON.parse(listed) } catch { named = listed.split(/\s*,\s*/) } }
+            if (!Array.isArray(named) || named.some(item => typeof item !== 'string' || !item.trim())) throw new CalculationError('paths must be a list of workspace file paths, such as ["week1.csv","week2.csv"]')
+            const unique = [...new Set((named as string[]).map(item => item.trim()))]
+            if (unique.length === 1) {
+              const only = await resolveData(unique[0]!)
+              return { output: await aggregateFile(only.path, only.relative, { path: only.relative, ...request }), failed: false, paths: [only.path] }
+            }
+            if (unique.length > MAX_FILES) throw new CalculationError(`paths lists ${unique.length} files; at most ${MAX_FILES} at once`)
+            const files = await Promise.all(unique.map(resolveData))
+            return { output: await aggregateFiles(files.map(item => ({ file: item.path, label: item.relative })), request), failed: false, paths: files.map(item => item.path) }
+          }
+          const { path, relative: rel } = await resolveData(text(args.path, 'path'))
+          return { output: await aggregateFile(path, rel, { path: rel, ...request }), failed: false, paths: [path] }
         } catch (error) {
           if (error instanceof CalculationError) return { output: `failed: ${error.message}`, failed: true, paths: [] }
           throw error
@@ -475,7 +500,7 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
           const pushed = await brokeredGitPush(context.workspace, command, context.signal)
           return { ...pushed, paths: [] }
         }
-        if (!context.sandbox) throw new SandboxUnavailableError('Sandbox unavailable: command execution is disabled without the Docker sandbox')
+        if (!context.sandbox) return sandboxDown('Sandbox unavailable: command execution is disabled without the Docker sandbox')
         if (context.analysisScratch) {
           const scratch = await resolveWritablePath(context.workspace, context.analysisScratch)
           if (scratch.relative === '.') throw new ToolPolicyError('Analysis scratch must be a task subdirectory')
@@ -484,7 +509,9 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
         } else context.sandbox.setAnalysisMode?.(!!context.analysis)
         const marker = '__CONDUCTOR_PAYLOAD_' + randomUUID().replace(/-/g, '') + '__'
         const execution = `cd ${quote('/workspace/' + cwd.relative)} || exit 125; printf 'environment: os=Linux sandbox=Docker cwd=%s runtime=%s\n' "$PWD" "$(command -v ${runtime} || printf unavailable)"; ${runtime} --version 2>&1; printf '\\n${marker}\\n'; printf '\\n${marker}\\n' >&2; ` + command
-        const result = await context.sandbox.exec(execution, Math.max(1, Math.min(integer(args.timeout_sec, context.timeoutSec), context.timeoutSec)), context.signal)
+        let result: Awaited<ReturnType<DockerSandbox['exec']>>
+        try { result = await context.sandbox.exec(execution, Math.max(1, Math.min(integer(args.timeout_sec, context.timeoutSec), context.timeoutSec)), context.signal) }
+        catch (error) { if (error instanceof SandboxUnavailableError && !context.signal?.aborted) return sandboxDown(error.message); throw error }
         const payload = splitExecutionEnvelope(result.stdout, result.stderr, marker)
         const environment = `[environment: ${JSON.stringify({ discovery: payload.environment.slice(0, 1024), stderr: payload.environmentStderr.slice(0, 1024), truncated: payload.environment.length > 1024 || payload.environmentStderr.length > 1024 })}]`
         const metadata = `[execution: payload_started=${payload.payloadStarted}; stdout_empty=${payload.payloadStarted ? payload.stdout.length === 0 : "unknown"}; stderr_empty=${payload.payloadStarted ? payload.stderr.length === 0 : "unknown"}; exit_code=${result.exitCode}; timed_out=${result.timedOut}; cancelled=${result.cancelled ?? false}; truncated=${result.truncated}; duration_ms=${result.durationMs}; source_read_only=${!!(context.analysis || context.analysisScratch)}]`
