@@ -91,7 +91,7 @@ export function grantHandoff(view, { capture, flagLog, model = WIZARD_MODEL, art
   /** agents.handoff({successor:true}) from a wizard; `onPrompt(as)` runs the moment the successor's CLI has its prompt. */
   const handOff = async (from, first, { onPrompt } = {}) => {
     await rm(capture, { force: true })
-    const handing = from.as('agents.handoff', { handoff: handoffText(first), successor: true })
+    const handing = from.as('agents.handoff', { handoff: handoffText(first), successor: true, force: true })
     const as = await Promise.race([credentialOf(first.split(' ').at(-1), onPrompt ? 20 : 250), handing.then(() => new Promise(() => {}))])
     const atPrompt = onPrompt ? await onPrompt(as).catch(error => ({ error: errorText(error) })) : undefined
     const result = await handing

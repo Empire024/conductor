@@ -85,7 +85,7 @@ const wizard = async (title, first) => {
 }
 const handOff = async (from, first) => {
   await rm(capture, { force: true })
-  const handing = from.as('agents.handoff', { handoff: handoffText(first), successor: true })
+  const handing = from.as('agents.handoff', { handoff: handoffText(first), successor: true, force: true })
   const as = await Promise.race([credentialOf(first.split(' ').at(-1)), handing.then(() => new Promise(() => {}))])
   const result = await handing
   await settled(result.agentSessionId, `${result.title} settles`)
@@ -114,7 +114,7 @@ async function s1() {
 
   step('S1: A hands off; B reads permissions.list the moment its CLI has its prompt')
   await rm(capture, { force: true })
-  const handing = a.as('agents.handoff', { handoff: handoffText('SYNTHETIC CLASSIFIER PLAN OTHER successor vr8f-s1-B'), successor: true })
+  const handing = a.as('agents.handoff', { handoff: handoffText('SYNTHETIC CLASSIFIER PLAN OTHER successor vr8f-s1-B'), successor: true, force: true })
   const asB = await Promise.race([credentialOf('vr8f-s1-B', 20), handing.then(() => new Promise(() => {}))])
   const firstList = await asB('permissions.list').catch(error => ({ error: errorText(error) }))
   const result = await handing

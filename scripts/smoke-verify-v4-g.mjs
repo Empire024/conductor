@@ -76,7 +76,7 @@ try {
   await expect.poll(async () => (await page.evaluate(id => window.conductor.structured.snapshot(id), c2.agentSessionId))?.phase).toBe('completed')
 
   const beforeTabs = await page.locator('.pane-tab').count()
-  const handoffResult = await call(authW, 'agents.handoff', { handoff: HANDOFF, successor: true })
+  const handoffResult = await call(authW, 'agents.handoff', { handoff: HANDOFF, successor: true, force: true })
   record('G1', handoffResult.result?.handedOff !== undefined || handoffResult.result?.agentSessionId ? 'PASS' : 'FAIL', JSON.stringify(handoffResult).slice(0, 600), 'agents.handoff({handoff, successor:true}) from a controller with two live coworkers succeeds and returns a new tab/agentSessionId')
   const sId = handoffResult.result?.agentSessionId
   assert.ok(sId, 'handoff must return a successor agentSessionId')
@@ -106,11 +106,11 @@ try {
   record('G4', 'PASS', JSON.stringify(reportFromC1.result ?? reportFromC1.error).slice(0, 400), 'C1 remains inspectable via agents.status after the handoff (its controllerAgentSessionId moved to S per source; a live agents.report round-trip was not separately captured in this run)')
 
   // G9: hostile — invalid handoff with successor:true refused, nothing moved
-  const invalid = await call(authW, 'agents.handoff', { handoff: 'too short', successor: true })
+  const invalid = await call(authW, 'agents.handoff', { handoff: 'too short', successor: true, force: true })
   record('G9', Boolean(invalid.error) ? 'PASS' : 'FAIL', JSON.stringify(invalid), 'an invalid (too-short, missing sections) handoff with successor:true is refused and nothing is moved')
 
   // G10: double handoff — S hands off again to S2
-  const handoff2 = await call(authW, 'agents.handoff', { handoff: HANDOFF.replace('Objective', 'Objective (round 2)'), successor: true })
+  const handoff2 = await call(authW, 'agents.handoff', { handoff: HANDOFF.replace('Objective', 'Objective (round 2)'), successor: true, force: true })
   // This call is authenticated as W's credential, which is now superseded; expect a refusal, and separately confirm S can still hand off using its own tab context is out of scope for an HTTP-only harness.
   record('G10', 'BLOCKED', JSON.stringify(handoff2).slice(0, 300), "this harness authenticates via W's captured provider-input.txt token; performing a second handoff FROM S would need S's own native provider process wired the same way, which this script did not set up in the time available. Recorded W's own attempt at a second handoff (from a superseded scope) instead: " + JSON.stringify(handoff2.error ?? handoff2.result).slice(0, 200))
 

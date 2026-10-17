@@ -89,7 +89,7 @@ try {
   await expect.poll(async () => (await call(caller, 'app.state').catch(() => null))?.wizard, { timeout: 15000 }).toBe(true)
   check('A wizard tab arms three watch loops in the background and is still inside its step')
 
-  const result = await call(caller, 'agents.handoff', { handoff, successor: true })
+  const result = await call(caller, 'agents.handoff', { handoff, successor: true, force: true })
   timings.handoffAt = Date.now()
   assert.equal(result.successor, true, JSON.stringify(result))
   assert.equal(result.wizard, true)

@@ -249,7 +249,7 @@ try {
   // ------------------------------------------------------------------ L2 continued from
   step('L2 a successor starts with "Continued from", and the link reopens the closed predecessor')
   const handoff = 'ARCHIVE successor: continue the tab work.\n\n' + [['Objective', 'Continue the tab work.'], ['Constraints', 'None.'], ['Owned files', 'None.'], ['Verified findings', 'The coworkers finished.'], ['Remaining work', 'Nothing.'], ['Artifact references', 'artifacts/tab-archive']].map(([h, l]) => h + '\n- ' + l).join('\n\n')
-  const successor = await tabCall(bossAuth, 'agents.handoff', { handoff, successor: true })
+  const successor = await tabCall(bossAuth, 'agents.handoff', { handoff, successor: true, force: true })
   await settled(successor.agentSessionId)
   await settled(boss.resourceId)
   await call('tabs.focus', { tabId: successor.tabId })

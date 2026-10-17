@@ -73,7 +73,7 @@ async function scenario(inst) {
 
   step('W hands off')
   const handoff = 'SYNTHETIC WATCH LOOPS successor: continue the swarm.\n\n' + [['Objective', 'Continue as the wizard.'], ['Constraints', 'Local commits only.'], ['Owned files', 'None.'], ['Verified findings', 'Three loops armed by the predecessor.'], ['Remaining work', 'Re-arm your own watchers.'], ['Artifact references', 'artifacts/verification/2026-09-25-vr6/handoff']].map(([h, l]) => h + '\n- ' + l).join('\n\n')
-  const result = await asW('agents.handoff', { handoff, successor: true })
+  const result = await asW('agents.handoff', { handoff, successor: true, force: true })
   const handedAt = Date.now()
   await poll(async () => (await snap(w))?.phase === 'completed', { timeoutMs: STEP_MS + 15_000, label: 'W step settles' })
   const settledMs = Date.now() - handedAt

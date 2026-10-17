@@ -80,7 +80,7 @@ const wizard = async (title, first) => {
 }
 const handOff = async (from, first) => {
   await rm(capture, { force: true })
-  const handing = from.as('agents.handoff', { handoff: handoffText(first), successor: true })
+  const handing = from.as('agents.handoff', { handoff: handoffText(first), successor: true, force: true })
   const as = await Promise.race([credentialOf(first.split(' ').at(-1)), handing.then(() => new Promise(() => {}))])
   const result = await handing
   await settled(result.agentSessionId, `${result.title} settles`)

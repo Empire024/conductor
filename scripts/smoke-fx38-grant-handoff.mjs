@@ -76,7 +76,7 @@ async function scenario(inst) {
   step('A hands off to successor B')
   await rm(capture, { force: true })
   const handoff = 'SYNTHETIC CLASSIFIER OTHER successor: continue as the wizard.\n\n' + [['Objective', 'Continue as the wizard; the pool fix waits on the owner.'], ['Constraints', 'Local commits only.'], ['Owned files', 'None.'], ['Verified findings', 'A filed one permission request for the pool fix.'], ['Remaining work', 'Run the pool fix once it is approved.'], ['Artifact references', 'artifacts/verification/2026-09-26-fx38']].map(([h, l]) => h + '\n- ' + l).join('\n\n')
-  const result = await asA('agents.handoff', { handoff, successor: true })
+  const result = await asA('agents.handoff', { handoff, successor: true, force: true })
   const b = result.agentSessionId
   const asB = await credentialOf('SYNTHETIC CLASSIFIER OTHER successor')
   await settled(b, "B's first turn settles")

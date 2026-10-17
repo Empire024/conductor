@@ -97,7 +97,7 @@ try {
     step('M1 handoff successor:true')
     // Every fixture prompt overwrites the capture; the successor's is the one carrying the handoff.
     writeFileSync(capture, '')
-    const handoff = await as(wizard, 'agents.handoff', { handoff: HANDOFF, successor: true })
+    const handoff = await as(wizard, 'agents.handoff', { handoff: HANDOFF, successor: true, force: true })
     if (handoff.status !== 200) throw new Error(`agents.handoff: ${handoff.status} ${JSON.stringify(handoff.body)}`)
     const result = handoff.body.result
     const successor = await poll(() => { const text = readCapture(); const found = tokenFrom(text); return found.token && text.includes('VR3 handoff') ? found : null }, { timeoutMs: 45_000, label: 'the successor credential' })

@@ -95,7 +95,7 @@ try {
   // The handoff happens while the owner keeps typing, a key every 25 ms, straight through the
   // notice, the tab switch and the successor pane's mount.
   const during = 'and these keys arrive while the wizard hands itself on to its successor tab; '
-  const handoffCall = call(caller, 'agents.handoff', { handoff, successor: true })
+  const handoffCall = call(caller, 'agents.handoff', { handoff, successor: true, force: true })
   await page.keyboard.type(during, { delay: 25 })
   const result = await handoffCall
   assert.equal(result.successor, true, JSON.stringify(result))
