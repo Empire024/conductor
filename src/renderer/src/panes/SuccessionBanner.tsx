@@ -17,12 +17,12 @@ export function successionOf(items: SessionProjection['items']): Succession | nu
   return null
 }
 
-/** Shown over a conversation that continued in a successor: it is read-only from here on, and
- *  the way to where the work went is one click. */
-export function SuccessionBanner({ succession, running }: { succession: Succession; running: boolean }) {
+/** Shown over a conversation that continued in a successor: it sends nothing from here on, and
+ *  the way to where the work went is one click (onOpen takes an unsent draft along). */
+export function SuccessionBanner({ succession, running, onOpen }: { succession: Succession; running: boolean; onOpen?: () => void }) {
   return <div className="sa-runtime-banner sa-runtime-succeeded" role="status">
     <GitBranchPlus size={15} aria-hidden="true" />
     <span><strong>Continued in {succession.title}</strong><small>{running ? 'This conversation is finishing its current step, then stops. ' : ''}It is read-only; its coworkers, wizard mode and remaining work moved to the successor.</small></span>
-    <button className="sa-runtime-resume" onClick={() => void window.conductor.agentControl.focusOrigin(succession.agentSessionId).catch(() => undefined)}><ArrowRight size={13} />Open {succession.title}</button>
+    <button className="sa-runtime-resume" onClick={() => onOpen ? onOpen() : void window.conductor.agentControl.focusOrigin(succession.agentSessionId).catch(() => undefined)}><ArrowRight size={13} />Open {succession.title}</button>
   </div>
 }

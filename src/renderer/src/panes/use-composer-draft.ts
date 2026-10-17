@@ -3,6 +3,7 @@ import { MAX_PROMPT_CHARS, type ContextAttachment } from '../../../shared/struct
 import { composerCommandQuery } from './composer-commands'
 import { ComposerDraftStore, composerDraftKey, type ComposerDraft } from './composer-draft-store'
 import { composerSendBlock, promptCharacterCount, type ComposerSendBlock } from './composer-settings'
+import { finishSuccessionFollow, notifySuccessionArrival, successionFollowInto, type SuccessionFollow } from './succession-follow'
 
 const drafts = new ComposerDraftStore(() => localStorage, () => {
   window.dispatchEvent(new CustomEvent('conductor:toast', { detail: 'Could not save this message draft to disk. Keep this window open until you can save or send it.' }))
@@ -22,6 +23,29 @@ export function attachToDraft(projectId: string, sessionId: string, attachment: 
   drafts.update(composerDraftKey(projectId, sessionId), draft => ({
     ...draft, attachments: [...draft.attachments.filter(item => item.id !== attachment.id), attachment].slice(-20)
   }))
+}
+
+/** Moves a predecessor's unsent draft onto its successor's, once per follow, and tells a mounted
+ *  successor pane it arrived. */
+export function deliverSuccessionDraft(follow: SuccessionFollow): { caret: number; moved: boolean } {
+  if (follow.delivered) return follow.delivered
+  let caret: number | null = null
+  try { caret = follow.caret() } catch { caret = null }
+  follow.delivered = drafts.move(composerDraftKey(follow.projectId, follow.fromSessionId), composerDraftKey(follow.projectId, follow.toSessionId), caret)
+  notifySuccessionArrival(follow.projectId, follow.toSessionId)
+  return follow.delivered
+}
+
+/** A successor pane takes the follow under way into it: the draft moves now if the predecessor
+ *  has not moved it yet, and the caret to put the owner at comes back (null: nothing to take, or
+ *  the owner was not typing and no words came along). */
+export function receiveSuccessionDraft(projectId: string, sessionId: string): { caret: number } | null {
+  const follow = successionFollowInto(projectId, sessionId)
+  if (!follow) return null
+  // Finished first: the arrival notice that delivering sends must not take it a second time.
+  finishSuccessionFollow(follow)
+  const result = deliverSuccessionDraft(follow)
+  return result.moved || follow.focus ? { caret: result.caret } : null
 }
 
 /** Whether a conversation holds words or context not sent yet: a tab Conductor must not close on its own. */

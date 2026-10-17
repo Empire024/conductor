@@ -1,4 +1,5 @@
 import type { ContextAttachment } from '../../../shared/structured-agent'
+import { mergeMovedDraft } from './succession-follow'
 
 export interface ComposerDraft {
   revision: string
@@ -91,6 +92,22 @@ export class ComposerDraftStore {
     this.update(key, () => emptyDraft)
     // Sent text leaves storage at once so a crash cannot bring it back.
     this.flush(key)
+  }
+
+  /** Moves one conversation's unsent draft onto another's (a predecessor's onto its successor's,
+   *  succession-follow.ts) and writes both at once, so neither a crash nor a reload can leave the
+   *  words in both places or in neither. Attachments the target has no room for stay behind. */
+  move(fromKey: string, toKey: string, sourceCaret?: number | null): { caret: number; moved: boolean } {
+    if (fromKey === toKey) return { caret: this.get(toKey).message.length, moved: false }
+    const result = mergeMovedDraft(this.get(fromKey), this.get(toKey), sourceCaret)
+    if (!result.moved) return { caret: result.caret, moved: false }
+    // An anonymous conversation's words stay out of storage wherever they go.
+    if (this.memoryOnly.has(fromKey)) this.keepInMemory(toKey)
+    this.update(toKey, () => result.target)
+    this.update(fromKey, () => result.source)
+    this.flush(toKey)
+    this.flush(fromKey)
+    return { caret: result.caret, moved: true }
   }
 
   /** Writes unsaved drafts now: one conversation's, or every one when no key is given. */

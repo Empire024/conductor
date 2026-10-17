@@ -34,12 +34,13 @@ import { composerStarterChoices, prepareComposerDraft } from './composer-starter
 import { CONDUCTOR_FILE_DRAG, decodeConductorFileDrag, isComposerFileDrag } from '../components/composer-file-drop'
 import { concreteModel } from '../../../shared/agent-model-selection'
 import { localModelLabel } from '../../../shared/local-models'
-import { attachToDraft, useComposerDraft, useComposerTextSync } from './use-composer-draft'
+import { attachToDraft, deliverSuccessionDraft, receiveSuccessionDraft, useComposerDraft, useComposerTextSync } from './use-composer-draft'
+import { beginSuccessionFollow, hasSuccessionArrivalListener, shouldFollowSuccession, subscribeSuccessionArrival, successionFollowFrom, successionFollowInto, type SuccessionFollow } from './succession-follow'
 import { foldInsertedText, foldOversizedMessage, isPastedText, mayFoldInput, removePastedText, unfoldPastedText } from '../../../shared/pasted-text'
 import { canOpenPastedText, openPastedText } from '../pasted-text-open'
 import { initialPermission, rememberPermission } from './permission-memory'
 import { bannerAbsorbsError, runtimeBanner } from './runtime-banner'
-import { SuccessionBanner, successionOf } from './SuccessionBanner'
+import { SuccessionBanner, successionOf, type Succession } from './SuccessionBanner'
 import { cleanIpcError } from '../ipc-errors'
 import { copyText } from '../clipboard'
 import { onAgentControlGrants, onAgentControlSettings } from '../agent-control-settings'
@@ -133,6 +134,40 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const draftRef = useMemo(() => ({ get current() { return currentDraft() } }), [currentDraft])
   const composer = useRef<HTMLTextAreaElement>(null)
   const pane = useRef<HTMLElement>(null)
+  // A predecessor that handed itself on is taking the owner here with their unsent draft
+  // (succession-follow.ts): the composer is open to typing at once, before this conversation's
+  // snapshot is even loaded, and takes the focus and caret the owner had over there.
+  const [arriving, setArriving] = useState(() => Boolean(successionFollowInto(props.project.id, activeId)))
+  const arrivalCaret = useRef<number | null>(null)
+  const focusArrival = useCallback((): boolean => {
+    const node = composer.current, caret = arrivalCaret.current
+    if (caret === null || !node || node.disabled) return false
+    arrivalCaret.current = null
+    node.focus()
+    node.setSelectionRange(caret, caret)
+    return true
+  }, [])
+  useLayoutEffect(() => {
+    const receive = (): void => {
+      const arrival = receiveSuccessionDraft(props.project.id, activeId)
+      if (!arrival) return
+      arrivalCaret.current = arrival.caret
+      if (!focusArrival()) setArriving(true)
+    }
+    receive()
+    return subscribeSuccessionArrival(props.project.id, activeId, receive)
+  }, [props.project.id, activeId, focusArrival])
+  useLayoutEffect(() => { if (arriving) focusArrival() }, [arriving, focusArrival])
+  useEffect(() => { if (arriving && ready) setArriving(false) }, [arriving, ready])
+  // Leaving a conversation that is taking the owner to its successor moves what they typed up to
+  // the last keystroke. A layout cleanup runs before the successor pane's layout effects in the
+  // same commit, so the words are in its composer before it paints.
+  const followSource = useRef({ projectId: props.project.id, activeId })
+  followSource.current = { projectId: props.project.id, activeId }
+  useLayoutEffect(() => () => {
+    const follow = successionFollowFrom(followSource.current.projectId, followSource.current.activeId)
+    if (follow) deliverSuccessionDraft(follow)
+  }, [])
   // Recall silently edits the prompt, so the ledger of what it injected is loaded alongside
   // the timeline and shown against the message it rode with.
   const [turnRecalls, setTurnRecalls] = useState<TurnMemoryRecall[]>([])
@@ -443,6 +478,9 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     const sent = oversized ? [...draft.attachments, oversized.attachment] : draft.attachments
     const connectingMetadata = projection.phase === 'starting' && metadataConnectionId.current === activeId
     const queuing = ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase)
+    // A conversation that continued in a successor sends nothing itself: Enter takes the owner
+    // there with the draft, where the next Enter sends it.
+    if (succession) { followSuccession(succession); return }
     if (composerSendBlock(draft.message, draft.attachments) || submitLock.current || conversationSwitch.current || !ready || historical || (activePhases.has(projection.phase) && !connectingMetadata && !queuing) || projection.archived) return
     // Captured before the turn starts, and off actual user turns rather than
     // unstartedConversation: focusing the composer alone can already connect a runtime (to load
@@ -620,6 +658,8 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     return () => window.removeEventListener('keydown', openFind)
   }, [activeId, addFileOpen, dispatchFind])
 
+  // A main brain that handed itself on (agents.handoff successor:true) sends nothing from here.
+  const succession = useMemo(() => historical ? null : successionOf(projection.items), [projection.items, historical])
   const promptChars = draftView.nearLimitChars
   // Also decides whether the composer has a placeholder: only while the draft is empty, because
   // Blink rewrites a present placeholder's inline style on every keystroke (a style recalc per key).
@@ -628,7 +668,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   // the owner continues here, which stops the CLI and brings its turns into this timeline.
   const cliOwned = Boolean(props.cliDrawer?.owned)
   const cliIdle = !activePhases.has(projection.phase) && !projection.queued
-  const canSubmit = !cliOwned && ready && !historical && !resuming && sendBlocked !== 'oversized' && (!activePhases.has(projection.phase) || ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) || (projection.phase === 'starting' && metadataConnectionId.current === activeId)) && !projection.archived && (projection.phase !== 'disconnected' || unstartedConversation || Boolean(projection.nativeSessionId))
+  const canSubmit = !cliOwned && !succession && ready && !historical && !resuming && sendBlocked !== 'oversized' && (!activePhases.has(projection.phase) || ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) || (projection.phase === 'starting' && metadataConnectionId.current === activeId)) && !projection.archived && (projection.phase !== 'disconnected' || unstartedConversation || Boolean(projection.nativeSessionId))
   const steering = ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) && Boolean(projection.capabilities?.steering)
   const sendIntent = sendButtonIntent({ active: activePhases.has(projection.phase), interrupting: projection.phase === 'interrupting', draft: sendBlocked !== 'empty', needsResume, autoResumeOnSend: projection.phase === 'disconnected', steering, historical, canSubmit, submitting })
   const pendingSteering = projection.pendingSteering ?? []
@@ -636,10 +676,41 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const capabilities = projection.capabilities
   const banner = runtimeBanner({ phase: projection.phase, historical, unstarted: unstartedConversation, archived: projection.archived, ready, resuming, canResume: Boolean(capabilities?.resume && projection.nativeSessionId) })
   const shownError = bannerAbsorbsError(banner, error) ? '' : cleanIpcError(error)
-  // A main brain that handed itself on (agents.handoff successor:true) is read-only here, and
-  // main already cleared its wizard flag; the composer's copy follows so it is not saved back.
-  const succession = useMemo(() => historical ? null : successionOf(projection.items), [projection.items, historical])
+  // A main brain that handed itself on (agents.handoff successor:true) sends nothing from here,
+  // and main already cleared its wizard flag; the composer's copy follows so it is not saved back.
   useEffect(() => { if (succession) setSettings(current => current.wizard ? { ...current, wizard: false } : current) }, [succession])
+  // feature-list conductor-task:3a590e76. The composer stays editable through a succession (it was
+  // disabled, which froze a half-typed message and dropped the focus). A succession that arrives
+  // while the owner has this conversation open takes them to the successor, and the unsent draft
+  // goes along; if the successor cannot be opened, the draft stays here, editable.
+  const sawLiveFor = useRef<string | null>(null)
+  const followedFor = useRef<string | null>(null)
+  const followSuccession = useCallback((to: Succession): void => {
+    const node = composer.current
+    const typing = Boolean(node && document.activeElement === node)
+    const follow: SuccessionFollow = { projectId: props.project.id, fromSessionId: activeId, toSessionId: to.agentSessionId, focus: typing, caret: () => typing && node ? node.selectionEnd : null }
+    const cancel = beginSuccessionFollow(follow)
+    void window.conductor.agentControl.focusOrigin(to.agentSessionId).then(() => {
+      // Normally this pane is gone by now and moved the draft as it went. One still showing
+      // beside the successor (a split view) moves it now; with no successor pane to take it, the
+      // switch did not happen and the draft stays here.
+      requestAnimationFrame(() => {
+        if (follow.delivered) return
+        if (hasSuccessionArrivalListener(follow.projectId, follow.toSessionId)) deliverSuccessionDraft(follow)
+        else cancel()
+      })
+    }, (reason: unknown) => {
+      cancel()
+      setError(`Could not open ${to.title}; your message is still here: ${reason instanceof Error ? reason.message : String(reason)}`)
+    })
+  }, [activeId, props.project.id])
+  useEffect(() => {
+    if (!ready || historical || projection.sessionId !== activeId) return
+    if (!succession) { sawLiveFor.current = activeId; return }
+    if (!shouldFollowSuccession({ succession: true, sawLiveConversation: sawLiveFor.current === activeId, followed: followedFor.current === activeId, historical })) return
+    followedFor.current = activeId
+    followSuccession(succession)
+  }, [ready, historical, succession, activeId, projection.sessionId, followSuccession])
   const pending = useMemo(() => projection.items.filter((item) => item.data.type === 'interaction' && item.data.interaction.status === 'pending').length, [projection.items])
   const residentItems = useMemo(() => projection.items.filter(isConversationActivity), [projection.items])
   // The projection holds the latest 2000 items; anything older is paged in from the store as the
@@ -1039,7 +1110,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     </AgentDialog>}
     {shownError && <div className="sa-error-bar" role="alert"><span>{shownError}</span><button aria-label="Dismiss error" onClick={() => setError('')}><X size={13} /></button></div>}
     {historical && <div className="sa-history-banner" role="status"><span><strong>{resuming ? 'Reconnecting conversation...' : 'Previewing saved conversation'}</strong><small>{projection.title || 'Saved messages'} ? Resume to continue from here.</small></span><button disabled={resuming} onClick={() => { setReady(false); setActiveId(props.resourceId); setHistorical(false) }}><ArrowLeft size={13} /> Back to current</button>{capabilities?.resume && projection.nativeSessionId && <button disabled={!ready || resuming || projection.archived} onClick={() => void resume()}>{resuming ? <LoaderCircle size={13} className="spin" /> : <Play size={13} />}{resuming ? 'Reconnecting...' : 'Resume this conversation'}</button>}</div>}
-    {succession && <SuccessionBanner succession={succession} running={activePhases.has(projection.phase)} />}
+    {succession && <SuccessionBanner succession={succession} running={activePhases.has(projection.phase)} onOpen={() => followSuccession(succession)} />}
     {banner && <div className={'sa-runtime-banner sa-runtime-' + projection.phase} role="status"><PlugZap size={15} aria-hidden="true" /><span><strong>{banner.title}</strong><small>{banner.detail}</small></span>{banner.resume && <button className="sa-runtime-resume" disabled={banner.disabled} onClick={() => void resume()}>{resuming ? <LoaderCircle size={13} className="spin" /> : <Play size={13} />}{resuming ? 'Reconnecting...' : 'Resume conversation'}</button>}</div>}
     {find.open && <ConversationFindBar query={find.query} count={findMatches.length} index={find.index} results={findResults} searching={findSearching} focusToken={findFocus} onQuery={query => dispatchFind({ type: 'query', query })} onStep={direction => dispatchFind({ type: 'step', direction, count: findMatches.length })} onOpenHit={openFindHit} onClose={() => { dispatchFind({ type: 'close' }); if (composer.current && !composer.current.disabled) composer.current.focus(); else timeline.current?.focus() }} />}
     {timelineView}
@@ -1059,7 +1130,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       {attachments.length > 0 && <div className="sa-context-chips">{attachments.map(attachment => <span key={attachment.id}><button type="button" title={canOpenPastedText(attachment) ? 'Open the pasted text as a file' : 'Inspect attached context'} onClick={() => { if (canOpenPastedText(attachment)) void openPastedText(props.project.id, attachment); else setInspectAttachment(attachment) }}>{attachment.kind === 'image' && <PromptImageThumbnail projectId={props.project.id} attachment={attachment} />}{attachment.name}{attachment.startLine ? ':' + attachment.startLine + (attachment.endLine ? '–' + attachment.endLine : '') : ''}</button>{isPastedText(attachment) && <button type="button" aria-label={'Put ' + attachment.name + ' back in the message as text'} title="Put back in the message as text" onClick={() => { const next = unfoldPastedText(draftRef.current.message, draftRef.current.attachments, attachment.id); setDraft(next.message, next.attachments) }}><Undo2 size={11} /></button>}<button type="button" aria-label={'Remove context ' + attachment.name} onClick={() => { if (isPastedText(attachment)) { const next = removePastedText(draftRef.current.message, draftRef.current.attachments, attachment.id); setDraft(next.message, next.attachments) } else setAttachments(current => current.filter(item => item.id !== attachment.id)) }}><X size={11} /></button></span>)}</div>}
       {promptChars > MAX_PROMPT_CHARS * 0.9 && <p className={'sa-prompt-limit' + (sendBlocked === 'oversized' ? ' sa-prompt-limit-over' : '')} role="status">{sendBlocked === 'oversized' ? `Too large to send: ${promptChars.toLocaleString()} of ${MAX_PROMPT_CHARS.toLocaleString()} characters including attachments. Remove or shorten an attachment, or trim the message.` : `${promptChars.toLocaleString()} / ${MAX_PROMPT_CHARS.toLocaleString()} characters`}</p>}
       {commandsOpen && <CommandAutocomplete id={commandListId} commands={commands} selected={Math.min(commandIndex, commands.length - 1)} loading={commandLoading} onSelect={setCommandIndex} onChoose={chooseCommand} />}
-      <ComposerTextarea projectId={props.project.id} sessionId={activeId} textareaRef={composer} aria-autocomplete="list" aria-controls={commandsOpen ? commandListId : undefined} aria-expanded={commandsOpen} aria-activedescendant={commandsOpen ? commandListId + '-' + Math.min(commandIndex, commands.length - 1) : undefined} aria-label={'Message ' + name} placeholder={sendBlocked !== 'empty' ? undefined : succession ? `Continued in ${succession.title}; send messages there` : cliOwned ? 'The native CLI has this conversation. Continue in Chat to send here.' : historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : steering ? (pendingSteering.some(input => input.status === 'sending' || input.status === 'accepted') ? 'Add another message' : 'Message after the next tool use') : activePhases.has(projection.phase) ? 'Queue a message after this turn' : 'Message ' + name} disabled={!ready || historical || resuming || projection.archived || cliOwned || Boolean(succession)} rows={2} onFocus={() => { if (ready && !historical && !projection.nativeSessionId && !activePhases.has(projection.phase)) void connect().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }} onBlur={() => { setCommandDismissed(true); flushDraft() }} onChange={event => {
+      <ComposerTextarea projectId={props.project.id} sessionId={activeId} textareaRef={composer} aria-autocomplete="list" aria-controls={commandsOpen ? commandListId : undefined} aria-expanded={commandsOpen} aria-activedescendant={commandsOpen ? commandListId + '-' + Math.min(commandIndex, commands.length - 1) : undefined} aria-label={'Message ' + name} placeholder={sendBlocked !== 'empty' ? undefined : succession ? `Continued in ${succession.title}; send messages there` : cliOwned ? 'The native CLI has this conversation. Continue in Chat to send here.' : historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : steering ? (pendingSteering.some(input => input.status === 'sending' || input.status === 'accepted') ? 'Add another message' : 'Message after the next tool use') : activePhases.has(projection.phase) ? 'Queue a message after this turn' : 'Message ' + name} disabled={(!ready && !arriving) || historical || resuming || projection.archived || cliOwned} rows={2} onFocus={() => { if (ready && !historical && !projection.nativeSessionId && !activePhases.has(projection.phase)) void connect().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }} onBlur={() => { setCommandDismissed(true); flushDraft() }} onChange={event => {
         // A long paste or drop folds into a "[Pasted text #N: L lines]" chip, as the Claude CLI does.
         // Only an event that could have inserted a long run pays for diffing the whole draft.
         const input = event.nativeEvent as Partial<InputEvent>
