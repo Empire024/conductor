@@ -738,13 +738,14 @@ export class ProductionStore {
 
   // ---- human-review answers ---------------------------------------------------------------------
 
-  /** Records (or replaces) the answer to one human-review item; results and findings stay as they were. */
+  /** Records (or replaces) the answer to one human-review item (or meaning); results and findings stay as they were. */
   answerReview(record: ReviewAnswerRecord): ReviewAnswerRecord {
     return this.tx(record.projectId, () => {
       const saved: ReviewAnswerRecord = { ...record, note: record.note === null ? null : text(record.note, 2_000) }
       this.db.prepare(`INSERT INTO ${T.reviewAnswers} (project_id, environment_id, item_id, answered_at, data) VALUES (?, ?, ?, ?, ?)
         ON CONFLICT (project_id, environment_id, item_id) DO UPDATE SET answered_at = excluded.answered_at, data = excluded.data`)
-        .run(saved.projectId, saved.environmentId, saved.itemId, saved.answeredAt, JSON.stringify(saved))
+        // Keyed by meaning when known, so a regenerated item's answer replaces the earlier answer to the same question (review-carry.ts).
+        .run(saved.projectId, saved.environmentId, saved.reviewKey || saved.itemId, saved.answeredAt, JSON.stringify(saved))
       return saved
     })
   }

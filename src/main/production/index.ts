@@ -21,6 +21,7 @@ import { recordsAdapter } from './checks/commerce-support'
 import { createFsSourceTree } from './discovery'
 import { tlsPolicyOf } from './netpolicy'
 import { runDrift, type DriftOutcome, type DriftPorts } from './drift'
+import { CHANGE_MAX_WAIT_MS, CHANGE_QUIET_WINDOW_MS, LOCK_FILES, QuietWindow, coveredFilesOf, filterCommitPaths, gitChangedFiles } from './change-filter'
 import { classifyChange, computeFingerprint, hashFiles, normalisePolicyText, type FingerprintFile } from './fingerprint'
 import { applyReviewAnswers, computeGate } from './gate'
 import type { InterpreterPorts } from './interpret'
@@ -29,6 +30,7 @@ import {
   dismissQuestion as dismissProfileQuestion, revokeWrites as removeWriteAuthorization,
 } from './profile'
 import { REGISTRY } from './registry'
+import { reviewKey } from './review-carry'
 import { ProductionRunner, guestStateAccount, type BrowserFactoryOptions, type FingerprintRequest, type RunnerDeps } from './runner'
 import { ACTIVE_RUN_STATUSES, OWNER, type ProductionStore, type ReconcileRunOutcome } from './store'
 import { ensureFixTasks, type FixTaskBoard, type FixTaskOutcome } from './tasks'
@@ -70,8 +72,10 @@ export interface ProductionDeps {
   discovery?: boolean
   leaseTtlMs?: number
   checkTimeoutMs?: number
-  /** Delay between a watched file change and the change trigger (default 30 s). */
+  /** Quiet window between the last watched file change of a burst and the change trigger (default CHANGE_QUIET_WINDOW_MS). */
   changeDebounceMs?: number
+  /** Files changed between two commits of a project; null when unknown (then the commit counts as covered). Default: git diff. */
+  changedFiles?(projectId: string, from: string, to: string): Promise<string[] | null>
   log?(line: string): void
 }
 
@@ -80,7 +84,6 @@ export const OWNER_ACTOR: Actor = { kind: 'owner', agentSessionId: null, title: 
 
 export type ProductionService = ReturnType<typeof createProductionService>
 
-const LOCK_FILES = ['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'composer.lock', 'Gemfile.lock', 'poetry.lock', 'Pipfile.lock', 'requirements.txt', 'go.sum', 'Cargo.lock']
 const MAX_FILE_BYTES = 512 * 1024
 
 export function createProductionService(deps: ProductionDeps) {
@@ -201,7 +204,9 @@ export function createProductionService(deps: ProductionDeps) {
 
   // ---- change detection from the file watcher ---------------------------------------------------
   const watchers = new Map<string, () => void>()
-  const pendingChange = new Map<string, NodeJS.Timeout>()
+  const quietMs = deps.changeDebounceMs ?? CHANGE_QUIET_WINDOW_MS
+  const pendingChange = new QuietWindow(quietMs, Math.max(CHANGE_MAX_WAIT_MS, quietMs), () => clock().getTime())
+  const changedFiles = deps.changedFiles ?? (async (projectId: string, from: string, to: string) => { const root = deps.projectRoot(projectId); return root ? gitChangedFiles(root, from, to) : null })
   const watchProject = (projectId: string): void => {
     if (!deps.watch || watchers.has(projectId)) return
     const root = deps.projectRoot(projectId)
@@ -211,8 +216,8 @@ export function createProductionService(deps: ProductionDeps) {
       if (!profile?.designation.productionReady) return
       const relevant = paths.some(path => isRelevantChange(path, root, profile))
       if (!relevant) return
-      clearTimeout(pendingChange.get(projectId))
-      pendingChange.set(projectId, setTimeout(() => { pendingChange.delete(projectId); void service.detectChange(projectId).catch(error => deps.log?.(`production change detection failed: ${String(error)}`)) }, deps.changeDebounceMs ?? 30_000))
+      // One detection per quiet window: a burst of commits yields one change run.
+      pendingChange.touch(projectId, () => { void service.detectChange(projectId).catch(error => deps.log?.(`production change detection failed: ${String(error)}`)) })
     }))
   }
 
@@ -264,7 +269,6 @@ export function createProductionService(deps: ProductionDeps) {
     async stop(): Promise<void> {
       for (const stop of watchers.values()) stop()
       watchers.clear()
-      for (const timer of pendingChange.values()) clearTimeout(timer)
       pendingChange.clear()
       await runner.stop()
     },
@@ -326,7 +330,8 @@ export function createProductionService(deps: ProductionDeps) {
     /**
      * Answers one human-review item of the environment's last completed run (the owner or a wizard;
      * the control layer checks who). The answer is kept per item id and carried to later runs until
-     * a change invalidates the control; results and findings are never edited.
+     * a change invalidates the control; results and findings are never edited. The item's wording
+     * is kept too, so a later run's regenerated item that asks the same thing receives the answer.
      */
     answerReview(projectId: string, request: { itemId: string; answer: ReviewAnswer; note?: string | null; environmentId?: string | null }, actor: Actor = OWNER_ACTOR): ReviewAnswerRecord {
       if (request.answer !== 'confirmed' && request.answer !== 'rejected') throw new Error('answer must be confirmed or rejected')
@@ -338,6 +343,7 @@ export function createProductionService(deps: ProductionDeps) {
       return store.answerReview({
         projectId, environmentId: environment.id, itemId: item.id, controlId: item.controlId, answer: request.answer, note: request.note?.trim() ? request.note.trim() : null,
         answeredBy: actorName(actor), answeredAt: clock().toISOString(), runId: completed.id, fingerprint: completed.fingerprint,
+        question: item.question, route: item.route, reviewKey: reviewKey(item),
       })
     },
 
@@ -393,7 +399,13 @@ export function createProductionService(deps: ProductionDeps) {
     runDrift: (projectId: string, signal: AbortSignal = new AbortController().signal): Promise<DriftOutcome> => runDrift(driftPorts, projectId, signal),
     driftPorts,
 
-    /** Recomputes the target without the network and starts a change run when a component moved. */
+    /**
+     * Recomputes the target without the network and starts a change run when a component moved.
+     * A moved commit counts only when the commits since the run that covers the target (the active
+     * run, else the last completed one) touched a file an audit covers (change-filter.ts): a commit
+     * of docs, scratch files or tests starts nothing. A queued change run that has not started yet
+     * is replaced by one for the newer target; a running one gets one follow-up (latest wins).
+     */
     async detectChange(projectId: string): Promise<{ changes: ChangeClass[]; outcome: RunRequestOutcome | null }> {
       const { profile, environment } = requireEnvironment(projectId)
       const last = store.lastCompletedRun(projectId, environment.id)
@@ -406,7 +418,30 @@ export function createProductionService(deps: ProductionDeps) {
       current.set(key(projectId, environment.id), next)
       const changes = classifyChange(last.fingerprint, next)
       if (!changes.length) return { changes, outcome: null }
-      const outcome = await startRun(projectId, environment.id, 'audit', trigger('change', CONDUCTOR_ACTOR, clock(), `The project changed: ${changes.join(', ')}`, changes))
+      const active = store.activeRun(projectId, environment.id)
+      // What is new beyond the run that already covers the target. Against an active run only the
+      // file-derived components compare (its policy and route hashes come from the live site).
+      const fresh = active ? classifyChange(active.fingerprint, next).filter(change => change === 'code' || change === 'configuration' || change === 'dependency' || change === 'profile' || change === 'registry') : changes
+      const base = active ?? last
+      if (active && !fresh.length) return { changes, outcome: { outcome: 'dropped', reason: `Run ${active.id} (${active.status}) already audits this target.`, run: active } }
+      if (fresh.length === 1 && fresh[0] === 'code' && base.fingerprint.commit && next.commit) {
+        const files = await changedFiles(projectId, base.fingerprint.commit, next.commit).catch(() => null)
+        if (files) {
+          const filtered = filterCommitPaths(files, coveredFilesOf(profile))
+          if (!filtered.triggers) {
+            const reason = `The commits ${base.fingerprint.commit.slice(0, 12)}..${next.commit.slice(0, 12)} touched only files no audit covers (${filtered.ignored.length} file(s): docs, scratch, tests); no change run.`
+            deps.log?.(`production ${projectId}: ${reason}`)
+            return { changes, outcome: { outcome: 'dropped', reason, run: active ?? null } }
+          }
+        }
+      }
+      let merged = changes
+      if (active && active.status === 'queued' && active.trigger.kind === 'change') {
+        // Not started yet: replace it with one run for the newer target instead of queueing a second.
+        merged = [...new Set([...active.trigger.changes, ...changes])]
+        runner.cancel(active.id, `Superseded by a newer change of the project (${next.commit?.slice(0, 12) ?? 'unknown commit'}) before it started`)
+      }
+      const outcome = await startRun(projectId, environment.id, 'audit', trigger('change', CONDUCTOR_ACTOR, clock(), `The project changed: ${merged.join(', ')}`, merged))
       return { changes, outcome }
     },
 

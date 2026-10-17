@@ -729,14 +729,18 @@ export interface HumanReviewItem {
   evidence: string[]
   /**
    * Set once a sovereign caller answered the item (production.review.answer). Answers are kept per
-   * project, environment and item id, and carried to a later run's item with the same id unless a
-   * change since the answer invalidated the control. When every item of a control is answered the
-   * gate lifts its NEEDS_HUMAN_REVIEW cap; a `rejected` answer makes the control FAIL.
+   * project, environment and meaning (control, route, normalised question), and carried to a later
+   * run's item that asks the same thing, whatever its id, unless a change since the answer
+   * invalidated the control (a code or deployment change alone does not; review-carry.ts). When
+   * every item of a control is answered the gate lifts its NEEDS_HUMAN_REVIEW cap; a `rejected`
+   * answer makes the control FAIL.
    */
   answer?: ReviewAnswer | null
   note?: string | null
   answeredBy?: string | null
   answeredAt?: string | null
+  /** The run whose same-meaning item the answer was given to, when it was carried forward from an earlier run. */
+  carriedFrom?: string | null
 }
 
 /** A stored answer to a human-review item (table `production_review_answers`). */
@@ -752,6 +756,14 @@ export interface ReviewAnswerRecord {
   /** The run whose item was answered, and the target it described. */
   runId: string
   fingerprint: TargetFingerprint
+  /**
+   * The answered item's wording and route, so a later run's regenerated item (new id, same control
+   * and meaning) receives the answer (review-carry.ts). Absent on answers recorded before.
+   */
+  question?: string | null
+  route?: string | null
+  /** Control, route and normalised meaning; the stored answer's key when present (one answer per meaning). */
+  reviewKey?: string | null
 }
 
 export interface ControlResult {

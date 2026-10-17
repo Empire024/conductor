@@ -5,6 +5,7 @@ import {
 } from '../../shared/production'
 import { classifyChange } from './fingerprint'
 import { controlsInvalidatedBy } from './registry'
+import { matchAnswers, type AnswerMatch } from './review-carry'
 
 /**
  * The release gate (docs/production-agent.md section 7): pure functions, recomputed from runs,
@@ -45,21 +46,33 @@ export function controlStatus(definition: Pick<ControlDefinition, 'humanReviewAl
 
 /**
  * The owner's answers laid over a run's results (production.review.answer). An answer counts for
- * the item it answered, and for a later run's item with the same id unless a change between the
- * target it answered and this run's target invalidates the control. Once every item of a control
+ * the item it answered, and for a later run's item that asks the same thing (control, route and
+ * meaning, review-carry.ts; marked `carriedFrom`) unless a change other than code or deployment
+ * between the target it answered and this run's target invalidates the control. An older answer
+ * recorded without its wording still matches by item id, under any invalidating change. Once every item of a control
  * is answered, its NEEDS_HUMAN_REVIEW cap lifts to the worst of its checks (a check's own
  * human-review floor counts as PASS); any `rejected` answer makes the control FAIL instead.
  */
 export function applyReviewAnswers(results: readonly ControlResult[], answers: readonly ReviewAnswerRecord[], runFingerprint: TargetFingerprint | null): ControlResult[] {
   if (!answers.length) return [...results]
-  const byItem = new Map(answers.map(answer => [answer.itemId, answer]))
   return results.map(result => {
     if (!result.humanReview.length) return result
-    const holds = (answer: ReviewAnswerRecord): boolean => answer.runId === result.runId || !runFingerprint
-      || !controlsInvalidatedBy(classifyChange(answer.fingerprint, runFingerprint)).includes(result.controlId)
+    const mine = answers.filter(answer => answer.controlId === result.controlId)
+    // A legacy answer (matched by item id alone) needs a target no change since invalidated for the
+    // control. A same-meaning answer is a human's judgement of the same question: a code or
+    // deployment change alone does not void it; any other invalidating change does.
+    const holds = (match: AnswerMatch): boolean => {
+      if (match.how === 'same-item' || !runFingerprint) return true
+      const changes = classifyChange(match.answer.fingerprint, runFingerprint)
+      const relevant = match.how === 'meaning' ? changes.filter(change => change !== 'code' && change !== 'deployment') : changes
+      return !controlsInvalidatedBy(relevant).includes(result.controlId)
+    }
+    const matches = mine.length ? matchAnswers(result.runId, result.humanReview, mine) : new Map<string, AnswerMatch>()
     const items: HumanReviewItem[] = result.humanReview.map(item => {
-      const answer = byItem.get(item.id)
-      return answer && answer.controlId === result.controlId && holds(answer) ? { ...item, answer: answer.answer, note: answer.note, answeredBy: answer.answeredBy, answeredAt: answer.answeredAt } : item
+      const match = matches.get(item.id)
+      if (!match || !holds(match)) return item
+      const { answer } = match
+      return { ...item, answer: answer.answer, note: answer.note, answeredBy: answer.answeredBy, answeredAt: answer.answeredAt, ...(answer.runId !== result.runId ? { carriedFrom: answer.runId } : {}) }
     })
     const decorated = { ...result, humanReview: items }
     if (items.some(item => !item.answer) || result.status === 'NOT_APPLICABLE' || result.status === 'UNVERIFIED') return decorated
@@ -69,7 +82,8 @@ export function applyReviewAnswers(results: readonly ControlResult[], answers: r
     }
     if (result.status !== 'NEEDS_HUMAN_REVIEW') return decorated
     const lifted = worst(result.checks.map(check => check.status === 'NEEDS_HUMAN_REVIEW' || check.status === 'NOT_APPLICABLE' ? 'PASS' : check.status).concat(['PASS']))
-    return { ...decorated, status: lifted, rationale: `${result.rationale}\nEvery human-review item was confirmed (${[...new Set(items.map(item => item.answeredBy))].join(', ')}).`.slice(0, 8_000) }
+    const carried = [...new Set(items.map(item => item.carriedFrom).filter((runId): runId is string => !!runId))]
+    return { ...decorated, status: lifted, rationale: `${result.rationale}\nEvery human-review item was confirmed (${[...new Set(items.map(item => item.answeredBy))].join(', ')}${carried.length ? `; carried forward from run ${carried.join(', ')}` : ''}).`.slice(0, 8_000) }
   })
 }
 
