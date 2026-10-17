@@ -17,3 +17,8 @@
 .provider-allowance-gauge.high { --gauge: var(--danger); }
 .provider-allowance-gauge.high b { color: color-mix(in srgb, var(--danger) 85%, var(--text)); }
 .provider-allowance-gauge.unknown b { color: var(--text-3); }
+/* Weekly pacing (shared/allowance-pacing.ts): time left to the reset; orange/red when unused allowance is about to be lost.
+   Distinct from .warn/.high (near the limit), which colour the line: these colour only the number and the countdown. */
+.provider-allowance-left { min-width: 17px; font-style: normal; font-size: 8px; color: var(--text-3); font-variant-numeric: tabular-nums; text-align: right; }
+.provider-allowance-gauge.waste-warn b, .provider-allowance-gauge.waste-warn .provider-allowance-left { color: #f08a3c; }
+.provider-allowance-gauge.waste-high b, .provider-allowance-gauge.waste-high .provider-allowance-left { color: var(--danger); font-weight: 700; }

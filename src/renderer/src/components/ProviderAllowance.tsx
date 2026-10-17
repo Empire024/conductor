@@ -1,5 +1,6 @@
 import { memo, useEffect, useState } from 'react'
 import { nextAllowanceReset, windowShortLabel, type AllowanceGauge, type ProviderAllowanceRow } from '../../../shared/provider-allowance'
+import { allowancePacing, formatTimeLeft, pacingHint } from '../../../shared/allowance-pacing'
 import './ProviderAllowance.css'
 
 const W = 34, H = 11
@@ -49,11 +50,17 @@ export function gaugeTitle(name: string, gauge: AllowanceGauge, now = Date.now()
   return `${name} ${gauge.label.toLowerCase()}: ${used}${reset} · reported ${relative(now - Date.parse(gauge.observedAt))} ago`
 }
 
-function Gauge({ name, gauge, fallback }: { name: string; gauge: AllowanceGauge | undefined; fallback: string }): React.JSX.Element {
+function Gauge({ name, gauge, fallback, pacing: withPacing }: { name: string; gauge: AllowanceGauge | undefined; fallback: string; pacing?: boolean }): React.JSX.Element {
   if (!gauge) return <span className="provider-allowance-gauge empty" />
   const level = allowanceLevel(gauge.usedPercent)
   const path = sparklinePath(gauge)
-  return <span className={`provider-allowance-gauge ${level}`} title={gaugeTitle(name, gauge)} data-window={fallback}>
+  // Weekly only: unused allowance against time left. Its orange/red marks tokens about to be
+  // lost at the reset, a separate signal from the near-limit level colour of the line.
+  const pacing = withPacing ? allowancePacing(gauge) : null
+  const hint = pacing && pacingHint(pacing)
+  const waste = pacing?.state === 'waste-high' || pacing?.state === 'waste-warn' ? ` ${pacing.state}` : ''
+  const title = hint ? `${hint}\n${gaugeTitle(name, gauge)}` : gaugeTitle(name, gauge)
+  return <span className={`provider-allowance-gauge ${level}${waste}`} title={title} data-window={fallback} data-pacing={pacing?.state}>
     <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} aria-hidden="true">
       <line x1="0" x2={W} y1={H - 0.5} y2={H - 0.5} className="track" />
       {path && <path className="area" d={`${path} V${H - 0.5} H${sparklineStart(gauge)} Z`} />}
@@ -62,6 +69,7 @@ function Gauge({ name, gauge, fallback }: { name: string; gauge: AllowanceGauge 
     </svg>
     <b>{gauge.usedPercent === null ? '–' : `${Math.round(gauge.usedPercent)}%`}</b>
     <small>{windowShortLabel(gauge.windowMinutes, fallback)}</small>
+    {pacing && <i className="provider-allowance-left">{pacing.leftMs !== null && pacing.unusedPercent !== null ? formatTimeLeft(pacing.leftMs) : ''}</i>}
   </span>
 }
 
@@ -97,7 +105,7 @@ export const ProviderAllowance = memo(function ProviderAllowance(): React.JSX.El
   return <section className="provider-allowance" aria-label="Provider allowance">
     {rows.map(row => <div key={row.provider} className="provider-allowance-row" data-provider={row.provider}>
       <span className="provider-allowance-name" title={row.planType ? `${row.name} (${row.planType} plan)` : row.name}>{row.name}</span>
-      <Gauge name={row.name} gauge={row.weekly} fallback="wk" />
+      <Gauge name={row.name} gauge={row.weekly} fallback="wk" pacing />
       <Gauge name={row.name} gauge={row.short} fallback="short" />
     </div>)}
   </section>
