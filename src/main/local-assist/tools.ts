@@ -62,6 +62,17 @@ const SAMPLE_CHARS = 12_000
 const CALL_BUDGET_MS = 240_000
 /** A generation still running this long into the call is abandoned, under the 300 s client limit. */
 const CALL_HARD_LIMIT_MS = 285_000
+/** A Claude caller's budget instead. Claude Code's MCP client stops waiting for an HTTP MCP call
+ *  after about 60 s (CLIENT_WAIT_SEC; the `conductor-local` entry written for Claude sets no
+ *  per-server timeout), and an answer that lands after that reaches nobody: 2026-10-17, every
+ *  large-file local_ask on Qwen 3.6 and a 1.5 MB one on the 9B returned nothing. So a Claude call
+ *  starts no section that would end past CLAUDE_CALL_BUDGET_MS, stops a generation still running
+ *  at CLAUDE_HARD_LIMIT_MS and returns what it has, marked partial. Codex is given
+ *  tool_timeout_sec (mcp-server.ts) and keeps the longer budget. */
+const CLAUDE_CALL_BUDGET_MS = 45_000
+const CLAUDE_HARD_LIMIT_MS = 52_000
+/** A section is not started with less than this left of the hard limit. */
+const MIN_SECTION_MS = 5_000
 /** Slowest prompt reading a request is given time for before it counts as stuck. */
 const MIN_PROMPT_TOKENS_PER_SEC = 200
 /** Raised from 512 KB: at the old cap a needle past it was never read at all (never mind
@@ -232,6 +243,23 @@ export function promptTerms(prompt: string): string[] {
   return [...new Set([...quoted, ...words].map(term => term.toLowerCase()))].slice(0, 12)
 }
 
+/** Words asking for numbers to be worked out: a sum, a total, an average, a count over data.
+ *  local_ask has no calculator, and on 2026-10-17 all four installed models gave wrong totals over
+ *  three timesheet CSVs with confident, self-consistent working (2026-10-17-local-usefulness.md,
+ *  T4), so such a question is refused with the routes that do compute. */
+const ARITHMETIC_CUES = /\b(?:add(?:ing)? (?:up|together|them)|sum(?:s|med|ming)?|totals?|totall?ed|subtotals?|averages?|medians?|mean (?:of|value)|the mean|aggregate[sd]?|altogether|in total|percent(?:age)?s?|(?:calculate|compute|work out) (?:the|a|an|how|each|every|total|sum|average)|count (?:the|all|every|each|of|how)|number of (?:\w+ )?(?:rows|lines|records|entries|items|occurrences|errors|warnings|requests|hours)|how many (?:\w+ )?(?:rows|lines|records|entries|items|occurrences|errors|warnings|requests|hours|minutes|days|bytes)|how much (?:time|money|in total))\b/i
+/** "Sum it up" and "summarise" ask for a summary, not a sum. */
+const SUMMARY_PHRASE = /\bsum(?:marize|marise)?\s+(?:it|them|this|that|these|those|everything|things|all(?: of)?(?: it| this| that| them)?)?\s*up\b|\bsumm(?:ary|aries|ari[sz]e[sd]?|ari[sz]ing)\b/gi
+/** Questions about code that computes a number (where the total is computed, why the average is
+ *  wrong) and verbatim extraction of the values are what local_ask is for. */
+const ABOUT_CODE = /^\s*where\b|\b(?:where (?:is|are|does|do|did)|which (?:function|file|line|method|class|module)|why|implement(?:s|ed|ation)?|defined?|definition|declared?|bug|refactor|rename|computed? (?:in|by)|calculated? (?:in|by))\b/i
+const VERBATIM = /\bverbatim\b|\bas written\b|\bquote\b|\bexactly as\b/i
+export function asksForArithmetic(prompt: string): boolean {
+  const text = prompt.replace(SUMMARY_PHRASE, ' ')
+  return ARITHMETIC_CUES.test(text) && !ABOUT_CODE.test(text) && !VERBATIM.test(text)
+}
+export const ARITHMETIC_REFUSAL = 'Not sent to the local model: this asks for arithmetic (a sum, total, average, count or percentage), and local_ask has no calculator. Every local model tested gave wrong totals with confident working. Compute it yourself (a short script over the files), or hand it to a local agent turn, which has the calculate tool. local_ask can still extract the numbers for you: ask it to list the values verbatim with their line numbers, then add them up yourself. If this is not a calculation, rephrase it without words like total, sum, average or count.'
+
 export class LocalAssistTools {
   private readonly run: CommandRunner
   private readonly readText: (file: string, maxBytes: number) => Promise<string>
@@ -338,11 +366,18 @@ export class LocalAssistTools {
   /** local_ask / summarize_file: read project files on the host and have the local model answer. */
   async ask(agentSessionId: string, args: Record<string, unknown>, tool: 'local_ask' | 'summarize_file' = 'local_ask', signal?: AbortSignal): Promise<LocalAssistResult> {
     const session = this.session(agentSessionId)
+    const callStarted = this.now().getTime()
+    // Claude's MCP client hangs up at about 60 s; anyone else waits the HTTP client's 300 s.
+    const claude = session.provider === 'claude'
+    const callBudget = claude ? CLAUDE_CALL_BUDGET_MS : CALL_BUDGET_MS
+    const hardLimit = claude ? CLAUDE_HARD_LIMIT_MS : CALL_HARD_LIMIT_MS
+    const returnWithin = (): number => Math.max(1, callStarted + hardLimit - this.now().getTime())
     const prompt = text(args, 'prompt', 8000)!
     const maxLines = count(args, 'maxLines', 30, 3, 200)
     const requested = args.files === undefined ? [] : args.files
     if (!Array.isArray(requested) || requested.some(entry => typeof entry !== 'string' || !entry.trim() || entry.length > 1000)) throw new Error('files must be a list of project-relative paths')
     if (requested.length > MAX_FILES) throw new Error(`At most ${MAX_FILES} files per call`)
+    if (asksForArithmetic(prompt)) return { text: ARITHMETIC_REFUSAL, structured: { answered: false, refused: 'arithmetic' } }
     const files: Array<{ relative: string; text: string; bytes: number; truncated: boolean }> = []
     for (const entry of requested as string[]) {
       const file = await projectFile(session.cwd, entry)
@@ -371,15 +406,21 @@ export class LocalAssistTools {
       let outcome: LocalModelOutcome | undefined
       if (measured && measured > budget.limit) windowChars = Math.floor(windowChars * budget.limit / measured * 0.95)
       else {
-        outcome = await this.deps.runner.ask({ system: ASK_SYSTEM, user, maxTokens: singleTokens, timeoutMs: readingTimeout(user.length / budget.charsPerToken), signal })
+        outcome = await this.deps.runner.ask({ system: ASK_SYSTEM, user, maxTokens: singleTokens, timeoutMs: readingTimeout(user.length / budget.charsPerToken), returnWithinMs: returnWithin(), signal })
         if (!outcome.ok && outcome.contextExceeded && files.length) { windowChars = Math.floor(windowChars / 2); outcome = undefined }
       }
       if (outcome) {
+        const yourself = `read ${listing || 'the files'} yourself`, Yourself = `Read ${listing || 'the files'} yourself`
+        const partial = outcome.ok && outcome.answer.partial === true
+        const timedOut = partial || (!outcome.ok && outcome.deadline === true)
         const body = outcome.ok
-          ? `${capLines(outcome.answer.text, maxLines)}\n— ${outcome.answer.model}, local${listing ? `, over ${listing}` : ''}`
-          : `Local model unavailable: ${outcome.reason}. Nothing was summarised; read ${listing || 'the files'} yourself or call again shortly.`
-        this.record(session, tool, outcome.ok && !signal?.aborted ? rawChars : 0, body.length, outcome)
-        return { text: body, structured: { answered: outcome.ok, ...record } }
+          ? `${capLines(outcome.answer.text, maxLines)}\n— ${outcome.answer.model}, local${listing ? `, over ${listing}` : ''}${partial ? `\nPARTIAL / TIMED OUT: the local model was stopped at this call's ${Math.round(hardLimit / 1000)} s budget before it finished, so the answer above may be incomplete. ${Yourself} for the rest, or ask a narrower question about less material.` : ''}`
+          : timedOut
+            ? `TIMED OUT: the local model had not answered within this call's ${Math.round(hardLimit / 1000)} s budget (your MCP client stops waiting at about ${CLIENT_WAIT_SEC} s), so nothing was summarised. ${Yourself}, or ask about a smaller file or fewer files.`
+            : `Local model unavailable: ${outcome.reason}. Nothing was summarised; ${yourself} or call again shortly.`
+        // A partial answer still leaves the caller reading the files, so it saved nothing either.
+        this.record(session, tool, outcome.ok && !partial && !signal?.aborted ? rawChars : 0, body.length, outcome)
+        return { text: body, structured: { answered: outcome.ok, ...(timedOut ? { partial: true, timedOut: true } : {}), ...record } }
       }
       // It did not fit after all (the server counted more than the estimate, or refused it):
       // fall through to windows at the size the server allows.
@@ -402,25 +443,29 @@ export class LocalAssistTools {
     const queue = first.length && first.length < planned.length ? [...first, ...planned.filter(window => !first.includes(window))] : [...planned]
     const found: Array<{ window: AskWindow; text: string }> = []
     const unread: AskWindow[] = []
-    let inputTokens = 0, outputTokens = 0, usedModel = false, lastModel: string | undefined, stopped: string | undefined, examined = 0, calls = 0, sections = planned.length
-    const started = this.now().getTime()
+    let inputTokens = 0, outputTokens = 0, usedModel = false, lastModel: string | undefined, stopped: string | undefined, examined = 0, calls = 0, sections = planned.length, timedOut = false
+    const started = callStarted
+    const budgetText = callBudget >= 60_000 ? `${callBudget / 60_000} min` : `${Math.round(callBudget / 1000)} s`
+    const ranOut = `this call's ${Math.round(hardLimit / 1000)} s budget ran out${claude ? ` (your MCP client stops waiting at about ${CLIENT_WAIT_SEC} s)` : ''}`
     let slowest = 0
     const request = (window: AskWindow): string => `${prompt}\n\nExcerpt of ${label(window)}, ${window.bytes} bytes total${window.truncated ? `, only the first ${MAX_FILE_BYTES} bytes of the file were read` : ''}. Lines are numbered from the start of the file, not this excerpt:\n${window.lines.join('\n')}`
     const halve = (window: AskWindow): AskWindow[] => { const middle = Math.ceil(window.lines.length / 2); sections++; return [{ ...window, lines: window.lines.slice(0, middle), retried: true }, { ...window, lines: window.lines.slice(middle), retried: true }] }
     while (queue.length) {
       const window = queue.shift()!
       if (calls >= MAX_ASK_CHUNKS) { stopped = `one call reads at most ${MAX_ASK_CHUNKS} sections`; unread.push(window, ...queue.splice(0)); break }
-      if (calls && this.now().getTime() - started + slowest > CALL_BUDGET_MS) { stopped = `one call answers within ${CALL_BUDGET_MS / 60_000} min, and a section takes about ${Math.round(slowest / 1000)} s on this model`; unread.push(window, ...queue.splice(0)); break }
+      if (calls && this.now().getTime() - started + slowest > callBudget) { stopped = `one call answers within ${budgetText}, and a section takes about ${Math.round(slowest / 1000)} s on this model`; unread.push(window, ...queue.splice(0)); break }
+      if (started + hardLimit - this.now().getTime() < MIN_SECTION_MS) { stopped = ranOut; timedOut = true; unread.push(window, ...queue.splice(0)); break }
       const user = request(window)
       const measured = await this.deps.runner.promptTokens?.({ system: CHUNK_ASK_SYSTEM, user }, signal).catch(() => null)
       if (measured && measured > budget.limit && window.lines.length > 1) { queue.unshift(...halve(window)); continue }
       const sent = this.now().getTime()
-      const outcome = await this.deps.runner.ask({ system: CHUNK_ASK_SYSTEM, user, maxTokens: windowTokens, timeoutMs: Math.max(30_000, Math.min(readingTimeout(measured ?? user.length / budget.charsPerToken), started + CALL_HARD_LIMIT_MS - sent)), signal })
+      const outcome = await this.deps.runner.ask({ system: CHUNK_ASK_SYSTEM, user, maxTokens: windowTokens, timeoutMs: Math.max(30_000, Math.min(readingTimeout(measured ?? user.length / budget.charsPerToken), started + CALL_HARD_LIMIT_MS - sent)), returnWithinMs: returnWithin(), signal })
       slowest = Math.max(slowest, this.now().getTime() - sent)
       calls++
       if (!outcome.ok) {
         if (outcome.contextExceeded && !window.retried && window.lines.length > 1) { queue.unshift(...halve(window)); continue }
-        stopped = `local model failed: ${outcome.reason}`
+        if (outcome.deadline) { stopped = `${ranOut} before the local model finished reading a section`; timedOut = true }
+        else stopped = `local model failed: ${outcome.reason}`
         unread.push(window, ...queue.splice(0))
         break
       }
@@ -433,6 +478,8 @@ export class LocalAssistTools {
       // a section holding only A, and dropping the whole answer lost A (VR3 A4 fixture, both needles).
       const answer = outcome.answer.text.split('\n').filter(line => line.trim() && !line.toUpperCase().includes(NOT_FOUND)).join('\n').trim()
       if (answer) found.push({ window, text: answer })
+      // Stopped mid-answer at the budget: keep what it wrote, but nobody finished this section.
+      if (outcome.answer.partial) { examined--; stopped = `${ranOut} while the local model was answering`; timedOut = true; unread.push(window, ...queue.splice(0)); break }
     }
     // Hits in file order, whatever order they were read in.
     found.sort((a, b) => planned.indexOf(original(planned, a.window)) - planned.indexOf(original(planned, b.window)) || firstLine(a.window) - firstLine(b.window))
@@ -440,14 +487,15 @@ export class LocalAssistTools {
     const remainder = unread.length
       ? ` ${unread.length} of ${sections} sections of ${listing || 'the file(s)'} were not examined (${stopped}): ${unreadRanges(unread)}.${order} Read those lines yourself, or ask about a smaller file.`
       : ''
+    const cutNote = timedOut ? '\nPARTIAL / TIMED OUT: this answer covers only the sections named above as read; read the unexamined lines yourself.' : ''
     const body = found.length
-      ? `${capLines(found.map(hit => `${label(hit.window)}: ${hit.text}`).join('\n'), maxLines)}\n— local, over ${listing}; read ${examined} of ${sections} sections.${remainder}`
-      : `Not found in the ${examined} of ${sections} section(s) of ${listing || 'the file(s)'} read.${remainder}`
+      ? `${capLines(found.map(hit => `${label(hit.window)}: ${hit.text}`).join('\n'), maxLines)}\n— local, over ${listing}; read ${examined} of ${sections} sections.${remainder}${cutNote}`
+      : `Not found in the ${examined} of ${sections} section(s) of ${listing || 'the file(s)'} read.${remainder}${cutNote}`
     // A caller that hung up (Claude Code's MCP client gives up after about 60 s) never received
     // this answer, so it saved nothing: 2026-10-17, a 1.5 MB local_ask was credited 1.55 M
     // characters after the client had already timed out.
-    this.recordUsage(session, tool, usedModel && !signal?.aborted ? rawChars : 0, body.length, { inputTokens, outputTokens, usedModel, model: lastModel })
-    return { text: body, structured: { answered: usedModel && found.length > 0, chunks: sections, examined, ...record } }
+    this.recordUsage(session, tool, usedModel && !timedOut && !signal?.aborted ? rawChars : 0, body.length, { inputTokens, outputTokens, usedModel, model: lastModel })
+    return { text: body, structured: { answered: usedModel && found.length > 0, chunks: sections, examined, ...(timedOut ? { partial: true, timedOut: true } : {}), ...record } }
   }
 
   /** How much material one request may carry: the running server's own context less the answer,
@@ -501,10 +549,10 @@ export const LOCAL_ASSIST_TOOLS: LocalAssistToolSpec[] = [
   {
     name: 'local_ask',
     annotations: { readOnlyHint: true },
-    description: 'Have the local model read project files and answer: summarise, extract, classify, or find where something happens. Returns a short answer with file:line references instead of the file contents. Use it for large files you would otherwise read whole.',
+    description: `Have the local model read project files and answer: summarise, extract, classify, or find where something happens. Returns a short answer with file:line references instead of the file contents. Use it for large files you would otherwise read whole. It answers within about ${Math.round(CLAUDE_HARD_LIMIT_MS / 1000)} s for a Claude caller: an answer cut off there is marked PARTIAL / TIMED OUT with the lines nobody read. It does not do arithmetic (sums, totals, averages, counts): compute those yourself or in a local agent turn with the calculate tool.`,
     inputSchema: schema({
       prompt: { type: 'string', description: 'The question or instruction.' },
-      files: { type: 'array', items: { type: 'string' }, description: 'Project-relative paths to read (up to 12; each capped at 512 KB).' },
+      files: { type: 'array', items: { type: 'string' }, description: 'Project-relative paths to read (up to 12; each capped at 1.5 MB).' },
       maxLines: { type: 'number', description: 'Most answer lines (default 30).' }
     }, ['prompt']),
     call: (tools, id, args, signal) => tools.ask(id, args, 'local_ask', signal)

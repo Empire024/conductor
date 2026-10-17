@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { LocalModelOutcome, LocalModelRequest, SavingsRecord } from './contract'
 import { capLines, failureLines, modelExcerpt, splitLines, stripAnsi } from './digest'
-import { LocalAssistTools, hostCommandRunner, promptTerms, type CommandRunner, type LocalAssistSession } from './tools'
+import { ARITHMETIC_REFUSAL, LocalAssistTools, asksForArithmetic, hostCommandRunner, promptTerms, type CommandRunner, type LocalAssistSession } from './tools'
 
 let root: string
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'local-assist-')) })
@@ -289,7 +289,8 @@ describe('local_ask and summarize_file', () => {
     writeFileSync(join(root, 's7-1mb.log'), denseLog())
     let clock = Date.parse('2026-09-25T12:00:00Z')
     const server = strictServer({ onAsk: () => { clock += 75_000 } })
-    const tools = new LocalAssistTools({ session: () => session(), runner: server.runner, ledger: { record: () => undefined, summary: () => { throw new Error('unused') } }, now: () => new Date(clock) })
+    // Codex waits tool_timeout_sec; a Claude caller has the 60 s budget below.
+    const tools = new LocalAssistTools({ session: () => session({ provider: 'codex' }), runner: server.runner, ledger: { record: () => undefined, summary: () => { throw new Error('unused') } }, now: () => new Date(clock) })
     const result = await tools.ask('a1', { prompt: 'values on the NEEDLE-ALPHA and NEEDLE-OMEGA lines', files: ['s7-1mb.log'] })
     // 75 s a section: sections end at 75, 150 and 225 s; a fourth would end at 300 s, past 240.
     expect(server.asked).toHaveLength(3)
@@ -300,6 +301,75 @@ describe('local_ask and summarize_file', () => {
     expect(result.text).toContain(`read 3 of ${total} sections. ${total - 3} of ${total} sections of s7-1mb.log (`)
     expect(result.text).toMatch(/bytes\) were not examined \(one call answers within 4 min, and a section takes about 75 s on this model\): s7-1mb\.log lines \d+–\d+/)
     expect(result.text).toContain('Sections naming "needle-alpha", "needle-omega" were read first.')
+  })
+
+  it('budgets a Claude caller under its MCP client\'s 60 s: no section is started that would end past 45 s', async () => {
+    writeFileSync(join(root, 's7-1mb.log'), denseLog())
+    let clock = Date.parse('2026-10-17T12:00:00Z')
+    const server = strictServer({ onAsk: () => { clock += 30_000 } })
+    const records: SavingsRecord[] = []
+    const tools = new LocalAssistTools({ session: () => session(), runner: server.runner, ledger: { record: entry => records.push({ at: 'now', ...entry }), summary: () => { throw new Error('unused') } }, now: () => new Date(clock) })
+    const result = await tools.ask('a1', { prompt: 'values on the NEEDLE-ALPHA and NEEDLE-OMEGA lines', files: ['s7-1mb.log'] })
+    // 30 s a section: a second one would end at 60 s, past the 45 s budget.
+    expect(server.asked).toHaveLength(1)
+    expect(server.asked[0]!.returnWithinMs).toBe(52_000)
+    expect(result.text).toContain('NEEDLE-ALPHA configuration value: 48213-KESTREL')
+    expect(result.text).toMatch(/were not examined \(one call answers within 45 s, and a section takes about 30 s on this model\)/)
+  })
+
+  it('returns a Claude caller\'s answer cut off at the budget as PARTIAL / TIMED OUT and credits nothing', async () => {
+    writeFileSync(join(root, 'mid.log'), Array.from({ length: 2000 }, (_, index) => `line ${index} ok`).join('\n'))
+    const h = harness({ outcome: { ok: true, answer: { text: 'mid.log:12 first match', model: 'local/qwen3.6-35b-a3b', inputTokens: 9000, outputTokens: 8, durationMs: 52_000, partial: true } } })
+    const result = await h.tools.ask('a1', { prompt: 'Which lines mention ok?', files: ['mid.log'] })
+    expect(h.asked[0]!.returnWithinMs).toBeLessThanOrEqual(52_000)
+    expect(result.text).toContain('mid.log:12 first match')
+    expect(result.text).toContain('PARTIAL / TIMED OUT: the local model was stopped at this call\'s 52 s budget before it finished')
+    expect(result.text).toContain('Read mid.log (')
+    expect(result.structured).toMatchObject({ answered: true, partial: true, timedOut: true })
+    expect(h.records[0]).toMatchObject({ rawChars: 0, usedModel: true })
+
+    const silent = harness({ outcome: { ok: false, reason: 'the local model had not answered when the call\'s 52 s budget ran out', deadline: true } })
+    const nothing = await silent.tools.summarizeFile('a1', { path: 'mid.log' })
+    expect(nothing.text).toMatch(/^TIMED OUT: the local model had not answered within this call's 52 s budget \(your MCP client stops waiting at about 60 s\), so nothing was summarised\. Read mid\.log \(\d+ bytes\) yourself/)
+    expect(nothing.structured).toMatchObject({ answered: false, timedOut: true })
+  })
+
+  it('keeps the long budget for a Codex caller, whose client is given tool_timeout_sec', async () => {
+    writeFileSync(join(root, 'a.md'), '# Title\n'.repeat(100))
+    const h = harness({ session: { provider: 'codex' } })
+    await h.tools.ask('a1', { prompt: 'What is the title?', files: ['a.md'] })
+    expect(h.asked[0]!.returnWithinMs).toBe(285_000)
+  })
+
+  it('stops a windowed Claude call whose section is cut at the budget, keeping its hits and naming the rest', async () => {
+    writeFileSync(join(root, 's7-1mb.log'), denseLog())
+    const server = strictServer()
+    const tools = new LocalAssistTools({ session: () => session(), runner: { ...server.runner, ask: async request => { const outcome = await server.runner.ask(request); return outcome.ok ? { ok: true, answer: { ...outcome.answer, partial: true } } : outcome } }, ledger: { record: () => undefined, summary: () => { throw new Error('unused') } } })
+    const result = await tools.ask('a1', { prompt: 'values on the NEEDLE-ALPHA and NEEDLE-OMEGA lines', files: ['s7-1mb.log'] })
+    expect(server.asked).toHaveLength(1)
+    expect(result.text).toContain('NEEDLE-ALPHA configuration value: 48213-KESTREL')
+    expect(result.text).toMatch(/read 0 of \d+ sections\. \d+ of \d+ sections of s7-1mb\.log \(\d+ bytes\) were not examined \(this call's 52 s budget ran out \(your MCP client stops waiting at about 60 s\) while the local model was answering\)/)
+    expect(result.text).toContain('PARTIAL / TIMED OUT')
+    expect(result.structured).toMatchObject({ partial: true, timedOut: true })
+  })
+
+  it('refuses arithmetic over data with the routes that compute, without calling the model (T4)', async () => {
+    writeFileSync(join(root, 'week1.csv'), 'date,person,project,hours\n2026-10-01,Ana,x,7.5\n')
+    const h = harness()
+    const result = await h.tools.ask('a1', { prompt: 'The three CSV files in this workspace are weekly timesheets (date,person,project,hours). Give the total hours per person across all three files, and the grand total, exactly, one per line as Name: hours, then Grand total: hours.', files: ['week1.csv'] })
+    expect(h.asked).toHaveLength(0)
+    expect(h.records).toHaveLength(0)
+    expect(result.structured).toMatchObject({ answered: false, refused: 'arithmetic' })
+    expect(result.text).toBe(ARITHMETIC_REFUSAL)
+    expect(result.text).toMatch(/calculate tool/)
+    expect((await h.tools.summarizeFile('a1', { path: 'week1.csv', question: 'What is the average of the hours column?' })).structured).toMatchObject({ refused: 'arithmetic' })
+  })
+
+  it('tells arithmetic apart from extraction, summaries and questions about code', () => {
+    for (const ask of ['Give the total hours per person and the grand total', 'sum the amounts in expenses.csv by month', 'add up the hours in week1.csv per person', 'what is the average latency in this log?', 'How many ERROR lines are there?', 'count the rows where status is failed', 'What percentage of requests failed?', 'calculate the median response time', 'how much time did the build spend in tests in total'])
+      expect(asksForArithmetic(ask), ask).toBe(true)
+    for (const plain of ['Summarise this file: its purpose, its main parts with line numbers, and anything unusual.', 'sum it up for me', 'where is the total computed?', 'which function calculates the average?', 'why is the subtotal wrong in cart.ts?', 'List every hours value verbatim with its line number', 'List the exported functions and consts with their line numbers', 'Quote the ERROR lines with their timestamps and codes', 'values on the NEEDLE-ALPHA and NEEDLE-OMEGA lines', 'list the imports per file'])
+      expect(asksForArithmetic(plain), plain).toBe(false)
   })
 
   it('credits no saving for an answer whose caller hung up before it arrived', async () => {

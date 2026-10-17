@@ -25,7 +25,7 @@ export interface LocalModelRunnerOptions {
   generationTimeoutMs?: number
 }
 
-class Fallback { constructor(readonly reason: string, readonly contextExceeded = false) {} }
+class Fallback { constructor(readonly reason: string, readonly contextExceeded = false, readonly deadline = false) {} }
 /** How long a measured context or a located server is trusted before it is read again. */
 const LOCATE_MEMORY_MS = 30_000
 
@@ -128,19 +128,30 @@ export function createLocalModelRunner(ports: LocalModelRunnerPorts, options: Lo
 
   const generate = async (request: LocalModelRequest, endpoint: string, model: string, apiKey: string, started: number): Promise<LocalModelOutcome> => {
     const controller = new AbortController()
-    let timedOut = false
+    let timedOut = false, cut = false, streamed = ''
     const timeoutMs = request.timeoutMs ?? generationTimeoutMs
     const timer = setTimeout(() => { timedOut = true; controller.abort() }, timeoutMs)
+    // The caller's own return bound: what the model has written by then is returned, not lost.
+    const returnBy = request.returnWithinMs === undefined ? Infinity : started + request.returnWithinMs
+    const cutAfter = returnBy - ports.now()
+    const cutTimer = cutAfter < timeoutMs ? setTimeout(() => { cut = true; controller.abort() }, Math.max(0, cutAfter)) : undefined
     const onAbort = (): void => controller.abort()
     request.signal?.addEventListener('abort', onAbort)
+    const partial = (): LocalModelOutcome => {
+      const text = stripThinking(streamed)
+      if (!text) throw new Fallback(`the local model had not answered when the call's ${seconds(request.returnWithinMs ?? 0)} s budget ran out`, false, true)
+      return { ok: true, answer: { text, model, inputTokens: estimate(request.system.length + request.user.length), outputTokens: estimate(streamed.length), durationMs: ports.now() - started, partial: true } }
+    }
     try {
       cancelled(request.signal)
       const result = await ports.complete({
         endpoint, apiKey, model,
         messages: [{ role: 'system', content: request.system }, { role: 'user', content: request.user }],
         maxTokens: request.maxTokens, temperature: 0.2, reasoningEffort: 'none', signal: controller.signal,
+        onText: delta => { streamed += delta },
         ...(request.jsonSchema ? { jsonSchema: request.jsonSchema } : {}),
       })
+      if (cut && !timedOut) return partial()
       if (timedOut) throw new Fallback(`the local model did not answer within ${seconds(timeoutMs)} s`)
       cancelled(request.signal)
       const text = stripThinking(result.content ?? '')
@@ -156,12 +167,14 @@ export function createLocalModelRunner(ports: LocalModelRunnerPorts, options: Lo
       }
     } catch (error) {
       if (error instanceof Fallback) throw error
+      if (cut && !timedOut && !request.signal?.aborted) return partial()
       if (timedOut) throw new Fallback(`the local model did not answer within ${seconds(timeoutMs)} s`)
       if (request.signal?.aborted) throw new Fallback('the call was cancelled')
       if (contextExceeded(error)) throw new Fallback(`the request was longer than the local model's context (${safeDetail(error, [apiKey])})`, true)
       throw new Fallback(`the local model failed: ${safeDetail(error, [apiKey])}`)
     } finally {
       clearTimeout(timer)
+      if (cutTimer) clearTimeout(cutTimer)
       request.signal?.removeEventListener('abort', onAbort)
     }
   }
@@ -204,7 +217,7 @@ export function createLocalModelRunner(ports: LocalModelRunnerPorts, options: Lo
     },
     async ask(request) {
       const started = ports.now()
-      const deadline = started + (request.waitBudgetMs ?? MODEL_WAIT_BUDGET_MS)
+      const deadline = started + Math.min(request.waitBudgetMs ?? MODEL_WAIT_BUDGET_MS, request.returnWithinMs ?? Infinity)
       let locked = false
       try {
         cancelled(request.signal)
@@ -229,7 +242,7 @@ export function createLocalModelRunner(ports: LocalModelRunnerPorts, options: Lo
         if (busy) throw new Fallback(`the local model was busy for ${seconds(Math.min(ports.now(), deadline) - started)} s`)
         return await generate(request, `http://127.0.0.1:${port}`, model, apiKey, started)
       } catch (error) {
-        if (error instanceof Fallback) return { ok: false, reason: error.reason, ...(error.contextExceeded ? { contextExceeded: true } : {}) }
+        if (error instanceof Fallback) return { ok: false, reason: error.reason, ...(error.contextExceeded ? { contextExceeded: true } : {}), ...(error.deadline ? { deadline: true } : {}) }
         return { ok: false, reason: `the local model failed: ${safeDetail(error, [safeKey(ports)])}` }
       } finally {
         if (locked) release()

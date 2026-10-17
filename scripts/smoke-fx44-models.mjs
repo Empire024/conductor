@@ -5,11 +5,11 @@
 // is started through Conductor's own admission path (an idle server this Conductor started gives way),
 // and a server this parked instance started is stopped with it at the end.
 //   node scripts/smoke-lock.mjs --timeout-min 40 -- node scripts/smoke-fx44-models.mjs --model local/ornith1.5-9b --only A [--label L] [--minutes 35]
-// --only takes one of A, R, T (or a comma list). Correctness is graded by the verifier against the truth
+// --only takes one of A, R, T (or a comma list). --questions <file.json> swaps in another A/R set (see loadQuestions). Correctness is graded by the verifier against the truth
 // re-checked on the day; this script saves answers, pages read and timings under
 // artifacts/verification/2026-09-26-fx44.
-import { writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { readFileSync, writeFileSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { call, configure, failed, finish, launchParked, listProcesses, loadCheck, openProject, openTab, outputDir, poll, record, sleep, step, watchdog } from './verify-kit.mjs'
 
@@ -24,7 +24,7 @@ watchdog(minutes * 60)
 await loadCheck()
 
 const C = 'current', P = 'plain', H = 'history', R = 'research'
-const conversations = [
+const builtIn = [
   { id: 'A', questions: [
     [P, 'how many feet are in a mile'],
     [C, 'what was the final score of the yankees game last night'],
@@ -42,6 +42,25 @@ const conversations = [
     [R, 'which of those reviews did you actually open, and what was the main complaint in it?']
   ] }
 ]
+// --questions <file.json>: { conversations: [{ id, questions: [{ kind, prompt, truth?, source? } | [kind, prompt]] }] }
+// replaces the built-in set (a held-out set, e.g. docs/verification/2026-10-17-held-out-web-questions.json).
+// Conversation T is the timesheet swarm below and is not read from the file.
+function loadQuestions(file) {
+  const parsed = JSON.parse(readFileSync(resolve(file), 'utf8'))
+  const list = Array.isArray(parsed) ? parsed : parsed.conversations
+  if (!Array.isArray(list) || !list.length) throw new Error(`${file}: expected { conversations: [...] }`)
+  return list.map(conversation => {
+    if (typeof conversation?.id !== 'string' || !Array.isArray(conversation.questions) || !conversation.questions.length) throw new Error(`${file}: every conversation needs an id and questions`)
+    return { id: conversation.id, questions: conversation.questions.map(question => {
+      const [kind, prompt] = Array.isArray(question) ? question : [question?.kind, question?.prompt]
+      if (![C, P, H, R].includes(kind) || typeof prompt !== 'string' || !prompt.trim()) throw new Error(`${file} ${conversation.id}: each question needs kind (${[C, P, H, R].join('/')}) and prompt`)
+      return [kind, prompt]
+    }) }
+  })
+}
+const questionsFile = arg('--questions', null)
+const conversations = questionsFile ? loadQuestions(questionsFile) : builtIn
+if (questionsFile) console.log(`[fx44] questions from ${questionsFile}: ${conversations.map(c => `${c.id}×${c.questions.length}`).join(', ')}`)
 const tool = name => String(name ?? '').split('__').at(-1)
 const SETTLED = new Set(['completed', 'failed', 'interrupted', 'idle'])
 const llama = async () => (await listProcesses()).list.filter(p => /^llama-server(\.exe)?$/i.test(p.name)).map(p => p.pid)
@@ -80,7 +99,8 @@ async function ask(id, prompt, timeoutMs) {
 const localTabs = async () => (await call('tabs.list')).filter(tab => tab.kind === 'agent' && tab.state?.provider === 'local')
 
 try {
-  const inst = await launchParked({ mode: 'playwright', env: only.some(id => id !== 'T') ? { CONDUCTOR_OFFLINE_TESTS: undefined } : {} })
+  // CONDUCTOR_SMOKE_MAIN: another build's main entry (a detached-worktree build), default out/main/index.js.
+  const inst = await launchParked({ mode: 'playwright', ...(process.env.CONDUCTOR_SMOKE_MAIN ? { build: resolve(process.env.CONDUCTOR_SMOKE_MAIN) } : {}), env: only.some(id => id !== 'T') ? { CONDUCTOR_OFFLINE_TESTS: undefined } : {} })
   record('env', 'INFO', { model: MODEL, servers: await servers(), llamaServers: await llama() }, 'local servers before the run')
   const projection = id => { const db = new DatabaseSync(join(inst.profile, 'conductor.db'), { readOnly: true }); try { return JSON.parse(db.prepare('SELECT projection_json FROM structured_sessions WHERE id = ?').get(id).projection_json) } finally { db.close() } }
   await openProject({ name: `FX44 ${short}`, files: { 'README.md': '# FX44 notes\n\nA scratch folder.\n', 'week1.csv': csv(week1), 'week2.csv': csv(week2) } })

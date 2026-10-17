@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { CompletionRequest, CompletionResult } from '../local-models/client.ts'
 import { DOLPHIN_X1_8B, ORNITH_9B, QWEN_9B, type LocalModelConfig } from '../local-models/config.ts'
 import type { LocalServerEntry } from '../local-models/servers.ts'
@@ -205,6 +205,38 @@ describe('local model runner', () => {
       complete: req => new Promise((_, reject) => req.signal!.addEventListener('abort', () => reject(new Error('aborted'))))
     })
     expect(await createLocalModelRunner(h.ports, { generationTimeoutMs: 20 }).ask(request)).toEqual({ ok: false, reason: 'the local model did not answer within 1 s' })
+  })
+
+  it('stops a generation at returnWithinMs and returns what it has written, marked partial', async () => {
+    vi.useFakeTimers()
+    try {
+      const h = harness({
+        servers: () => [entry(QWEN_9B, 6001)],
+        complete: req => new Promise((_, reject) => { req.onText?.('src/a.ts:3 first finding\n'); req.onText?.('src/b.ts:9 sec'); req.signal!.addEventListener('abort', () => reject(new Error('aborted'))) })
+      })
+      const pending = createLocalModelRunner(h.ports).ask({ ...request, timeoutMs: 120_000, returnWithinMs: 50_000 })
+      await vi.advanceTimersByTimeAsync(49_999)
+      let settled = false
+      void pending.then(() => { settled = true })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(settled).toBe(false)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(await pending).toMatchObject({ ok: true, answer: { text: 'src/a.ts:3 first finding\nsrc/b.ts:9 sec', model: QWEN_9B, partial: true } })
+    } finally { vi.useRealTimers() }
+  })
+
+  it('falls back with deadline when nothing was written by returnWithinMs, and keeps the plain timeout otherwise', async () => {
+    vi.useFakeTimers()
+    try {
+      const silent = (): ReturnType<typeof harness> => harness({ servers: () => [entry(QWEN_9B, 6001)], complete: req => new Promise((_, reject) => req.signal!.addEventListener('abort', () => reject(new Error('aborted')))) })
+      const cut = createLocalModelRunner(silent().ports).ask({ ...request, timeoutMs: 120_000, returnWithinMs: 50_000 })
+      await vi.advanceTimersByTimeAsync(50_000)
+      expect(await cut).toEqual({ ok: false, reason: 'the local model had not answered when the call\'s 50 s budget ran out', deadline: true })
+      // A generation timeout shorter than the return bound is the ordinary timeout, not a deadline.
+      const slow = createLocalModelRunner(silent().ports).ask({ ...request, timeoutMs: 10_000, returnWithinMs: 50_000 })
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(await slow).toEqual({ ok: false, reason: 'the local model did not answer within 10 s' })
+    } finally { vi.useRealTimers() }
   })
 
   it('stops when the caller cancels', async () => {

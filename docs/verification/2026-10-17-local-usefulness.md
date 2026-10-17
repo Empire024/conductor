@@ -176,3 +176,72 @@ project's Codex tab was using local assist during the 12-minute window when othe
 Raw answers, logs of the agent runs and the harness: `artifacts/verification/2026-10-17-local-usefulness/`
 (the harness runs from `.conductor-scratch/usefulness-20261017/`, where `node gen.mjs` regenerates the
 fixtures and `truth.json`).
+
+## Follow-up the same day: step 5 web part, local_ask budget and arithmetic (second coworker)
+
+### Step 5, held-out web comparison
+
+Question set `docs/verification/2026-10-17-held-out-web-questions.json`: same shape as VR9d/FX44 (5 current
+between 4 plain and 1 history; a research question and its follow-up), all new questions. Truth for each
+current question was read from its primary source at 07:56Z (GOV.UK content API, python.org release API,
+ECB daily XML, kernel.org releases.json, nodejs.org dist index; review pages for the research question),
+sources in the file. Run with the new `--questions` option, serially under smoke-lock, from a detached
+worktree build of `3e7ad23` (the shared `out/` was from 2026-10-06), default settings, one server at a
+time. Dolphin X1 8B was not run: improvement area 7 above rules it out of delegation. Answers:
+`artifacts/verification/2026-09-26-fx44/2026-10-held-out-<model>-{A,R}.answers.json`.
+
+| | Qwen 3.6 35B-A3B | Qwen 3.5 9B (default) | Ornith 1.5 9B |
+| --- | --- | --- | --- |
+| Plain + history (5) | 5/5 | 5/5 | 5/5 |
+| Current (5) | **5/5** (Node: "v24" line, no patch number) | 4/5: Node wrong ("26.x LTS, 26.11.1"; truth v24.22.0, v26 is Current) | **5/5** (Node 24.22.0 exact, but adds a false "26 became Active LTS on 28 October") |
+| UK PM (all pages failed to load) | right, from search snippets, 153 s | right, from snippets | right, 1 page read |
+| Research Q1 | consistent with truth, 3 pages read; one quote from an unopened Digital Trends snippet | consistent, 3 pages read | consistent, 4 pages read |
+| Research follow-up | **right**: the 3 opened pages and their verdicts | partial: ran an unrelated new search (Rotten Tomatoes), then listed the 3 opened pages without verdicts | partial: same unrelated search; PhoneArena 7.4, Trusted Reviews, Popular Mechanics verdicts right, but says it did not open Android Headlines, which it did |
+| Model time (12 answers) | 716 s (current median 44 s) | 106 s (median 8 s) | 113 s (median 8 s) |
+| Shape flags | Q7 (20 C to F) used calculate: right, answer printed twice | none | Q7 same as Qwen 3.6 |
+
+Total model time about 16 min, inside the 60 min bound. The step-5 picture is the file-task one again: Qwen
+3.6 is the only fully correct model, at 6-7x the 9B's latency; the 9B default is fast and right on 9/10 but
+gets a version-line question wrong with confidence; Ornith is as fast and as right as Qwen 3.6 on the
+current questions but misreports its own reads.
+
+New improvement areas from this run:
+9. **A follow-up about the conversation's own reads starts a fresh web search** on both 9B models
+   ("which of those reviews did you open"): web intent should treat a question about the previous turn's
+   sources as answerable from the conversation.
+10. **Every `web_read` failed on 3 of 12 questions** (news sites, exchange-rate pages); answers then
+    come from search snippets. They were right here, but the answer does not say it rests on snippets.
+
+### Code changes
+
+- **local_ask / summarize_file answer a Claude caller within its MCP client's wait** (area 1, the
+  budget route; no MCP `timeout` key was added, so no live-tab check was needed). A Claude caller's call
+  starts no section that would end past 45 s and stops a generation still running at 52 s; Codex callers
+  (given `tool_timeout_sec`) keep 240/285 s. The runner takes `returnWithinMs`: its waits end by then,
+  and a generation still running is stopped and returns what it has streamed as a `partial` answer, or a
+  `deadline` fallback when nothing was written. The tool answers `PARTIAL / TIMED OUT` / `TIMED OUT`
+  with the file to read yourself (and, windowed, the unread line ranges) and credits no saving.
+  run_and_summarize is unchanged. Files: `src/main/local-assist/contract.ts`, `model-runner.ts`,
+  `tools.ts`.
+- **Arithmetic is refused by local_ask** (area 4): `asksForArithmetic` (sum, total, average, median,
+  percentage, count/how many over rows, lines, hours…; not "summarise", "sum it up", questions about code,
+  or verbatim extraction) returns a refusal, without a model call, naming the routes that compute: a
+  script, or a local agent turn with `calculate`, and "list the values verbatim" for extraction. Routing
+  into the agent path was not chosen: local_ask has no agent session, sandbox or grants to run it in.
+- `scripts/smoke-fx44-models.mjs`: `--questions <file.json>` (built-in set stays the default) and
+  `CONDUCTOR_SMOKE_MAIN` to run a worktree build.
+- Tests: `model-runner.test.ts` (fake timers: partial at returnWithinMs, deadline fallback, plain
+  timeout unchanged), `tools.test.ts` (45 s Claude budget, partial and timed-out bodies, Codex keeps
+  285 s, windowed cut, T4 prompt refused, detector cases). `npm run typecheck` passes;
+  `src/main/local-assist` with `--maxWorkers=4`: 70/70.
+
+### Server state
+
+Start: Qwen 3.5 9B (pid 62220), idle. Each parked run stopped the server it started. End: Qwen 3.5 9B
+restarted by a `local_ask` from this tab (pid 35800, 08:18:25Z, `startedByConductor: true`), idle; the
+CPU decider untouched.
+
+### What remains
+
+Step 5 is now done for the three models worth comparing. Open improvement areas: 5, 6, 9, 10 (none
+blocks the item).

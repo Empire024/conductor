@@ -1,0 +1,29 @@
+{
+  "name": "2026-10-held-out",
+  "captured": "2026-10-17T07:56Z",
+  "note": "Held-out step-5 web set for frontier-local-usefulness-20260928 (docs/verification/2026-10-17-local-usefulness.md). Same shape as VR9d/FX44 (5 current between 4 plain and 1 history question; a research question and its follow-up), new questions. Truth for every current question was read from its primary source on the capture day; re-check before grading a later run. Used by: node scripts/smoke-fx44-models.mjs --questions docs/verification/2026-10-17-held-out-web-questions.json",
+  "conversations": [
+    {
+      "id": "A",
+      "questions": [
+        { "kind": "plain", "prompt": "how many ounces are in a pound", "truth": "16 (avoirdupois)" },
+        { "kind": "current", "prompt": "who is the uk prime minister right now?", "truth": "Andy Burnham (current role appointment on GOV.UK; predecessor Sir Keir Starmer)", "source": "https://www.gov.uk/api/content/government/ministers/prime-minister" },
+        { "kind": "plain", "prompt": "what's the difference between a virus and a bacterium, keep it short", "truth": "bacteria are single-celled living organisms that reproduce on their own; viruses are much smaller, not cells, and replicate only inside a host cell; antibiotics act on bacteria, not viruses" },
+        { "kind": "current", "prompt": "what's the newest version of python?", "truth": "Python 3.15.0, released 2026-10-09", "source": "https://www.python.org/api/v2/downloads/release/?is_published=true&pre_release=false" },
+        { "kind": "current", "prompt": "what's the euro to dollar exchange rate today?", "truth": "ECB reference rate 1 EUR = 1.1253 USD (2026-10-16, the latest fixing on a Saturday); a market quote within about 1.12-1.13 counts", "source": "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml" },
+        { "kind": "history", "prompt": "when did the berlin wall fall?", "truth": "9 November 1989" },
+        { "kind": "plain", "prompt": "convert 20 celsius to fahrenheit", "truth": "68 F" },
+        { "kind": "current", "prompt": "what's the latest stable linux kernel version?", "truth": "7.2.11 (stable, 2026-10-15); mainline is 7.3-rc7 (2026-10-12)", "source": "https://www.kernel.org/releases.json" },
+        { "kind": "plain", "prompt": "why do we have seasons?", "truth": "the Earth's axis is tilted about 23.4 degrees, so each hemisphere gets more direct sunlight and longer days for part of the orbit; not the distance from the Sun" },
+        { "kind": "current", "prompt": "what's the current lts version of node.js?", "truth": "v24.22.0 'Krypton' (2026-10-14); the Current line is v26.12.0", "source": "https://nodejs.org/dist/index.json" }
+      ]
+    },
+    {
+      "id": "R",
+      "questions": [
+        { "kind": "research", "prompt": "find what reviewers are saying about the google pixel 11 pro online and sum it up for me, with sources", "truth": "Mixed-positive: cameras (120x AI zoom) and software praised; complaints about little gain over the Pixel 10 Pro / value, heat and throttling (Smartprix: throttled to 55% in its CPU test), slow and hot wired charging (Android Authority), 12 GB RAM instead of 16 GB, disappointing battery life and EUR 1199 list price (Androidplanet, 7.2/10, page read 2026-10-17), weak portraits (91mobiles); Tom's Guide headline (read): 'a sprinkling of interesting features can't make up for offering little else'; 4gnews 4.5/5. Android Authority and 91mobiles answered 403 to a fetch; their points are from the search snippets", "source": "https://www.androidauthority.com/pixel-11-pro-review-3703549/ ; https://www.tomsguide.com/phones/google-pixel-phones/google-pixel-11-pro-pro-xl-review ; https://www.91mobiles.com/reviews/google-pixel-11-pro-review/ ; https://www.smartprix.com/bytes/google-pixel-11-pro-review-as-incrimental-as-updates-gets/ ; https://www.androidplanet.nl/reviews/google-pixel-11-pro-review/" },
+        { "kind": "research", "prompt": "which of those reviews did you actually open, and what score or verdict did it give?", "truth": "must name only pages its web_read actually opened (graded against the run's own read list), with that page's verdict or score" }
+      ]
+    }
+  ]
+}

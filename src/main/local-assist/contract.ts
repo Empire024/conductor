@@ -25,10 +25,14 @@ export interface LocalModelAnswer {
   inputTokens: number
   outputTokens: number
   durationMs: number
+  /** The generation was stopped at the request's returnWithinMs before it finished: `text` is what
+   *  it had written by then and may be incomplete. */
+  partial?: boolean
 }
 
-/** `ok: false` names why the local model was not used; the tool then returns raw lines and says so. */
-export type LocalModelOutcome = { ok: true; answer: LocalModelAnswer } | { ok: false; reason: string; contextExceeded?: boolean }
+/** `ok: false` names why the local model was not used; the tool then returns raw lines and says so.
+ *  `deadline` marks a request that reached its returnWithinMs before the model wrote anything. */
+export type LocalModelOutcome = { ok: true; answer: LocalModelAnswer } | { ok: false; reason: string; contextExceeded?: boolean; deadline?: boolean }
 
 export interface LocalModelRequest {
   system: string
@@ -40,6 +44,11 @@ export interface LocalModelRequest {
   waitBudgetMs?: number
   /** Overrides GENERATION_TIMEOUT_MS for a request whose prompt alone takes longer to read. */
   timeoutMs?: number
+  /** The whole call (queue, server wait and generation) returns within this many ms of ask():
+   *  waits end by then, and a generation still running is stopped and returns what it has written
+   *  so far as a `partial` answer (or a `deadline` fallback when it has written nothing). For a
+   *  caller whose MCP client gives up at a fixed time (Claude Code: about 60 s). */
+  returnWithinMs?: number
   signal?: AbortSignal
   /** Never start a server for this call: only one already running answers, found when the call
    *  takes the queue (not when it was made); otherwise it falls back. Model intelligence's
