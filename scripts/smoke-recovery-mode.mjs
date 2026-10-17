@@ -222,9 +222,14 @@ try {
   await expect.poll(async () => (await status(wizard)).phase, { timeout: 30_000, intervals: [500] }).toBe('completed')
   before = (await lines(promptLog)).length
   const pid2 = owner.pid
-  // The relaunched app briefs the resumed wizard with its own control endpoint.
-  await expect.poll(async () => readFile(capture, 'utf8').then(text => text.includes(owner.endpoint)).catch(() => false), { timeout: 30_000, intervals: [500] }).toBe(true)
-  wizardAuth = await tabCredential()
+  // App control keeps its port and credentials across a restart (FX33, control-endpoint.json), so
+  // the resumed wizard's briefing still holds a working endpoint and token and is not resent
+  // (turn-briefing.ts resends the static block only when the control paragraph changed).
+  assert.equal(owner.endpoint, wizardAuth.endpoint, 'app control did not keep its endpoint across the recovery relaunch')
+  const kept = await request(wizardAuth, 'tools.list', { brief: true })
+  assert.equal(kept.status, 200, `the wizard's briefed credential no longer answers after the recovery relaunch: ${JSON.stringify(kept.body).slice(0, 300)}`)
+  assert.ok(!message1.includes('Conductor app control:'), 'the continue message resent an unchanged control briefing')
+  observe('wizard credential kept across the relaunch', { endpoint: owner.endpoint })
   await request(wizardAuth, 'app.restart', {}).catch(error => observe('app.restart transport ended', { error: String(error) }))
   await expect.poll(() => alive(pid2), { timeout: 60_000 }).toBe(false)
   await cameBack(pid2, 120_000)
