@@ -37,6 +37,7 @@ import { CODEX_FALLBACK_MODEL } from '../../shared/agent-model-selection'
 import { codexConductorThreadConfig, codexLocalAssistThreadConfig, mergeCodexMcpConfigs } from '../local-assist/mcp-config'
 import { canonicalAction } from '../approval-review'
 import { commandClass, commandText } from '../approval-review-rules'
+import { aclRepairNotice, repairSandboxReadAccess, runIcacls, type IcaclsRunner } from './codex-sandbox-acl'
 import { defaultApprovalPolicy, MAX_WRITABLE_ROOTS, policyNotice, writableRootPaths, writableRootProblem, type PolicyDecision, type PolicyRequest } from '../approval-policy'
 
 export const CODEX_PROTOCOL_BASELINE = '0.159.1'
@@ -55,6 +56,10 @@ export interface CodexAdapterDependencies {
   transport?: (options: TransportOptions) => WireTransport
   version?: () => Promise<string>
   requestTimeoutMs?: number
+  /** The icacls.exe runner for repairing .deps/.cache read access (codex-sandbox-acl.ts), and the
+   *  platform it applies on; tests replace both. */
+  icacls?: IcaclsRunner
+  platform?: NodeJS.Platform
 }
 class CodexRpcError extends Error {
   constructor(readonly code: unknown, readonly data: unknown, message: string) { super(`Codex request failed (${String(code ?? 'unknown')}): ${message}`) }
@@ -225,9 +230,10 @@ export const codexExecpolicyAmendment = (decisions: readonly unknown[]): string[
 /** A project's own Codex sandbox settings, beside .conductor/delivery.json. */
 export const CODEX_SANDBOX_FILE = '.conductor/codex-sandbox.json'
 /** Project folders a sandboxed command writes without asking whenever they exist as real folders:
- *  dependencies installed with pip --target .deps, and tool caches. They are inside the workspace,
- *  but naming them makes the Windows sandbox grant them itself: files a pip install moved in from
- *  %TEMP% keep that folder's permissions, and the sandbox could not read .deps/PIL (miron, 2026-10-17). */
+ *  dependencies installed with pip --target .deps, and tool caches. They are inside the workspace;
+ *  naming them makes the Windows sandbox grant the folder itself. That grant does not reach a
+ *  package a pip install moved in from %TEMP% with a protected owner-only permission list (.deps/PIL,
+ *  miron 2026-10-17): repairDependencyReadAccess (codex-sandbox-acl.ts) turns its inheritance back on. */
 export const CODEX_PROJECT_WRITABLE_DIRS = ['.deps', '.cache'] as const
 export interface CodexSandboxSettings {
   /** Writable roots beyond the workspace, absolute existing folders, in order. */
@@ -542,6 +548,8 @@ export class CodexAdapter implements ProviderAdapter {
   /** Sandbox setting problems already told in this runtime, and the extra writable roots last announced. */
   private sandboxNotices = new Set<string>()
   private sandboxRoots = ''
+  /** Project dependency folder → the modification time its permissions were last checked at. */
+  private aclChecked = new Map<string, number>()
   private sandboxSetupNoticed = false
   /** MCP servers Codex reported for this thread and their latest startup state. */
   private mcpStartup = new Map<string, string>()
@@ -716,6 +724,8 @@ export class CodexAdapter implements ProviderAdapter {
 
   async submit(text: string, settings: SessionSettings, attachments?: ContextAttachment[]): Promise<void> {
     await this.start()
+    // Before the turn guards, so no await sits between them and `dispatching`.
+    await this.repairDependencyReadAccess()
     if (this.disposed || this.failed || !this.threadId || !this.defaults || !this.transport?.connected) throw new Error('Codex session is disconnected; resume explicitly')
     if (this.turnId || this.dispatching || this.pending.size) throw new Error('A Codex turn or interaction is already active')
     if (settings.plan && !this.experimental) throw new Error('Codex plan mode requires the explicitly enabled experimental protocol')
@@ -1444,6 +1454,27 @@ export class CodexAdapter implements ProviderAdapter {
       setTimeout(() => { if (!this.mcpStartup.size) finish() }, graceMs)
       check()
     })
+  }
+
+  /** On Windows, before a sandboxed turn: the project's .deps and .cache entries a pip install left
+   *  with an owner-only permission list get inheritance back, so the sandbox can read them
+   *  (codex-sandbox-acl.ts). Checked again only when the folder changed; never throws. */
+  private async repairDependencyReadAccess(): Promise<void> {
+    if ((this.dependencies.platform ?? process.platform) !== 'win32') return
+    for (const name of CODEX_PROJECT_WRITABLE_DIRS) {
+      const root = join(this.options.cwd, name)
+      let stamp: number
+      try { const entry = lstatSync(root); if (!entry.isDirectory() || entry.isSymbolicLink()) continue; stamp = entry.mtimeMs } catch { continue }
+      if (this.aclChecked.get(root) === stamp) continue
+      this.aclChecked.set(root, stamp)
+      try {
+        const result = await repairSandboxReadAccess(root, this.dependencies.icacls ?? runIcacls)
+        if (result.repaired.length) this.emit({ data: { type: 'notice', message: `Codex sandbox: ${aclRepairNotice(root, result.repaired)}.`, payload: { repaired: result.repaired } } })
+        for (const problem of result.problems) this.sandboxNotice(problem)
+      } catch (error) {
+        this.sandboxNotice(`the permissions of ${root} could not be checked (${error instanceof Error ? error.message : String(error)})`)
+      }
+    }
   }
 
   /** Once per runtime and problem: a sandbox setting that was left out, and why. */

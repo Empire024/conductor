@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path'
 import type { AdapterEvent, Json, SessionSettings } from '../../shared/structured-agent'
 import type { AdapterOptions } from './adapter'
 import type { TransportOptions } from './transport'
-import { CodexAdapter, CODEX_PROTOCOL_BASELINE, CODEX_SANDBOX_FILE, codexPreset, codexSandboxSettings, ownerOnlyEscalation, ownerOnlyReach } from './codex'
+import { CodexAdapter, CODEX_PROTOCOL_BASELINE, type CodexAdapterDependencies, CODEX_SANDBOX_FILE, codexPreset, codexSandboxSettings, ownerOnlyEscalation, ownerOnlyReach } from './codex'
 import { reachOf } from '../approval-review-gate'
 import { defaultApprovalPolicy, evaluateApprovalPolicy, setCurrentApprovalPolicy, type PolicyRequest } from '../approval-policy'
 
@@ -104,13 +104,14 @@ describe('owner-only boundaries are judged on what a command touches, not where 
 // One in-memory App Server per test: requests are injected, responses read from what was sent.
 const threadId = 'spam-thread', turnId = 'spam-turn'
 const asJson = (value: unknown): Json => JSON.parse(JSON.stringify(value)) as Json
-function fixture(permission: SessionSettings['permission'] = 'accept-edits', extra: Partial<AdapterOptions> = {}, cwd = process.cwd()) {
+function fixture(permission: SessionSettings['permission'] = 'accept-edits', extra: Partial<AdapterOptions> = {}, cwd = process.cwd(), dependencies: Partial<CodexAdapterDependencies> = {}) {
   const settings: SessionSettings = { permission, plan: false }
   const events: AdapterEvent[] = [], sent: Json[] = []
   let wire!: TransportOptions, connected = false
   const inject = (message: unknown) => wire.onMessage(asJson(message))
   const adapter = new CodexAdapter({ executable: 'never-launched', cwd, runtimeId: 'spam-runtime', settings, ...extra, emit: event => events.push(event) }, {
     version: async () => `codex-cli ${CODEX_PROTOCOL_BASELINE}`,
+    ...dependencies,
     transport: options => {
       wire = options
       return {
@@ -263,6 +264,25 @@ describe('extra writable roots of the Codex sandbox', () => {
     const f = fixture('accept-edits', {}, project); await f.start()
     expect(f.turnStart()?.sandboxPolicy).toMatchObject({ type: 'workspaceWrite', writableRoots: [project, join(project, '.deps'), outside], networkAccess: true })
     expect(f.notices().filter(notice => notice.message.startsWith('Codex sandbox: besides the workspace'))).toHaveLength(1)
+  })
+
+  it('repairs a .deps package the sandbox cannot read before the turn, once per change of the folder', async () => {
+    // feature-list conductor-task:codex-deps-exec-deny: .deps/PIL kept the owner-only DACL of the
+    // %TEMP% folder pip built it in, and Get-ChildItem .deps/PIL was denied inside the sandbox.
+    const project = temp('codex-deps-acl')
+    mkdirSync(join(project, '.deps', 'PIL'), { recursive: true })
+    const calls: string[][] = []
+    const icacls = async (args: string[]) => {
+      calls.push(args)
+      return { code: 0, stdout: args.length === 1 ? `${join(project, '.deps', 'PIL')} OWNER RIGHTS:(OI)(CI)(F)
+` : 'Successfully processed 1 files', stderr: '' }
+    }
+    const f = fixture('auto', {}, project, { icacls, platform: 'win32' }); await f.start()
+    expect(calls).toEqual([[join(project, '.deps', '*')], [join(project, '.deps', 'PIL'), '/inheritance:e', '/C', '/Q']])
+    expect(f.notices().filter(notice => notice.message.includes('owner-only permission list'))).toEqual([expect.objectContaining({ payload: { repaired: [join(project, '.deps', 'PIL')] } })])
+    expect(f.turnStart()?.sandboxPolicy).toMatchObject({ writableRoots: expect.arrayContaining([join(project, '.deps')]) })
+    const other = fixture('auto', {}, project, { icacls, platform: 'linux' }); await other.start()
+    expect(calls).toHaveLength(2)
   })
 
   it.runIf(windows)('carries the default OptiX cache root once it exists, and skips it without a notice where it does not', async () => {
