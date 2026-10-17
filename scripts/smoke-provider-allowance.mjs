@@ -66,7 +66,8 @@ try {
   assert.equal(first.length, 1, JSON.stringify(first))
   assert.equal(first[0].provider, 'claude')
   assert.deepEqual(first[0].gauges.map(gauge => [gauge.value, gauge.window]), [['41%', '7d'], ['18%', '5h']])
-  assert.match(first[0].gauges[0].title, /^Claude weekly: 41% used · resets .+\(in [34] d/)
+  // The weekly gauge leads with its pacing line (unused share and time to the reset).
+  assert.match(first[0].gauges[0].title, /^59% unused, resets in [34](\.\d)? days.*\nClaude weekly: 41% used · resets .+\(in [34] d/)
   assert.match(first[0].gauges[1].title, /^Claude 5 hour: 18% used · resets .+\(in [23] h/)
   record('P1', 'PASS', {}, `${JSON.stringify(first)}; ${await shot('p1-first-report')}`)
 
