@@ -249,6 +249,10 @@ export const argumentsAreObject = (raw: string): boolean => {
 
 /** What the history keeps in place of arguments that are not a JSON object. */
 export const UNPARSEABLE_ARGUMENTS = '{}'
+/** A tool call the model wrote as reply text in its chat template's own markup (Qwen 3.x XML
+ *  `<tool_call><function=name>`, or the Hermes JSON `<tool_call>{"name": …}`) instead of a call
+ *  the server parsed. */
+export const TEXT_TOOL_CALL = /<tool_call>\s*(?:<function=[A-Za-z_][\w.-]*>|\{\s*"name"\s*:)/
 
 /** The model is told why its call did not run and how to succeed next time, in the terms it
  *  controls: a smaller call. */
@@ -1334,9 +1338,17 @@ export class LocalAgentSession {
       // the stream then ends with no text, no reasoning and no call at all. Answered with "give
       // your final answer", the model reports work it never did, so that empty reply gets the same
       // grammar-enforced retry (at most twice a turn).
-      const dropped = !truncated && !ruminated && !calls.length && !completion.content.trim() && !completion.reasoning.trim() && tools.length > 0 && !ledger.finalizing && (ledger.droppedRepairs ?? 0) < 2
+      // Qwen-family models (Qwen 3.5 9B, Ornith 1.5 9B) also write a call in their template's own
+      // shape as plain text ("<tool_call>\n<function=calculate>\n<parameter=…") that the server's
+      // parser did not pick up. Taken as the answer, the turn ended on a call that never ran (the
+      // 2026-10-17 usefulness run: 2 of 8 agent runs). It gets the same grammar-enforced retry,
+      // and the unrun call text is withdrawn from the timeline first.
+      const replyable = !truncated && !ruminated && !calls.length && tools.length > 0 && !ledger.finalizing && (ledger.droppedRepairs ?? 0) < 2
+      const textCall = replyable && TEXT_TOOL_CALL.test(completion.content)
+      const dropped = textCall || replyable && !completion.content.trim() && !completion.reasoning.trim()
       if (!truncated && (dropped || calls.length && calls.some(call => !argumentsAreObject(call.arguments))) && ledger.requests < requestCeiling) {
         if (dropped) ledger.droppedRepairs = (ledger.droppedRepairs ?? 0) + 1
+        if (textCall) events.textWithdraw?.()
         const names = dropped ? 'tool' : [...new Set(calls.filter(call => !argumentsAreObject(call.arguments)).map(call => call.name))].join(', ')
         events.notice?.(`The local server could not parse the model's ${names} call; asking again with the tool grammar enforced.`)
         let repaired: CompletionResult | undefined

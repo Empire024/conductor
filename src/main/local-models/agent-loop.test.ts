@@ -304,6 +304,33 @@ describe('local agent loop', () => {
     expect(second!.messages.length).toBe(first!.messages.length)
   })
 
+  it('re-asks under the tool grammar when a Qwen-family model writes its call as template XML text, instead of ending on it', async () => {
+    // 2026-10-17 usefulness run: Qwen 3.5 9B and Ornith 1.5 9B ended two agent runs with an unrun
+    // "<tool_call>\n<function=calculate>…" as their final answer.
+    const xml = 'Now the grand total:\n\n<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/index.ts\n</parameter>\n</function>\n</tool_call>'
+    const stub = await stubServer([
+      [frame({ content: xml }, 'stop')],
+      [frame({ tool_calls: [{ index: 0, id: 'call_1', function: { name: 'read_file', arguments: '{"path":"src/index.ts"}' } }] }, 'tool_calls')],
+      [frame({ content: 'The answer is 42.' }, 'stop')]
+    ])
+    cleanup.push(() => stub.server.close())
+    const notices: string[] = [], tools: string[] = []
+    let withdrawn = 0
+    const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: workspace(), sandbox: null, readOnly: false, timeoutSec: 30, contextTokens: 32768 })
+    const outcome = await session.run('What is the answer?', { notice: message => notices.push(message), textWithdraw: () => { withdrawn++ }, toolEnd: call => tools.push(`${call.name}:${call.failed ? 'failed' : 'ok'}`) })
+    expect(outcome.stopReason).toBe('completed')
+    expect(outcome.text).toBe('The answer is 42.')
+    expect(tools).toEqual(['read_file:ok'])
+    expect(withdrawn).toBeGreaterThanOrEqual(1)
+    expect(notices.some(message => /could not parse the model's tool call/.test(message))).toBe(true)
+    const [first, second, third] = stub.requests as Array<{ tool_choice?: string; messages: Array<{ role: string; content: string }> }>
+    expect(first!.tool_choice).toBe('auto')
+    expect(second!.tool_choice).toBe('required')
+    // The unrun call text never entered the history.
+    expect(second!.messages.length).toBe(first!.messages.length)
+    expect(third!.messages.some(message => typeof message.content === 'string' && message.content.includes('<tool_call>'))).toBe(false)
+  })
+
   it('ends a run whose calls stay unreadable even under the grammar, instead of spending every round on them', async () => {
     const stub = await stubServer([[frame({ tool_calls: [{ index: 0, id: 'call_1', function: { name: 'conductor', arguments: '{' } }] }, 'tool_calls')]])
     cleanup.push(() => stub.server.close())

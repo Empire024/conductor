@@ -302,6 +302,31 @@ describe('local_ask and summarize_file', () => {
     expect(result.text).toContain('Sections naming "needle-alpha", "needle-omega" were read first.')
   })
 
+  it('credits no saving for an answer whose caller hung up before it arrived', async () => {
+    // 2026-10-17: Claude Code's MCP client gave up on a 1.5 MB local_ask after 60 s; the windows
+    // read before the abort were still credited as 1.55 M characters saved.
+    writeFileSync(join(root, 's7-1mb.log'), denseLog())
+    const records: SavingsRecord[] = []
+    const caller = new AbortController()
+    const server = strictServer({ onAsk: () => caller.abort() })
+    const tools = new LocalAssistTools({ session: () => session(), runner: { ...server.runner, ask: async request => { const outcome = await server.runner.ask(request); return request.signal?.aborted && server.asked.length > 1 ? { ok: false, reason: 'aborted' } : outcome } }, ledger: { record: entry => records.push({ at: 'now', ...entry }), summary: () => { throw new Error('unused') } } })
+    await tools.ask('a1', { prompt: 'values on the NEEDLE-ALPHA and NEEDLE-OMEGA lines', files: ['s7-1mb.log'] }, 'local_ask', caller.signal)
+    expect(records).toHaveLength(1)
+    expect(records[0]).toMatchObject({ tool: 'local_ask', usedModel: true, rawChars: 0 })
+
+    // The same call with the caller still there is credited in full.
+    const kept = new LocalAssistTools({ session: () => session(), runner: strictServer().runner, ledger: { record: entry => records.push({ at: 'now', ...entry }), summary: () => { throw new Error('unused') } } })
+    await kept.ask('a1', { prompt: 'values on the NEEDLE-ALPHA and NEEDLE-OMEGA lines', files: ['s7-1mb.log'] }, 'local_ask', new AbortController().signal)
+    expect(records[1]!.rawChars).toBeGreaterThan(1_000_000)
+  })
+
+  it('credits no saving for a run_and_summarize whose caller hung up', async () => {
+    const caller = new AbortController()
+    const h = harness({ output: longLog(), run: async request => { writeFileSync(request.logFile, longLog()); caller.abort(); return { exitCode: 1, durationMs: 10, timedOut: false, outputChars: longLog().length } } })
+    await h.tools.runAndSummarize('a1', { command: 'npm test', timeoutSec: 30 }, caller.signal)
+    expect(h.records[0]).toMatchObject({ tool: 'run_and_summarize', rawChars: 0 })
+  })
+
   it('picks only distinctive literals from the question', () => {
     expect(promptTerms('values on the NEEDLE-ALPHA and NEEDLE-OMEGA lines')).toEqual(['needle-alpha', 'needle-omega'])
     expect(promptTerms('where is line1500 defined? Is there a line saying ALL_DONE or "exit code 3"?')).toEqual(['exit code 3', 'line1500', 'all_done'])

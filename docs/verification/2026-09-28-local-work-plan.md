@@ -6,6 +6,8 @@ The owner approved scoped fault/harness repairs with independent review, the per
 
 The owner deferred typing optimization until they complain again. Preserve the guarded 17.9–23.6 ms finding and <16 ms target as history, but do not run another typing-fix batch. The approved load guard/control is a separate remaining acceptance check.
 
+**Status 2026-10-17:** steps 1, 2, 3 and 6 are done, step 4 and the file-task part of step 5 are measured in `2026-10-17-local-usefulness.md` (status table, results, improvement areas); the held-out web-question part of step 5 remains.
+
 ## Delivery order and acceptance
 
 1. **Question UI bug.** The owner reports that this conversation's `functions.request_user_input_async` questions appeared only as text, with no GUI choices. Trace actual events from this conversation through the Codex adapter, durable request state and renderer; do not infer a protocol from its name. `src/main/providers/codex.ts` currently handles `item/tool/requestUserInput`; a repository search found no `request_user_input_async` handling. That is an investigation lead, not a proven cause. Preserve async answering while work continues, stable question IDs, multiple questions, custom text, answer delivery exactly once, and cancellation/reload behavior as applicable to the actual protocol. A fresh reviewer must inspect the fix. Acceptance needs a parked end-to-end question card, selection/custom-answer round trip, and a real owner-visible check when a candidate is available. Do not re-ask the three approvals already answered.

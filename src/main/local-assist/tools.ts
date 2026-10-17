@@ -323,7 +323,7 @@ export class LocalAssistTools {
         : [`Local summary unavailable: ${outcome.reason}.`, ...(() => { const found = failureLines(lines, maxLines); return found.length ? ['Failure-looking lines (pattern match, not the model):', ...found] : [] })()].join('\n')
     }
     const body = [header, summary, `Last ${tail.length} lines (verbatim):`, ...tail].filter(Boolean).join('\n')
-    this.record(session, 'run_and_summarize', raw.length, body.length, outcome)
+    this.record(session, 'run_and_summarize', signal?.aborted ? 0 : raw.length, body.length, outcome)
     return { text: body, structured: { exitCode: run.exitCode, timedOut: run.timedOut, durationMs: run.durationMs, logPath, lines: lines.length, summarized: Boolean(outcome?.ok) } }
   }
 
@@ -378,7 +378,7 @@ export class LocalAssistTools {
         const body = outcome.ok
           ? `${capLines(outcome.answer.text, maxLines)}\n— ${outcome.answer.model}, local${listing ? `, over ${listing}` : ''}`
           : `Local model unavailable: ${outcome.reason}. Nothing was summarised; read ${listing || 'the files'} yourself or call again shortly.`
-        this.record(session, tool, outcome.ok ? rawChars : 0, body.length, outcome)
+        this.record(session, tool, outcome.ok && !signal?.aborted ? rawChars : 0, body.length, outcome)
         return { text: body, structured: { answered: outcome.ok, ...record } }
       }
       // It did not fit after all (the server counted more than the estimate, or refused it):
@@ -443,7 +443,10 @@ export class LocalAssistTools {
     const body = found.length
       ? `${capLines(found.map(hit => `${label(hit.window)}: ${hit.text}`).join('\n'), maxLines)}\n— local, over ${listing}; read ${examined} of ${sections} sections.${remainder}`
       : `Not found in the ${examined} of ${sections} section(s) of ${listing || 'the file(s)'} read.${remainder}`
-    this.recordUsage(session, tool, usedModel ? rawChars : 0, body.length, { inputTokens, outputTokens, usedModel, model: lastModel })
+    // A caller that hung up (Claude Code's MCP client gives up after about 60 s) never received
+    // this answer, so it saved nothing: 2026-10-17, a 1.5 MB local_ask was credited 1.55 M
+    // characters after the client had already timed out.
+    this.recordUsage(session, tool, usedModel && !signal?.aborted ? rawChars : 0, body.length, { inputTokens, outputTokens, usedModel, model: lastModel })
     return { text: body, structured: { answered: usedModel && found.length > 0, chunks: sections, examined, ...record } }
   }
 
