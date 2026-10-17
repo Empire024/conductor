@@ -116,9 +116,11 @@ and `node_modules` events.
 - `CONDUCTOR_BACKGROUND_PRIORITY=0` keeps normal priority everywhere, for the stand-in of a
   measurement or a run someone deliberately wants at full speed.
 
-- `vitest.config.ts` runs at most half the logical cores locally (`maxWorkers: '50%'`, 12 here; CI
-  keeps 2). Priority alone decides who runs first, not who shares a core: with a fork on every
-  logical core, the owner's renderer shared its core's second thread with a test worker.
+- `vitest.config.ts` runs at most four workers locally (half the logical cores on a smaller machine;
+  CI keeps 2). Priority alone decides who runs first, not who shares a core: with a fork on every
+  logical core, the owner's renderer shared its core's second thread with a test worker. Half the
+  cores (12 here) was tried next and starved the SQLite fixtures into 332 timeouts
+  (`docs/delivery-test-policy.md`, "Local full suite").
 
 - Agent CLIs and the runtime host are lowered when they are spawned (`providers/transport.ts`,
   `runtime-host/host.ts`), so a bare `tsc` or `npm run package` a coworker runs is below normal too.

@@ -33,4 +33,25 @@ See `delivery-test-policy-measurements.json` for measured host delivery and rece
 
 The baseline is real delivery `680fb1c`: full tests/script suite 344.286 s, parallel typecheck/build 25.752 s, entire ship 352.366 s. Replays include graph discovery (6.1/5.9 s), fresh incremental typecheck caches, and bundling. These observed timings compare the previous unscoped/full route with the new narrow route. Explicitly scoped narrow ships already had related tests, so this table is not a claim of a twelvefold improvement for those ships. Snapshot and machine load differ; core/full fallback still takes the full-suite time.
 
+### Local full suite (2026-10-17)
+
+`git.ship` and `app.update` always run Vitest with `CI=1` (`src/main/delivery.ts`): two workers and 60 s test/hook timeouts. A plain local `npm test` used half the logical cores (12 workers on this 24-thread Windows 11 machine) with 5 s/10 s timeouts. The SQLite/fsync fixtures contend the same way on a developer machine once the run fans out, so every test got slower as workers were added. The 5 s limit had no room for that, and timeouts were the only failures. Full-suite runs on the same tree, one after another, machine otherwise in normal use:
+
+| Mode | Workers | Timeouts (test/hook) | Failed tests | Sum of test time | Wall |
+| --- | ---: | --- | ---: | ---: | ---: |
+| local, before | 12 | 5 s / 10 s | 332 (all timeouts) | 4452 s | 459 s |
+| local, `--maxWorkers=6` | 6 | 5 s / 10 s | 74 (all timeouts) | 2949 s | 555 s |
+| local, `--maxWorkers=4` | 4 | 5 s / 10 s | 15 (all timeouts) | 1539 s | 422 s |
+| `CI=1` (git.ship) | 2 | 60 s / 60 s | 0 | 1068 s | 601 s |
+| local, 4 workers, 60 s | 4 | 60 s / 60 s | 1 (`database-wal`) + 4 RPC errors | 2095 s | 558 s |
+| + `database-wal` fix | 4 | 60 s / 60 s | 0 + 2 RPC errors (exit 1) | 1557 s | 424 s |
+| local, after (`npm test`) | 4 | 60 s / 60 s | 0 (exit 0) | 1433 s | 394 s (399 s with `test:scripts`) |
+
+`structured-store.test.ts` shows the contention: alone it takes 9.8 s for 28 tests, and with 12 workers it took 262 s and 27 of its tests timed out. Even with two workers some fixture-heavy tests run over 5 s (p99 18 s), so a 5 s limit was too tight at any worker count. `vitest.config.ts` now caps local runs at four workers (`min(4, half the logical cores)`), and local runs use the same 60 s test and hook timeouts as CI. CI and `git.ship` keep their settings, so their timings do not change. A test that actually fails still fails on its assertion. Only a slow test gets the extra time.
+
+Two further failures only showed up once the timeouts were gone:
+
+- `database-wal.test.ts` made 3000 separately fsynced commits: 19 s with two workers, 60 s with four, 94 s with six. It now writes the same 12 MB in 300 commits (0.6 s alone) and asserts the same things.
+- `[vitest-worker]: Timeout calling "onTaskUpdate"` errors (12 with 12 workers, 2–4 with four) made the run exit 1 even though every test passed. A worker waits at most 60 s for the main process to answer each test report, and Vitest has no setting for that limit. Tagging the forks pool's rethrow traced the errors to `agent-control.test.ts`. Its synchronous SQLite tests chain through resolved promises, so the worker's event loop went 10.8 s without turning even when the file ran alone, and the file runs about 4.6× slower inside the full suite. When the loop finally turned, the expired timer fired before the answer already waiting in the pipe was read. `src/test-event-loop-yield.ts` (a `setupFiles` entry) yields one real macrotask after every test. That cut the file's longest stall from 10.8 s to 0.6 s at no cost: 51.4 s against 52.0 s.
+
 Reproduce narrow replays with `node scripts/measure-delivery-test-policy.mjs <recent-sha> <recent-sha>` in a clean isolated snapshot. Full logs remain under `.conductor-scratch/policy-measurements/`. Core changes intentionally retain full verification; a fallback increases runtime to preserve confidence.

@@ -16,8 +16,10 @@ describe('the workspace database log across a restart (FX33)', () => {
     // Another store's connection (orchestration, schedules, durable jobs) that is still open.
     const other = new DatabaseSync(path)
     other.prepare('SELECT count(*) FROM settings').get()
-    const body = 'x'.repeat(4000)
-    for (let index = 0; index < 3000; index++) database.setSetting(`fx33-ballast-${index}`, body)
+    // The same 12 MB in 300 commits rather than 3000: every commit is an fsync, and under a full
+    // local suite's disk contention 3000 of them ran past the 60 s timeout (delivery-test-policy.md).
+    const body = 'x'.repeat(40_000)
+    for (let index = 0; index < 300; index++) database.setSetting(`fx33-ballast-${index}`, body)
     expect(statSync(path + '-wal').size).toBeGreaterThan(1024 * 1024)
 
     database.close()
@@ -26,7 +28,7 @@ describe('the workspace database log across a restart (FX33)', () => {
     other.close()
 
     const next = new ConductorDatabase(path)
-    expect(next.getSetting('fx33-ballast-2999')).toBe(body)
+    expect(next.getSetting('fx33-ballast-299')).toBe(body)
     next.close()
   })
 })
