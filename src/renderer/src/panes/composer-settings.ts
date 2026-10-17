@@ -59,12 +59,12 @@ export function nextComposerSettings(current: SessionSettings, change: Partial<S
 export const composerChildKey = (child: string, conversationId: string): string => child + ':' + conversationId
 
 /** What a Codex mode actually does, in the terms its own `/permissions` presets use. The picker
- *  has to say this: Edit and Auto differ by whether Codex interrupts at all, and only the owner
- *  can decide that an uninterrupted conversation may also reach the network. */
+ *  has to say this: Edit and Auto differ by whether Codex interrupts at all. Both reach the
+ *  network (a project switches it off in .conductor/codex-sandbox.json; providers/codex.ts). */
 const codexModeDescriptions: Record<string, string> = {
   default: 'Approve requests the way your Codex CLI is configured to.',
   'read-only': 'Inspect the workspace without making changes.',
-  'accept-edits': 'Edit files and run workspace commands; ask before leaving the workspace.',
+  'accept-edits': 'Edit files and run workspace commands, network included; ask before leaving the workspace.',
   auto: 'Never ask: workspace edits, commands and network run without approval, MCP tools such as the project browser are allowed for you, and a command or file change that has to leave the workspace sandbox is allowed once when Codex asks, unless it reaches Windows system files, the registry, elevation, services, the firewall, credentials, disks or a recursive delete, which stay yours. Questions always reach you.'
 }
 /** Grok's modes are enforced by Conductor on what Grok escalates (grokApprovalPolicy); Auto is

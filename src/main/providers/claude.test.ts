@@ -5,6 +5,7 @@ import { autoModeDenialOf } from '../../shared/auto-mode-denial'
 import { ClaudeAdapter, CLAUDE_COMPATIBILITY, claudeCompatibility, claudeHookHealth, HOOK_FREE_READ_TOOLS, PRE_TOOL_USE_MATCHER, resetClaudeHookHealth } from './claude'
 import { JsonLineDecoder, JsonLineTransport, type TransportOptions } from './transport'
 import { SteeringUnavailableError, type AdapterOptions } from './adapter'
+import type { PolicyRequest } from '../approval-policy'
 import { resolve, join } from 'node:path'
 import { setClaudeTokenSource } from '../claude-login'
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, symlinkSync } from 'node:fs'
@@ -1895,5 +1896,63 @@ describe('a turn interrupted before the CLI started it', () => {
     // Unknown whether it ran, so its message is not offered again; the conversation is told.
     expect(sessionEvents(older).at(-1)).not.toHaveProperty('notStarted')
     expect(older.events.some(event => event.data.type === 'notice' && /showed no sign of the interrupted turn/.test(event.data.message))).toBe(true)
+  })
+})
+
+// conductor-task:wake-controller-on-approval: the owner's auto-approve policy answers before a card.
+describe('the owner\'s auto-approve policy in a Claude runtime', () => {
+  const covered = (request: PolicyRequest) => request.kind === 'command' && request.command === 'python render.py' || request.kind === 'file-write' ? { decision: 'allow' as const, rule: request.kind === 'command' ? 'python' : 'workspace-write' } : null
+  it('answers a covered can_use_tool request itself: no card, one notice, the host asked with the native request', async () => {
+    const approvalPolicy = vi.fn(covered)
+    const f = fixture({ approvalPolicy })
+    await f.adapter.start()
+    await f.adapter.submit('Render', settings)
+    f.transport.receive(toolUse('run', 'Bash', { command: 'python render.py' }))
+    f.transport.receive(permission('policy-1', 'run', 'Bash', { command: 'python render.py' }))
+    await flush()
+    expect(approvalPolicy).toHaveBeenCalledWith(expect.objectContaining({ provider: 'claude', kind: 'command', command: 'python render.py', shell: 'posix', cwd: process.cwd(), projectRoot: process.cwd() }), { requestId: 'policy-1', tool: 'Bash', input: { command: 'python render.py' } })
+    expect(f.transport.sent).toContainEqual(expect.objectContaining({ type: 'control_response', response: expect.objectContaining({ request_id: 'policy-1', response: { behavior: 'allow', updatedInput: { command: 'python render.py' }, toolUseID: 'run' } }) }))
+    expect(f.events.some(event => event.data.type === 'interaction')).toBe(false)
+    expect(f.events.filter(event => event.data.type === 'notice' && /^Allowed by the auto-approve policy \(python\): Bash python render\.py$/.test(event.data.message))).toHaveLength(1)
+    // Not covered: the card is raised exactly as before.
+    f.transport.receive(permission('policy-2', 'push', 'Bash', { command: 'git push' }))
+    await flush()
+    expect(f.events.some(event => event.data.type === 'interaction' && event.data.interaction.id === 'policy-2' && event.data.interaction.status === 'pending')).toBe(true)
+  })
+
+  it('never asks it about a question, an owner ask rule, a plan or an isolated reviewer', async () => {
+    const approvalPolicy = vi.fn(covered)
+    const f = fixture({ approvalPolicy })
+    await f.adapter.start()
+    await f.adapter.submit('Render', settings)
+    f.transport.receive({ type: 'control_request', request_id: 'asked', request: { subtype: 'can_use_tool', tool_use_id: 'ask', tool_name: 'Bash', input: { command: 'python render.py' }, matched_ask_rule: { behavior: 'ask' } } })
+    f.transport.receive(permission('question', 'q', 'AskUserQuestion', { questions: [{ question: 'Which?', options: [{ label: 'A' }] }] }))
+    await flush()
+    expect(approvalPolicy).not.toHaveBeenCalled()
+    expect(f.events.filter(event => event.data.type === 'interaction' && event.data.interaction.status === 'pending').map(event => event.data.type === 'interaction' && event.data.interaction.id)).toEqual(['asked', 'question'])
+    const planned = fixture({ approvalPolicy, settings: { ...settings, plan: true } })
+    await planned.adapter.start()
+    planned.transport.receive(permission('plan', 'p', 'Bash', { command: 'python render.py' }))
+    await flush()
+    expect(approvalPolicy).not.toHaveBeenCalled()
+    expect(planned.events.some(event => event.data.type === 'interaction' && event.data.interaction.id === 'plan')).toBe(true)
+  })
+
+  it('answers the PreToolUse hook with allow for a covered call, after the edit snapshot, so neither a prompt nor Auto\'s classifier refuses it', async () => {
+    const approvalPolicy = vi.fn(covered), order: string[] = []
+    const beforeTool = vi.fn(async () => { order.push('snapshot') })
+    const f = fixture({ approvalPolicy, beforeTool })
+    await f.adapter.start()
+    f.transport.receive(hook('pre-run', 'conductor_before', 'run', 'Bash', { command: 'python render.py' }))
+    f.transport.receive(hook('pre-write', 'conductor_before', 'write', 'Write', { file_path: 'out/a.txt', content: 'x' }))
+    f.transport.receive(hook('pre-push', 'conductor_before', 'push', 'Bash', { command: 'git push' }))
+    await vi.waitFor(() => expect(f.transport.sent.filter(entry => (entry as { type?: string }).type === 'control_response').length).toBeGreaterThanOrEqual(3))
+    const answer = (requestId: string) => (f.transport.sent.find(entry => (entry as { response?: { request_id?: string } }).response?.request_id === requestId) as { response: { response: unknown } }).response.response
+    expect(answer('pre-run')).toEqual({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', permissionDecisionReason: 'Conductor\'s auto-approve policy (python)' } })
+    expect(answer('pre-write')).toEqual({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', permissionDecisionReason: 'Conductor\'s auto-approve policy (workspace-write)' } })
+    expect(answer('pre-push')).toEqual({})
+    expect(beforeTool).toHaveBeenCalledWith('write', ['out/a.txt'])
+    expect(order).toEqual(['snapshot'])
+    expect(approvalPolicy).toHaveBeenCalledWith(expect.objectContaining({ kind: 'file-write', paths: ['out/a.txt'] }), expect.objectContaining({ requestId: 'hook:write', tool: 'Write' }))
   })
 })

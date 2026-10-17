@@ -109,7 +109,7 @@ export class AwaitingResults {
   /** Replaces the waiter's wait with these conversations (order kept, duplicates dropped).
    *  `baseline` is the waiter's sequence before the message that asked for the results went out;
    *  by default its sequence now. */
-  declare(waiter: string, agents: readonly string[], reason?: string, baseline?: number, kept: Record<string, number> = {}, deadline?: string): AwaitingRecord {
+  declare(waiter: string, agents: readonly string[], reason?: string, baseline?: number, kept: Record<string, number> = {}, deadline?: string, approvals = false): AwaitingRecord {
     const unique = [...new Set(agents.filter(id => id && id !== waiter))].slice(0, MAX_AWAITED)
     if (!unique.length) throw new Error('Name at least one other conversation to wait for')
     const from = baseline ?? this.deps.snapshot(waiter)?.sequence ?? 0
@@ -119,7 +119,8 @@ export class AwaitingResults {
       // An agent still owed from an earlier wait keeps its own, earlier baseline.
       baselines: Object.fromEntries(unique.map(id => [id, kept[id] ?? from])),
       ...(reason?.trim() ? { reason: reason.trim().slice(0, MAX_AWAIT_REASON) } : {}),
-      deadline: deadline ?? new Date(now + DEFAULT_AWAIT_MINUTES * 60_000).toISOString()
+      deadline: deadline ?? new Date(now + DEFAULT_AWAIT_MINUTES * 60_000).toISOString(),
+      ...(approvals ? { approvals: true as const } : {})
     }
     this.quietSince.delete(waiter)
     this.save(waiter, record)
@@ -138,7 +139,7 @@ export class AwaitingResults {
     // baseline; one already owed keeps its earlier baseline.
     const kept = { ...current ? Object.fromEntries(current.agents.map(id => [id, baselineOf(current, id)])) : {}, ...current?.agents.includes(agentSessionId) ? {} : { [agentSessionId]: baseline } }
     // An earlier deadline still stands; a first wait gets the default one.
-    return this.declare(waiter, [...current?.agents ?? [], agentSessionId], reason ?? current?.reason, from, kept, current?.deadline)
+    return this.declare(waiter, [...current?.agents ?? [], agentSessionId], reason ?? current?.reason, from, kept, current?.deadline, current?.approvals === true)
   }
 
   clear(waiter: string): boolean {

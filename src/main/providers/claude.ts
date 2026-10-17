@@ -17,6 +17,7 @@ import { LOCAL_ASSIST_MCP_SERVER_NAME } from '../local-assist/contract'
 import { LOCAL_ASSIST_TOOLS } from '../local-assist/tools'
 import { grantCallIdentity, type NativeGrantCall } from '../permission-grants/identity'
 import { CONDUCTOR_MCP_ALLOWED_TOOLS } from '../permission-grants/control-mcp'
+import { policyNotice, policyRequestFor, type PolicyDecision } from '../approval-policy'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 
 /** The local CLI bridge is checked against the official CLI/extension 2.1.278: the 2026-09-21
@@ -1414,6 +1415,19 @@ export class ClaudeAdapter implements ProviderAdapter {
     // Edit rules also govern Write/NotebookEdit in the provider permission engine.
     const ruleNames = new Set([name, ...(['Write', 'NotebookEdit', 'MultiEdit'].includes(name) ? ['Edit'] : [])])
     const requiredApproval = request.matched_ask_rule != null || /requires? (?:user )?approval|requires? user interaction/i.test(string(request.decision_reason) ?? '')
+    // The owner's auto-approve policy answers a benign project action itself (approval-policy.ts):
+    // no card, no stronger review, no controller wake. Never a question, an owner ask rule or a
+    // mandatory approval.
+    if (!question && !requiredApproval) {
+      const decision = this.policyDecision(name, input, id)
+      if (decision) {
+        this.reply(id, { behavior: 'allow', updatedInput: input, ...(toolId ? { toolUseID: toolId } : {}) })
+        if (toolId) this.updateTool(toolId, { status: 'preparing' })
+        const notice = policyNotice(policySubject(name, input), decision.rule)
+        this.emit({ requestId: id, itemId: `approval-policy:${id}`, parentId: toolId ? this.tools.get(toolId)?.parentId : undefined, data: { type: 'notice', message: notice.message, payload: notice.payload }, native: { method: 'can_use_tool', payload: request } })
+        return
+      }
+    }
     const permissionUpdates: ObjectValue[] = requiredApproval || this.settings.plan ? [] : array(request.permission_suggestions ?? request.permissionSuggestions ?? request.suggestions).flatMap(value => {
       const update = object(value), rules = array(update.rules)
       // The CLI offers its native session Edit mode on Write/Edit requests.
@@ -1436,6 +1450,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     const interaction: PendingInteraction = {
       id, kind: question ? 'question' : 'approval', status: 'pending', title: string(request.title) ?? (question ? 'Claude needs your input' : `Allow ${name}?`),
       ...(nativeGrant ? { permissionGrantId: nativeGrant.id } : {}),
+      ...(requiredApproval && !question ? { required: true } : {}),
       input, choices: [{ id: 'allow', label: question ? 'Submit answers' : 'Allow once' }, ...(!question ? [
         { id: 'allow-session', label: 'Allow for this session', description: sessionDescription, disabled: !permissionUpdates.length },
         { id: 'auto-mode', label: 'Switch to auto-mode', disabled: autoMode,
@@ -1483,6 +1498,13 @@ export class ClaudeAdapter implements ProviderAdapter {
         const tool = this.tools.get(id)
         if (tool) tool.captured = true
       }
+      // The owner's auto-approve policy answers before Claude's own permission check, so a benign
+      // project action becomes neither a card nor an Auto classifier refusal. Claude still applies
+      // its deny and ask rules after a hook's allow (hooks reference, PreToolUse decision control).
+      if (string(object(this.capabilities.effectiveSettings).permissionMode) !== 'bypassPermissions') {
+        const decision = this.policyDecision(name, args, `hook:${id}`)
+        if (decision) return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', permissionDecisionReason: `Conductor's auto-approve policy (${decision.rule})` } }
+      }
       return
     }
     const response = object(input.tool_response), success = callback === 'conductor_after' && response.interrupted !== true && (number(response.exitCode) ?? 0) === 0
@@ -1523,6 +1545,14 @@ export class ClaudeAdapter implements ProviderAdapter {
   }
   private interruptWaitingTools(): void {
     for (const request of this.requests.values()) if (request.toolId) this.updateTool(request.toolId, { status: 'interrupted' })
+  }
+  /** The owner's auto-approve policy for one tool call (approval-policy.ts; the host journals an
+   *  allow). Never asked for an isolated reviewer or in plan or read-only mode. */
+  private policyDecision(name: string, input: ObjectValue, requestId: string): PolicyDecision {
+    if (!this.options.approvalPolicy || this.options.approvalReviewer || this.settings.plan || this.settings.permission === 'read-only') return null
+    const request = policyRequestFor({ provider: 'claude', tool: name, nativeMethod: 'can_use_tool', input, cwd: this.options.cwd, projectRoot: this.options.cwd })
+    if (!request) return null
+    try { return this.options.approvalPolicy(request, { requestId, tool: name, input }) } catch { return null }
   }
   private emitWaiting(): void {
     const pending = [...this.requests.values()]
@@ -1572,6 +1602,11 @@ export class ClaudeAdapter implements ProviderAdapter {
 }
 
 /** `promise`, or `message` as an error once `ms` pass without it. */
+/** What a policy notice names: the command, or the file a tool reads or writes. */
+function policySubject(name: string, input: ObjectValue): string {
+  const detail = string(input.command) ?? string(input.file_path) ?? string(input.notebook_path) ?? string(input.path) ?? string(input.pattern) ?? ''
+  return detail ? `${name} ${detail}` : name
+}
 function within<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
   return Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms) })]).finally(() => clearTimeout(timer))

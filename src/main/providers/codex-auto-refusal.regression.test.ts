@@ -93,20 +93,23 @@ describe('Auto refusal incident: native approval lifecycle', () => {
     expect({ pending: f.pending(), responses: f.responses() }).toEqual({ pending: [], responses: [{ id: nativeRequestId, result: { decision: 'accept' } }] })
   })
 
+  const escaped = (text: string) => text.replace(/[.*+?^$()|[\]\\]/g, '\\$&')
   it.each([
-    ['a Windows system directory or the hosts file', 'Add-Content C:\\Windows\\System32\\drivers\\etc\\hosts "127.0.0.1 faktury.test"'],
-    ['the registry', 'reg add HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v Invoices /d start.cmd'],
-    ['elevation', 'Start-Process powershell -Verb RunAs -ArgumentList "-File setup.ps1"'],
-    ['services, scheduled tasks or startup', 'schtasks /create /tn Invoices /tr start.cmd /sc onlogon'],
-    ['the firewall, network configuration or Defender', 'netsh advfirewall firewall add rule name=Invoices dir=in action=allow'],
-    ['a credential or key store', 'Copy-Item .\\key C:\\Users\\owner\\.ssh\\id_ed25519'],
-    ['disks, boot, accounts or permissions', 'icacls C:\\Users\\owner\\Documents /grant Everyone:F'],
-    ['recursive deletion', 'Remove-Item -Recurse -Force C:\\Users\\owner\\Documents\\old']
-  ])('an escalation that reaches %s stays an owner card in Auto, with the reason and the offered choices', async (boundary, command) => {
+    ['a Windows system directory or the hosts file', 'Add-Content C:\\Windows\\System32\\drivers\\etc\\hosts "127.0.0.1 faktury.test"', 'C:\\Windows\\System32\\drivers\\etc\\hosts'],
+    ['the registry', 'reg add HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v Invoices /d start.cmd', 'reg add'],
+    ['elevation', 'Start-Process powershell -Verb RunAs -ArgumentList "-File setup.ps1"', 'Start-Process powershell -Verb'],
+    ['services, scheduled tasks or startup', 'schtasks /create /tn Invoices /tr start.cmd /sc onlogon', 'schtasks'],
+    ['the firewall, network configuration or Defender', 'netsh advfirewall firewall add rule name=Invoices dir=in action=allow', 'netsh'],
+    ['a credential or key store', 'Copy-Item .\\key C:\\Users\\owner\\.ssh\\id_ed25519', 'C:\\Users\\owner\\.ssh\\id_ed25519'],
+    ['disks, boot, accounts or permissions', 'icacls C:\\Users\\owner\\Documents /grant Everyone:F', 'icacls'],
+    ['recursive deletion', 'Remove-Item -Recurse -Force C:\\Users\\owner\\Documents\\old', 'Remove-Item -Recurse']
+  ])('an escalation that reaches %s stays an owner card in Auto, with the reason, the matched text and the offered choices', async (boundary, command, matched) => {
     const f = fixture(); await f.start(); f.request('commandExecution', command)
     expect({ pending: f.pending().map(interaction => interaction.choices.map(choice => choice.id)), responses: f.responses(), last: f.events.at(-1)?.data })
       .toMatchObject({ pending: [['accept', 'decline', 'cancel']], responses: [], last: { type: 'session', phase: 'waiting_approval' } })
-    expect(f.notices(new RegExp('^Auto left “Synthetic policy escalation” to you: it reaches ' + boundary.replace(/[.*+?^$()|[\]\\]/g, '\\$&') + '\\. The native request is pending'))).toBe(1)
+    expect(f.notices(new RegExp('^Auto left “Synthetic policy escalation” to you: it reaches ' + escaped(boundary) + ' \\(“' + escaped(matched) + '”\\)\\. The native request is pending'))).toBe(1)
+    // The owner's card is marked as theirs, so no auto-approve policy ever answers it.
+    expect(f.pending()[0]?.required).toBe(true)
     await f.answer()
     expect(f.responses()).toEqual([{ id: nativeRequestId, result: { decision: 'accept' } }])
   })
@@ -124,19 +127,22 @@ describe('Auto refusal incident: native approval lifecycle', () => {
   })
 
   it('a live-quoted wrapper still holds what the command itself reaches', async () => {
-    expect(ownerOnlyEscalation(liveWrapper + "'Add-Content C:\\Windows\\System32\\drivers\\etc\\hosts x'")).toBe('a Windows system directory or the hosts file')
-    expect(ownerOnlyEscalation(liveWrapper + "'Copy-Item k C:\\Users\\owner\\.docker\\config.json'")).toBe('a credential or key store')
+    expect(ownerOnlyEscalation(liveWrapper + "'Add-Content C:\\Windows\\System32\\drivers\\etc\\hosts x'")).toBe('a Windows system directory or the hosts file (“C:\\Windows\\System32\\drivers\\etc\\hosts”)')
+    expect(ownerOnlyEscalation(liveWrapper + "'Copy-Item k C:\\Users\\owner\\.docker\\config.json'")).toBe('a credential or key store (“C:\\Users\\owner\\.docker\\config.json”)')
     const f = fixture(); await f.start(); f.request('commandExecution', liveWrapper + "'reg add HKCU\\Software\\x'", ['accept', livePrefix, 'cancel'])
     expect(f.pending().map(interaction => interaction.choices.map(choice => choice.id))).toEqual([['accept', 'cancel']])
   })
 
-  it('outside Auto the owner may save the prefix Codex offers, answered exactly as offered', async () => {
+  it('outside Auto "for this session" saves the prefix Codex offers, answered exactly as offered', async () => {
+    // Codex on Windows offers no session grant for a command, only its prefix rule: that rule is the session choice.
     const f = fixture('accept-edits'); await f.start(); f.request('commandExecution', liveEvaluation, ['accept', livePrefix, 'cancel'])
     const [card] = f.pending()
-    expect(card?.choices.map(choice => [choice.id, choice.label])).toEqual([['accept', 'Allow once'], ['acceptWithExecpolicyAmendment', 'Always allow `node artifacts/local-files/evaluate.mjs`'], ['cancel', 'Cancel turn']])
-    await f.answer('acceptWithExecpolicyAmendment')
+    expect(card?.choices.map(choice => [choice.id, choice.label])).toEqual([['accept', 'Allow once'], ['acceptForSession', 'Allow for this session'], ['cancel', 'Cancel turn']])
+    expect(card?.choices[1]?.description).toContain('`node artifacts/local-files/evaluate.mjs` as an allow rule')
+    await f.answer('acceptForSession')
     expect(f.responses()).toEqual([{ id: nativeRequestId, result: { decision: livePrefix } }])
     const plain = fixture('accept-edits'); await plain.start(); plain.request('commandExecution', liveEvaluation, ['accept', 'cancel'])
+    await expect(plain.answer('acceptForSession')).rejects.toThrow('not offered')
     await expect(plain.answer('acceptWithExecpolicyAmendment')).rejects.toThrow('not offered')
   })
 
@@ -145,7 +151,7 @@ describe('Auto refusal incident: native approval lifecycle', () => {
     expect({ pending: blind.pending().length, responses: blind.responses(), held: blind.notices(/^Auto left .* to you: it names no paths Auto can check\./) }).toEqual({ pending: 1, responses: [], held: 1 })
     const seen = fixture(); await seen.start(); seen.fileChangeStarted('C:\\Users\\owner\\.ssh\\config'); seen.request('fileChange')
     expect({ pending: seen.pending().length, responses: seen.responses(), held: seen.notices(/it reaches a credential or key store/) }).toEqual({ pending: 1, responses: [], held: 1 })
-    expect(ownerOnlyEscalation(JSON.stringify({ fileSystem: { write: ['C:\\Windows\\System32'] } }))).toBe('a Windows system directory or the hosts file')
+    expect(ownerOnlyEscalation(JSON.stringify({ fileSystem: { write: ['C:\\Windows\\System32'] } }))).toBe('a Windows system directory or the hosts file (“C:\\Windows\\System32”)')
     expect(ownerOnlyEscalation(JSON.stringify({ network: { enabled: true } }))).toBeUndefined()
   })
 

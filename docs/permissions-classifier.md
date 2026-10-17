@@ -241,8 +241,27 @@ says to inspect the native denial, rule matching and effective settings before d
     launch and in every live rule set a grant change sends.
   - Evidence: `docs/verification/2026-09-29-approvals-clauses-3-5.md`.
 
+- **The owner's auto-approve policy (2026-10-17, feature-list `wake-controller-on-approval`).**
+  `src/main/approval-policy.ts` answers benign project actions before any card: Python, Blender
+  (its bundled Python and quoted Program Files paths included), downloads and `pip --target` into
+  the project, project scripts, and reads and writes inside the project (classes on by default,
+  `approvals.policy.get/set`). In a Claude tab it answers twice, with the same decision:
+  - the PreToolUse hook (`conductor_before`) returns `permissionDecision: "allow"` for a covered
+    call, after the edit snapshot. Claude still evaluates its deny and ask rules after a hook's
+    allow (hooks reference, PreToolUse decision control), so an owner ask rule keeps its card;
+  - a `can_use_tool` request it covers is answered `allow` at once, with the notice
+    `Allowed by the auto-approve policy (<rule>): …` instead of a card. A question, an owner ask
+    rule (`matched_ask_rule`), a mandatory approval, plan mode, Full Auto and an isolated reviewer
+    are never asked.
+  Every allow is recorded with `answeredBy: "policy"` and the rule (`policyAnswerLog`, a digest
+  of the arguments only).
+
 ## UNCONFIRMED
 
+- **Whether a PreToolUse allow also skips Auto's server classifier** in the installed CLI. The
+  hooks reference says an allow skips the permission prompt; for Auto the classifier is that
+  prompt's stand-in, but no probe has measured it yet. If it does not, a covered call is still
+  judged by the classifier, and only a refusal of it becomes a card as before.
 - **Precedence in later CLI versions:** the behaviour above is claude 2.1.282's. Rerun
   `CONDUCTOR_REAL_CLAUDE=1 node scripts/probe-classifier-precedence.mjs` and
   `scripts/probe-request-permission-exempt.mjs` after a CLI upgrade.

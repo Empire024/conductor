@@ -26,6 +26,7 @@ import { CoworkerRecovery } from './coworker-recovery'
 import { encodeRestartInitiator, encodeRestartRequest, parseRestartRequest, RESTART_INITIATOR_KEY, RESTART_REQUEST_KEY, takeRestartInitiator } from './restart-initiator'
 import type { SupervisorOverview } from './supervisor-overview'
 import { UsageWeeksService } from './usage-weeks'
+import { defaultApprovalPolicy, setCurrentApprovalPolicy } from './approval-policy'
 
 const dispose: Array<() => void> = []
 afterEach(() => { for (const close of dispose.splice(0).reverse()) close(); vi.unstubAllEnvs(); vi.useRealTimers() })
@@ -3792,5 +3793,122 @@ describe('relay and coordinator tabs roll to a fresh session past the context bo
     expect(f.control.tabs(f.scope).filter(tab => tab.kind === 'agent')).toHaveLength(3)
     expect(relayBrief({ role: 'coordinator', title: 'Batch', from: 'agent_x', used: 70_000, bound: 60_000, instructions: 'x'.repeat(9000) })).toContain(' […]')
     expect(relayBrief({ role: 'coordinator', title: 'Batch', from: 'agent_x', used: 70_000, bound: 60_000 })).toContain('(not recorded)')
+  })
+})
+
+// conductor-task:wake-controller-on-approval: a coworker's card wakes its wizard; no overseer polls.
+describe('a coworker\'s approval card wakes whoever can answer it', () => {
+  const asWizard = (f: ReturnType<typeof fixture>) => {
+    const state = f.database.structured.snapshot(f.spec.id)!
+    f.database.structured.update(f.spec.id, { settings: { ...state.settings, wizard: true, model: 'gpt-6-astra' } })
+  }
+  const raise = (f: ReturnType<typeof fixture>, id: string, requestId: string, input: Record<string, unknown> = { command: 'npm install left-pad' }, extra: Record<string, unknown> = {}) => {
+    const state = f.database.structured.snapshot(id)!
+    const event = { sessionId: id, runtimeId: state.runtimeId, sequence: state.sequence + 1, timestamp: new Date().toISOString(), itemId: 'card-' + requestId, requestId,
+      data: { type: 'interaction', interaction: { id: requestId, kind: 'approval', status: 'pending', title: typeof input.file_path === 'string' ? 'Allow Read?' : 'Allow Bash?', input, choices: [{ id: 'allow', label: 'Allow once' }, { id: 'deny', label: 'Deny' }], ...extra } } }
+    f.database.structured.append(event as never)
+    f.control.noteAwaitingEvents([event] as never)
+  }
+  const wakes = (f: ReturnType<typeof fixture>, id: string) => f.submissions.filter(entry => (void id, /approval/.test(entry.prompt) && entry.prompt.startsWith('[Conductor]')))
+
+  it('wakes the wizard controller once per card and coalesces a burst into one message', async () => {
+    const f = fixture()
+    asWizard(f)
+    const tab = await f.control.call(f.scope, 'tabs.open', { title: 'Installer' }) as AgentControlTab
+    const worker = tab.resourceId!
+    raise(f, worker, 'req-1')
+    raise(f, worker, 'req-2', { command: 'git push origin main' })
+    expect(await f.control.sweepApprovalWakes(0)).toBe(1)
+    const sent = wakes(f, f.spec.id)
+    expect(sent).toHaveLength(1)
+    expect(sent[0]!.prompt).toMatch(/waiting on 2 approvals/)
+    expect(sent[0]!.prompt).toContain(`agents.approve({agentSessionId:"${worker}", requestId:"req-1"`)
+    expect(sent[0]!.prompt).toContain('requestId:"req-2"')
+    expect(sent[0]!.prompt).toContain('"git push origin main"')
+    // The same cards never wake it again; a new one does, alone.
+    await vi.waitFor(() => expect(f.database.structured.snapshot(f.spec.id)!.phase).toBe('completed'))
+    expect(await f.control.sweepApprovalWakes(0)).toBe(0)
+    // A card that states its reason (Codex titles its card with it) carries it into the wake.
+    raise(f, worker, 'req-3', { command: 'npm install left-pad' }, { title: 'Needs the network to fetch a package' })
+    expect(await f.control.sweepApprovalWakes(0)).toBe(1)
+    expect(wakes(f, f.spec.id).at(-1)!.prompt).not.toContain('req-1')
+    expect(wakes(f, f.spec.id).at(-1)!.prompt).toContain('req-3')
+    expect(wakes(f, f.spec.id).at(-1)!.prompt).toContain('reason: Needs the network to fetch a package')
+    expect(wakes(f, f.spec.id)[0]!.prompt).not.toMatch(/[(;] reason: /)
+  })
+
+  it('leaves a card the stronger review is answering, and an ordinary controller that cannot answer', async () => {
+    const f = fixture()
+    const tab = await f.control.call(f.scope, 'tabs.open', { title: 'Reviewed' }) as AgentControlTab
+    raise(f, tab.resourceId!, 'req-1')
+    // Not a wizard: nothing is sent (the owner's card stands).
+    expect(await f.control.sweepApprovalWakes(0)).toBe(0)
+    asWizard(f)
+    raise(f, tab.resourceId!, 'req-2', { command: 'npm run lint' }, { review: { id: 'rv', digest: 'd', phase: 'reviewing', rationale: 'Waiting for a stronger reviewing turn' } })
+    expect(await f.control.sweepApprovalWakes(0)).toBe(1)
+    expect(wakes(f, f.spec.id).at(-1)!.prompt).toContain('req-1')
+    expect(wakes(f, f.spec.id).at(-1)!.prompt).not.toContain('req-2')
+  })
+
+  it('agents.await({approvals:true}) ends when an awaited conversation raises a card', async () => {
+    const f = fixture()
+    const fixer = agentIn(f, f.project.id, f.workspace.id, 'fixer')
+    await expect(f.control.call(f.scope, 'agents.await', { agents: [fixer.agentSessionId], approvals: 'yes' })).rejects.toThrow(/approvals must be true or false/)
+    const declared = await f.control.call(f.scope, 'agents.await', { agents: [fixer.agentSessionId], reason: 'W5', approvals: true }) as { approvals?: boolean; note: string }
+    expect(declared).toMatchObject({ approvals: true, note: expect.stringMatching(/raises an approval/) })
+    expect(await f.control.sweepApprovalWakes(0)).toBe(0)
+    raise(f, fixer.agentSessionId, 'req-9', { command: 'rm -rf dist' })
+    expect(await f.control.sweepApprovalWakes(0)).toBe(1)
+    const sent = wakes(f, f.spec.id).at(-1)!
+    expect(sent.prompt).toMatch(/Your wait \(W5\) ended because a conversation you wait for is asking for an approval/)
+    expect(sent.prompt).toContain('req-9')
+    expect(sent.prompt).toContain('the owner answers it in that tab')
+    expect(f.control.awaitingFact(f.scope.agentSessionId)).toBeUndefined()
+    expect(await f.control.sweepApprovalWakes(0)).toBe(0)
+    // Without approvals:true a wait is not ended by a card.
+    await f.control.call(f.scope, 'agents.await', { agents: [fixer.agentSessionId] })
+    raise(f, fixer.agentSessionId, 'req-10')
+    expect(await f.control.sweepApprovalWakes(0)).toBe(0)
+    expect(f.control.awaitingFact(f.scope.agentSessionId)).toBeDefined()
+  })
+
+  it('the owner\'s auto-approve policy answers a card it covers itself, recorded as "policy", and wakes nobody', async () => {
+    const f = fixture()
+    const tab = await f.control.call(f.scope, 'tabs.open', { title: 'Renderer' }) as AgentControlTab
+    const worker = tab.resourceId!
+    try {
+      // Anyone reads the policy (on by default); only the owner or a wizard changes it.
+      expect(await f.control.call(f.scope, 'approvals.policy.get', {})).toMatchObject({ enabled: true, rules: expect.arrayContaining([expect.objectContaining({ rule: 'python', on: true })]) })
+      expect(await f.control.call(f.scope, 'approvals.policy.get', {})).not.toHaveProperty('answered')
+      await expect(f.control.call(f.scope, 'approvals.policy.set', { rules: { python: false } })).rejects.toThrow(/answers only a wizard tab/)
+      asWizard(f)
+      await expect(f.control.call(f.scope, 'approvals.policy.set', { rules: { everything: true } })).rejects.toThrow(/Unknown policy class everything/)
+      await expect(f.control.call(f.scope, 'approvals.policy.set', { writableRoots: [f.root.slice(0, 3)] })).rejects.toThrow(/cannot be a writable root/)
+      await expect(f.control.call(f.scope, 'approvals.policy.set', {})).rejects.toThrow(/Name what changes/)
+      const respond = vi.spyOn(f.sessions, 'respond').mockResolvedValue()
+      const outside = join(f.root, 'elsewhere')
+      // A Codex coworker's escalations: a project script run, one writing outside, one Codex holds for the owner.
+      raise(f, worker, 'run-1', { command: 'python render.py --output out/run-1', cwd: f.project.path }, { choices: [{ id: 'accept', label: 'Allow once' }, { id: 'decline', label: 'Deny' }] })
+      raise(f, worker, 'run-2', { command: `python render.py --output "${outside}"`, cwd: f.project.path }, { choices: [{ id: 'accept', label: 'Allow once' }, { id: 'decline', label: 'Deny' }] })
+      raise(f, worker, 'run-3', { command: 'reg add HKCU\\Software\\x', cwd: f.project.path }, { choices: [{ id: 'accept', label: 'Allow once' }, { id: 'decline', label: 'Deny' }] })
+      expect(await f.control.sweepApprovalWakes(0)).toBe(1)
+      expect(respond).toHaveBeenCalledTimes(1)
+      expect(respond).toHaveBeenCalledWith(expect.objectContaining({ sessionId: worker, requestId: 'run-1', decision: 'accept' }))
+      const sent = wakes(f, f.spec.id).at(-1)!.prompt
+      expect(sent).not.toContain('run-1')
+      expect(sent).toContain('run-2')
+      expect(sent).toContain('run-3')
+      const state = await f.control.call(f.scope, 'approvals.policy.get', {}) as { answered: { total: number; byRule: Record<string, number>; recent: Array<Record<string, unknown>> } }
+      expect(state.answered).toMatchObject({ total: 1, byRule: { python: 1 } })
+      expect(state.answered.recent[0]).toMatchObject({ requestId: 'run-1', answeredBy: 'policy', rule: 'python', workerId: worker })
+      expect(JSON.stringify(state.answered.recent[0])).not.toContain('render.py')
+      // Switched off by the wizard: the next such card goes to the wizard instead.
+      expect(await f.control.call(f.scope, 'approvals.policy.set', { rules: { python: false } })).toMatchObject({ rules: expect.arrayContaining([expect.objectContaining({ rule: 'python', on: false })]), setBy: 'Wizard controller' })
+      expect(JSON.parse(f.database.getSetting('approvalPolicy')!)).toMatchObject({ rules: { python: false }, setBy: 'Wizard controller' })
+      raise(f, worker, 'run-4', { command: 'python render.py --output out/run-4', cwd: f.project.path }, { choices: [{ id: 'accept', label: 'Allow once' }, { id: 'decline', label: 'Deny' }] })
+      expect(await f.control.sweepApprovalWakes(0)).toBe(1)
+      expect(respond).toHaveBeenCalledTimes(1)
+      expect(wakes(f, f.spec.id).at(-1)!.prompt).toContain('run-4')
+    } finally { setCurrentApprovalPolicy(defaultApprovalPolicy()) }
   })
 })

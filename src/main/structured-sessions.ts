@@ -31,6 +31,7 @@ import { normaliseContract } from './local-models/completion.ts'
 import { composeLocalPrompt } from './local-models/briefing.ts'
 import { LOCAL_MODEL_SETUP_ERROR_CODE } from '../shared/local-models.ts'
 import { ApprovalReviewGate, type ApprovalReviewRouting } from './approval-review-gate'
+import { evaluateApprovalPolicy, policyAnswerLog, type PolicyDecision, type PolicyRequest } from './approval-policy'
 import { SUCCESSION_NUDGE, type BriefingContext } from './turn-briefing'
 import type { PermissionGrants } from './permission-grants/service'
 
@@ -208,6 +209,10 @@ export class StructuredSessions {
    *  rule (approval-review-rules.ts) is consulted, and the class such a rule would cover. */
   approvalReviewClass(id: string, runtimeId: string, requestId: string): { reviewed: boolean; key?: string } { return this.approvalGate.reviewedClass(id, runtimeId, requestId) }
   setApprovalReviewRouting(routing: ApprovalReviewRouting): void { this.reviewRouting = routing; this.approvalGate.routing = routing }
+  private controllerOf?: (id: string) => string | undefined
+  /** Whose coworker a conversation is (agent-control's control links): the auto-approve policy
+   *  stands in for a controller that delegated the work. */
+  setControllerLookup(lookup: (id: string) => string | undefined): void { this.controllerOf = lookup }
   markApprovalReviewer(id: string): void { this.database.setSetting('approval-reviewer:' + id, 'true') }
   isApprovalReviewer(id: string): boolean { return this.database.getSetting('approval-reviewer:' + id) === 'true' }
   /** Whether this process holds a runtime for the conversation (connected or connecting). */
@@ -531,6 +536,8 @@ export class StructuredSessions {
       approvalReviewer: this.isApprovalReviewer(id),
       reviewApprovals: Boolean(this.reviewRouting?.enabled(live.spec)),
       authorizeTool: (name, input) => this.approvalGate.guardTool(live.spec, name, input),
+      // The owner's auto-approve policy, asked before a native card is raised (approval-policy.ts).
+      ...(!isolated && (live.spec.provider === 'claude' || live.spec.provider === 'codex') ? { approvalPolicy: (request, native) => this.policyAnswer(live, runtimeId, request, native) } : {}),
       ...(live.spec.provider === 'local' ? { localTaskId: id,
         localCheckpoint: sessionCheckpoint(this.database, { projectId: live.spec.projectId, taskId: id }, () => {
           if (live.closed || live.runtimeId !== runtimeId || this.live.get(id) !== live) throw new Error('Local checkpoint is unavailable for this runtime')
@@ -557,6 +564,24 @@ export class StructuredSessions {
         catch (error) { this.snapshotNotice(live, runtimeId, itemId, error) }
       }
     }
+  }
+  /** The owner's auto-approve policy for one native request of this runtime: never for a closed or
+   *  replaced runtime or a plan or read-only conversation, always for the registered project
+   *  folder whatever the adapter names; an allow is recorded with answeredBy "policy". It stands in
+   *  for whoever delegated the work, a coworker's controller or an owner who chose Auto: the owner's
+   *  own conversation in Ask or Edit mode keeps asking, because they chose to be asked. */
+  private policyAnswer(live: LiveSession, runtimeId: string, request: PolicyRequest, native: { requestId: string; tool: string; input: Json }): PolicyDecision {
+    if (live.closed || live.runtimeId !== runtimeId) return null
+    const settings = this.database.structured.snapshot(live.spec.id)?.settings
+    if (!settings || settings.plan || settings.permission === 'read-only' || settings.sandbox === 'read-only') return null
+    let delegated = settings.permission === 'auto'
+    if (!delegated) try { delegated = Boolean(this.controllerOf?.(live.spec.id)) } catch { delegated = false }
+    if (!delegated) return null
+    const decision = evaluateApprovalPolicy({ ...request, projectRoot: live.spec.cwd })
+    if (!decision) return null
+    try { policyAnswerLog(this.database).record({ rule: decision.rule, provider: live.spec.provider, kind: request.kind, tool: native.tool, projectId: live.spec.projectId, workerId: live.spec.id, runtimeId, requestId: native.requestId, input: native.input }) }
+    catch (error) { console.warn('A policy approval could not be recorded; the answer itself stands', error) }
+    return decision
   }
   /** Report a snapshot failure the owner could not have predicted — once. The same reason
    *  recurring on every tool call says nothing new after the first time, and burying the
@@ -1925,7 +1950,10 @@ export class StructuredSessions {
     if (!live.adapter) return false
     return active.has(this.database.structured.snapshot(live.spec.id)!.phase) || (live.backgroundTasks ?? 0) > 0
   }
-  dispose(): void { this.killWhere(() => true); this.database.structured.flush() }
+  dispose(): void {
+    this.killWhere(() => true); this.database.structured.flush()
+    try { policyAnswerLog(this.database).flush() } catch (error) { console.warn('The auto-approve policy log could not be saved', error) }
+  }
 
   /** Keeps every conversation whose turn is still running alive in the runtime host across an
    *  app restart (docs/runtime-host.md): its adapter lets go of the provider process, and what it

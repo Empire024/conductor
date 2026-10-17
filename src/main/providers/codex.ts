@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { providerEnvironment } from '../provider-environment'
 import { execFile } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { lstatSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { isAbsolute, join, relative, resolve } from 'node:path'
 import { SteeringUnavailableError, type AdapterOptions, type ProviderAdapter, type RuntimeDetachment } from './adapter'
 import { captureAdapterState, restoreAdapterState, settled } from './adapter-state'
 import { currentRuntimeHost, JsonLineTransport, type HostedRuntimeHandle, type TransportOptions } from './transport'
@@ -35,6 +36,8 @@ import { BROWSER_MCP_SERVER_NAME } from '../../shared/browser-mcp'
 import { CODEX_FALLBACK_MODEL } from '../../shared/agent-model-selection'
 import { codexConductorThreadConfig, codexLocalAssistThreadConfig, mergeCodexMcpConfigs } from '../local-assist/mcp-config'
 import { canonicalAction } from '../approval-review'
+import { commandClass, commandText } from '../approval-review-rules'
+import { defaultApprovalPolicy, MAX_WRITABLE_ROOTS, policyNotice, writableRootPaths, writableRootProblem, type PolicyDecision, type PolicyRequest } from '../approval-policy'
 
 export const CODEX_PROTOCOL_BASELINE = '0.159.1'
 /** Exact runtimes the fixture suite covers: the baseline and the previous minor, whose wire the
@@ -76,9 +79,15 @@ const statusFor = (status: string, complete: boolean): ActivityStatus => status 
  * before leaving the workspace; Auto asks Codex-side the same way (`on-request`, the policy its
  * own automatic mode uses) and Conductor answers for the owner: enabled MCP tools are allowed,
  * a command, file change or permission grant that has to leave the workspace sandbox is allowed
- * once unless it reaches an owner-only boundary (OWNER_ONLY_ESCALATIONS), unattended commands
- * get the network, and questions always reach the owner. Under a "Review coworkers" controller
- * the same requests are review cards instead, and an isolated reviewer never executes.
+ * once unless it reaches an owner-only boundary (OWNER_ONLY_ESCALATIONS), and questions always
+ * reach the owner. Under a "Review coworkers" controller the same requests are review cards
+ * instead, and an isolated reviewer never executes.
+ * Both workspace-write modes carry the network: a download, a pip install or an API call is
+ * ordinary workspace work, and without it every one was a sandbox failure followed by an
+ * escalation (codex-approval-spam, owner 2026-10-17). Until then only Auto had it: the first
+ * adapter (2026b43) copied Codex's own workspace-write default, network off, and the presets
+ * (67651bc) kept it for the asking modes so Codex would request it per command. A project
+ * switches it off with `"network": false` in .conductor/codex-sandbox.json (codexSandboxSettings).
  * `never` is deliberately not used: under it Codex refuses, rather than asks about, any MCP tool
  * not annotated read-only (verified against codex-cli 0.155.1), which is how Auto lost every
  * browser tool. `danger-full-access` is not used either: the sandbox still fails a command first,
@@ -87,41 +96,121 @@ const statusFor = (status: string, complete: boolean): ActivityStatus => status 
 const PERMISSION_PRESETS: Record<SessionSettings['permission'], { sandbox: NonNullable<SessionSettings['sandbox']>; approvalPolicy: NonNullable<SessionSettings['approvalPolicy']>; network: boolean; unattended: boolean }> = {
   default: { sandbox: 'inherit', approvalPolicy: 'inherit', network: false, unattended: false },
   'read-only': { sandbox: 'read-only', approvalPolicy: 'untrusted', network: false, unattended: false },
-  'accept-edits': { sandbox: 'workspace-write', approvalPolicy: 'on-request', network: false, unattended: false },
+  'accept-edits': { sandbox: 'workspace-write', approvalPolicy: 'on-request', network: true, unattended: false },
   auto: { sandbox: 'workspace-write', approvalPolicy: 'on-request', network: true, unattended: true }
 }
 /** The Codex preset a composer mode maps to. Stored per-conversation sandbox/approval overrides
  *  from earlier versions are ignored rather than silently changing what the mode says. */
 export const codexPreset = (settings: Pick<SessionSettings, 'permission'>): (typeof PERMISSION_PRESETS)[SessionSettings['permission']] => PERMISSION_PRESETS[settings.permission] ?? PERMISSION_PRESETS.default
 
+const SYSTEM_DIRECTORY = 'a Windows system directory or the hosts file'
 /** Where Auto never answers for the owner, however Codex justifies the request. A native
  *  escalation whose command, paths or permission profile reach one of these stays an owner card;
  *  everything else that has to leave the workspace sandbox — a shortcut on the desktop, a file in
  *  the profile, a process or port query — is allowed once. The test is where an action reaches,
- *  not how it is worded, and a request that names nothing Auto can check is left to the owner. */
+ *  not how it is worded, and a request that names nothing Auto can check is left to the owner.
+ *  Every pattern names a real system context, never a word ordinary work also uses: until
+ *  2026-10-17 a bare `hosts` (`--hosts 3`), `credential` (Get-Credential, credentials.md),
+ *  `vault`, `format ` (`Get-Date -Format`), `shutdown` (`server.shutdown()`), any `\startup`
+ *  (Blender's scripts\startup) and any `Program Files` held ordinary work for the owner, Blender's
+ *  own python.exe included (feature-list codex-approval-spam). */
 const OWNER_ONLY_ESCALATIONS: ReadonlyArray<readonly [string, RegExp]> = [
   ['the registry', /\bhk(?:lm|cu|cr|u|cc)\b|hkey_|\breg(?:\.exe)?\s+(?:add|delete|import|restore|load|unload|copy)\b|regedit|registry::/i],
   ['elevation', /-verb\s+runas|\bsudo\b|\bgsudo\b|\brunas(?:\.exe)?\b|start-process\b[^|;\n]*-verb\b/i],
-  ['services, scheduled tasks or startup', /\bsc(?:\.exe)?\s+(?:create|config|delete|start|stop|failure)\b|\b(?:new|set|remove|start|stop|restart|suspend)-service\b|schtasks|scheduledtask|[\\/]startup\b|winlogon|\bwmic\b/i],
+  ['services, scheduled tasks or startup', /\bsc(?:\.exe)?\s+(?:create|config|delete|start|stop|failure)\b|\b(?:new|set|remove|start|stop|restart|suspend)-service\b|schtasks|scheduledtask|start menu[\\/]programs[\\/]startup\b|shell:(?:common )?startup\b|winlogon|\bwmic\b/i],
   ['the firewall, network configuration or Defender', /\bnetsh\b|netfirewall|new-netroute|set-dnsclient|add-mppreference|set-mppreference|\bmpcmdrun\b|\bdefender\b|\broute\s+(?:add|delete)\b/i],
-  ['a credential or key store', /\.ssh\b|\.gnupg\b|\.gpg\b|\.aws\b|\.azure\b|\.kube\b|\.docker[\\/]config|\.config[\\/]gh\b|\.git-credentials|credential|\.npmrc|\.pypirc|\.netrc|_netrc|\bcmdkey\b|\bvault\b|keychain|\bdpapi\b|\bcertutil\b|\bcertmgr\b|\bcert:\\/i],
-  ['disks, boot, accounts or permissions', /\bformat(?:\.com)?\s|\bdiskpart\b|\bbcdedit\b|\bshutdown\b|restart-computer|stop-computer|clear-disk|remove-partition|initialize-disk|\bcipher\s+\/w|\bnet\s+(?:user|localgroup|accounts)\b|(?:new|remove|set|enable|disable)-localuser|add-localgroupmember|\bicacls\b|\btakeown\b|set-acl/i],
+  ['a credential or key store', /\.ssh\b|\.gnupg\b|\.gpg\b|\.aws\b|\.azure\b|\.kube\b|\.docker[\\/]config|\.config[\\/]gh\b|\.git-credentials|\bgit(?:\.exe)?(?:\s+-[cC]\s+\S+)*\s+credential\b|\bgit-credential|credential\.helper|credential[\s-]?manager|\bcredman\b|\bvaultcmd\b|storedcredential\b|passwordvault|[\\/]microsoft[\\/](?:credentials|protect|vault)\b|\bvault\s+(?:kv|read|write|login|token|secrets|unseal|operator)\b|\.npmrc|\.pypirc|\.netrc|_netrc|\bcmdkey\b|keychain|\bdpapi\b|\bcertutil\b|\bcertmgr\b|\bcert:\\/i],
+  ['disks, boot, accounts or permissions', /(?:^|[\s;|&"'(])format(?:\.com)?\s+[a-z]:|\bformat-volume\b|\bdiskpart\b|\bbcdedit\b|\bshutdown(?:\.exe)?\s+[/-]\w|restart-computer|stop-computer|clear-disk|remove-partition|initialize-disk|\bcipher\s+\/w|\bnet\s+(?:user|localgroup|accounts)\b|(?:new|remove|set|enable|disable)-localuser|add-localgroupmember|\bicacls\b|\btakeown\b|set-acl/i],
   ['recursive deletion', /remove-item\b[^|;\n]*-rec|\brm\s+-[a-z]*r|\brd\s+\/s|\brmdir\s+\/s|\bdel\s+\/s|\bri\s+[^|;\n]*-rec|\|\s*remove-item\b/i],
-  // Last on purpose: registry paths such as HKLM\Software\Microsoft\Windows\CurrentVersion\Run contain
-  // "\Windows\", and the more specific boundary above must be the one the owner is told about.
-  ['a Windows system directory or the hosts file', /[\\/:](?:windows|winnt)[\\/]|system32|syswow64|drivers[\\/]etc|\bhosts\b|program files|programdata|\$env:(?:windir|systemroot|programfiles|programw6432|programdata|allusersprofile)\b|%(?:windir|systemroot|programfiles|programw6432|programdata|allusersprofile)%/i]
+  // Last on purpose: the more specific boundary above must be the one the owner is told about.
+  // The Windows folder counts at a drive's root only: \Microsoft\Windows\ inside AppData is the profile's.
+  [SYSTEM_DIRECTORY, /\b[a-z]:[\\/](?:windows|winnt)\b|(?:^|[\s"'=(,])[\\/][a-z][\\/](?:windows|winnt)\b|system32|syswow64|drivers[\\/]etc|[\\/]etc[\\/]hosts\b|\$\{?env:(?:windir|systemroot)\b|%(?:windir|systemroot)%/i]
 ]
+/** Program and machine-wide data folders are owner-only where a command writes into them, not
+ *  where it reads from them or runs a program installed there: Blender and its bundled Python
+ *  live under Program Files. A non-elevated write there fails anyway; ProgramData is partly
+ *  writable by every user. */
+const WRITE_ONLY_LOCATIONS = /\b[a-z]:[\\/](?:program ?files(?: ?\(x86\))?|programdata)\b|\$\{?env:(?:programfiles(?:\(x86\))?|programw6432|programdata|allusersprofile)\b|%(?:programfiles(?:\(x86\))?|programw6432|programdata|allusersprofile)%/gi
+/** A write before such a path in the same statement: a cmdlet, command or alias that creates,
+ *  changes, copies, moves or deletes files, an output redirect, or an output or destination option. */
+const WRITE_VERB = /(?:^|[\s;|&(){}"'`])(?:set-content|add-content|out-file|new-item|copy-item|move-item|rename-item|remove-item|clear-content|tee-object|export-csv|export-clixml|expand-archive|compress-archive|new-itemproperty|set-itemproperty|start-bitstransfer|invoke-webrequest|invoke-restmethod|iwr|irm|sc|ac|ni|ri|rni|cpi|mi|copy|cp|xcopy|robocopy|move|mv|ren|rename|rm|del|erase|rd|rmdir|md|mkdir|touch|tee|install|ln|mklink|rsync|dd|msiexec|setx|unzip|tar|7z)(?:\.exe)?(?=[\s"'`]|$)|>|(?:^|\s)-{1,2}(?:outfile|outputdirectory|destination(?:path)?|target|prefix|output|installdir|install-dir|dest|o|t|d)(?=[\s=:"']|$)|\bwrite(?:all(?:text|bytes|lines))?\s*\(|\bopen\s*\([^)]*,\s*['"][wax]/i
+/** Where a request itself says a path is written: a file-change path, a grant root, a permission write list. */
+const WRITE_KEY = /"(?:path|grantroot|file_path|notebook_path|move_path|cwd)"\s*:\s*\\?"$|"write"\s*:\s*\[[^\]]*$/i
+
+/** An absolute path's root as a command names it: a drive, Git Bash's /c/, or an environment variable. */
+const PATH_ROOT = String.raw`(?:[a-z]:|\/[a-z](?=[\\/])|\$\{?env:\w+\}?|%\w+%)[\\/]`
+/** Where a command names the program it runs: a statement separator or PowerShell's call operator,
+ *  a shell's -Command or -c, cmd's /c or /k, Start-Process, and the start of a line (when arguments
+ *  follow). The line start is last: it also matches empty, and must not hide a leading `& `. */
+const PROGRAM_POSITION = /[;|&][ \t]*|(?:^|[\s"'])(?:-command|-[li]?c|\/[ck])[ \t]+(?:\\?["'])?[ \t]*|\bstart-process[ \t]+(?:-filepath[ \t]+)?|(?<line>(?:^|\n)[ \t]*)/gi
+/** The program's path there: JSON-escaped, double, doubled single or single quotes (spaces allowed), or bare. */
+const PROGRAM_PATH = new RegExp(String.raw`^(?:"\\"(${PATH_ROOT}[^"\n]*?)\\"|\\?"(${PATH_ROOT}[^"\n]*?)\\?"|''(${PATH_ROOT}[^'\n]*?)''|'(${PATH_ROOT}[^'\n]*?)'|"?(${PATH_ROOT}[^\s"'|;&<>()]*))`, 'i')
+
+/** The text with every program path reduced to the program's bare name: a command is judged on
+ *  what its arguments reach, not on where the program it runs is installed. Codex on Windows runs
+ *  everything as `"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -Command '…'`
+ *  (live-observed 2026-09-22, codex-cli 0.155.1), and a Blender coworker as `& 'C:/Program
+ *  Files/Blender Foundation/Blender 5.2/5.2/python/bin/python.exe' script.py` inside it
+ *  (2026-10-17, every one held as a system directory). A path alone on its line (a file-change
+ *  path, a working directory, a file argument) is what a request touches and stays whole. */
+function reducePrograms(text: string): string {
+  let out = '', cursor = 0
+  for (const position of text.matchAll(PROGRAM_POSITION)) {
+    const at = position.index + position[0].length
+    if (at < cursor) continue
+    const token = PROGRAM_PATH.exec(text.slice(at))
+    if (!token) continue
+    const path = token[1] ?? token[2] ?? token[3] ?? token[4] ?? token[5] ?? ''
+    const name = /[^\\/]+$/.exec(path)?.[0].replace(/\.(?:exe|com)$/i, '')
+    const end = at + token[0].length
+    if (!name || position.groups?.line !== undefined && !/^[ \t]+\S/.test(text.slice(end))) continue
+    out += text.slice(cursor, at) + name
+    cursor = end
+  }
+  return out + text.slice(cursor)
+}
+
+/** The whole word or path a boundary matched inside, for the owner to read. */
+function matchedText(text: string, start: number, end: number): string {
+  const edge = /[\s"'`,;|()[\]{}<>]/
+  let left = start, right = end
+  while (left > 0 && start - left < 80 && !edge.test(text[left - 1]!)) left--
+  while (right < text.length && right - end < 80 && !edge.test(text[right]!)) right++
+  const matched = text.slice(left, right).replace(/\s+/g, ' ').trim()
+  return matched.length > 120 ? matched.slice(0, 119) + '…' : matched
+}
+
+/** A program or machine-data folder the text writes into, judged per statement. */
+function writeTarget(acted: string): string | undefined {
+  for (const match of acted.matchAll(WRITE_ONLY_LOCATIONS)) {
+    const head = acted.slice(0, match.index), both = head.lastIndexOf('&&')
+    const before = head.slice(Math.max(head.lastIndexOf('\n'), head.lastIndexOf(';'), head.lastIndexOf('|'), both < 0 ? -1 : both + 1) + 1)
+    if (/^\s*["'\\]*$/.test(before) || WRITE_KEY.test(before) || WRITE_VERB.test(before)) return matchedText(acted, match.index, match.index + match[0].length)
+  }
+  return undefined
+}
+
+/** An owner-only boundary a request reaches, and the text that reaches it. */
+export interface OwnerOnlyReach { boundary: string; matched: string }
 /** The owner-only boundary a native escalation reaches, if any, judged on where it acts. */
+export function ownerOnlyReach(reach: string): OwnerOnlyReach | undefined {
+  // Codex quotes its wrapper path with doubled separators (`"C:\\WINDOWS\\System32\\…"`, live-observed
+  // 2026-09-23 on every escalation of a Conductor evaluation run, and again on 2026-10-17), so
+  // separator runs are collapsed first; otherwise no path reads as the path it is.
+  const acted = reducePrograms(reach.replace(/\\{2,}/g, '\\'))
+  for (const [boundary, pattern] of OWNER_ONLY_ESCALATIONS) {
+    const match = pattern.exec(acted)
+    if (match) return { boundary, matched: matchedText(acted, match.index, match.index + match[0].length) }
+  }
+  const written = writeTarget(acted)
+  return written ? { boundary: SYSTEM_DIRECTORY, matched: written } : undefined
+}
+/** The owner-only boundary a native escalation reaches, if any, with the text that reaches it:
+ *  `a Windows system directory or the hosts file (“C:\Windows\System32\drivers\etc\hosts”)`. Every
+ *  caller says "it reaches …", so the owner, a wizard and a review's reason all read what matched. */
 export const ownerOnlyEscalation = (reach: string): string | undefined => {
-  // Codex on Windows wraps every command as `"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -Command '…'`
-  // (live-observed 2026-09-22, codex-cli 0.155.1; availableDecisions accept / acceptWithExecpolicyAmendment / cancel).
-  // The interpreter's own path would trip the system-directory rule and hold the owner's desktop-shortcut command,
-  // so an absolute interpreter path is reduced to its bare name before matching; what the command itself reaches
-  // is still judged in full. Codex quotes that path with doubled separators (`"C:\\WINDOWS\\System32\\…"`,
-  // live-observed 2026-09-23 on every escalation of a Conductor evaluation run), so separator runs are
-  // collapsed first; otherwise the reduction misses and every Windows escalation reads as a system directory.
-  const acted = reach.replace(/\\{2,}/g, '\\').replace(/"?[a-z]:\\(?:[^"\\\s]+\\)*(powershell|pwsh|cmd|bash|sh|zsh|node|python3?)(\.exe)?"?/gi, '$1')
-  return OWNER_ONLY_ESCALATIONS.find(([, pattern]) => pattern.test(acted))?.[0]
+  const found = ownerOnlyReach(reach)
+  return found && `${found.boundary} (“${found.matched}”)`
 }
 
 /** The command prefix Codex offers to remember for a command approval, exactly as offered. */
@@ -131,6 +220,97 @@ export const codexExecpolicyAmendment = (decisions: readonly unknown[]): string[
     if (Array.isArray(amendment) && amendment.length && amendment.every(part => typeof part === 'string')) return amendment
   }
   return undefined
+}
+
+/** A project's own Codex sandbox settings, beside .conductor/delivery.json. */
+export const CODEX_SANDBOX_FILE = '.conductor/codex-sandbox.json'
+/** Project folders a sandboxed command writes without asking whenever they exist as real folders:
+ *  dependencies installed with pip --target .deps, and tool caches. They are inside the workspace,
+ *  but naming them makes the Windows sandbox grant them itself: files a pip install moved in from
+ *  %TEMP% keep that folder's permissions, and the sandbox could not read .deps/PIL (miron, 2026-10-17). */
+export const CODEX_PROJECT_WRITABLE_DIRS = ['.deps', '.cache'] as const
+export interface CodexSandboxSettings {
+  /** Writable roots beyond the workspace, absolute existing folders, in order. */
+  writableRoots: string[]
+  /** false when the project switched the sandbox network off; otherwise absent. */
+  network?: false
+  /** What was left out and why, one notice each. */
+  problems: string[]
+}
+const sameFolder = (path: string): string => process.platform === 'win32' ? path.toLowerCase() : path
+/** Why an expanded folder cannot widen this project's sandbox, or undefined when it can. */
+function extraRootProblem(path: string, cwd: string): string | undefined {
+  if (!isAbsolute(path)) return 'it is not an absolute folder path'
+  let real: string
+  try {
+    if (!statSync(path).isDirectory()) return 'it is not a folder'
+    real = realpathSync.native(path)
+  } catch { return 'it does not exist (create it once, then it applies from the next turn)' }
+  const problem = writableRootProblem(real)
+  if (problem) return problem
+  const boundary = ownerOnlyEscalation(real)
+  if (boundary) return `it reaches ${boundary}`
+  let project = resolve(cwd)
+  try { project = realpathSync.native(cwd) } catch { /* the workspace itself is checked by its session */ }
+  const inside = relative(sameFolder(real), sameFolder(project))
+  if (inside === '' || !inside.startsWith('..') && !isAbsolute(inside)) return 'it contains the project itself'
+  return undefined
+}
+
+/**
+ * The extra writable roots and network switch of a project's workspace-write Codex sandbox:
+ * - the project's own .deps and .cache folders (CODEX_PROJECT_WRITABLE_DIRS);
+ * - the owner's writable roots (approval-policy.ts writableRootPaths, e.g.
+ *   %LOCALAPPDATA%\NVIDIA\OptixCache, where a sandboxed Blender GPU render stalled), in every mode;
+ * - the project's .conductor/codex-sandbox.json `{"writableRoots": [...], "network": false}`, with
+ *   %VAR%, $env:VAR and ~ expanded and absolute folders only. The agent can change that file
+ *   without asking, so its roots apply only where Conductor answers such escalations anyway
+ *   (`projectRoots`: Auto); in Edit they would let it widen its own sandbox. Its `"network": false`
+ *   applies in every mode: a restriction is the agent's to add.
+ * Every extra root must exist, must not contain the project, and must pass the policy's
+ * writableRootProblem and the owner-only boundaries, also after links are followed.
+ */
+export function codexSandboxSettings(cwd: string, options: { projectRoots: boolean; ownerRoots?: readonly string[] }): CodexSandboxSettings {
+  const writableRoots: string[] = [], problems: string[] = []
+  const seen = new Set([sameFolder(resolve(cwd))])
+  const add = (path: string): void => { const key = sameFolder(resolve(path)); if (!seen.has(key)) { seen.add(key); writableRoots.push(resolve(path)) } }
+  for (const name of CODEX_PROJECT_WRITABLE_DIRS) {
+    try { const entry = lstatSync(join(cwd, name)); if (entry.isDirectory() && !entry.isSymbolicLink()) add(join(cwd, name)) } catch { /* not there: nothing to grant */ }
+  }
+  for (const root of options.ownerRoots ?? []) {
+    // The owner's roots include a default (approval-policy.ts DEFAULT_WRITABLE_ROOTS: the OptiX
+    // cache) that a machine without an NVIDIA GPU never has: a root that is not there does not apply.
+    try { statSync(root) } catch { continue }
+    const problem = extraRootProblem(root, cwd)
+    if (problem) problems.push(`the owner's writable root ${root} was left out: ${problem}`)
+    else add(root)
+  }
+  let config: Record<string, unknown> | undefined
+  try {
+    const text = readFileSync(join(cwd, CODEX_SANDBOX_FILE), 'utf8')
+    const parsed: unknown = text.length > 64 * 1024 ? undefined : JSON.parse(text)
+    if (record(parsed)) config = parsed
+    else problems.push(`${CODEX_SANDBOX_FILE} must hold one JSON object of at most 64 KB; it was ignored`)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') problems.push(`${CODEX_SANDBOX_FILE} could not be read (${error instanceof Error ? error.message : String(error)}); it was ignored`)
+  }
+  if (!config) return { writableRoots, problems }
+  const unknown = Object.keys(config).filter(key => key !== 'writableRoots' && key !== 'network')
+  if (unknown.length) problems.push(`${CODEX_SANDBOX_FILE} has unknown key(s) ${unknown.join(', ')}; it takes writableRoots and network`)
+  if (config.network !== undefined && typeof config.network !== 'boolean') problems.push(`${CODEX_SANDBOX_FILE} "network" must be true or false`)
+  const listed = config.writableRoots
+  if (listed !== undefined && (!Array.isArray(listed) || !listed.every(entry => typeof entry === 'string'))) problems.push(`${CODEX_SANDBOX_FILE} "writableRoots" must be a list of folder paths`)
+  else if (Array.isArray(listed) && listed.length && !options.projectRoots) problems.push(`${CODEX_SANDBOX_FILE} writable roots apply in Auto only, because the agent can change that file without asking; for Edit, the owner adds them to the auto-approve policy's writable roots (approvals.policy)`)
+  else if (Array.isArray(listed)) {
+    if (listed.length > MAX_WRITABLE_ROOTS) problems.push(`${CODEX_SANDBOX_FILE} lists more than ${MAX_WRITABLE_ROOTS} writable roots; the rest were left out`)
+    for (const root of (listed as string[]).slice(0, MAX_WRITABLE_ROOTS)) {
+      const expanded = writableRootProblem(root) ? undefined : writableRootPaths({ ...defaultApprovalPolicy(), writableRoots: [root] })[0]
+      const problem = expanded === undefined ? writableRootProblem(root) ?? 'it is not an absolute folder path' : extraRootProblem(expanded, cwd)
+      if (problem) problems.push(`${CODEX_SANDBOX_FILE} writable root ${root} was left out: ${problem}`)
+      else add(expanded!)
+    }
+  }
+  return { writableRoots, problems, ...(config.network === false ? { network: false as const } : {}) }
 }
 
 /** What a failed Codex command says when the CLI's Windows sandbox helper could not refresh the
@@ -355,6 +535,13 @@ export class CodexAdapter implements ProviderAdapter {
   /** Requests Auto answered itself, by canonical arguments: a repeated delivery gets no second
    *  response, and a reused identity with other arguments is refused like a reused card. */
   private autoAnswered = new Map<string, string>()
+  /** Command classes (sessionClassOf) the owner or a wizard allowed for this session in this
+   *  runtime, with the request title that was allowed: a later command of the same class is
+   *  answered without a card, as Codex's own session grant would. */
+  private sessionClasses = new Map<string, string>()
+  /** Sandbox setting problems already told in this runtime, and the extra writable roots last announced. */
+  private sandboxNotices = new Set<string>()
+  private sandboxRoots = ''
   private sandboxSetupNoticed = false
   /** MCP servers Codex reported for this thread and their latest startup state. */
   private mcpStartup = new Map<string, string>()
@@ -543,7 +730,16 @@ export class CodexAdapter implements ProviderAdapter {
     // sandbox/approval overrides from earlier versions no longer take part.
     const preset = codexPreset(settings)
     const { sandbox, approvalPolicy } = preset
-    const networkAccess = preset.network
+    // A workspace-write turn carries the project's extra writable roots and its network switch,
+    // read again every turn so a changed setting applies from the next message (codexSandboxSettings).
+    const workspace = sandbox === 'workspace-write' ? codexSandboxSettings(this.options.cwd, { projectRoots: preset.unattended, ownerRoots: writableRootPaths() }) : undefined
+    for (const problem of workspace?.problems ?? []) this.sandboxNotice(problem)
+    const roots = (workspace?.writableRoots ?? []).join(', ')
+    if (workspace && roots !== this.sandboxRoots) {
+      this.sandboxRoots = roots
+      if (roots) this.emit({ data: { type: 'notice', message: `Codex sandbox: besides the workspace, these folders are writable without asking: ${roots}.`, payload: { writableRoots: workspace.writableRoots } } })
+    }
+    const networkAccess = preset.network && workspace?.network !== false
     this.unattended = preset.unattended
     if (!this.capabilities.sandboxModes!.includes(sandbox) || !this.capabilities.approvalPolicies!.includes(approvalPolicy)) throw new Error('Unsupported Codex sandbox or approval policy')
     const params: TurnStartParams = {
@@ -555,7 +751,7 @@ export class CodexAdapter implements ProviderAdapter {
       ...(preset.unattended ? { approvalsReviewer: 'user' as const } : {}),
       sandboxPolicy: sandbox === 'inherit' ? this.defaults.sandbox : sandbox === 'read-only'
         ? { type: 'readOnly', networkAccess: false }
-        : { type: 'workspaceWrite', writableRoots: [this.options.cwd], networkAccess, excludeTmpdirEnvVar: false, excludeSlashTmp: false }
+        : { type: 'workspaceWrite', writableRoots: [this.options.cwd, ...workspace?.writableRoots ?? []], networkAccess, excludeTmpdirEnvVar: false, excludeSlashTmp: false }
     }
     // Native collaboration mode survives adapter reconstruction/resume. Always
     // apply the selected mode when this version-gated surface is enabled.
@@ -649,6 +845,9 @@ export class CodexAdapter implements ProviderAdapter {
       throw error
     }
     this.emitInteraction(request, { ...interaction, status: 'resolved', outcome: response.decision ?? 'answered' })
+    // Allowed for this session, by Codex's own session grant or its lasting rule: a later command of
+    // the same kind in this runtime is answered without a card (sessionClasses).
+    if (response.decision === 'acceptForSession' || response.decision === 'acceptWithExecpolicyAmendment') this.rememberSessionClass(request, interaction.title)
     this.emitPhase()
   }
 
@@ -1035,6 +1234,16 @@ export class CodexAdapter implements ProviderAdapter {
       throw new Error('Provider approval identity was reused with changed arguments')
     }
     if (this.pending.size >= 128) throw new Error('Too many pending provider requests')
+    // A request this adapter already answered itself (Auto, a session class, the owner's policy): a
+    // repeated delivery gets no second answer, and a reused identity with other arguments is refused
+    // like a reused card.
+    const answered = this.autoAnswered.get(id)
+    if (answered !== undefined) {
+      if (answered === canonicalAction(params)) return
+      this.autoAnswered.delete(id)
+      this.invalidApprovalRequests.add(id)
+      throw new Error('Provider approval identity was reused with changed arguments')
+    }
     let choices: PendingInteraction['choices'] = [{ id: 'accept', label: 'Allow once' }, { id: 'acceptForSession', label: 'Allow for this session' }, { id: 'decline', label: 'Deny' }, { id: 'cancel', label: 'Cancel turn' }]
     let title = 'Approve file changes'
     if (request.method === 'item/commandExecution/requestApproval') {
@@ -1042,9 +1251,16 @@ export class CodexAdapter implements ProviderAdapter {
       if (request.params.availableDecisions) {
         choices = choices.filter(choice => request.params.availableDecisions!.some(decision => decision === choice.id))
         // Codex's own "don't ask again" for a command prefix. It writes a lasting Codex rule, so it is
-        // only ever the owner's click, labelled with the exact prefix, and never an Auto answer.
+        // only ever the owner's (or a wizard's) answer and never an Auto one. On Windows Codex offers
+        // no session grant for a command, only this rule (accept / acceptWithExecpolicyAmendment /
+        // cancel, live-observed 2026-09-22 and on every miron request of 2026-10-17), so there the
+        // rule is the session choice: "for this session" on the card, or agents.approve with scope
+        // "session", answers with it (decisionResult). Beside a session grant of Codex's own it stays
+        // a separate "Always allow".
         const amendment = codexExecpolicyAmendment(request.params.availableDecisions)
-        if (amendment) choices.splice(1, 0, { id: 'acceptWithExecpolicyAmendment', label: `Always allow \`${amendment.join(' ')}\``, description: 'Codex saves this prefix as a rule and runs matching commands without asking again, in this and later conversations.' })
+        const shown = amendment?.join(' ') ?? ''
+        if (amendment && choices.some(choice => choice.id === 'acceptForSession')) choices.splice(1, 0, { id: 'acceptWithExecpolicyAmendment', label: `Always allow \`${shown}\``, description: 'Codex saves this prefix as a rule and runs matching commands without asking again, in this and later conversations.' })
+        else if (amendment) choices.splice(1, 0, { id: 'acceptForSession', label: 'Allow for this session', description: `Codex saves \`${shown.length > 160 ? shown.slice(0, 159) + '…' : shown}\` as an allow rule and runs it again without asking, in this and later conversations; Conductor also allows commands of the same kind for the rest of this conversation.` })
       }
     } else if (request.method === 'item/permissions/requestApproval') {
       title = request.params.reason ?? 'Grant requested permissions'
@@ -1054,6 +1270,10 @@ export class CodexAdapter implements ProviderAdapter {
       choices = [{ id: 'accept', label: 'Allow once' }, ...(mcpApproval.persist.includes('session') ? [{ id: 'acceptForSession', label: 'Allow for this session' }] : []), { id: 'decline', label: 'Deny' }]
     }
     const isQuestion = request.method === 'item/tool/requestUserInput'
+    // What the request reaches. An owner-only boundary is never answered here, never offered for a
+    // session, never forms a session class, and its card says it is the owner's (required).
+    const check = isQuestion || mcpApproval ? undefined : this.ownerOnlyEscalation(request)
+    const ownerOnly = Boolean(check?.boundary)
     // A controller's "Review coworkers" opt-in never turns Auto off for a worker: it runs unattended
     // as configured, and only the isolated reviewer itself keeps every request pending.
     if (this.unattended && !isQuestion && !this.options.approvalReviewer) {
@@ -1063,60 +1283,137 @@ export class CodexAdapter implements ProviderAdapter {
       // gate and an isolated reviewer keep their pending cards, and so does a request that
       // offers no plain accept. Nothing here is an owner denial or a turn cancellation.
       const decision = mcpApproval?.persist.includes('session') ? 'acceptForSession' : 'accept'
-      const held = mcpApproval ? undefined : this.ownerOnlyEscalation(request)
       if (!choices.some(choice => choice.id === decision)) this.emit({ ...this.correlation(params), data: { type: 'notice', message: `Auto could not approve “${title}”: Codex offered no plain accept for it. The native request is pending; review it and choose an offered action.` } })
-      else if (held) this.emit({ ...this.correlation(params), data: { type: 'notice', message: `Auto left “${title}” to you: ${held}. The native request is pending; review it and choose an offered action.` } })
+      else if (check) this.emit({ ...this.correlation(params), data: { type: 'notice', message: `Auto left “${title}” to you: ${check.held}. The native request is pending; review it and choose an offered action.` } })
       else {
-        const answered = this.autoAnswered.get(id), action = canonicalAction(params)
-        if (answered === action) return
-        if (answered !== undefined) { this.autoAnswered.delete(id); this.invalidApprovalRequests.add(id); throw new Error('Provider approval identity was reused with changed arguments') }
-        if (this.autoAnswered.size >= 128) this.autoAnswered.delete(this.autoAnswered.keys().next().value!)
-        this.autoAnswered.set(id, action)
-        this.transport?.send({ id: request.id, result: this.decisionResult(request, decision) })
         const subject = mcpApproval ? `${mcpApproval.serverName}/${mcpApproval.tool}`
           : request.method === 'item/commandExecution/requestApproval' && request.params.networkApprovalContext ? `network access to ${request.params.networkApprovalContext.host}`
             : request.method === 'item/fileChange/requestApproval' ? 'file changes outside the workspace sandbox'
               : request.method === 'item/permissions/requestApproval' ? `the requested permissions for this turn (${title})` : `“${title}” outside the workspace sandbox`
-        this.emit({ ...this.correlation(params), data: { type: 'notice', message: `Auto allowed ${subject} without asking.` }, native: { method: request.method, payload: json(params) } })
+        this.answerItself(request, id, decision, { message: `Auto allowed ${subject} without asking.` })
         return
       }
     }
-    // A reviewed, isolated-reviewer or owner-held Auto request is one exact action, never a session grant.
-    if (this.unattended && !isQuestion && !mcpApproval) choices = choices.filter(choice => choice.id !== 'acceptForSession' && choice.id !== 'acceptWithExecpolicyAmendment')
+    if (!isQuestion && !mcpApproval && request.method !== 'item/permissions/requestApproval' && !this.options.approvalReviewer && choices.some(choice => choice.id === 'accept')) {
+      // A command of a kind the owner or a wizard already allowed for this session in this runtime.
+      const sessionClass = ownerOnly ? undefined : this.sessionClassOf(request)
+      const allowedAs = sessionClass ? this.sessionClasses.get(sessionClass) : undefined
+      if (sessionClass && allowedAs !== undefined) {
+        this.answerItself(request, id, 'accept', { message: `Allowed “${title}” for this session without asking: a command of the same kind (${sessionClass}) was allowed for this session (“${allowedAs}”).`, payload: { sessionClass } })
+        return
+      }
+      // The owner's auto-approve policy (approval-policy.ts) answers what it covers with no card and
+      // no review, before the stronger review, a wizard or the owner would be asked; the host
+      // journals it with answeredBy "policy". An owner-only boundary is never its to allow.
+      const policy = this.policyRequest(request, ownerOnly)
+      let verdict: PolicyDecision = null
+      try { verdict = policy && this.options.approvalPolicy ? this.options.approvalPolicy(policy, { requestId: id, tool: this.toolName(request), input: json(params) }) : null } catch { verdict = null }
+      if (verdict?.decision === 'allow' && !ownerOnly) {
+        this.answerItself(request, id, 'accept', policyNotice(this.policySubject(request, title), verdict.rule))
+        return
+      }
+    }
+    // An owner-only boundary is one exact action in every mode, and so is an isolated reviewer's or
+    // an Auto request held for the owner: never a session grant or a lasting Codex rule.
+    if (!isQuestion && !mcpApproval && (ownerOnly || this.unattended || this.options.approvalReviewer)) choices = choices.filter(choice => choice.id !== 'acceptForSession' && choice.id !== 'acceptWithExecpolicyAmendment')
     const interaction: PendingInteraction = {
       id, kind: isQuestion ? 'question' : 'approval', title: isQuestion ? 'Codex needs your input' : title,
-      input: json(params), choices: isQuestion ? [] : choices, status: 'pending',
+      input: json(params), choices: isQuestion ? [] : choices, status: 'pending', ...(ownerOnly ? { required: true } : {}),
       ...(isQuestion ? { questions: request.params.questions.map(question => ({ id: question.id, header: question.header, question: question.question, options: question.options ?? [], isSecret: question.isSecret, allowCustom: question.isOther || !question.options?.length })) } : {})
     }
     this.pending.set(id, { request, interaction, blocking: !isQuestion || request.params.isBlocking !== false })
     this.emitInteraction(request, interaction)
-    if (!isQuestion && !mcpApproval) this.emit({ ...this.correlation(params), data: { type: 'tool', name: this.items.get(this.itemKey(this.correlation(params)))?.name ?? (request.method.includes('fileChange') ? 'File change' : 'Command'), status: 'awaiting_approval' } })
+    if (!isQuestion && !mcpApproval) this.emit({ ...this.correlation(params), data: { type: 'tool', name: this.toolName(request), status: 'awaiting_approval' } })
     this.emitPhase()
   }
 
-  /** Why Auto leaves a native escalation to the owner, or undefined when it may answer it: the
-   *  request must name what it reaches, and none of it may be an owner-only boundary. */
-  private ownerOnlyEscalation(request: ServerRequest): string | undefined {
+  /** Answers a native request in place of a card (Auto, a session class, the owner's policy), once
+   *  per request identity: a repeated delivery finds it in autoAnswered and gets no second answer. */
+  private answerItself(request: ServerRequest, id: string, decision: string, notice: { message: string; payload?: Json }): void {
+    if (this.autoAnswered.size >= 128) this.autoAnswered.delete(this.autoAnswered.keys().next().value!)
+    this.autoAnswered.set(id, canonicalAction(request.params))
+    this.transport?.send({ id: request.id, result: this.decisionResult(request, decision) })
+    this.emit({ ...this.correlation(request.params), data: { type: 'notice', message: notice.message, ...(notice.payload !== undefined ? { payload: notice.payload } : {}) }, native: { method: request.method, payload: json(request.params) } })
+  }
+
+  /** The tool row a native request belongs to, as the timeline names it. */
+  private toolName(request: ServerRequest): string {
+    return this.items.get(this.itemKey(this.correlation(request.params)))?.name ?? (request.method.includes('fileChange') ? 'File change' : 'Command')
+  }
+
+  /** The paths a file-change request names: its grant root and the paths its item reported. */
+  private requestPaths(request: Extract<ServerRequest, { method: 'item/fileChange/requestApproval' }>): string[] {
+    return [...(request.params.grantRoot ? [request.params.grantRoot] : []), ...(this.items.get(this.itemKey(this.correlation(request.params)))?.paths ?? [])]
+  }
+
+  /** The kind of command a session allowance covers: the program and its subcommand or script, for
+   *  a local, workspace-scoped command only (approval-review-rules.ts commandClass, the classes the
+   *  review gate's session rules use). Undefined for anything else, a network request included. */
+  private sessionClassOf(request: ServerRequest): string | undefined {
+    if (request.method !== 'item/commandExecution/requestApproval' || !request.params.command || request.params.networkApprovalContext) return undefined
+    return commandClass({ tool: request.method, arguments: { command: request.params.command }, paths: [], boundary: 'workspace-write', cwd: request.params.cwd ?? this.options.cwd })
+  }
+
+  /** After an answer "for this session" (Codex's own session grant or its lasting rule): later
+   *  commands of the same class in this runtime are answered without a card. Never an owner-only one. */
+  private rememberSessionClass(request: ServerRequest, title: string): void {
+    if (request.method !== 'item/commandExecution/requestApproval' || this.ownerOnlyEscalation(request)?.boundary) return
+    const sessionClass = this.sessionClassOf(request)
+    if (!sessionClass) return
+    if (this.sessionClasses.size >= 256) this.sessionClasses.delete(this.sessionClasses.keys().next().value!)
+    this.sessionClasses.set(sessionClass, title)
+  }
+
+  /** What the owner's auto-approve policy is asked about a request (approval-policy.ts), or
+   *  undefined when it names nothing the policy reads. Permission grants and MCP tools are not asked. */
+  private policyRequest(request: ServerRequest, nativeOwner: boolean): PolicyRequest | undefined {
+    const base = { provider: 'codex', projectRoot: this.options.cwd, ...(nativeOwner ? { nativeOwner: true } : {}) }
+    if (request.method === 'item/commandExecution/requestApproval') {
+      if (!request.params.command) return undefined
+      return { ...base, kind: request.params.networkApprovalContext ? 'network' : 'command', command: request.params.command, cwd: request.params.cwd ?? this.options.cwd }
+    }
+    if (request.method === 'item/fileChange/requestApproval') {
+      const paths = this.requestPaths(request)
+      return paths.length ? { ...base, kind: 'file-write', paths, cwd: this.options.cwd } : undefined
+    }
+    return undefined
+  }
+
+  /** One line naming what a policy-allowed request does, for its notice. */
+  private policySubject(request: ServerRequest, title: string): string {
+    if (request.method === 'item/commandExecution/requestApproval' && request.params.command) return commandText({ command: request.params.command }) ?? request.params.command
+    if (request.method === 'item/fileChange/requestApproval') return `file changes to ${this.requestPaths(request).join(', ')}`
+    return title
+  }
+
+  /** Why Auto leaves a native escalation to the owner (`held`), or undefined when it may answer it:
+   *  the request must name what it reaches, and none of it may be an owner-only boundary
+   *  (`boundary`, with the text that reaches it). */
+  private ownerOnlyEscalation(request: ServerRequest): { held: string; boundary?: OwnerOnlyReach } | undefined {
     let reach: string
     if (request.method === 'item/commandExecution/requestApproval') {
-      if (!request.params.command) return 'it names no command Auto can check'
+      if (!request.params.command) return { held: 'it names no command Auto can check' }
       reach = [request.params.command, request.params.cwd ?? '', request.params.networkApprovalContext?.host ?? ''].join('\n')
     } else if (request.method === 'item/fileChange/requestApproval') {
-      const paths = [...(request.params.grantRoot ? [request.params.grantRoot] : []), ...(this.items.get(this.itemKey(this.correlation(request.params)))?.paths ?? [])]
-      if (!paths.length) return 'it names no paths Auto can check'
+      const paths = this.requestPaths(request)
+      if (!paths.length) return { held: 'it names no paths Auto can check' }
       reach = paths.join('\n')
     } else if (request.method === 'item/permissions/requestApproval') reach = JSON.stringify(request.params.permissions)
-    else return 'it is not a request Auto answers'
-    const boundary = ownerOnlyEscalation(reach)
-    return boundary ? `it reaches ${boundary}` : undefined
+    else return { held: 'it is not a request Auto answers' }
+    const boundary = ownerOnlyReach(reach)
+    return boundary ? { held: `it reaches ${boundary.boundary} (“${boundary.matched}”)`, boundary } : undefined
   }
 
   /** The exact response Codex expects for a decision on this request. */
   private decisionResult(request: ServerRequest, decision: string): Json {
-    if (decision === 'acceptWithExecpolicyAmendment' && request.method === 'item/commandExecution/requestApproval') {
-      const amendment = codexExecpolicyAmendment(request.params.availableDecisions ?? [])
-      if (!amendment) throw new Error('Codex offered no command prefix rule for this request')
-      return { decision: { acceptWithExecpolicyAmendment: { execpolicy_amendment: amendment } } }
+    if (request.method === 'item/commandExecution/requestApproval') {
+      // Where Codex offers no session grant of its own, the session choice is its execpolicy rule.
+      const offered = request.params.availableDecisions
+      if (decision === 'acceptWithExecpolicyAmendment' || decision === 'acceptForSession' && Array.isArray(offered) && !offered.includes('acceptForSession')) {
+        const amendment = codexExecpolicyAmendment(offered ?? [])
+        if (!amendment) throw new Error('Codex offered no command prefix rule for this request')
+        return { decision: { acceptWithExecpolicyAmendment: { execpolicy_amendment: amendment } } }
+      }
     }
     const granted = decision === 'accept' || decision === 'acceptForSession'
     if (request.method === 'item/permissions/requestApproval') {
@@ -1147,6 +1444,13 @@ export class CodexAdapter implements ProviderAdapter {
       setTimeout(() => { if (!this.mcpStartup.size) finish() }, graceMs)
       check()
     })
+  }
+
+  /** Once per runtime and problem: a sandbox setting that was left out, and why. */
+  private sandboxNotice(problem: string): void {
+    if (this.sandboxNotices.has(problem) || this.sandboxNotices.size >= 64) return
+    this.sandboxNotices.add(problem)
+    this.emit({ data: { type: 'notice', message: `Codex sandbox: ${problem}.` } })
   }
 
   /** Once per runtime: a command that failed before it ran because Codex's Windows sandbox helper

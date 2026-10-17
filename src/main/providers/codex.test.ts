@@ -189,8 +189,8 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
       await waitFor(() => completed(events.slice(before)))
       return starts().at(-1)
     }
-    // Edit: workspace work runs unprompted; leaving the workspace is a request the owner answers.
-    expect(await turn({ ...settings, permission: 'accept-edits' })).toMatchObject({ params: { approvalPolicy: 'on-request', sandboxPolicy: { type: 'workspaceWrite', networkAccess: false } } })
+    // Edit: workspace work, network included, runs unprompted; leaving the workspace is a request the owner answers.
+    expect(await turn({ ...settings, permission: 'accept-edits' })).toMatchObject({ params: { approvalPolicy: 'on-request', sandboxPolicy: { type: 'workspaceWrite', networkAccess: true } } })
     expect((starts().at(-1) as { params: Record<string, unknown> }).params.approvalsReviewer).toBeUndefined()
     // Auto routes requests to Conductor's native approval path and carries the network.
     expect(await turn({ ...settings, permission: 'auto' })).toMatchObject({ params: { approvalPolicy: 'on-request', approvalsReviewer: 'user', sandboxPolicy: { type: 'workspaceWrite', networkAccess: true } } })

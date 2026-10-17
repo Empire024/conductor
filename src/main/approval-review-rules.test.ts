@@ -45,6 +45,19 @@ describe('approval session rule classes', () => {
     expect(commandText({ command: ['git', 'status'] })).toBe('git status')
     expect(commandClass({ tool: 'item/commandExecution/requestApproval', arguments: { command: '"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command \'npx vitest run\'' }, paths: [], boundary: 'workspace-write' })).toBe('item/commandExecution/requestApproval:npx vitest')
   })
+  it('classes a Codex command by its program: the call operator and a quoted program path taken off (codex-approval-spam)', () => {
+    const tool = 'item/commandExecution/requestApproval'
+    // Live form 2026-10-17: doubled separators in the wrapper, the script in double quotes, the program in single quotes.
+    const wrapped = (inner: string) => `"C:\\\\WINDOWS\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe" -Command "${inner}"`
+    const key = (command: string) => commandClass({ tool, arguments: { command }, paths: [], boundary: 'workspace-write', cwd: 'C:/work' })
+    const download = key(wrapped("& 'C:/Program Files/Blender Foundation/Blender 5.2/5.2/python/bin/python.exe' rosin_lab/collect_references.py download"))
+    expect(download).toBe(`${tool}:python rosin_lab/collect_references.py`)
+    expect(key(wrapped("& 'C:/Program Files/Blender Foundation/Blender 5.2/5.2/python/bin/python.exe' rosin_lab/collect_references.py sheets"))).toBe(download)
+    expect(key(wrapped('& "C:\\Python312\\python.exe" render.py'))).toBe(`${tool}:python render.py`)
+    // Still compound after the call operator: its own exact class.
+    expect(key(wrapped("& python x.py; echo done"))).toMatch(new RegExp(`^${tool}=`))
+    expect(key(wrapped("& python x.py; Remove-Item y"))).toBeUndefined()
+  })
   it('covers a later action of the same class for the same worker runtime only', () => {
     const rules = new SessionRules()
     const worker = { workerId: 'worker', runtimeId: 'runtime-1' }

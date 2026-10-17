@@ -5,6 +5,7 @@ import { ApprovalReviews, canonicalAction, type ReviewPersistence } from './appr
 import { attributeAnswer, reachOf } from './approval-review-gate'
 import { commandClass, commandText, sessionRules } from './approval-review-rules'
 import { ownerOnlyEscalation } from './providers/codex'
+import { APPROVAL_POLICY_RULE_TEXT, APPROVAL_POLICY_RULES, MAX_WRITABLE_ROOTS, writableRootProblem, type ApprovalPolicyRule, type ApprovalPolicySettings } from './approval-policy'
 
 /**
  * A wizard answers its coworkers' approvals itself (wizard-answers-approvals, owner 2026-09-25:
@@ -20,11 +21,14 @@ import { ownerOnlyEscalation } from './providers/codex'
  * answered, so no provider or managed restriction is lifted here.
  */
 export const WIZARD_APPROVAL_SIGNATURES: Record<string, string> = {
-  'agents.approvals': '({agentSessionId?}) — wizard tab or owner credential only: the approvals your coworkers are waiting on (or one coworker\'s), each with requestId, the exact tool and arguments, its class (local/shared/destructive/external), attention (why a non-local action deserves a careful look, if it does), whether its runtime offers an allow (mayAllow), its choices, what allowing it "for the session" would really cover (sessionScope: "native-session", "once+app-rule" or "once", exactly as agents.approve then reports effectiveScope) with the app-side rule it would record (sessionClass, else null), and the stronger review\'s phase and rationale if one ran',
+  'agents.approvals': '({agentSessionId?}) — wizard tab or owner credential only: the approvals your coworkers are waiting on (or one coworker\'s), each with requestId, the exact tool and arguments, its class (local/shared/destructive/external), attention (why a non-local action deserves a careful look, if it does), whether its runtime offers an allow (mayAllow), its choices, what allowing it "for the session" would really cover (sessionScope: "native-session", "once+app-rule" or "once", exactly as agents.approve then reports effectiveScope) with the app-side rule it would record (sessionClass, else null), and the stronger review\'s phase and rationale if one ran. You need not poll it: a coworker you control whose card nothing answers automatically within a few seconds wakes you with the card and the exact call that answers it (once per card, a burst in one message)',
+  'approvals.policy.set': '({enabled?, rules?:{<class>:true|false}, writableRoots?:[folder]}) — wizard tab or owner credential only: change the owner\'s auto-approve policy, which Conductor answers itself before any card, stronger review or controller wake, with no model turn, recorded with answeredBy "policy" and the rule (approvals.policy.get shows it and what it answered). Every class is on unless switched off: ' + APPROVAL_POLICY_RULES.map(rule => `"${rule}" (${APPROVAL_POLICY_RULE_TEXT[rule]})`).join(', ') + '. enabled:false turns the whole policy off. writableRoots (at most ' + MAX_WRITABLE_ROOTS + ' absolute folders, %VAR% and $env:VAR expanded; never a drive, the home folder, a system, program, credential or startup folder) replaces the folders outside the project that writes may also reach (on Windows it starts as %LOCALAPPDATA%\\NVIDIA\\OptixCache, the OptiX kernel cache a Blender GPU render writes; an empty list removes it); Codex coworkers also get them as sandbox writable roots. The policy never answers a native-owner action (an owner ask rule, a mandatory approval, an owner-only reach), a plan or read-only conversation, a write or program argument outside the project and writable roots, agent configuration or credentials, git, elevation, the registry, uploads, links or a nested project',
   'agents.approve': '({agentSessionId, requestId, decision:"allow"|"deny", scope?:"once"|"session", reason}) — wizard tab or owner credential only, the same authority as permissions.decide: the owner answers any conversation of this project, a wizard the same, its own included, plus the coworkers it controls elsewhere and the wizard of a project co-opened in this window with its coworkers; any class, local, shared, destructive or external (production included), so review the exact action first. Answers one pending native approval with a choice its runtime offers. scope "session" uses the runtime\'s own for-this-session choice when it offers one (effectiveScope "native-session", lasting as the runtime states); otherwise Conductor answers once, and only when the request is under stronger review and its action forms a class the review gate covers (the program and subcommand, workspace edits, one tool; never an owner ask rule or owner-only boundary) does an in-memory rule answer later requests of that class while this runtime runs ("once+app-rule"; a restart, reconnect or handoff ends it); else only this request is allowed ("once"). agents.approvals shows which beforehand (sessionScope). Recorded in the approval journal with your reason'
 }
 export const WIZARD_APPROVAL_METHODS = Object.keys(WIZARD_APPROVAL_SIGNATURES)
 
+/** The owner's auto-approve policy (approval-policy.ts): read, replaced, and described as approvals.policy.get shows it. */
+export interface ApprovalPolicyPort { get(): ApprovalPolicySettings; set(policy: ApprovalPolicySettings): void; describe(): unknown }
 export interface WizardApprovalScope { agentSessionId: string; projectId: string; owner?: boolean; wizard?: boolean }
 export interface AnswerableConversation { agentSessionId: string; title?: string; cwd: string; projectId: string; provider?: string }
 export interface WizardApprovalPorts {
@@ -38,6 +42,8 @@ export interface WizardApprovalPorts {
   /** Whether this pending request is under stronger review, the only place an app-side session
    *  rule answers later requests, and the class that rule would cover (approval-review-gate.ts). */
   reviewClass?(agentSessionId: string, runtimeId: string, requestId: string): { reviewed: boolean; key?: string }
+  /** The owner's auto-approve policy per project (approvals.policy); absent: the method is unavailable. */
+  policy?: ApprovalPolicyPort
 }
 
 type Args = Record<string, unknown>
@@ -52,7 +58,7 @@ const ALLOW_ONCE = ['allow', 'accept'], ALLOW_SESSION = ['allow-session', 'accep
 const pick = (interaction: PendingInteraction, ids: string[]) => ids.map(id => interaction.choices.find(choice => choice.id === id && !choice.disabled)).find(Boolean)?.id
 
 /** The tool a pending approval is for: its tool row, the card title, or the shape of its input. */
-function toolOf(state: SessionProjection, item: TimelineItem, interaction: PendingInteraction): string {
+export function toolOf(state: SessionProjection, item: TimelineItem, interaction: PendingInteraction): string {
   const row = item.nativeItemId ? state.items.find(entry => entry.data.type === 'tool' && entry.nativeItemId === item.nativeItemId && entry.runtimeId === item.runtimeId) : undefined
   if (row?.data.type === 'tool' && row.data.name) return row.data.name
   const titled = /^Allow ([\w.-]+)\?$/.exec(interaction.title)?.[1]
@@ -62,21 +68,21 @@ function toolOf(state: SessionProjection, item: TimelineItem, interaction: Pendi
 }
 
 /** The action's class and, for anything beyond a local workspace action, why it deserves a careful look. */
-function classify(tool: string, input: Json, cwd: string): { class: string; attention?: string; paths: string[] } {
+export function classify(tool: string, input: Json, cwd: string): { class: string; attention?: string; paths: string[] } {
   const command = commandText(input)
   const described = describeGrantRequest(command !== undefined ? { tool: tool === 'PowerShell' ? 'PowerShell' : 'Bash', input: { command }, cwd } : { tool, input, cwd })
   const args = object(input), requested = args.file_path ?? args.notebook_path ?? args.path
   const path = typeof requested === 'string' ? resolve(cwd, requested) : undefined
   const outside = path !== undefined && (isAbsolute(relative(cwd, path)) || relative(cwd, path).startsWith('..'))
   const reach = ownerOnlyEscalation(reachOf(args))
-  const attention = described.class !== 'local' ? `a ${described.class} action (${described.action})`
+  const attention = described.class !== 'local' ? `${described.class === 'external' ? 'an' : 'a'} ${described.class} action (${described.action})`
     : reach ? `it reaches ${reach}`
       : outside ? 'it writes outside the coworker\'s workspace'
         : undefined
   return { class: described.class, ...(attention ? { attention } : {}), paths: path && !outside ? [process.platform === 'win32' ? path.toLowerCase() : path] : [] }
 }
 
-function pendingOf(state: SessionProjection): Array<{ item: TimelineItem; interaction: PendingInteraction }> {
+export function pendingOf(state: SessionProjection): Array<{ item: TimelineItem; interaction: PendingInteraction }> {
   return state.items.flatMap(item => item.runtimeId === state.runtimeId && item.data.type === 'interaction' && item.data.interaction.kind === 'approval' && item.data.interaction.status === 'pending'
     ? [{ item, interaction: item.data.interaction }] : [])
 }
@@ -117,6 +123,36 @@ export async function callWizardApprovals(ports: WizardApprovalPorts, scope: Wiz
   const targets = named ? answerable.filter(entry => entry.agentSessionId === named) : answerable
   if (named && !targets.length) throw new Error(scope.owner ? 'No such agent conversation in this project' : 'That conversation is neither in this project, one of your coworkers, nor a co-open project\'s wizard or its coworkers')
   const by = scope.owner ? 'Owner control credential' : `Wizard ${scope.agentSessionId}`
+
+  if (method === 'approvals.policy.set') {
+    if (!ports.policy) throw new Error('The auto-approve policy is not available in this Conductor')
+    const unknown = Object.keys(args).filter(key => !['enabled', 'rules', 'writableRoots'].includes(key))
+    if (unknown.length) throw new Error(`approvals.policy.set does not take ${unknown.join(', ')}; it takes {enabled?, rules?, writableRoots?}`)
+    if (args.enabled === undefined && args.rules === undefined && args.writableRoots === undefined) throw new Error('Name what changes: enabled, rules ({class: true|false}) or writableRoots; approvals.policy.get reads the policy')
+    const current = ports.policy.get()
+    const next: ApprovalPolicySettings = { ...current, rules: { ...current.rules }, writableRoots: [...current.writableRoots] }
+    if (args.enabled !== undefined) {
+      if (typeof args.enabled !== 'boolean') throw new Error('enabled is true or false')
+      next.enabled = args.enabled
+    }
+    if (args.rules !== undefined) {
+      if (!args.rules || typeof args.rules !== 'object' || Array.isArray(args.rules)) throw new Error(`rules is an object of classes to true or false; the classes are ${APPROVAL_POLICY_RULES.join(', ')}`)
+      for (const [name, on] of Object.entries(args.rules as Record<string, unknown>)) {
+        if (!(APPROVAL_POLICY_RULES as readonly string[]).includes(name)) throw new Error(`Unknown policy class ${name}; the classes are ${APPROVAL_POLICY_RULES.join(', ')}`)
+        if (typeof on !== 'boolean') throw new Error(`rules.${name} is true or false`)
+        next.rules[name as ApprovalPolicyRule] = on
+      }
+    }
+    if (args.writableRoots !== undefined) {
+      if (!Array.isArray(args.writableRoots) || !args.writableRoots.every(root => typeof root === 'string')) throw new Error('writableRoots is a list of absolute folder paths (an empty list removes them all)')
+      const roots = [...new Set((args.writableRoots as string[]).map(root => root.trim()))]
+      if (roots.length > MAX_WRITABLE_ROOTS) throw new Error(`At most ${MAX_WRITABLE_ROOTS} writable roots`)
+      for (const root of roots) { const problem = writableRootProblem(root); if (problem) throw new Error(`${root} cannot be a writable root: ${problem}`) }
+      next.writableRoots = roots
+    }
+    ports.policy.set({ ...next, setBy: by, setAt: new Date().toISOString() })
+    return ports.policy.describe()
+  }
 
   if (method === 'agents.approvals') {
     const allowed = new Set(['agentSessionId'])

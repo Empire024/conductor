@@ -108,7 +108,7 @@ describe('approval gate on a live workspace-write boundary', () => {
     expect(stack.boundaries.status('approval', 'workspace-write')).toMatchObject({ cases: 31, agreed: 31 })
     expect(stack.shadow.stats()).toMatchObject({ liveAllowed: 4, audited: 1 })
   })
-  it('leaves everything else to the reviewer: an unsure or denying local verdict, a native-owner request, a slow decider, a boundary not switched live', async () => {
+  it('leaves everything else to the reviewer (an unsure or denying local verdict, a slow decider, a boundary not switched live) and a native-owner request to the owner', async () => {
     for (const [name, stack, ownerRule] of [
       ['unsure', liveStack(async () => verdict(0.8)), false],
       ['deny', liveStack(async () => ({ ok: true, verdict: { decider: 'local-llm:fake', probabilities: { allow: 0.01, deny: 0.98, escalate: 0.01 }, rationale: 'no', elapsedMs: 1 } })), false],
@@ -119,6 +119,14 @@ describe('approval gate on a live workspace-write boundary', () => {
       await stack.ready()
       const f = fixture('deny', stack.shadow)
       f.gate.intercept(f.spec, f.runtime, f.request(ownerRule))
+      if (name === 'native-owner') {
+        // An owner boundary goes straight to the owner: neither the local decider nor a reviewer turn runs.
+        await new Promise(resolve => setTimeout(resolve, 50))
+        expect(f.run, name).not.toHaveBeenCalled()
+        expect(f.responses, name).toHaveLength(0)
+        stack.shadow.dispose()
+        continue
+      }
       await vi.waitFor(() => expect(f.run, name).toHaveBeenCalledTimes(1))
       await vi.waitFor(() => expect(f.responses, name).toHaveLength(1))
       expect(f.responses.map(response => response.decision), name).toEqual(['deny'])

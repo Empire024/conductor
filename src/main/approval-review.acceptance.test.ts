@@ -10,6 +10,7 @@ import { JsonLineTransport } from './providers/transport'
 import { createApprovalRouting } from './approval-review-routing'
 import { ApprovalReviews } from './approval-review'
 import { sessionRules } from './approval-review-rules'
+import { policyAnswerLog } from './approval-policy'
 import type { AgentControlDependencies } from './agent-control'
 import type { AgentSpec } from '../shared/models'
 import type { SessionSettings, TimelineItem } from '../shared/structured-agent'
@@ -96,6 +97,19 @@ describe('stronger-model review through real adapters (offline fixture, zero inf
     expect(record.history.map(entry => entry.phase)).toEqual(['approved', 'responding', 'responded', 'executed'])
     const item = f.approval()
     expect(item?.data.type === 'interaction' && item.data.interaction.status).toBe('resolved')
+  })
+
+  it('with the owner\'s auto-approve policy (on by default) a delegated coworker\'s workspace edit needs neither a review nor a card', async () => {
+    const f = harness('allow')
+    f.manager.setControllerLookup(id => id === f.coworker.id ? 'controller' : undefined)
+    await f.start()
+    await vi.waitFor(() => expect(f.snapshot().phase).toBe('completed'), { timeout: 15000 })
+    expect(readFileSync(join(f.workspace, 'panel.mjs'), 'utf8')).toBe(edited)
+    // No reviewer turn was paid for and no approval card was raised.
+    expect(f.opened).toEqual([])
+    expect(f.approval()).toBeUndefined()
+    const answered = policyAnswerLog(f.database).summary()
+    expect(answered.recent.find(entry => entry.workerId === f.coworker.id)).toMatchObject({ answeredBy: 'policy', rule: 'workspace-write', provider: 'claude' })
   })
 
   it('a reviewer denial answers the coworker, leaves the file alone and fences the target for later routes', async () => {

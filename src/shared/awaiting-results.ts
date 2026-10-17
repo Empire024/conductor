@@ -41,6 +41,9 @@ import type { SessionProjection } from './structured-agent'
  *   awaited conversation has gone quiet (idle, completed, failed or closed, with no background work
  *   and no wait of its own) for AWAIT_QUIET_GRACE_MS without messaging, the waiter is woken with
  *   that fact and each one's last answer. Either wake ends the wait (AgentControl.sweepAwaiting).
+ * - agents.await({approvals:true}) also ends the wait when an awaited conversation raises an
+ *   approval or permission card that nothing answers automatically within a few seconds; the
+ *   wake carries the card and the call that answers it (AgentControl.sweepApprovalWakes).
  */
 
 export const AWAITING_RESULTS_PREFIX = 'awaitingResults:'
@@ -67,6 +70,9 @@ export interface AwaitingRecord {
   baselines?: Record<string, number>
   /** When the waiter is woken regardless (ISO). Absent in records written before it existed. */
   deadline?: string
+  /** agents.await({approvals:true}): the wait also ends when an awaited conversation raises an
+   *  approval or permission card nothing answers automatically (approval-wakes.ts). */
+  approvals?: true
 }
 
 export const baselineOf = (record: Pick<AwaitingRecord, 'sinceSequence' | 'baselines'>, agentSessionId: string): number => record.baselines?.[agentSessionId] ?? record.sinceSequence
@@ -84,7 +90,7 @@ export function parseAwaitingRecord(raw: string | null | undefined): AwaitingRec
     const value = JSON.parse(raw) as Partial<AwaitingRecord>
     if (!Array.isArray(value.agents) || !value.agents.every(id => typeof id === 'string' && id) || typeof value.since !== 'string' || typeof value.sinceSequence !== 'number') return null
     const baselines = value.baselines && typeof value.baselines === 'object' && !Array.isArray(value.baselines) ? Object.fromEntries(Object.entries(value.baselines).filter(([, sequence]) => typeof sequence === 'number')) as Record<string, number> : undefined
-    return { agents: value.agents, since: value.since, sinceSequence: value.sinceSequence, ...(typeof value.reason === 'string' && value.reason ? { reason: value.reason } : {}), ...(baselines ? { baselines } : {}), ...(typeof value.deadline === 'string' && value.deadline ? { deadline: value.deadline } : {}) }
+    return { agents: value.agents, since: value.since, sinceSequence: value.sinceSequence, ...(typeof value.reason === 'string' && value.reason ? { reason: value.reason } : {}), ...(baselines ? { baselines } : {}), ...(typeof value.deadline === 'string' && value.deadline ? { deadline: value.deadline } : {}), ...(value.approvals === true ? { approvals: true as const } : {}) }
   } catch { return null }
 }
 

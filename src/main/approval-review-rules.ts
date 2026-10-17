@@ -43,6 +43,18 @@ export function commandText(input: Json): string | undefined {
   return (wrapped ? wrapped[2]! : command).trim()
 }
 
+/** The command as a class reads it: PowerShell's call operator taken off and the program's path
+ *  reduced to its name, so `& 'C:/Program Files/…/python.exe' x.py download` is `python x.py
+ *  download`. Before 2026-10-17 the `&` made every such Codex command compound, its own exact
+ *  class, and a session rule never covered the next `… x.py sheets` (codex-approval-spam). */
+function classText(command: string): string {
+  const text = command.replace(/^&\s*/, '')
+  const program = /^(['"])([^'"]+)\1(?=\s|$)/.exec(text) ?? /^()(\S+)/.exec(text)
+  if (!program || !/[\\/]/.test(program[2]!)) return text
+  const name = program[2]!.replace(/[\\/]+$/, '').split(/[\\/]/).pop()!.replace(/\.(?:exe|com)$/i, '')
+  return name + text.slice(program[0].length)
+}
+
 /** The class one action belongs to, or undefined when it may only ever be decided by itself. */
 export function commandClass(action: ClassifiedAction): string | undefined {
   if (action.boundary !== 'workspace-write') return undefined
@@ -65,8 +77,9 @@ export function commandClass(action: ClassifiedAction): string | undefined {
     if (action.tool === 'mcp__conductor__control') return typeof input.method === 'string' && input.method ? `mcp:${action.tool}:${input.method}` : undefined
     return 'mcp:' + action.tool
   }
-  const command = commandText(input)
-  if (!command) return undefined
+  const raw = commandText(input)
+  if (!raw) return undefined
+  const command = classText(raw)
   const shell = action.tool === 'PowerShell' ? 'PowerShell' : 'Bash'
   if (describeGrantRequest({ tool: shell, input: { command }, cwd }).class !== 'local') return undefined
   const label = action.tool

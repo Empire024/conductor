@@ -1,4 +1,5 @@
 import { encodeRestartInitiator, encodeRestartRequest, launchRestartInitiator, parseRestartRequest, RESTART_INITIATOR_KEY, RESTART_REQUEST_KEY, type RestartInitiator, type RestartRequest } from './restart-initiator'
+import { APPROVAL_POLICY_SETTING, parseApprovalPolicySettings, policyAnswerLog, setApprovalPolicyProjects, setCurrentApprovalPolicy } from './approval-policy'
 import { coworkerResumeMessage, encodeRestartIntent, mayInstallOnQuit, parseRestartIntent, RESTART_INTENT_KEY, restartLine, restartReason, resumeAction, resumePlan, watchChanged, wizardResumeMessage, workingSet, type RestartIntent, type ReattachBrief, type RestartKind, type ResumeAction, type ResumeCandidate, type ResumePlan } from './restart-resume'
 import { StopConfirmations, type StopDecision } from './stop-confirmation'
 import { connectRuntimeHost } from './runtime-host/launcher'
@@ -2796,6 +2797,12 @@ app.whenReady().then(async () => {
   app.setAppUserModelId('io.conductor.desktop')
   const databasePath = join(app.getPath('userData'), 'conductor.db')
   database = new ConductorDatabase(databasePath)
+  // The owner's auto-approve policy, live before any runtime asks it (approval-policy.ts).
+  {
+    const store = database
+    setCurrentApprovalPolicy(parseApprovalPolicySettings(store.getSetting(APPROVAL_POLICY_SETTING)))
+    setApprovalPolicyProjects(() => store.listProjects().map(project => project.path))
+  }
   if (app.isPackaged) {
     const previous = database.getSetting('phone.activity.installedVersion')
     const version = app.getVersion()
@@ -3168,6 +3175,10 @@ app.whenReady().then(async () => {
   const awaitSweepMs = (awaitTest && Number(process.env.CONDUCTOR_TEST_AWAIT_SWEEP_MS)) || 30_000
   const awaitQuietMs = awaitTest && process.env.CONDUCTOR_TEST_AWAIT_QUIET_MS ? Number(process.env.CONDUCTOR_TEST_AWAIT_QUIET_MS) : undefined
   setInterval(() => { void control.sweepAwaiting(awaitQuietMs) }, awaitSweepMs).unref()
+  // A coworker's approval card nothing answers automatically wakes its wizard controller, or a wait
+  // declared with approvals:true, instead of an overseer polling agents.approvals (approval-wakes.ts).
+  const approvalGraceMs = awaitTest && process.env.CONDUCTOR_TEST_APPROVAL_WAKE_MS ? Number(process.env.CONDUCTOR_TEST_APPROVAL_WAKE_MS) : undefined
+  setInterval(() => { void control.sweepApprovalWakes(approvalGraceMs) }, 2_000).unref()
   // Needs attention under the projects (src/main/needs-attention.ts).
   const needsAttention = needsAttentionService = createNeedsAttention({ database, permissionRequests: () => permissionGrants?.grants.state().requests ?? [], publish: snapshot => publish('attention:changed', snapshot) })
   onBroadcast(channel => { if (channel === 'agent:status') needsAttention.attention.changed() })
@@ -3436,6 +3447,7 @@ app.on('will-quit', () => {
       recordRestartIntent(updateReady ? 'update-on-quit' : 'quit', true)
     } catch (error) { console.warn('The quit could not be recorded for the next launch', error) }
   }
+  try { if (database) policyAnswerLog(database).flush() } catch (error) { console.warn('The auto-approve policy log could not be saved', error) }
   hostLifecycle?.dispose()
   // Closing each job's held stdin is what tells its node to stop it.
   void remoteJobs?.shutdown(0)

@@ -23,7 +23,7 @@ export const MUTATION_FAMILIES = {
     'ideas.capture', 'ideas.link', 'ideas.note', 'ideas.explore', 'ideas.work',
     'ideas.run', 'ideas.run.approve', 'ideas.run.decide', 'ideas.run.pause', 'ideas.run.resume', 'ideas.run.stop'
   ],
-  permissions: ['permissions.request', 'permissions.decide', 'permissions.revoke', 'permissions.withdraw'],
+  permissions: ['permissions.request', 'permissions.decide', 'permissions.revoke', 'permissions.withdraw', 'approvals.policy.set'],
   models: ['models.refresh', 'models.outcome', 'models.evaluate', 'decisions.live', 'models.upgrades.check', 'models.upgrades.prepared', 'models.upgrades.accept', 'models.upgrades.decline', 'models.upgrades.retry', 'models.upgrades.configure'],
   production: [
     'production.profile.update', 'production.designate', 'production.answer', 'production.review.answer', 'production.audit', 'production.retest', 'production.verify',
@@ -42,7 +42,7 @@ const FAMILY_OF = new Map<string, MutationFamily>(Object.entries(MUTATION_FAMILI
 export const CONTROL_METHOD_CLASSES = new Set<`${ControlMethodClass}:${string}`>([
   ...[
     'tools.list', 'app.state', 'projects.list', 'machines.list', 'models.list', 'tabs.list',
-    'agents.list', 'agents.snapshot', 'agents.history', 'agents.artifact', 'agents.status', 'agents.approvals',
+    'agents.list', 'agents.snapshot', 'agents.history', 'agents.artifact', 'agents.status', 'agents.approvals', 'approvals.policy.get',
     'files.list', 'files.read', 'tasks.list', 'memory.recall', 'orchestration.snapshot',
     'app.update.status', 'supervisor.overview', 'git.status', 'git.ship.status', 'local.servers', 'usage.limits', 'usage.weekly',
     'jobs.list', 'jobs.status', 'jobs.events', 'schedules.list', 'schedules.get',

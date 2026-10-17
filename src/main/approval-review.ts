@@ -118,7 +118,12 @@ export class ApprovalReviews {
     if (replay) return this.transition(record, 'blocked', 'This logical operation already has a native response intent. Reconnect or replacement requests cannot execute it again')
     if (uncertain) return this.transition(record, 'blocked', 'A prior action on this target has no conclusive execution result; another route cannot retry it')
     if (action.boundary === 'unsupported') return this.transition(record, 'blocked', action.reason)
-    if (rule) return action.boundary === 'workspace-write' ? this.transition(record, 'approved', rule.rationale, { coveredBy: rule.key }) : this.transition(record, 'blocked', 'A session rule never answers a native owner boundary')
+    // A native owner boundary (an owner ask rule, an owner-only reach) is never the reviewer's to
+    // allow, so it goes straight to the owner: no reviewer turn is paid for, none of the task's
+    // review budget is spent, and its controller is woken at once (approval-wakes.ts;
+    // feature-list codex-approval-spam). The owner's card answers it as an escalation.
+    if (action.boundary === 'native-owner') return this.transition(record, 'owner', `Owner decision: ${action.reason.replace(/[.\s]+$/, '')}. A stronger review cannot allow an owner boundary, so none was run`)
+    if (rule) return this.transition(record, 'approved', rule.rationale, { coveredBy: rule.key })
     changed(record)
     const promise = (async () => {
       try {

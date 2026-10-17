@@ -60,7 +60,8 @@ describe('host approval response gate (synthetic reviewers, no inference)', () =
     const f = fixture()
     sessionRules.add({ workerId: 'worker', runtimeId: 'runtime' }, { key: 'Bash:Remove-Item -Recurse', source: 'wizard', by: 'test', at: 'now', example: 'Bash' })
     f.gate.intercept(f.spec, 'runtime', f.request('danger', { command: 'Remove-Item -Recurse -Force C:\\Users\\owner\\Documents\\old' }, 'Bash'))
-    await f.waitPhase('blocked')
+    await f.waitPhase('owner')
+    expect(f.run).not.toHaveBeenCalled()
     expect(f.responses).toHaveLength(0)
   })
 
@@ -77,9 +78,10 @@ describe('host approval response gate (synthetic reviewers, no inference)', () =
   it('keeps a command that reaches an owner-only boundary with the owner, whatever the reviewer says', async () => {
     const f = fixture()
     f.gate.intercept(f.spec, 'runtime', f.request('danger', { command: 'Remove-Item -Recurse -Force C:\\Users\\owner\\Documents\\old' }, 'Bash'))
-    await f.waitPhase('blocked')
-    expect(f.run.mock.calls[0]![1]).toMatchObject({ boundary: 'native-owner' })
-    expect(f.run.mock.calls[0]![1].reason).toContain('recursive deletion')
+    // Straight to the owner: no reviewer turn is paid for an action it could never allow.
+    await f.waitPhase('owner')
+    expect(f.run).not.toHaveBeenCalled()
+    expect(f.last().review).toMatchObject({ phase: 'owner', rationale: expect.stringContaining('recursive deletion') })
     expect(f.responses).toHaveLength(0)
     expect(f.last().choices.every(choice => !choice.disabled)).toBe(true)
   })
@@ -155,12 +157,27 @@ describe('host approval response gate (synthetic reviewers, no inference)', () =
     f.gate.intercept({ ...f.spec, provider: 'codex' }, 'runtime', f.request('command-2', { command: 'npm run build' }, 'Bash'))
     await vi.waitFor(() => expect(f.responses).toHaveLength(2))
   })
+  it('answers a Codex reviewer allow with accept and a deny with decline, never cancel (codex-approval-spam)', async () => {
+    const f = fixture()
+    const codex: AgentSpec = { ...f.spec, provider: 'codex' }
+    const codexRequest = (id: string, command: string): AdapterEvent => ({ itemId: 'item-' + id, requestId: id,
+      data: { type: 'interaction', interaction: { id, kind: 'approval', status: 'pending', title: 'Approve command execution', input: { command, cwd: f.cwd, itemId: 'item-' + id, threadId: 'thread', turnId: 'turn' },
+        choices: [{ id: 'accept', label: 'Allow once' }, { id: 'acceptForSession', label: 'Allow for this session' }, { id: 'decline', label: 'Deny' }, { id: 'cancel', label: 'Cancel turn' }] } },
+      native: { method: 'item/commandExecution/requestApproval', payload: { command, cwd: f.cwd } } })
+    f.gate.intercept(codex, 'runtime', codexRequest('allowed', 'npm run build'))
+    await vi.waitFor(() => expect(f.responses.map(response => response.decision)).toEqual(['accept']))
+    expect(f.last().review?.phase).not.toBe('blocked')
+    f.setDecision(async (_action, digest) => ({ digest, decision: 'deny', rationale: 'Harms the project', reviewerId: 'reviewer', model: 'claude-opus-test', turnId: 'turn-2' }))
+    f.gate.intercept(codex, 'runtime', codexRequest('denied', 'npm run nuke'))
+    await vi.waitFor(() => expect(f.responses.map(response => response.decision)).toEqual(['accept', 'decline']))
+  })
   it('never replaces mandatory native approval with a reviewer allow', async () => {
     const f = fixture()
     f.gate.intercept(f.spec, 'runtime', f.request('mandatory', { file_path: 'panel.txt', content: 'x' }, 'Write', { matched_ask_rule: { behavior: 'ask' } }))
-    await f.waitPhase('blocked')
+    await f.waitPhase('owner')
+    expect(f.run).not.toHaveBeenCalled()
     expect(f.responses).toHaveLength(0)
-    expect(f.last().review?.rationale).toContain('native owner boundary')
+    expect(f.last().review?.rationale).toContain('cannot allow an owner boundary')
   })
   it('preserves an outage as paused, leaves the decision with the owner and never falls back to another model', async () => {
     const f = fixture()

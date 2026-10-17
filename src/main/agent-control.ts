@@ -20,7 +20,7 @@ import { agentConfirmFailure } from './agent-confirm-broker'
 import { controlMethodFamily } from './control-method-classes'
 import type { AgentConfirmOutcome } from '../shared/agent-confirm'
 import { isMemoryKind, MEMORY_KINDS, makeId, type AgentProviderInfo, type AgentSpec, type AppUpdateState, type LayoutNode, type PaneKind, type PaneTab, type ProjectRecord } from '../shared/models'
-import type { PromptOrigin, SessionProjection, SessionSettings, StructuredProvider } from '../shared/structured-agent'
+import type { Json, PendingInteraction, PromptOrigin, SessionProjection, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import { isFrontierModel, isSessionPermission, MAX_PROMPT_CHARS, settingsForRuntime, WIZARD_MODEL_HINT, wizardActive } from '../shared/structured-agent'
 import { rememberedPermission } from './app-settings'
 import type { CreateOrchestrationTaskInput, SaveRoutineInput, UpdateOrchestrationTaskInput } from '../shared/orchestration'
@@ -44,7 +44,6 @@ import type { AllowanceWeekReport } from '../shared/usage-weeks'
 import type { DeliveryRequester, DeliveryRun, RepositoryStatus } from '../shared/delivery'
 import { LOCAL_CONNECTION, LOCAL_MACHINE_ID, type MachineDescriptor } from '../shared/remote-control'
 import { createApprovalRouting } from './approval-review-routing'
-import { ApprovalReviews } from './approval-review'
 import { sinceCursor, supervise } from './agent-supervision'
 import { CoworkerRecovery } from './coworker-recovery'
 import { AwaitingResults } from './awaiting-results'
@@ -68,7 +67,13 @@ import type { RemoteJobService } from './remote-jobs/service'
 import type { LocalMachineReadiness } from '../shared/always-on'
 import { ControlActivityRecorder, type PreparedCall } from './control-activity'
 import { callPermissions, PERMISSION_METHOD_SIGNATURES, PERMISSION_METHODS, PERMISSION_OWNER_SIGNATURES } from './permission-grants/control'
-import { callWizardApprovals, WIZARD_APPROVAL_METHODS, WIZARD_APPROVAL_SIGNATURES, type AnswerableConversation, type WizardApprovalScope } from './wizard-approvals'
+import { callWizardApprovals, classify, pendingOf, toolOf, WIZARD_APPROVAL_METHODS, WIZARD_APPROVAL_SIGNATURES, type AnswerableConversation, type WizardApprovalScope } from './wizard-approvals'
+import { ApprovalWakes, awaitWakeText, cardKey, controllerWakeText, type PendingCard } from './approval-wakes'
+import { APPROVAL_POLICY_SETTING, currentApprovalPolicy, describeApprovalPolicy, evaluateApprovalPolicy, policyAnswerLog, policyNotice, policyRequestFor, setCurrentApprovalPolicy } from './approval-policy'
+import { reachOf } from './approval-review-gate'
+import { ownerOnlyEscalation } from './providers/codex'
+import { commandText } from './approval-review-rules'
+import { ApprovalReviews, canonicalAction } from './approval-review'
 import type { PermissionGrants } from './permission-grants/service'
 import { CONTROL_WAIT_MAX_SECONDS } from './permission-grants/control-mcp'
 import { isControlActivityNotice, type AppControlEntry, type ControlTarget } from '../shared/control-activity'
@@ -86,6 +91,8 @@ import { freshestCatalog } from './model-upgrades/better'
 type Args = Record<string, unknown>
 /** Conductor's messaging tools whose refusal the recipient is told about (tellRefusedMessage). */
 const REFUSABLE_MESSAGE = /^(?:mcp__conductor__|conductor[./:])?(?:send_message|report)$/
+/** A card title that says nothing beyond its tool: no reason worth repeating in a wake. */
+const GENERIC_APPROVAL_TITLE = /^(?:Owner decision: )?(?:Allow [\w.-]+\?|Approve command execution|Approve file changes|Grant requested permissions|Pending stronger-model review|Codex needs your input|Claude needs your input)$/
 /** waitSeconds caps over HTTP; the conductor MCP control tool cuts any wait to
  *  CONTROL_WAIT_MAX_SECONDS first, inside its client's tool-call limit (control-mcp.ts). */
 const FINISH_WAIT_SECONDS = FINISH_WAIT_MAX_SECONDS
@@ -274,7 +281,8 @@ const toolSignatures = {
   'agents.fork': '({agentSessionId,title?}) — fork supported idle native history into a visible linked tab, opened in the workspace that holds the original; outside this workspace only a coworker this caller controls',
   'agents.release': '({agentSessionId}) — release this controller relationship, wherever the coworker lives',
   'agents.report': '({text}) — deliver a report to the conversation that opened this tab (its controller, whoever that is; a controller that handed itself on is reached through its successor), as agents.steer does: steered into a running turn where the provider can, else queued or starting one. Never refused for length: the first 2000 characters (cut at a line break) are delivered with a pointer, and the whole text is kept as an artifact the controller reads with agents.artifact; the result says {delivered,total,artifactId}. Takes no agentSessionId: it always reports to the caller\'s own controller, never any other target. For a local model this is the way to reach its controller directly instead of the controller polling agents.status',
-  'agents.await': '({agents,reason?,timeoutMinutes?}|{clear:true}) — declare that this conversation ends its turn waiting for results from the named conversations (agent ids, at most ' + MAX_AWAITED + '; reason up to ' + MAX_AWAIT_REASON + ' characters): its tab stays in the active group labelled "waiting for …" instead of Done, and no sweep closes it; it survives a restart. Their message (send_message, agents.report) wakes you as it always does, so end your turn and never poll. Each one drops out when its message arrives; once all have and your turn ends without declaring again, the tab is finished work. A conversation whose tab closed is no longer waited for. A wait never stalls silently: after timeoutMinutes (default ' + DEFAULT_AWAIT_MINUTES + ', at most ' + MAX_AWAIT_MINUTES + ') you are woken with "deadline passed", and once every awaited conversation has gone idle, completed, failed or closed without messaging you, you are woken with that fact and their last answers; either wake ends the wait. send_message awaitReply waits get the same default deadline. Calling it again replaces the list; clear:true cancels; agents.finish ends it. Your own live coworkers need no declaration',
+  'agents.await': '({agents,reason?,timeoutMinutes?,approvals?}|{clear:true}) — declare that this conversation ends its turn waiting for results from the named conversations (agent ids, at most ' + MAX_AWAITED + '; reason up to ' + MAX_AWAIT_REASON + ' characters): its tab stays in the active group labelled "waiting for …" instead of Done, and no sweep closes it; it survives a restart. Their message (send_message, agents.report) wakes you as it always does, so end your turn and never poll. Each one drops out when its message arrives; once all have and your turn ends without declaring again, the tab is finished work. A conversation whose tab closed is no longer waited for. A wait never stalls silently: after timeoutMinutes (default ' + DEFAULT_AWAIT_MINUTES + ', at most ' + MAX_AWAIT_MINUTES + ') you are woken with "deadline passed", and once every awaited conversation has gone idle, completed, failed or closed without messaging you, you are woken with that fact and their last answers; either wake ends the wait. approvals:true also ends the wait when one of them raises an approval or permission card that nothing (the stronger review, the owner\'s auto-approve policy) answers within a few seconds: the wake names the card and the exact agents.approve or permissions.decide call that answers it, so an overseer never polls agents.approvals (a wizard controller is woken for its own coworkers\' cards without it). send_message awaitReply waits get the same default deadline. Calling it again replaces the list; clear:true cancels; agents.finish ends it. Your own live coworkers need no declaration',
+  'approvals.policy.get': '({}) — the owner\'s auto-approve policy: the classes of native approval Conductor answers itself, before any card, stronger review or controller wake, with no model turn (each class on or off, with what it covers), the writable roots outside the project, and what it never answers; for the owner or a wizard also how many requests it answered, by class, and the latest. Shape a command to fit it (a script inside the project, pip --target .deps, a download into the project) and it never asks anyone. Only the owner or a wizard changes it (approvals.policy.set)',
   'agents.finish': '({agentSessionId?,waitSeconds?,force?}) — close a finished coworker: its tab closes with history kept (reopenable from the closed tabs) and its CLI process is released. With agentSessionId, a controller finishes a coworker it controls whose turn has settled with no background tasks, at once and without an owner dialog; waitSeconds (max ' + FINISH_WAIT_SECONDS + MCP_WAIT_NOTE + '; a longer wait is capped and the result says so in waitCapped) first waits that long for it to settle, so there is no agents.status loop; refused, naming the reason, while it is (still) running, has background tasks, waits on an approval, has an unsent draft, is a wizard tab or still controls open coworkers. With {} a coworker finishes itself as its last act: Conductor closes it once this turn settles, so call it after your work is delivered and reported, then end the turn; background tasks of your own are waited for with waitSeconds, or stopped with your CLI with force:true',
   'agents.handoff': `({handoff,title?,successor?,provider?,model?,effort?}) — hand your own remaining work to a fresh tab when this conversation's context has grown expensive. Takes no agentSessionId: it always hands off the caller. handoff is ${HANDOFF_MINIMUM}-${HANDOFF_MAXIMUM} characters holding the six sections of docs/token-thrift-policy.md on their own lines, in order (${handoffSections.join(', ')}); reference long output by repository path rather than pasting it. The new tab opens in this workspace with your provider, model, effort and mode, and receives the handoff as its first prompt; provider, model and effort from models.list continue you elsewhere (another provider must name its model; your mode is kept, never widened). Your tab stays open and steerable: finish the step you are in, report it, and stop. successor:true is for a main brain (a wizard tab, or a controller with live coworkers): the new tab is you continued, not your coworker. It opens as a root (under your own controller, if you have one), inherits wizard mode and limit continuation, takes over every coworker you control (their agents.report, approvals and steering go to it) and any pending restart that would bring you back (a wizard's successor must be a model that can hold the wand, else nothing opens); you lose wizard mode, are marked superseded, and your tab shows “Continued in <tab>”`,
   'files.list': '({query?,projectId?}) — indexed project search, at most 100 matches with stable URIs',
@@ -506,6 +514,8 @@ export class AgentControl {
   constructor(private readonly deps: AgentControlDependencies) {
     // The briefing tells a main brain when to hand off to a successor; only this class knows the links.
     deps.sessions.setMainBrain?.(spec => this.mainBrain(spec))
+    // The auto-approve policy answers for a controller that delegated the work (approval-policy.ts).
+    deps.sessions.setControllerLookup?.(id => this.linkFor(id)?.controllerAgentSessionId)
     deps.sessions.setApprovalReviewRouting(this.approvalRouting = createApprovalRouting(deps, {
       controller: id => this.linkFor(id)?.controllerAgentSessionId,
       localAndOpen: spec => {
@@ -1480,6 +1490,7 @@ export class AgentControl {
    *  answered dependency is recorded durably before the bounded projection can drop the reply. */
   noteAwaitingStatus(agentSessionId: string): void {
     try { if (this.awaiting().record(agentSessionId)) this.awaiting().consume(agentSessionId) } catch (error) { console.warn('Waiting-for-results consume failed', error) }
+    if (this.deps.database.structured.snapshot(agentSessionId)?.phase === 'waiting_approval') this.approvalCandidates.add(agentSessionId)
   }
 
   /** Journal events as they are broadcast (index.ts): a message from another conversation
@@ -1487,6 +1498,8 @@ export class AgentControl {
   noteAwaitingEvents(events: Parameters<AwaitingResults['noteEvents']>[0]): void {
     try { this.awaiting().noteEvents(events) } catch (error) { console.warn('Waiting-for-results consume failed', error) }
     for (const event of events) {
+      const raised = event.data as { type: string; interaction?: { kind?: string; status?: string } }
+      if (raised.type === 'interaction' && raised.interaction?.kind === 'approval' && raised.interaction.status === 'pending') this.approvalCandidates.add(event.sessionId)
       const data = event.data as { type: string; name?: string; status?: string; input?: unknown; output?: string }
       if (data.type !== 'tool' || data.status !== 'rejected' || !REFUSABLE_MESSAGE.test(data.name ?? '')) continue
       const key = `${event.sessionId}\n${(event as { itemId?: string }).itemId ?? event.sequence}`
@@ -1560,6 +1573,139 @@ export class AgentControl {
     return wakes.length
   }
 
+  /** Conversations that raised an approval card (broadcast journal, waiting_approval status) or
+   *  are awaited with approvals:true, looked at by the approval sweep until nothing is pending. */
+  private readonly approvalCandidates = new Set<string>()
+  private approvalLedger?: ApprovalWakes
+  /** Cards the auto-approve policy looked at and left alone, so a sweep does not re-read them. */
+  private readonly policyDeclined = new Set<string>()
+  private sweepingApprovals = false
+
+  /** The approval sweep (index.ts, every couple of seconds; approval-wakes.ts): the owner's
+   *  auto-approve policy answers what it covers, then every card nothing answered automatically
+   *  within the grace period wakes whoever waits on it with agents.await({approvals:true}), and
+   *  the rest wake the wizard controlling that coworker, once per card and one message per burst.
+   *  Returns how many messages went out. */
+  async sweepApprovalWakes(graceMs?: number): Promise<number> {
+    if (this.sweepingApprovals) return 0
+    this.sweepingApprovals = true
+    try { return await this.approvalSweep(graceMs) } catch (error) { console.warn('Approval wake sweep failed', error); return 0 } finally { this.sweepingApprovals = false }
+  }
+
+  private async approvalSweep(graceMs?: number): Promise<number> {
+    const { database, sessions } = this.deps
+    const ledger = this.approvalLedger ??= new ApprovalWakes({ graceMs })
+    const requests = (this.deps.permissionGrants?.state().requests ?? []).filter(request => request.status === 'pending' && !(request.source === 'native' && request.nativeAvailable === false))
+    const ids = new Set([...this.approvalCandidates, ...requests.map(request => request.agentSessionId)])
+    if (!ids.size) return 0
+    const titleOf = (id: string) => this.describeTarget({ agentSessionId: id })?.title ?? database.structured.snapshot(id)?.title ?? database.structured.spec<AgentSpec>(id)?.title
+    const cards: PendingCard[] = []
+    for (const id of ids) {
+      const state = database.structured.snapshot(id), spec = database.structured.spec<AgentSpec>(id)
+      const link = this.linkFor(id)
+      const controller = link ? this.successorOf(link.controllerProjectId ?? link.projectId, link.controllerAgentSessionId) : undefined
+      let pending = 0
+      if (state && spec) for (const { item, interaction } of pendingOf(state)) {
+        pending++
+        // A native request with a permission card is answered there (permissions.decide).
+        if (interaction.permissionGrantId) continue
+        const tool = toolOf(state, item, interaction)
+        // Why it asks: the review's escalation, or the runtime's own reason (Codex titles its card with it).
+        const reason = interaction.review?.rationale || (GENERIC_APPROVAL_TITLE.test(interaction.title) ? undefined : interaction.title.replace(/^Owner decision: /, ''))
+        const card: PendingCard = { agentSessionId: id, title: titleOf(id), kind: 'approval', requestId: interaction.id, runtimeId: state.runtimeId, tool, action: commandText(interaction.input) ?? canonicalAction(interaction.input), requestedAt: Date.parse(item.timestamp) || undefined, ...(reason ? { reason } : {}), ...(interaction.review ? { reviewPhase: interaction.review.phase } : {}), ...(controller ? { controller } : {}) }
+        if (ledger.wasWoken(card)) continue
+        if (await this.answerByPolicy(card, spec, state, interaction)) { ledger.mark(card); continue }
+        const verdict = classify(tool, interaction.input, spec.cwd)
+        cards.push({ ...card, class: verdict.class, ...(verdict.attention ? { attention: verdict.attention } : {}) })
+      }
+      for (const request of requests) if (request.agentSessionId === id) {
+        pending++
+        cards.push({ agentSessionId: id, title: titleOf(id), kind: 'permission', requestId: request.id, tool: request.tool, action: request.resource, class: request.class, ...(request.reason ?? request.category ? { reason: request.reason ?? request.category } : {}), requestedAt: Date.parse(request.requestedAt) || undefined, ...(controller ? { controller } : {}) })
+      }
+      if (!pending && !this.awaitedForApprovals(id)) this.approvalCandidates.delete(id)
+    }
+    const due = ledger.due(cards)
+    if (!due.length) return 0
+    const sealedFor = (recipient: string) => (card: PendingCard) => anonymousConversations.has(card.agentSessionId) && !anonymousConversations.has(recipient)
+    const canAnswer = (id: string) => wizardActive(database.structured.snapshot(id)?.settings, database.structured.spec<AgentSpec>(id)?.provider)
+    let sent = 0
+    const delivered = new Set<string>()
+    // Waits declared with approvals:true end first, so a controller that waits is told once.
+    for (const waiter of this.awaiting().waiters()) {
+      let record: ReturnType<AwaitingResults['consume']>
+      try { record = this.awaiting().record(waiter)?.approvals ? this.awaiting().consume(waiter) : null } catch { record = null }
+      if (!record?.approvals) continue
+      const awaited = new Set(record.agents.flatMap(id => [id, ...this.successorsOf(database.structured.spec<AgentSpec>(id)?.projectId ?? '', id)]))
+      const mine = due.filter(card => awaited.has(card.agentSessionId) && !delivered.has(cardKey(card)))
+      const state = database.structured.snapshot(waiter)
+      if (!mine.length || !state) continue
+      try { await sessions.steerOrStart(waiter, awaitWakeText(mine, { canAnswer: canAnswer(waiter), reason: record.reason, sealed: sealedFor(waiter) }), state.settings) }
+      catch (error) { console.warn('Approval wake of a waiter failed', error); continue }
+      this.awaiting().clear(waiter)
+      for (const card of mine) { delivered.add(cardKey(card)); ledger.mark(card) }
+      sent++
+    }
+    // The rest wake the wizard that controls the coworker; an ordinary controller cannot answer.
+    const byController = new Map<string, PendingCard[]>()
+    for (const card of due) if (card.controller && !delivered.has(cardKey(card))) byController.set(card.controller, [...byController.get(card.controller) ?? [], card])
+    for (const [controller, mine] of byController) {
+      const state = database.structured.snapshot(controller)
+      if (!state || !canAnswer(controller)) continue
+      try { await sessions.steerOrStart(controller, controllerWakeText(mine, { canAnswer: true, sealed: sealedFor(controller) }), state.settings) }
+      catch (error) { console.warn('Approval wake of a controller failed', error); continue }
+      for (const card of mine) ledger.mark(card)
+      sent++
+    }
+    return sent
+  }
+
+  /** Whether a wait declared with approvals:true names this conversation. */
+  private awaitedForApprovals(id: string): boolean {
+    try { return this.awaiting().waiters().some(waiter => { const record = this.awaiting().record(waiter); return Boolean(record?.approvals && record.agents.includes(id)) }) } catch { return false }
+  }
+
+  /** The owner's auto-approve policy (approval-policy.ts) for a card that is already up: one raised
+   *  before the policy changed, or by a runtime that does not ask it first (the Claude and Codex
+   *  adapters do). Answered with the runtime's plain allow, with no model turn, and recorded with
+   *  answeredBy "policy" and the rule; false when it stays a card. Native coworkers only: a local
+   *  model keeps its own sandbox rules. */
+  private async answerByPolicy(card: PendingCard, spec: AgentSpec, state: SessionProjection, interaction: PendingInteraction): Promise<boolean> {
+    const { database, sessions } = this.deps
+    const key = cardKey(card)
+    if (this.policyDeclined.has(key)) return false
+    const decline = (): false => {
+      this.policyDeclined.add(key)
+      if (this.policyDeclined.size > 2000) this.policyDeclined.delete(this.policyDeclined.values().next().value!)
+      return false
+    }
+    const settings = state.settings
+    if ((spec.provider !== 'claude' && spec.provider !== 'codex') || interaction.required || interaction.review || settings.plan || settings.permission === 'read-only' || settings.sandbox === 'read-only') return decline()
+    if (sessions.approvalReviewClass?.(spec.id, state.runtimeId, interaction.id)?.reviewed === true) return decline()
+    // It stands in for whoever delegated the work: a controller, or an owner who chose Auto.
+    if (!card.controller && settings.permission !== 'auto') return decline()
+    const allow = interaction.choices.find(choice => (choice.id === 'allow' || choice.id === 'accept') && !choice.disabled)?.id
+    if (!allow) return decline()
+    const input = interaction.input && typeof interaction.input === 'object' && !Array.isArray(interaction.input) ? interaction.input as Record<string, Json> : {}
+    // A Codex card's input is the native request; Codex's owner-only reach is its owner boundary.
+    const codex = spec.provider === 'codex'
+    const nativeMethod = !codex ? 'can_use_tool' : typeof input.command === 'string' ? 'item/commandExecution/requestApproval' : typeof input.grantRoot === 'string' ? 'item/fileChange/requestApproval' : 'unknown'
+    const request = policyRequestFor({ provider: spec.provider, tool: card.tool, nativeMethod, input: interaction.input, cwd: spec.cwd, projectRoot: spec.cwd, ...(codex && ownerOnlyEscalation(reachOf(input)) ? { nativeOwner: true } : {}) })
+    const decision = request ? evaluateApprovalPolicy(request) : null
+    if (!request || !decision) return decline()
+    try { await sessions.respond({ sessionId: spec.id, runtimeId: state.runtimeId, requestId: interaction.id, decision: allow }) }
+    catch (error) { console.warn('The auto-approve policy could not answer a request; it goes to a person', error); return decline() }
+    try { policyAnswerLog(database).record({ rule: decision.rule, provider: spec.provider, kind: request.kind, tool: card.tool, projectId: spec.projectId, workerId: spec.id, runtimeId: state.runtimeId, requestId: interaction.id, input: interaction.input }) }
+    catch (error) { console.warn('A policy approval could not be recorded; the answer itself was delivered', error) }
+    try { const notice = policyNotice(`${card.tool} ${card.action}`, decision.rule); sessions.notice(spec.id, notice.message, notice.payload, `approval-policy:${interaction.id}`) } catch { /* the notice is informational */ }
+    return true
+  }
+
+  /** approvals.policy.get: the owner's auto-approve policy; what it answered only for the owner or a wizard. */
+  private approvalPolicyState(scope: AgentControlScope, args: Args): unknown {
+    validateArgs('approvals.policy.get', args, [])
+    return describeApprovalPolicy(currentApprovalPolicy(), sovereign(scope) ? policyAnswerLog(this.deps.database).summary() : undefined)
+  }
+
   /** Whom this conversation waits for right now, for workspace clarity; undefined when nobody. */
   awaitingFact(agentSessionId: string): AwaitingFact | undefined {
     try { return this.awaiting().fact(agentSessionId) } catch { return undefined }
@@ -1568,10 +1714,10 @@ export class AgentControl {
   /** agents.await: the caller declares (or cancels) the wait its turn ends on. */
   private declareAwait(scope: AgentControlScope, args: Args): unknown {
     if (scope.owner) throw new Error('agents.await is declared by the conversation that waits; the owner credential has none')
-    const input = validateArgs('agents.await', args, ['agents', 'reason', 'clear', 'timeoutMinutes'], { aliases: { agentSessionIds: 'agents', agentIds: 'agents', agentSessionId: 'agents', agentId: 'agents', for: 'reason', timeout: 'timeoutMinutes', deadlineMinutes: 'timeoutMinutes' } })
+    const input = validateArgs('agents.await', args, ['agents', 'reason', 'clear', 'timeoutMinutes', 'approvals'], { aliases: { agentSessionIds: 'agents', agentIds: 'agents', agentSessionId: 'agents', agentId: 'agents', for: 'reason', timeout: 'timeoutMinutes', deadlineMinutes: 'timeoutMinutes', onApproval: 'approvals', wakeOnApproval: 'approvals' } })
     const ledger = this.awaiting()
     if (input.clear !== undefined) {
-      if (input.clear !== true || input.agents !== undefined) throw new ArgumentError('clear:true cancels the wait and takes nothing else')
+      if (input.clear !== true || input.agents !== undefined || input.approvals !== undefined) throw new ArgumentError('clear:true cancels the wait and takes nothing else')
       return { cleared: ledger.clear(scope.agentSessionId), awaiting: null }
     }
     const named = typeof input.agents === 'string' ? [input.agents] : input.agents
@@ -1581,13 +1727,16 @@ export class AgentControl {
     for (const id of agents) if (!this.deps.database.structured.spec<AgentSpec>(id)) throw new ArgumentError(`No conversation ${id} exists in this Conductor; agents.list gives the ids`)
     const reason = input.reason === undefined ? undefined : text(input, 'reason', MAX_AWAIT_REASON)
     if (input.timeoutMinutes !== undefined && (typeof input.timeoutMinutes !== 'number' || !Number.isFinite(input.timeoutMinutes) || input.timeoutMinutes <= 0 || input.timeoutMinutes > MAX_AWAIT_MINUTES)) throw new ArgumentError(`timeoutMinutes is a number of minutes above 0 and at most ${MAX_AWAIT_MINUTES}; omitted, the wait ends after ${DEFAULT_AWAIT_MINUTES}`)
+    if (input.approvals !== undefined && typeof input.approvals !== 'boolean') throw new ArgumentError('approvals must be true or false: true also ends the wait when one of them raises an approval card')
     const minutes = typeof input.timeoutMinutes === 'number' ? input.timeoutMinutes : DEFAULT_AWAIT_MINUTES
     const deadline = new Date(Date.now() + minutes * 60_000).toISOString()
-    ledger.declare(scope.agentSessionId, agents, reason, undefined, {}, deadline)
+    ledger.declare(scope.agentSessionId, agents, reason, undefined, {}, deadline, input.approvals === true)
     const fact = ledger.fact(scope.agentSessionId)
+    // Their cards may already be waiting: the next sweep delivers them.
+    if (input.approvals === true) for (const id of agents) this.approvalCandidates.add(id)
     return {
-      awaiting: fact ?? null, ...(fact ? { deadline } : {}),
-      note: fact ? `${awaitingSentence(fact)} Conductor wakes you at ${deadline} if nobody has answered, or once every one of them has gone quiet without messaging you. End your turn now; do not poll.` : 'None of those conversations has an open tab, so nothing is waited for; message them first, or finish your work.'
+      awaiting: fact ?? null, ...(fact ? { deadline } : {}), ...(fact && input.approvals === true ? { approvals: true } : {}),
+      note: fact ? `${awaitingSentence(fact)} Conductor wakes you at ${deadline} if nobody has answered, or once every one of them has gone quiet without messaging you${input.approvals === true ? ', or when one of them raises an approval nothing answers automatically' : ''}. End your turn now; do not poll.` : 'None of those conversations has an open tab, so nothing is waited for; message them first, or finish your work.'
     }
   }
 
@@ -1904,7 +2053,15 @@ export class AgentControl {
       const approver = { agentSessionId: scope.agentSessionId, projectId: scope.projectId, owner: scope.owner === true, wizard: scope.wizard === true }
       return callPermissions(this.deps.permissionGrants, { ...approver, answers: id => this.answerable(approver).some(entry => entry.agentSessionId === id) }, method, args)
     }
-    if (WIZARD_APPROVAL_METHODS.includes(method)) return callWizardApprovals({ answerable: current => this.answerable(current), snapshot: id => database.structured.snapshot(id), respond: response => sessions.respond(response), persistence: database, reviewClass: (id, runtimeId, requestId) => sessions.approvalReviewClass?.(id, runtimeId, requestId) ?? { reviewed: false } }, { agentSessionId: scope.agentSessionId, projectId: scope.projectId, owner: scope.owner === true, wizard: scope.wizard === true }, method, args)
+    if (method === 'approvals.policy.get') return this.approvalPolicyState(scope, args)
+    if (WIZARD_APPROVAL_METHODS.includes(method)) return callWizardApprovals({ answerable: current => this.answerable(current), snapshot: id => database.structured.snapshot(id), respond: response => sessions.respond(response), persistence: database, reviewClass: (id, runtimeId, requestId) => sessions.approvalReviewClass?.(id, runtimeId, requestId) ?? { reviewed: false },
+      policy: {
+        get: () => currentApprovalPolicy(),
+        // The owner's setting: stored, then live for every adapter at once; cards the old policy
+        // left alone are looked at again.
+        set: policy => { database.setSetting(APPROVAL_POLICY_SETTING, JSON.stringify(policy)); setCurrentApprovalPolicy(policy); this.policyDeclined.clear() },
+        describe: () => describeApprovalPolicy(currentApprovalPolicy(), policyAnswerLog(database).summary())
+      } }, { agentSessionId: scope.agentSessionId, projectId: scope.projectId, owner: scope.owner === true, wizard: scope.wizard === true }, method, args)
     if (upgradeMethods.has(method)) return this.modelUpgradesMethod(scope, method, args)
     if (supervisorMethods.has(method)) {
       if (!scope.owner) throw new Error(`${method} answers only the owner's own control credential (control-owner.json), which the meta-wizard uses`)

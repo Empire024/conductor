@@ -133,6 +133,9 @@ export interface PendingInteraction {
   id: string
   /** Exact native grant card replacing this interaction's owner controls, not its projection. */
   permissionGrantId?: string
+  /** An owner ask rule or a mandatory approval matched it: the owner's auto-approve policy never
+   *  answers it (approval-wakes.ts). */
+  required?: boolean
   kind: 'approval' | 'question'
   title: string
   input: Json

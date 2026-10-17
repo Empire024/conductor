@@ -106,14 +106,16 @@ describe('ApprovalReviews', () => {
     expect(runs).toBe(0)
   })
 
-  it('blocks reviewer allow for native-owner boundaries and permits only explicit escalation to owner', async () => {
+  it('sends a native-owner boundary straight to the owner without a reviewer turn (codex-approval-spam)', async () => {
     const journal = new ApprovalReviews(new MemoryPersistence())
-    const allow = await journal.review(action({ boundary: 'native-owner' }), async digest => result(digest, 'allow'), unchanged)
-    expect(allow.phase).toBe('blocked')
-    expect(allow.rationale).toContain('Explicit escalation is required')
-
-    const escalation = await journal.review(action({ requestId: 'request-2', boundary: 'native-owner' }), async digest => result(digest, 'escalate'), unchanged)
-    expect(escalation.phase).toBe('owner')
+    let runs = 0
+    const owner = await journal.review(action({ boundary: 'native-owner', reason: 'This request reaches recursive deletion, an owner-only boundary.' }), async digest => { runs++; return result(digest, 'allow') }, unchanged)
+    expect(owner.phase).toBe('owner')
+    expect(owner.rationale).toBe('Owner decision: This request reaches recursive deletion, an owner-only boundary. A stronger review cannot allow an owner boundary, so none was run')
+    expect(owner.reviewerId).toBeUndefined()
+    expect(runs).toBe(0)
+    // The owner's card answers it as an escalation.
+    expect(journal.reserve(action({ boundary: 'native-owner', reason: 'This request reaches recursive deletion, an owner-only boundary.' }), 'deny').phase).toBe('denied')
   })
 
   it('requires reviewer escalation before accepting an owner answer', async () => {
@@ -180,7 +182,7 @@ describe('ApprovalReviews', () => {
     expect(covered).toMatchObject({ phase: 'approved', coveredBy: 'edit:workspace' })
     expect(covered.reviewerId).toBeUndefined()
     const owner = await journal.review(action({ requestId: 'owner-boundary', boundary: 'native-owner' }), async digest => { runs++; return result(digest) }, unchanged, { key: 'edit:workspace', rationale: 'Covered by rule' })
-    expect(owner.phase).toBe('blocked')
+    expect(owner.phase).toBe('owner')
     expect(runs).toBe(0)
   })
 

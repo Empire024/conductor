@@ -90,6 +90,10 @@ type Binding = { spec: AgentSpec; runtimeId: string; source: AdapterEvent; inter
 const object = (value: unknown): Record<string, Json> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, Json> : {}
 /** Phases after which a record carries a response intent; an owner answer no longer changes them. */
 const SETTLED_PHASES = ['responding', 'responded', 'execution-unknown', 'executed', 'execution-failed']
+/** The one-action allow and deny as each runtime names them: Claude allow/deny, Codex accept/decline. */
+const ALLOW_ONCE = ['allow', 'accept'], DENY_ONCE = ['deny', 'decline']
+const offeredChoice = (interaction: PendingInteraction, ids: readonly string[]): string | undefined => ids.find(id => interaction.choices.some(choice => choice.id === id && !choice.disabled))
+const oneAction = (decision: string): 'allow' | 'deny' | undefined => ALLOW_ONCE.includes(decision) ? 'allow' : DENY_ONCE.includes(decision) ? 'deny' : undefined
 
 /** Intercepts before actionable UI publication and is also checked by the single response API. */
 export class ApprovalReviewGate {
@@ -229,22 +233,28 @@ export class ApprovalReviewGate {
     const rule = routine ? undefined : sessionRules.covering(scope, { ...binding.action, cwd: binding.spec.cwd })
     const covered = routine ? { key: routine, rationale: `Routine in-workspace action (${routine.slice('routine:'.length)}): allowed automatically, as Auto mode would; no review` }
       : rule ? { key: rule.key, rationale: `Covered by this conversation's session rule "${rule.key}" (${rule.source === 'wizard' ? 'allowed for the session by ' + rule.by : 'first allowed by the ' + rule.by + ' review'}); no new review` }
-      : await this.liveVerdict(binding.spec, binding.action)
-    if (!covered) try { this.routing?.shadow?.reviewing(binding.spec, binding.action) } catch { /* the shadow only observes */ }
+      : binding.action.boundary === 'workspace-write' ? await this.liveVerdict(binding.spec, binding.action) : undefined
+    // A native owner boundary goes straight to the owner (ApprovalReviews.review): neither the local
+    // decider nor a reviewer turn runs for it.
+    const reviewerTurn = !covered && binding.action.boundary === 'workspace-write'
+    if (reviewerTurn) try { this.routing?.shadow?.reviewing(binding.spec, binding.action) } catch { /* the shadow only observes */ }
     const record = await this.journal.review(binding.action, digest => this.routing!.run(binding.spec, binding.action!, digest), record => { if (!binding.settled) this.update(binding, record) }, covered)
     if (record.phase === 'approved' && record.reviewerId && !record.coveredBy) {
       const key = commandClass({ ...binding.action, cwd: binding.spec.cwd })
       if (key) sessionRules.add(scope, { key, source: 'review', recordId: record.id, by: record.reviewerModel ?? 'stronger', at: record.updatedAt, example: binding.action.tool })
     }
-    if (!covered) this.tell('reviewed', record)
+    if (reviewerTurn) this.tell('reviewed', record)
     this.report(binding)
     // An owner who answered meanwhile has already settled the record; the reviewer's late word is not used.
     if (binding.settled) return
     this.update(binding, record)
     if (this.bindings.get(this.key(binding.spec.id, binding.runtimeId, binding.interaction.id)) !== binding) return
     if (record.phase === 'approved' || record.phase === 'denied') {
-      const decision = record.phase === 'approved' ? 'allow' : 'deny'
-      if (!binding.interaction.choices.some(choice => choice.id === decision && !choice.disabled)) { this.update(binding, this.journal.transition(record, 'blocked', 'Native provider did not offer the exact one-action response')); return }
+      // Each runtime names its one-action answers: Claude allow/deny, Codex accept/decline (never
+      // cancel, which ends the turn). Until 2026-10-17 only allow/deny were looked for, so every
+      // Codex allow ended blocked and no Codex request was ever approved (codex-approval-spam).
+      const decision = offeredChoice(binding.interaction, record.phase === 'approved' ? ALLOW_ONCE : DENY_ONCE)
+      if (!decision) { this.update(binding, this.journal.transition(record, 'blocked', 'Native provider did not offer the exact one-action response')); return }
       await this.respond({ sessionId: binding.spec.id, runtimeId: binding.runtimeId, requestId: binding.interaction.id, decision })
     }
   }
@@ -290,7 +300,8 @@ export class ApprovalReviewGate {
   async reserve(response: InteractionResponse, automatic: boolean, required = false): Promise<ReviewRecord | undefined> {
     const binding = this.bindings.get(this.key(response.sessionId, response.runtimeId, response.requestId))
     if (!binding) { if (automatic && required) throw new Error('Required stronger review has no live action binding'); return undefined }
-    const decision = response.decision ?? ''
+    // A runtime's own name for the one-action answer (Codex accept/decline) is the same answer.
+    const decision = oneAction(response.decision ?? '') ?? response.decision ?? ''
     const record = binding.record && this.journal.get(binding.record.projectId, binding.record.id)
     if (automatic) {
       if (!binding.action || !record) throw new Error('Stronger-model review has not completed')

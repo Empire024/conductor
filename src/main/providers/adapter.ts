@@ -51,6 +51,11 @@ export interface AdapterOptions {
   reviewApprovals?: boolean
   /** Host denial fence, including tools which native remembered rules would otherwise allow. */
   authorizeTool?(name: string, input: Json): Promise<string | undefined>
+  /** The owner's auto-approve policy (src/main/approval-policy.ts): asked before a native approval
+   *  card is raised. An allow is answered at once with the runtime's plain allow, shown as a notice
+   *  (policyNotice) instead of a card, and journaled by the host with answeredBy "policy". Null:
+   *  the request goes its normal way. Absent (reviewers, evaluation turns, tests): never asked. */
+  approvalPolicy?(request: import('../approval-policy').PolicyRequest, native: { requestId: string; tool: string; input: Json }): import('../approval-policy').PolicyDecision
   /** Trusted, registered-session broker for the Local runtime only. Never a bearer token. */
   localControl?(method: string, args: Record<string, unknown>): Promise<unknown>
   /** Continue this provider process instead of starting one: start() restores the state and
