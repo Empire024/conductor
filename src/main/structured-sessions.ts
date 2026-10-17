@@ -32,7 +32,7 @@ import { composeLocalPrompt } from './local-models/briefing.ts'
 import { LOCAL_MODEL_SETUP_ERROR_CODE } from '../shared/local-models.ts'
 import { ApprovalReviewGate, type ApprovalReviewRouting } from './approval-review-gate'
 import { evaluateApprovalPolicy, policyAnswerLog, type PolicyDecision, type PolicyRequest } from './approval-policy'
-import { SUCCESSION_NUDGE, type BriefingContext } from './turn-briefing'
+import { SUCCESSION_NUDGE, successionProgress, type BriefingContext } from './turn-briefing'
 import type { PermissionGrants } from './permission-grants/service'
 import type { NativeSlashCommand } from '../shared/slash-commands'
 
@@ -1211,9 +1211,9 @@ export class StructuredSessions {
       const share = summarizeContext(state.items, live.adapter ? live.runtimeId : undefined)
       // A main brain is also told, once, when it has run long enough to hand off to a successor.
       const mainBrain = this.mainBrain?.(live.spec) === true
-      const briefing: BriefingContext | undefined = mainBrain
-        ? { ...(share ? { percent: share.percent } : {}), mainBrain, turns: state.items.filter(item => item.data.type === 'text' && item.data.role === 'user').length + 1,
-          nudged: state.items.some(item => item.data.type === 'notice' && typeof item.data.payload === 'object' && item.data.payload !== null && !Array.isArray(item.data.payload) && item.data.payload[SUCCESSION_NUDGE] === true),
+      const progress = mainBrain ? successionProgress(state.items) : undefined
+      const briefing: BriefingContext | undefined = progress
+        ? { ...(share ? { percent: share.percent } : {}), mainBrain, turns: progress.turns + 1, nudged: progress.nudged,
           notice: message => this.emit(live, { data: { type: 'notice', message, payload: { [SUCCESSION_NUDGE]: true } } }) }
         : share ? { percent: share.percent } : undefined
       // An evaluation turn (AgentSpec.profile) is graded on its prompt alone: no briefing or recalled memory.

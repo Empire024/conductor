@@ -1351,6 +1351,13 @@ describe('a conversation a paired machine is driving', () => {
   })
 })
 
+/** Conductor's notice that a main brain may pass itself on (turn-briefing successionNudge). Without
+ *  it, or the turns or context it stands for, agents.handoff refuses a successor. */
+function due(f: ReturnType<typeof fixture>, agentSessionId: string): void {
+  const state = f.database.structured.snapshot(agentSessionId)!
+  f.database.structured.append({ sessionId: agentSessionId, runtimeId: state.runtimeId ?? 'runtime', sequence: state.sequence + 1, timestamp: new Date().toISOString(), itemId: 'succession-nudge-' + (state.sequence + 1), data: { type: 'notice', message: 'Conductor: this main conversation has run 25 turns.', payload: { [SUCCESSION_NUDGE]: true } } } as never)
+}
+
 /** A handoff in the shape docs/token-thrift-policy.md asks for. `omit` drops one section and
  *  `swap` exchanges two, so a test can name exactly which rule it is exercising. */
 function handoff(options: { omit?: string; swap?: [string, string]; pad?: number } = {}): string {
@@ -1532,6 +1539,7 @@ describe('main-brain succession: agents.handoff successor:true', () => {
     f.database.setSetting(RESTART_REQUEST_KEY, encodeRestartRequest({ agentSessionId: f.spec.id, title: 'Controller', reason: 'Install the batch', at: new Date().toISOString() }))
     f.database.setSetting(RESTART_INITIATOR_KEY, encodeRestartInitiator({ agentSessionId: f.spec.id, method: 'app.restart', at: new Date().toISOString() }))
     const body = handoff()
+    due(f, f.scope.agentSessionId)
     const result = await f.control.call(f.scope, 'agents.handoff', { handoff: body, successor: true }) as Succession
     expect(result).toMatchObject({ handedOff: true, successor: true, title: 'Controller (continued)', wizard: true, continueOnLimit: true, controller: null, restart: { initiator: true, request: true } })
     expect(result.coworkers.sort()).toEqual([first.resourceId, second.resourceId].sort())
@@ -1574,6 +1582,7 @@ describe('main-brain succession: agents.handoff successor:true', () => {
     const worker = await f.control.call(f.scope, 'tabs.open', { title: 'W1' }) as AgentControlTab
     const workerScope = { ...f.scope, agentSessionId: worker.resourceId! }
     expect(await f.control.call(workerScope, 'agents.report', { text: 'before' })).toMatchObject({ agentSessionId: f.spec.id })
+    due(f, f.scope.agentSessionId)
     const result = await f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: true }) as Succession
     const successorScope = { ...f.scope, agentSessionId: result.agentSessionId }
     expect(await f.control.call(workerScope, 'agents.report', { text: 'W1 DONE abc123' })).toEqual({ agentSessionId: result.agentSessionId, delivery: expect.any(String), delivered: 14, total: 14 })
@@ -1589,12 +1598,14 @@ describe('main-brain succession: agents.handoff successor:true', () => {
     const f = fixture()
     await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: 'yes' })).rejects.toThrow('successor must be true or false')
     // Neither a wizard nor a controller: nothing is opened.
+    due(f, f.scope.agentSessionId)
     await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: true })).rejects.toThrow(/main brain.*without successor/)
     expect(f.control.tabs(f.scope).filter(tab => tab.kind === 'agent')).toHaveLength(1)
     // A controller with a live coworker is one, wand or not; it keeps its limit continuation.
     const state = f.database.structured.snapshot(f.spec.id)!
     f.sessions.setContinueOnLimit(f.spec.id, true)
     const worker = await f.control.call(f.scope, 'tabs.open', { title: 'W1' }) as AgentControlTab
+    due(f, f.scope.agentSessionId)
     const result = await f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: true }) as Succession
     expect(result).toMatchObject({ successor: true, wizard: false, continueOnLimit: true, coworkers: [worker.resourceId] })
     expect(f.database.structured.snapshot(result.agentSessionId)?.settings.wizard).toBeFalsy()
@@ -1607,6 +1618,7 @@ describe('main-brain succession: agents.handoff successor:true', () => {
     const middle = await f.control.call(f.scope, 'tabs.open', { title: 'Lead' }) as AgentControlTab
     const middleScope = { ...f.scope, agentSessionId: middle.resourceId! }
     const worker = await f.control.call(middleScope, 'tabs.open', { title: 'W1' }) as AgentControlTab
+    due(f, middleScope.agentSessionId)
     const result = await f.control.call(middleScope, 'agents.handoff', { handoff: handoff(), successor: true }) as Succession
     expect(result).toMatchObject({ controller: f.spec.id, coworkers: [worker.resourceId] })
     const links = f.control.listLinks(f.project.id, f.workspace.id)
@@ -1618,6 +1630,7 @@ describe('main-brain succession: agents.handoff successor:true', () => {
   it('opens every successor of a two-hop chain as a root, and each predecessor messages it without taking control', async () => {
     const f = fixture(false, undefined, undefined, astra)
     asWizard(f)
+    due(f, f.scope.agentSessionId)
     const first = await f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: true }) as Succession
     const firstScope = { ...f.scope, agentSessionId: first.agentSessionId }
     // The old main reports its last step to the one that continues it: delivered, no control taken.
@@ -1628,6 +1641,7 @@ describe('main-brain succession: agents.handoff successor:true', () => {
     f.database.setSetting('agentControlParent:' + first.agentSessionId, JSON.stringify({ projectId: f.project.id, sessionId: f.workspace.id, controllerAgentSessionId: f.spec.id, targetAgentSessionId: first.agentSessionId, controllerTabId: f.rootTab.id, controlledTabId: first.tabId }))
     expect(f.control.listLinks(f.project.id, f.workspace.id).find(link => link.targetAgentSessionId === first.agentSessionId)).toBeUndefined()
     // Second hop: the successor hands itself on in turn, and the new wizard is a root too.
+    due(f, firstScope.agentSessionId)
     const second = await f.control.call(firstScope, 'agents.handoff', { handoff: handoff(), successor: true }) as Succession
     expect(second).toMatchObject({ successor: true, wizard: true, controller: null })
     expect(f.database.getSetting('agentControlParent:' + second.agentSessionId)).toBeNull()
@@ -1648,6 +1662,7 @@ describe('main-brain succession: agents.handoff successor:true', () => {
     const other = sibling(f, 'Haftheme'), asker = agentIn(f, other.project.id, other.workspace.id, 'theme-asker')
     await f.control.call(asker, 'agents.steer', { projectId: f.project.id, prompt: 'Can you fix the shared build?' })
     expect(f.submissions.at(-1)!.prompt).toContain('Can you fix the shared build?')
+    due(f, f.scope.agentSessionId)
     const next = await f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: true }) as Succession
     const nextScope = { ...f.scope, agentSessionId: next.agentSessionId }
     // The successor answers across projects as a reply: no control taken over the asker.
@@ -1676,6 +1691,51 @@ describe('main-brain succession: agents.handoff successor:true', () => {
     expect(prompts[0]).toContain('agents.handoff({handoff, successor:true})')
   })
 
+  // conductor-task:wizard-successor-churn-20261017: a Codex Astra wizard chain handed itself on after
+  // every finished experiment, 1-2 turns in at 24-33% context, eight tabs in an hour.
+  it('refuses a successor before the rule is met, so a fresh successor cannot hand straight on', async () => {
+    const f = fixture(false, undefined, undefined, astra)
+    asWizard(f)
+    const worker = await f.control.call(f.scope, 'tabs.open', { title: 'Geometry' }) as AgentControlTab
+    const append = (id: string, data: Record<string, unknown>) => {
+      const state = f.database.structured.snapshot(id)!
+      f.database.structured.append({ sessionId: id, runtimeId: state.runtimeId ?? 'runtime', sequence: state.sequence + 1, timestamp: new Date().toISOString(), itemId: `item-${id}-${state.sequence + 1}`, data } as never)
+    }
+    const context = (id: string, used: number) => append(id, { type: 'usage', scope: 'session', source: 'provider', inputTokens: used, outputTokens: 100, limits: { contextUsedTokens: used, contextCapacityTokens: 258_400, modelContextWindow: 258_400 } })
+    // The rosin wizard at its handoff: two turns (the brief and one coworker report), 30.7% context.
+    append(f.spec.id, { type: 'text', role: 'user', text: 'Objective ...', mode: 'snapshot' })
+    append(f.spec.id, { type: 'text', role: 'user', text: 'V12 visual review: rejected', mode: 'snapshot' })
+    context(f.spec.id, 79_204)
+    const tabs = () => f.control.tabs(f.scope).filter(tab => tab.kind === 'agent').length
+    const before = tabs()
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: true })).rejects.toThrow(/^Not yet: .*about 25 turns or 40% context, and this conversation has run 2 turns at 31% of its context\. Nothing was handed over: keep working here/)
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: true, force: 'yes' })).rejects.toThrow('force must be true or false')
+    // Nothing moved: no tab, the coworker and the wand stay with the caller.
+    expect(tabs()).toBe(before)
+    expect(f.submissions).toHaveLength(0)
+    expect(f.control.listLinks(f.project.id, f.workspace.id).find(link => link.targetAgentSessionId === worker.resourceId)?.controllerAgentSessionId).toBe(f.spec.id)
+    expect(f.database.structured.snapshot(f.spec.id)?.settings.wizard).toBe(true)
+    // A worker's ordinary context handoff is not a succession and is never held back.
+    await expect(f.control.call({ ...f.scope, agentSessionId: worker.resourceId! }, 'agents.handoff', { handoff: handoff() })).resolves.toMatchObject({ handedOff: true })
+    // Past 40% context it may.
+    context(f.spec.id, 105_000)
+    const first = await f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: true }) as Succession
+    expect(first).toMatchObject({ handedOff: true, successor: true, wizard: true })
+    // The successor's own timeline starts empty: not the predecessor's 2 turns and 41%, so it keeps
+    // working, and it is told so in its first prompt.
+    const firstScope = { ...f.scope, agentSessionId: first.agentSessionId }
+    expect(f.submissions.at(-1)!.prompt).toMatch(/Keep working here until Conductor tells you succession is due \(about 25 turns or 40% context of this conversation\); any hand-on rule in the handoff above means that notice/)
+    await expect(f.control.call(firstScope, 'agents.handoff', { handoff: handoff(), successor: true })).rejects.toThrow(/^Not yet: .*has run 1 turn\. Nothing was handed over/)
+    // 25 turns are enough without the context; so is Conductor's notice, or the owner asking (force).
+    for (let turn = 1; turn < SUCCESSION_TURNS; turn++) append(first.agentSessionId, { type: 'text', role: 'user', text: 'Coworker report ' + turn, mode: 'snapshot' })
+    const second = await f.control.call(firstScope, 'agents.handoff', { handoff: handoff(), successor: true }) as Succession
+    const secondScope = { ...f.scope, agentSessionId: second.agentSessionId }
+    await expect(f.control.call(secondScope, 'agents.handoff', { handoff: handoff(), successor: true })).rejects.toThrow(/Not yet/)
+    due(f, second.agentSessionId)
+    const third = await f.control.call(secondScope, 'agents.handoff', { handoff: handoff(), successor: true }) as Succession
+    await expect(f.control.call({ ...f.scope, agentSessionId: third.agentSessionId }, 'agents.handoff', { handoff: handoff(), successor: true, force: true })).resolves.toMatchObject({ handedOff: true, successor: true, wizard: true })
+  })
+
   it('hands a wizard successor to a named model on another provider, taking coworkers, wizard mode and the pending restart with it', async () => {
     const f = fixture(false, undefined, undefined, extraModels)
     asWizard(f)
@@ -1685,6 +1745,7 @@ describe('main-brain succession: agents.handoff successor:true', () => {
     f.database.setSetting(RESTART_REQUEST_KEY, encodeRestartRequest({ agentSessionId: f.spec.id, title: 'Controller', reason: 'Install the batch', at: new Date().toISOString() }))
     f.database.setSetting(RESTART_INITIATOR_KEY, encodeRestartInitiator({ agentSessionId: f.spec.id, method: 'app.restart', at: new Date().toISOString() }))
     const body = handoff()
+    due(f, f.scope.agentSessionId)
     const result = await f.control.call(f.scope, 'agents.handoff', { handoff: body, successor: true, provider: 'claude', model: 'opus', effort: 'medium' }) as Succession & { provider: string }
     expect(result).toMatchObject({ handedOff: true, successor: true, provider: 'claude', wizard: true, continueOnLimit: true, restart: { initiator: true, request: true } })
     expect(result.coworkers.sort()).toEqual([first.resourceId, second.resourceId].sort())
@@ -1710,6 +1771,7 @@ describe('main-brain succession: agents.handoff successor:true', () => {
     seedClaudeModels(f)
     const worker = await f.control.call(f.scope, 'tabs.open', { title: 'W1' }) as AgentControlTab
     const before = f.control.tabs(f.scope).filter(tab => tab.kind === 'agent').length
+    due(f, f.scope.agentSessionId)
     await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: true, provider: 'claude', model: 'claude-advanced' })).rejects.toThrow(/hold the wand/)
     expect(f.control.tabs(f.scope).filter(tab => tab.kind === 'agent')).toHaveLength(before)
     expect(f.control.listLinks(f.project.id, f.workspace.id).find(link => link.targetAgentSessionId === worker.resourceId)?.controllerAgentSessionId).toBe(f.spec.id)
@@ -1721,6 +1783,7 @@ describe('main-brain succession: agents.handoff successor:true', () => {
     asWizard(f)
     const worker = await f.control.call(f.scope, 'tabs.open', { title: 'W1' }) as AgentControlTab
     vi.spyOn(f.sessions, 'submit').mockRejectedValueOnce(new Error('boom'))
+    due(f, f.scope.agentSessionId)
     await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: true })).rejects.toThrow(/would not accept the handoff/)
     const link = f.control.listLinks(f.project.id, f.workspace.id).find(candidate => candidate.targetAgentSessionId === worker.resourceId)
     expect(link?.controllerAgentSessionId).toBe(f.spec.id)
@@ -3437,6 +3500,7 @@ describe('B5-F: dispatch, list, status and artifact friction', () => {
     expect(await f.control.call(f.scope, 'agents.artifact', { agentSessionId: finished.resourceId, artifactId: finishedArtifact })).toMatchObject({ content: 'Finished report' })
     const state = f.database.structured.snapshot(f.spec.id)!
     f.database.structured.update(f.spec.id, { settings: { ...state.settings, wizard: true, model: 'gpt-6-astra', effort: 'high', permission: 'accept-edits' } })
+    due(f, f.scope.agentSessionId)
     const succession = await f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: true }) as { agentSessionId: string }
     const successor = { ...f.scope, agentSessionId: succession.agentSessionId }
     expect(await f.control.call(successor, 'agents.artifact', { agentSessionId: finished.resourceId, artifactId: finishedArtifact })).toMatchObject({ content: 'Finished report' })
@@ -3702,6 +3766,42 @@ describe('waiting for results (src/shared/awaiting-results.ts)', () => {
     expect(await f.control.sweepAwaiting(0)).toBe(1)
     expect(f.submissions.at(-1)).toMatchObject({ prompt: expect.stringMatching(/^\[Conductor\] Everyone you were waiting for has gone quiet[\s\S]*last answer: "All five browsers pass; see state.md"/) })
     expect(f.database.getSetting('awaitingResults:' + f.scope.agentSessionId)).toBeNull()
+  })
+
+  // conductor-task:wizard-successor-churn-20261017: a controller waited on the head of a main-brain
+  // chain that kept handing itself on; the wait has to follow the chain, not only its deadline.
+  it('agents.await on a main brain follows its successor chain: busy, a message, quiet and a card all come from the newest one', async () => {
+    const f = fixture()
+    const w0 = agentIn(f, f.project.id, f.workspace.id, 'rosin-w0')
+    await f.control.call(w0, 'tabs.open', { title: 'Geometry' })
+    due(f, w0.agentSessionId)
+    const w1 = { ...w0, agentSessionId: (await f.control.call(w0, 'agents.handoff', { handoff: handoff(), successor: true }) as { agentSessionId: string }).agentSessionId }
+    due(f, w1.agentSessionId)
+    const w2 = { ...w0, agentSessionId: (await f.control.call(w1, 'agents.handoff', { handoff: handoff(), successor: true }) as { agentSessionId: string }).agentSessionId }
+    const declared = await f.control.call(f.scope, 'agents.await', { agents: [w0.agentSessionId], reason: 'rosin chain', approvals: true }) as { awaiting: { agents: Array<{ agentSessionId: string }> } }
+    expect(declared.awaiting.agents.map(agent => agent.agentSessionId)).toEqual([w2.agentSessionId])
+    // The newest successor still works, though both predecessors settled: nothing wakes.
+    const real = f.database.structured.snapshot.bind(f.database.structured)
+    const running = vi.spyOn(f.database.structured, 'snapshot').mockImplementation(id => { const state = real(id); return state && id === w2.agentSessionId ? { ...state, phase: 'running' } : state })
+    expect(await f.control.sweepAwaiting(0)).toBe(0)
+    running.mockRestore()
+    // Its message answers the wait declared on the first.
+    await f.control.call(w2, 'agents.steer', { agentSessionId: f.scope.agentSessionId, prompt: 'Rosin: contour taper rendered' })
+    expect(f.control.awaitingFact(f.scope.agentSessionId)).toBeUndefined()
+    // Once it settles too, the quiet wake names it, not the retired first tab.
+    await f.control.call(f.scope, 'agents.await', { agents: [w0.agentSessionId], reason: 'rosin chain' })
+    expect(await f.control.sweepAwaiting(0)).toBe(1)
+    expect(f.submissions.at(-1)!.prompt).toMatch(/^\[Conductor\] Everyone you were waiting for \(rosin chain\) has gone quiet/)
+    expect(f.submissions.at(-1)!.prompt).toContain(w2.agentSessionId)
+    // A card on the newest successor ends an approvals wait declared on the first.
+    await f.control.call(f.scope, 'agents.await', { agents: [w0.agentSessionId], reason: 'rosin chain', approvals: true })
+    const state = f.database.structured.snapshot(w2.agentSessionId)!
+    const card = { sessionId: w2.agentSessionId, runtimeId: state.runtimeId, sequence: state.sequence + 1, timestamp: new Date().toISOString(), itemId: 'card-chain', requestId: 'req-chain',
+      data: { type: 'interaction', interaction: { id: 'req-chain', kind: 'approval', status: 'pending', title: 'Allow Bash?', input: { command: 'npm install left-pad' }, choices: [{ id: 'allow', label: 'Allow once' }, { id: 'deny', label: 'Deny' }] } } }
+    f.database.structured.append(card as never)
+    expect(await f.control.sweepApprovalWakes(0)).toBe(1)
+    expect(f.submissions.at(-1)!.prompt).toMatch(/Your wait \(rosin chain\) ended because a conversation you wait for is asking for an approval/)
+    expect(f.control.awaitingFact(f.scope.agentSessionId)).toBeUndefined()
   })
 
   it('a refused send_message never strands its recipient: the recipient is told why, and its wait on the sender ends', async () => {

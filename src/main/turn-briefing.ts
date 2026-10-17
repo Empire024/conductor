@@ -21,7 +21,8 @@
  * does too.
  */
 import { createHash } from 'node:crypto'
-import type { AgentEvent } from '../shared/structured-agent'
+import type { AgentEvent, TimelineItem } from '../shared/structured-agent'
+import { summarizeContext } from '../shared/usage-accounting'
 import type { AgentSpec } from '../shared/models'
 import type { ConductorDatabase } from './database'
 import type { CoworkerBriefingOptions, SentLease } from './agent-collaboration-store'
@@ -87,11 +88,35 @@ export const handoffNudge = (percent: number, successor = false): string =>
 export const SUCCESSION_TURNS = 25
 export const SUCCESSION_PERCENT = 40
 
-/** The per-runtime line a main brain gets with its static briefing. */
-export const SUCCESSION_HINT = `Main brain: when this conversation passes about ${SUCCESSION_TURNS} turns or ${SUCCESSION_PERCENT}% context and your coworkers are idle, finish the step you're in and call agents.handoff({handoff, successor:true}) with the six-section handoff. The successor opens as a root tab with your wizard mode, model, effort and mode, and takes over every coworker you control.`
+/** The per-runtime line a main brain gets with its static briefing. A model cannot see the turns
+ *  Conductor counts, and a Codex Astra wizard chain read "about 25 turns" as its own tool rounds and
+ *  "finish the step you're in" as the trigger: each successor handed on after one experiment, every
+ *  5-10 minutes at 24-33% context (miron rosin, 2026-10-17), and copied the rule into its own handoff
+ *  for the next. So the hint names Conductor's notice as the trigger, and agents.handoff refuses a
+ *  successor before the rule is met (successionDue). */
+export const SUCCESSION_HINT = `Main brain: Conductor counts this conversation's turns and context, and when it passes about ${SUCCESSION_TURNS} turns or ${SUCCESSION_PERCENT}% context it posts a succession notice in this tab saying so. Only then, once your coworkers are idle, finish the step you're in and call agents.handoff({handoff, successor:true}) with the six-section handoff. Until that notice keep working here: finishing a step is no reason to hand on, and agents.handoff refuses an earlier successor. The successor opens as a root tab with your wizard mode, model, effort and mode, and takes over every coworker you control; it gets this rule from Conductor, so leave it out of the handoff.`
 
 /** Set on the payload of the Conductor notice that told a main brain it crossed that threshold. */
 export const SUCCESSION_NUDGE = 'successionNudge'
+
+/** How far a main brain has run, read from its own timeline, which a successor starts empty: `turns`
+ *  counts the user messages it has had (the owner's, coworker reports and steering, since each wakes
+ *  it), `percent` how full its runtime's window is, and `nudged` whether Conductor already told it
+ *  to pass itself on. */
+export interface SuccessionProgress { turns: number; percent?: number; nudged: boolean }
+
+export function successionProgress(items: TimelineItem[], runtimeId?: string): SuccessionProgress {
+  const percent = summarizeContext(items, runtimeId)?.percent
+  return {
+    turns: items.filter(item => item.data.type === 'text' && item.data.role === 'user').length,
+    ...(percent !== undefined && Number.isFinite(percent) ? { percent } : {}),
+    nudged: items.some(item => item.data.type === 'notice' && typeof item.data.payload === 'object' && item.data.payload !== null && !Array.isArray(item.data.payload) && item.data.payload[SUCCESSION_NUDGE] === true)
+  }
+}
+
+/** Whether a main brain may pass itself on: told so already, or past either threshold now. */
+export const successionDue = (progress: SuccessionProgress): boolean =>
+  progress.nudged || progress.turns >= SUCCESSION_TURNS || (progress.percent ?? 0) >= SUCCESSION_PERCENT
 
 export const successionNudge = (turns: number, percent?: number): string =>
   `Conductor: this main conversation has run ${turns} turns${percent === undefined ? '' : ` and uses ${Math.round(percent)}% of its context`}. Once your coworkers are idle, finish the step you're in and call agents.handoff({handoff, successor:true}) with the six-section handoff; the successor continues as this conversation, with your coworkers.`

@@ -46,6 +46,7 @@ import { LOCAL_CONNECTION, LOCAL_MACHINE_ID, type MachineDescriptor } from '../s
 import { createApprovalRouting } from './approval-review-routing'
 import { sinceCursor, supervise } from './agent-supervision'
 import { CoworkerRecovery } from './coworker-recovery'
+import { SUCCESSION_PERCENT, SUCCESSION_TURNS, successionDue, successionProgress } from './turn-briefing'
 import { AwaitingResults } from './awaiting-results'
 import { awaitingSentence, DEFAULT_AWAIT_MINUTES, MAX_AWAITED, MAX_AWAIT_MINUTES, MAX_AWAIT_REASON, type AwaitingFact } from '../shared/awaiting-results'
 import { displaySessionPhase } from '../shared/project-activity'
@@ -284,7 +285,7 @@ const toolSignatures = {
   'agents.await': '({agents,reason?,timeoutMinutes?,approvals?}|{clear:true}) — declare that this conversation ends its turn waiting for results from the named conversations (agent ids, at most ' + MAX_AWAITED + '; reason up to ' + MAX_AWAIT_REASON + ' characters): its tab stays in the active group labelled "waiting for …" instead of Done, and no sweep closes it; it survives a restart. Their message (send_message, agents.report) wakes you as it always does, so end your turn and never poll. Each one drops out when its message arrives; once all have and your turn ends without declaring again, the tab is finished work. A conversation whose tab closed is no longer waited for. A wait never stalls silently: after timeoutMinutes (default ' + DEFAULT_AWAIT_MINUTES + ', at most ' + MAX_AWAIT_MINUTES + ') you are woken with "deadline passed", and once every awaited conversation has gone idle, completed, failed or closed without messaging you, you are woken with that fact and their last answers; either wake ends the wait. approvals:true also ends the wait when one of them raises an approval or permission card that nothing (the stronger review, the owner\'s auto-approve policy) answers within a few seconds: the wake names the card and the exact agents.approve or permissions.decide call that answers it, so an overseer never polls agents.approvals (a wizard controller is woken for its own coworkers\' cards without it). send_message awaitReply waits get the same default deadline. Calling it again replaces the list; clear:true cancels; agents.finish ends it. Your own live coworkers need no declaration',
   'approvals.policy.get': '({}) — the owner\'s auto-approve policy: the classes of native approval Conductor answers itself, before any card, stronger review or controller wake, with no model turn (each class on or off, with what it covers), the writable roots outside the project, and what it never answers; for the owner or a wizard also how many requests it answered, by class, and the latest. Shape a command to fit it (a script inside the project, pip --target .deps, a download into the project) and it never asks anyone. Only the owner or a wizard changes it (approvals.policy.set)',
   'agents.finish': '({agentSessionId?,waitSeconds?,force?}) — close a finished coworker: its tab closes with history kept (reopenable from the closed tabs) and its CLI process is released. With agentSessionId, a controller finishes a coworker it controls whose turn has settled with no background tasks, at once and without an owner dialog; waitSeconds (max ' + FINISH_WAIT_SECONDS + MCP_WAIT_NOTE + '; a longer wait is capped and the result says so in waitCapped) first waits that long for it to settle, so there is no agents.status loop; refused, naming the reason, while it is (still) running, has background tasks, waits on an approval, has an unsent draft, is a wizard tab or still controls open coworkers. With {} a coworker finishes itself as its last act: Conductor closes it once this turn settles, so call it after your work is delivered and reported, then end the turn; background tasks of your own are waited for with waitSeconds, or stopped with your CLI with force:true',
-  'agents.handoff': `({handoff,title?,successor?,provider?,model?,effort?}) — hand your own remaining work to a fresh tab when this conversation's context has grown expensive. Takes no agentSessionId: it always hands off the caller. handoff is ${HANDOFF_MINIMUM}-${HANDOFF_MAXIMUM} characters holding the six sections of docs/token-thrift-policy.md on their own lines, in order (${handoffSections.join(', ')}); reference long output by repository path rather than pasting it. The new tab opens in this workspace with your provider, model, effort and mode, and receives the handoff as its first prompt; provider, model and effort from models.list continue you elsewhere (another provider must name its model; your mode is kept, never widened). Your tab stays open and steerable: finish the step you are in, report it, and stop. successor:true is for a main brain (a wizard tab, or a controller with live coworkers): the new tab is you continued, not your coworker. It opens as a root (under your own controller, if you have one), inherits wizard mode and limit continuation, takes over every coworker you control (their agents.report, approvals and steering go to it) and any pending restart that would bring you back (a wizard's successor must be a model that can hold the wand, else nothing opens); you lose wizard mode, are marked superseded, and your tab shows “Continued in <tab>”`,
+  'agents.handoff': `({handoff,title?,successor?,force?,provider?,model?,effort?}) — hand your own remaining work to a fresh tab when this conversation's context has grown expensive. Takes no agentSessionId: it always hands off the caller. handoff is ${HANDOFF_MINIMUM}-${HANDOFF_MAXIMUM} characters holding the six sections of docs/token-thrift-policy.md on their own lines, in order (${handoffSections.join(', ')}); reference long output by repository path rather than pasting it. The new tab opens in this workspace with your provider, model, effort and mode, and receives the handoff as its first prompt; provider, model and effort from models.list continue you elsewhere (another provider must name its model; your mode is kept, never widened). Your tab stays open and steerable: finish the step you are in, report it, and stop. successor:true is for a main brain (a wizard tab, or a controller with live coworkers): the new tab is you continued, not your coworker. It opens as a root (under your own controller, if you have one), inherits wizard mode and limit continuation, takes over every coworker you control (their agents.report, approvals and steering go to it) and any pending restart that would bring you back (a wizard's successor must be a model that can hold the wand, else nothing opens); you lose wizard mode, are marked superseded, and your tab shows “Continued in <tab>”. A successor is refused until the rule is met (about ${SUCCESSION_TURNS} turns or ${SUCCESSION_PERCENT}% context; Conductor posts a notice in your tab when it is); force:true only when the owner asked for the handoff`,
   'files.list': '({query?,projectId?}) — indexed project search, at most 100 matches with stable URIs',
   'files.read': '({path,projectId?}) — UTF-8 text up to 1 MiB; projectId reads a sibling project from projects.list',
   'files.write': '({path,content,expectedContent}) — atomic compare-and-save in this project only; expectedContent:null creates a file; live views refresh. To change a sibling project, open a tab there with tabs.open({projectId}) and dispatch the work to it',
@@ -1661,7 +1662,9 @@ export class AgentControl {
 
   /** Whether a wait declared with approvals:true names this conversation. */
   private awaitedForApprovals(id: string): boolean {
-    try { return this.awaiting().waiters().some(waiter => { const record = this.awaiting().record(waiter); return Boolean(record?.approvals && record.agents.includes(id)) }) } catch { return false }
+    // A wait names the conversation it was declared on; the successors carrying its work count too.
+    const { database } = this.deps
+    try { return this.awaiting().waiters().some(waiter => { const record = this.awaiting().record(waiter); return Boolean(record?.approvals && record.agents.some(awaited => awaited === id || this.successorsOf(database.structured.spec<AgentSpec>(awaited)?.projectId ?? '', awaited).includes(id))) }) } catch { return false }
   }
 
   /** The owner's auto-approve policy (approval-policy.ts) for a card that is already up: one raised
@@ -1732,8 +1735,8 @@ export class AgentControl {
     const deadline = new Date(Date.now() + minutes * 60_000).toISOString()
     ledger.declare(scope.agentSessionId, agents, reason, undefined, {}, deadline, input.approvals === true)
     const fact = ledger.fact(scope.agentSessionId)
-    // Their cards may already be waiting: the next sweep delivers them.
-    if (input.approvals === true) for (const id of agents) this.approvalCandidates.add(id)
+    // Their cards may already be waiting, or their successors' (a wizard chain): the next sweep delivers them.
+    if (input.approvals === true) for (const id of agents) for (const each of [id, ...this.successorsOf(this.deps.database.structured.spec<AgentSpec>(id)?.projectId ?? '', id)]) this.approvalCandidates.add(each)
     return {
       awaiting: fact ?? null, ...(fact ? { deadline } : {}), ...(fact && input.approvals === true ? { approvals: true } : {}),
       note: fact ? `${awaitingSentence(fact)} Conductor wakes you at ${deadline} if nobody has answered, or once every one of them has gone quiet without messaging you${input.approvals === true ? ', or when one of them raises an approval nothing answers automatically' : ''}. End your turn now; do not poll.` : 'None of those conversations has an open tab, so nothing is waited for; message them first, or finish your work.'
@@ -3475,6 +3478,7 @@ export class AgentControl {
     const spec = this.authorize(scope)
     if (args.agentSessionId !== undefined) throw new Error('agents.handoff always hands off the calling conversation and takes no agentSessionId. To give work to a different tab, use agents.submit.')
     if (args.successor !== undefined && typeof args.successor !== 'boolean') throw new Error('successor must be true or false')
+    if (args.force !== undefined && typeof args.force !== 'boolean') throw new ArgumentError('force must be true or false')
     const handoff = handoffText(args)
     const settings = settingsForRuntime(database.structured.snapshot(scope.agentSessionId)!.settings)
     const source = this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)
@@ -3482,7 +3486,7 @@ export class AgentControl {
     // that a repeated handoff cannot grow an unbounded tab title.
     const title = args.title === undefined ? (source?.title ?? spec.title).slice(0, 100).replace(/ \(continued\)$/, '') + ' (continued)' : text(args, 'title', 120)
     const receiver = this.handoffReceiver(scope, spec, settings, args)
-    if (args.successor === true) return this.succeed(scope, spec, source, { handoff, receiver, title })
+    if (args.successor === true) return this.succeed(scope, spec, source, { handoff, receiver, title, force: args.force === true })
     // Deliberately the ordinary tabs.open path: same catalog check, same machine inheritance,
     // same permission clamping. Provider, model and effort are this conversation's unless the
     // caller named others; permission is always named so the receiver keeps the mode the owner set
@@ -3711,7 +3715,7 @@ export class AgentControl {
     return { kind: 'agent', provider, model, permission: settings.permission, exactPermission: true, ...(effort ? { effort } : {}) }
   }
 
-  private async succeed(scope: AgentControlScope, spec: AgentSpec, source: AgentControlTab | undefined, request: { handoff: string; receiver: Args & { provider: StructuredProvider; model: string }; title: string; roll?: { role: 'relay' | 'coordinator'; used: number; bound: number; instructions?: string } }): Promise<unknown> {
+  private async succeed(scope: AgentControlScope, spec: AgentSpec, source: AgentControlTab | undefined, request: { handoff: string; receiver: Args & { provider: StructuredProvider; model: string }; title: string; force?: boolean; roll?: { role: 'relay' | 'coordinator'; used: number; bound: number; instructions?: string } }): Promise<unknown> {
     const { database, sessions } = this.deps
     const wizard = scope.wizard === true
     const coworkers = this.controlledBy(scope.agentSessionId)
@@ -3719,6 +3723,13 @@ export class AgentControl {
     const roll = request.roll
     if (!roll && !wizard && !coworkers.length) throw new Error('successor:true is for a main brain: a wizard tab, or a controller with live coworkers. This conversation is neither; call agents.handoff without successor to hand your work to a fresh tab')
     if (source?.state?.remotePeerId || this.callerMachineId(scope) !== LOCAL_MACHINE_ID) throw new Error('A successor opens on this machine, and this conversation runs on or is driven by another one; call agents.handoff without successor')
+    // The succession rule is Conductor's to judge, not the model's: a Codex Astra wizard chain handed
+    // on after every finished experiment at 1-2 turns and 24-33% context (miron rosin, 2026-10-17).
+    if (!roll && !request.force) {
+      const state = database.structured.snapshot(scope.agentSessionId)
+      const progress = successionProgress(state?.items ?? [], state?.runtimeId)
+      if (!successionDue(progress)) throw new Error(`Not yet: a main brain passes itself on at about ${SUCCESSION_TURNS} turns or ${SUCCESSION_PERCENT}% context, and this conversation has run ${progress.turns} turn${progress.turns === 1 ? '' : 's'}${progress.percent === undefined ? '' : ` at ${Math.round(progress.percent)}% of its context`}. Nothing was handed over: keep working here, step after step; finishing a step is no reason to hand on. Conductor posts a succession notice in this tab when it is due. Pass force:true only when the owner asked for this handoff.`)
+    }
     const { handoff, receiver, title } = request
     // Refused before anything opens: the wand, the coworkers and any restart stay with the caller.
     if (receiver.provider === 'local') throw new Error('A successor continues a main brain on a native Claude, Codex or Grok model; a local model cannot take over coworkers or the wand')
@@ -3740,7 +3751,7 @@ export class AgentControl {
     const previous = coworkers.map(link => [link.targetAgentSessionId, database.getSetting(key(link.targetAgentSessionId))] as const)
     for (const link of coworkers) database.setSetting(key(link.targetAgentSessionId), JSON.stringify({ ...link, controllerAgentSessionId: agentSessionId, controllerTabId: tab.id }))
     const prompt = roll ? handoff + (coworkers.length ? `\n\nYou control ${coworkers.length} coworker${coworkers.length === 1 ? '' : 's'} (${coworkers.map(link => link.targetAgentSessionId).join(', ')}); their reports, approvals and steering come to you.` : '')
-      : handoff + `\n\nConductor: you are the successor of “${source?.title ?? spec.title}” (${scope.agentSessionId}), not its coworker${wizard ? ', and this tab is now the wizard' : ''}. ${coworkers.length ? `You now control ${coworkers.length} coworker${coworkers.length === 1 ? '' : 's'} (${coworkers.map(link => link.targetAgentSessionId).join(', ')}); their reports, approvals and steering come to you. ` : ''}The previous tab finishes its current step and stops.`
+      : handoff + `\n\nConductor: you are the successor of “${source?.title ?? spec.title}” (${scope.agentSessionId}), not its coworker${wizard ? ', and this tab is now the wizard' : ''}. ${coworkers.length ? `You now control ${coworkers.length} coworker${coworkers.length === 1 ? '' : 's'} (${coworkers.map(link => link.targetAgentSessionId).join(', ')}); their reports, approvals and steering come to you. ` : ''}The previous tab finishes its current step and stops. Keep working here until Conductor tells you succession is due (about ${SUCCESSION_TURNS} turns or ${SUCCESSION_PERCENT}% context of this conversation); any hand-on rule in the handoff above means that notice, and agents.handoff refuses an earlier successor.`
     // Straight to the session rather than through agents.submit, which would take control of the
     // tab it prompts and so make the successor the caller's coworker after all.
     const origin: PromptOrigin = { agentSessionId: scope.agentSessionId, label: source?.title || spec.title }

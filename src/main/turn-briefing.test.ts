@@ -3,12 +3,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AgentSpec } from '../shared/models'
+import type { TimelineItem } from '../shared/structured-agent'
 import { ConductorDatabase } from './database'
 import { MEMORY_PROTOCOL } from './memory'
 import type { CoworkerBriefingOptions } from './agent-collaboration-store'
 import { CoworkerRecovery } from './coworker-recovery'
 import { COWORKER_OPENED_PREFIX } from './coworker-autoclose'
-import { CONTEXT_RESET, OUTAGE_NUDGES, FINISH_HINT, MEMORY_HEADING, LOCAL_ASSIST_HINT, SHELL_HYGIENE_HINT, TurnBriefings, handoffNudge, SUCCESSION_HINT, SUCCESSION_PERCENT, SUCCESSION_TURNS, successionNudge, coworkerHint } from './turn-briefing'
+import { CONTEXT_RESET, OUTAGE_NUDGES, FINISH_HINT, MEMORY_HEADING, LOCAL_ASSIST_HINT, SHELL_HYGIENE_HINT, TurnBriefings, handoffNudge, SUCCESSION_HINT, SUCCESSION_NUDGE, SUCCESSION_PERCENT, SUCCESSION_TURNS, successionDue, successionNudge, successionProgress, coworkerHint } from './turn-briefing'
 
 const roots: string[] = [], databases: ConductorDatabase[] = []
 afterEach(() => {
@@ -380,6 +381,33 @@ describe('telling a main brain when to pass itself on', () => {
   it('points a main brain at the successor form of the ordinary context-band nudge', () => {
     expect(handoffNudge(60, true)).toContain('agents.handoff({handoff, successor:true})')
     expect(handoffNudge(60)).not.toContain('successor')
+  })
+
+  // conductor-task:wizard-successor-churn-20261017
+  it('makes Conductor\'s notice, not a finished step, the trigger, and keeps the rule out of the handoff', () => {
+    expect(SUCCESSION_HINT).toContain('Conductor counts this conversation\'s turns and context')
+    expect(SUCCESSION_HINT).toContain('Until that notice keep working here: finishing a step is no reason to hand on, and agents.handoff refuses an earlier successor')
+    expect(SUCCESSION_HINT).toContain('leave it out of the handoff')
+  })
+
+  it('measures a main brain from its own timeline: user messages, its runtime\'s context and the notice', () => {
+    let sequence = 0
+    const item = (data: TimelineItem['data'], runtimeId = 'runtime-1'): TimelineItem => ({ id: 'item-' + ++sequence, sequence, runtimeId, timestamp: '2026-10-17T18:00:00.000Z', data } as TimelineItem)
+    const usage = (used: number, runtimeId?: string) => item({ type: 'usage', scope: 'session', source: 'provider', inputTokens: used, outputTokens: 10, limits: { contextUsedTokens: used, contextCapacityTokens: 258_400, modelContextWindow: 258_400 } } as TimelineItem['data'], runtimeId)
+    const user = (text: string) => item({ type: 'text', role: 'user', text, mode: 'snapshot' })
+    expect(successionProgress([])).toEqual({ turns: 0, nudged: false })
+    // The rosin successor at its early handoff: its brief and one report, assistant text between.
+    const rosin = [user('Objective ...'), item({ type: 'text', role: 'assistant', text: 'Rendering v12', mode: 'snapshot' }), user('V12 rejected'), usage(79_204)]
+    const progress = successionProgress(rosin)
+    expect(progress).toMatchObject({ turns: 2, nudged: false })
+    expect(progress.percent).toBeCloseTo(30.7, 1)
+    expect(successionDue(progress)).toBe(false)
+    // Either threshold, or the notice already in the timeline, makes it due.
+    expect(successionDue(successionProgress([...rosin, usage(105_000)]))).toBe(true)
+    expect(successionDue(successionProgress(Array.from({ length: SUCCESSION_TURNS }, (_, index) => user('Report ' + index))))).toBe(true)
+    expect(successionDue(successionProgress([...rosin, item({ type: 'notice', message: successionNudge(25), payload: { [SUCCESSION_NUDGE]: true } })]))).toBe(true)
+    // Context is the current runtime's: a previous process's fuller window does not count.
+    expect(successionProgress([usage(200_000, 'runtime-0'), user('Resumed'), usage(50_000)]).percent).toBeCloseTo(19.35, 1)
   })
 })
 
