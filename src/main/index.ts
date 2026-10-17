@@ -1813,6 +1813,14 @@ const registerIpc = (): void => {
     if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.discover(sessionId)
     return agents.structured.discover(sessionId)
   })
+  ipcMain.handle('structured:command', (event, id, command, args) => {
+    trustedStructured(event)
+    if (command !== 'compact' && command !== 'review') throw new Error('Invalid slash command')
+    if (typeof args !== 'string' || args.length > 4000) throw new Error('Invalid slash command arguments')
+    const sessionId = structuredId(id)
+    if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.unsupported(sessionId, '/' + command)
+    return agents.structured.slashCommand(sessionId, command, args.trim())
+  })
   ipcMain.handle('structured:rename', (event, id, title) => {
     trustedStructured(event)
     if (typeof title !== 'string' || !title.trim() || title.length > 160) throw new Error('Invalid title')

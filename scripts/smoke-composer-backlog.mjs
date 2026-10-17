@@ -67,7 +67,9 @@ try {
   await page.keyboard.press('Escape')
   await composer.fill('/ed')
   await composer.press('Enter')
-  await expect(mode).toContainText('Edit')
+  // Codex's /edit only leaves plan mode (its tabs open on Auto since 2026-09-22); Claude's also picks Edit.
+  if (provider === 'claude') await expect(mode).toContainText('Edit')
+  else await expect(mode).not.toContainText('Plan')
   if (provider === 'claude') {
     await composer.fill('/fi')
     await expect(page.getByRole('option', { name: /[/]fixture/ })).toBeVisible()

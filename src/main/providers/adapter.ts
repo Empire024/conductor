@@ -98,6 +98,9 @@ export interface ProviderAdapter {
    *  conversation (the local runtime; native CLIs compact themselves). Null when there is
    *  nothing to fold. */
   compactContext?(): Promise<Json | null>
+  /** A composer slash command the runtime runs through its own protocol request (Codex
+   *  thread/compact/start and review/start; docs/slash-commands.md). Only between turns. */
+  slashCommand?(command: import('../../shared/slash-commands').NativeSlashCommand, args: string): Promise<void>
   /** The runtime's compact view of where a run stands: stop reason, rounds, context figures,
    *  files changed. Null when the runtime does not keep one. */
   runStatus?(): Json | null

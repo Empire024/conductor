@@ -315,6 +315,8 @@ export interface StructuredAgentBridge {
   saveSettings(id: string, settings: SessionSettings): Promise<void>
   fork(id: string): Promise<string>
   discover(id: string): Promise<Json>
+  /** A slash command the runtime runs through its own protocol request (shared/slash-commands.ts). */
+  command(id: string, command: import('./slash-commands').NativeSlashCommand, args: string): Promise<void>
   rename(id: string, title: string): Promise<void>
   archive(id: string, archived: boolean): Promise<void>
   history(projectId: string, query?: string): Promise<ConversationHistoryEntry[]>

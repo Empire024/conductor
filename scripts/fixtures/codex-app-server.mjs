@@ -160,6 +160,28 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     setTimeout(() => finish('interrupted'), 15)
     return
   }
+  // The composer's /compact and /review (docs/slash-commands.md): each starts its own native turn.
+  if (message.method === 'thread/compact/start' || message.method === 'review/start') {
+    currentTurn = `synthetic-turn-${++turnNumber}`
+    const turn = { id: currentTurn, status: 'inProgress', items: [], error: null }
+    if (message.method === 'review/start' && process.env.CONDUCTOR_TEST_REVIEW_REFUSED === '1') { send({ id: message.id, error: { code: -32600, message: 'review requires a git repository' } }); return }
+    send({ id: message.id, result: message.method === 'review/start' ? { turn, reviewThreadId: threadId } : {} })
+    notify('turn/started', { threadId, turn })
+    if (message.method === 'thread/compact/start') {
+      itemEvent('item/started', { type: 'contextCompaction', id: 'compact-' + turnNumber })
+      setTimeout(() => { itemEvent('item/completed', { type: 'contextCompaction', id: 'compact-' + turnNumber }); finish() }, 60)
+    } else {
+      const target = message.params.target
+      const label = target.type === 'custom' ? 'custom: ' + target.instructions : target.type === 'baseBranch' ? 'base branch ' + target.branch : target.type === 'commit' ? 'commit ' + target.sha : 'uncommitted changes'
+      itemEvent('item/started', { type: 'enteredReviewMode', id: 'review-' + turnNumber, review: label })
+      setTimeout(() => {
+        itemEvent('item/completed', { type: 'exitedReviewMode', id: 'review-' + turnNumber, review: 'Synthetic review of ' + label + ': no issues found.' })
+        itemEvent('item/completed', { type: 'agentMessage', id: 'review-answer-' + turnNumber, text: 'Synthetic review of ' + label + ': no issues found.', phase: null, memoryCitation: null, delivery: null, questions: null })
+        finish()
+      }, 60)
+    }
+    return
+  }
   if (message.method !== 'turn/start') { send({ id: message.id, error: { code: -32601, message: 'unsupported synthetic request' } }); return }
   currentTurn = `synthetic-turn-${++turnNumber}`
   const promptText = message.params.input[0].text

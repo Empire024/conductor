@@ -32,6 +32,10 @@ import type { GetAccountRateLimitsResponse } from './generated/codex/v2/GetAccou
 import type { ThreadForkResponse } from './generated/codex/v2/ThreadForkResponse'
 import type { ThreadGoalGetResponse } from './generated/codex/v2/ThreadGoalGetResponse'
 import type { SkillsListResponse } from './generated/codex/v2/SkillsListResponse'
+import type { ReviewStartResponse } from './generated/codex/v2/ReviewStartResponse'
+import type { ReviewTarget } from './generated/codex/v2/ReviewTarget'
+import type { ThreadCompactStartResponse } from './generated/codex/v2/ThreadCompactStartResponse'
+import type { NativeSlashCommand } from '../../shared/slash-commands'
 import { BROWSER_MCP_SERVER_NAME } from '../../shared/browser-mcp'
 import { CODEX_FALLBACK_MODEL } from '../../shared/agent-model-selection'
 import { codexConductorThreadConfig, codexLocalAssistThreadConfig, mergeCodexMcpConfigs } from '../local-assist/mcp-config'
@@ -65,6 +69,17 @@ class CodexRpcError extends Error {
   constructor(readonly code: unknown, readonly data: unknown, message: string) { super(`Codex request failed (${String(code ?? 'unknown')}): ${message}`) }
 }
 
+/** What `/review` reviews, as the Codex TUI's review picker offers it: no argument reviews the
+  *  uncommitted changes, `base <branch>` the diff against a branch, `commit <sha>` one commit, and
+  *  anything else is custom review instructions. */
+export function codexReviewTarget(args: string): ReviewTarget {
+  const text = args.trim()
+  const [word, value, ...rest] = text.split(/\s+/)
+  if (!text) return { type: 'uncommittedChanges' }
+  if (/^(base|branch)$/i.test(word!) && value && !rest.length) return { type: 'baseBranch', branch: value }
+  if (/^commit$/i.test(word!) && value && /^[0-9a-f]{4,40}$/i.test(value) && !rest.length) return { type: 'commit', sha: value, title: null }
+  return { type: 'custom', instructions: text }
+}
 type PendingRpc = { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }
 type PendingRequest = { request: ServerRequest; interaction: PendingInteraction; blocking: boolean }
 type Correlation = Pick<AdapterEvent, 'nativeSessionId' | 'turnId' | 'itemId' | 'parentId'>
@@ -883,6 +898,39 @@ export class CodexAdapter implements ProviderAdapter {
     // The new backend session will explicitly resume this native conversation.
     await this.request('thread/unsubscribe', { threadId: response.thread.id })
     return response.thread.id
+  }
+
+  /** `/compact` and `/review` from the composer, run the way the Codex TUI runs them: their own
+   *  App Server requests, which start a compaction or review turn on this thread
+   *  (docs/slash-commands.md). The turn then reports itself like any other. */
+  async slashCommand(command: NativeSlashCommand, args: string): Promise<void> {
+    await this.start()
+    if (this.disposed || this.failed || !this.threadId || !this.transport?.connected) throw new Error('Codex session is disconnected; resume explicitly')
+    if (this.turnId || this.dispatching || this.pending.size) throw new Error(`Wait for the current Codex turn to finish before /${command}`)
+    if (command === 'compact' && args) throw new Error('Codex /compact takes no instructions; send /compact on its own')
+    const target: ReviewTarget | undefined = command !== 'review' ? undefined : codexReviewTarget(args)
+    this.turnKind = undefined
+    this.dispatching = true
+    this.interrupted = false
+    this.liveRetryStopped = false
+    this.items.clear()
+    this.completedItems.clear()
+    try {
+      if (command === 'compact') await this.request<ThreadCompactStartResponse>('thread/compact/start', { threadId: this.threadId })
+      else {
+        const result = await this.request<ReviewStartResponse>('review/start', json({ threadId: this.threadId, target: target!, delivery: 'inline' }))
+        if (result.turn?.id && !this.completedTurns.get(result.turn.id)) {
+          this.turnId = result.turn.id
+          this.turnKind = 'review'
+          this.emit({ data: { type: 'session', phase: 'running', capabilities: this.capabilities } })
+        }
+      }
+    } catch (error) {
+      // A refusal (not a git repository, nothing to compact) leaves the thread as it was; a lost
+      // acknowledgement is not permission to claim nothing started.
+      if (!(error instanceof CodexRpcError)) this.disconnect(error instanceof Error ? error.message : `Codex /${command} dispatch failed`)
+      throw error
+    } finally { this.dispatching = false; if (this.turnId) this.emitPhase(true) }
   }
 
   async rename(title: string): Promise<void> {

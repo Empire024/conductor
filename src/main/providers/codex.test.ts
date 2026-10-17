@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { CodexAdapter, CODEX_PROTOCOL_BASELINE, codexChanges, codexDiffCounts, codexInput, codexEvaluationThreadConfig, codexLaunchArguments, validateCodexLiveConfiguration, codexLiveSkillOverrides } from './codex'
+import { CodexAdapter, CODEX_PROTOCOL_BASELINE, codexChanges, codexReviewTarget, codexDiffCounts, codexInput, codexEvaluationThreadConfig, codexLaunchArguments, validateCodexLiveConfiguration, codexLiveSkillOverrides } from './codex'
 import { JsonLineTransport } from './transport'
 import { SteeringUnavailableError, type AdapterOptions } from './adapter'
 import type { AdapterEvent, AgentEvent, Json, SessionSettings } from '../../shared/structured-agent'
@@ -613,4 +613,39 @@ it('marks a completed compaction so the host restates its briefing', async () =>
   const notices = projected.items.filter(item => item.data.type === 'notice').map(item => item.data.type === 'notice' ? item.data.message : '')
   expect(notices).toContain('Codex compacted this conversation; Conductor restates its briefing with the next message.')
   expect(notices).toContain('Codex contextCompaction')
+})
+
+describe('composer slash commands through the App Server (docs/slash-commands.md)', () => {
+  it('/compact starts a native compaction turn with thread/compact/start', async () => {
+    const { adapter, events, sent } = create()
+    await adapter.start()
+    await adapter.slashCommand('compact', '')
+    await waitFor(() => completed(events))
+    expect(sent.find(message => (message as { method?: string }).method === 'thread/compact/start')).toMatchObject({ params: { threadId: 'synthetic-thread-1' } })
+    expect(sent.some(message => (message as { method?: string }).method === 'turn/start')).toBe(false)
+    expect(events.some(event => event.data.type === 'notice' && (event.data.payload as { contextReset?: boolean } | undefined)?.contextReset === true)).toBe(true)
+    await expect(adapter.slashCommand('compact', 'keep the API notes')).rejects.toThrow(/takes no instructions/)
+  })
+
+  it('/review starts an inline review of the uncommitted changes, a branch, a commit or custom instructions', async () => {
+    const { adapter, events, sent } = create()
+    await adapter.start()
+    await adapter.slashCommand('review', '')
+    await waitFor(() => completed(events))
+    const reviews = () => sent.filter(message => (message as { method?: string }).method === 'review/start').map(message => (message as { params: Json }).params)
+    expect(reviews()[0]).toEqual({ threadId: 'synthetic-thread-1', target: { type: 'uncommittedChanges' }, delivery: 'inline' })
+    expect(events.some(event => event.data.type === 'text' && /Synthetic review of uncommitted changes/.test(event.data.text))).toBe(true)
+    expect(codexReviewTarget('base main')).toEqual({ type: 'baseBranch', branch: 'main' })
+    expect(codexReviewTarget('commit d5a1a18')).toEqual({ type: 'commit', sha: 'd5a1a18', title: null })
+    expect(codexReviewTarget('focus on the IPC validation')).toEqual({ type: 'custom', instructions: 'focus on the IPC validation' })
+  })
+
+  it('refuses while a turn runs, and a refused review leaves the thread connected', async () => {
+    const { adapter, events } = create({ CONDUCTOR_TEST_REVIEW_REFUSED: '1' })
+    await adapter.start()
+    await expect(adapter.slashCommand('review', '')).rejects.toThrow(/git repository/)
+    expect(events.some(event => event.data.type === 'session' && event.data.phase === 'disconnected')).toBe(false)
+    await adapter.submit('synthetic:steer', settings)
+    await expect(adapter.slashCommand('compact', '')).rejects.toThrow(/Wait for the current Codex turn/)
+  })
 })

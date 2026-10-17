@@ -187,6 +187,7 @@ const bridge: ConductorBridge = {
     saveSettings: (id, settings) => ipcRenderer.invoke('structured:settings', id, settings),
     fork: (id) => ipcRenderer.invoke('structured:fork', id),
     discover: (id) => ipcRenderer.invoke('structured:discover', id),
+    command: (id, command, args) => ipcRenderer.invoke('structured:command', id, command, args),
     rename: (id, title) => ipcRenderer.invoke('structured:rename', id, title),
     archive: (id, archived) => ipcRenderer.invoke('structured:archive', id, archived),
     history: (projectId, query) => ipcRenderer.invoke('structured:history', projectId, query),

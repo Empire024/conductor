@@ -34,6 +34,7 @@ import { ApprovalReviewGate, type ApprovalReviewRouting } from './approval-revie
 import { evaluateApprovalPolicy, policyAnswerLog, type PolicyDecision, type PolicyRequest } from './approval-policy'
 import { SUCCESSION_NUDGE, type BriefingContext } from './turn-briefing'
 import type { PermissionGrants } from './permission-grants/service'
+import type { NativeSlashCommand } from '../shared/slash-commands'
 
 interface LiveSession {
   spec: AgentSpec
@@ -833,6 +834,21 @@ export class StructuredSessions {
     if (!live.adapter?.compactContext) throw new Error('This provider compacts its own context; there is nothing for Conductor to fold')
     if (['starting', 'running', 'waiting_input', 'waiting_approval', 'interrupting'].includes(this.database.structured.snapshot(id)!.phase)) throw new Error('Wait for the current turn to finish before compacting')
     return await live.adapter.compactContext()
+  }
+  /** A composer slash command run through the runtime's own protocol (docs/slash-commands.md):
+   *  Codex compacts and reviews natively; the local runtime's /compact folds its transcript. */
+  async slashCommand(id: string, command: NativeSlashCommand, args: string): Promise<void> {
+    if (this.get(id).handoff || this.cliOwned(id)) throw new Error('Switch this conversation from CLI to Chat first')
+    const live = this.get(id), state = this.database.structured.snapshot(id)!
+    if (state.phase === 'disconnected') throw new Error(`Resume this conversation before /${command}`)
+    // A connection still starting (a mode change reconnects) is waited for; only a turn refuses.
+    const turning = (phase: string): boolean => ['running', 'waiting_input', 'waiting_approval', 'interrupting'].includes(phase)
+    if (turning(state.phase)) throw new Error(`Wait for the current turn to finish before /${command}`)
+    await this.connect(live)
+    if (turning(this.database.structured.snapshot(id)!.phase)) throw new Error(`Wait for the current turn to finish before /${command}`)
+    if (live.adapter?.slashCommand) return await live.adapter.slashCommand(command, args)
+    if (command === 'compact' && live.adapter?.compactContext) { await live.adapter.compactContext(); return }
+    throw new Error(`/${command} is not available for this runtime`)
   }
   /** The local runtime's own compact view of its last run, when it keeps one. */
   runStatus(id: string): Json | null {

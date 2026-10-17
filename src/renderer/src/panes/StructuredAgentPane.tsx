@@ -26,9 +26,13 @@ import { ConversationFindBar } from './ConversationFindBar'
 import { CLOSED_FIND, clearFindRanges, collectQueryRanges, conversationMatches, findReducer, paintFindRanges, type ConversationMatch, type FindAction } from './conversation-find'
 import { useOlderHistory, withStoredMatches } from './conversation-paging'
 import { FileAttachmentInput } from '../components/FileAttachmentInput'
-import { composerChildKey, composerSendBlock, nextComposerSettings, resolvedComposerSettings } from './composer-settings'
+import { composerChildKey, composerSendBlock, conversationModes, modelDisplayName, nextComposerSettings, resolvedComposerSettings } from './composer-settings'
 import { activateBrowserMention, CommandAutocomplete } from './CommandAutocomplete'
-import { composerCommands, matchingComposerCommands, type ComposerCommand } from './composer-commands'
+import { composerCommands, matchingComposerCommands, nativeCommandNames, type ComposerCommand } from './composer-commands'
+import { resolveSlashCommand, type ConductorSlashAction, type SlashHandling } from '../../../shared/slash-commands'
+import { conversationStatusText, lastAssistantText, matchConversationMode, matchEffort, matchModel } from './slash-command-actions'
+import { modelEfforts, supportedEffortChoices } from '../../../shared/model-effort'
+import { permissionParity } from '../../../shared/permission-parity'
 import { ComposerStarterMenu } from './ComposerStarterMenu'
 import { composerStarterChoices, prepareComposerDraft } from './composer-starters'
 import { CONDUCTOR_FILE_DRAG, decodeConductorFileDrag, isComposerFileDrag } from '../components/composer-file-drop'
@@ -237,6 +241,19 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const [rename, setRename] = useState<string | null>(null)
   const [discovery, setDiscovery] = useState<Json | undefined>(undefined)
   const [commandDiscovery, setCommandDiscovery] = useState<Json | undefined>()
+  /** The inline answer to a slash command: its result, or why it does not run here. */
+  const [commandNotice, setCommandNotice] = useState<{ text: string; tone: 'info' | 'unsupported' } | null>(null)
+  useEffect(() => setCommandNotice(null), [activeId])
+  // A /compact the owner asked for says when it is done: the runtime's context-reset notice is a
+  // diagnostic the timeline leaves out (shared/conversation-activity.ts).
+  const compactWatch = useRef<number | null>(null)
+  const contextResets = (items: TimelineItem[]): number => items.filter(item => item.data.type === 'notice' && (item.data.payload as { contextReset?: unknown } | undefined)?.contextReset === true).length
+  useEffect(() => {
+    if (compactWatch.current === null || contextResets(projection.items) <= compactWatch.current) return
+    compactWatch.current = null
+    setCommandNotice({ text: 'Conversation compacted. Conductor restates its briefing with your next message.', tone: 'info' })
+  }, [projection.items])
+  useEffect(() => { compactWatch.current = null }, [activeId])
   const [commandLoading, setCommandLoading] = useState(false)
   const commandLoad = useRef<string | null>(null)
   const [commandDismissed, setCommandDismissed] = useState(false)
@@ -474,7 +491,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     // A draft past the per-message ceiling goes as pasted context rather than being refused.
     const draft = draftRef.current
     const oversized = foldOversizedMessage(draft.message, draft.attachments)
-    const text = oversized ? oversized.message : draft.message.trim()
+    let text = oversized ? oversized.message : draft.message.trim()
     const sent = oversized ? [...draft.attachments, oversized.attachment] : draft.attachments
     const connectingMetadata = projection.phase === 'starting' && metadataConnectionId.current === activeId
     const queuing = ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase)
@@ -482,6 +499,25 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     // there with the draft, where the next Enter sends it.
     if (succession) { followSuccession(succession); return }
     if (composerSendBlock(draft.message, draft.attachments) || submitLock.current || conversationSwitch.current || !ready || historical || (activePhases.has(projection.phase) && !connectingMetadata && !queuing) || projection.archived) return
+    // A `/command` never reaches the model by accident (shared/slash-commands.ts): Conductor runs
+    // it, the runtime's protocol runs it, the runtime runs it as typed, or it answers inline why not.
+    let nativeCommand = false, commandPrompt = false
+    if (!oversized) {
+      const slash = resolveSlashCommand(provider, text, nativeCommandNames(commandDiscovery))
+      if (slash.kind === 'literal') text = slash.text
+      else if (slash.kind === 'unknown') { setCommandNotice({ text: slash.reason, tone: 'unsupported' }); return }
+      else if (slash.kind === 'command') {
+        const { handling, invocation } = slash
+        if (handling.kind === 'unsupported') { setCommandNotice({ text: `/${invocation.name}: ${handling.reason}`, tone: 'unsupported' }); return }
+        if (handling.kind === 'conductor' || handling.kind === 'protocol') { void runSlashCommand(invocation.name, invocation.args, handling).then(used => { if (used) clearSubmitted(draft.revision) }); return }
+        if (handling.kind === 'prompt') { commandPrompt = true; text = handling.prompt + (invocation.args ? '\n\n' + invocation.args : '') }
+        else {
+          nativeCommand = true
+          if (handling.as) text = handling.as + (invocation.args ? ' ' + invocation.args : '')
+          if (invocation.name === 'compact') compactWatch.current = contextResets(projection.items)
+        }
+      }
+    }
     // Captured before the turn starts, and off actual user turns rather than
     // unstartedConversation: focusing the composer alone can already connect a runtime (to load
     // its model catalog) and set a native session id, well before anything is sent. This is the
@@ -491,16 +527,18 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     submitLock.current = true
     setSubmitting(true)
     setError('')
+    setCommandNotice(null)
     try {
       // A user can press Send while the model catalog is loading. Await that
       // owned handshake once; do not drop the click or dispatch a duplicate turn.
       if (connection.current?.sessionId === activeId) await connection.current.promise
       if (activeIdRef.current !== activeId) return
-      if (queuing && projection.capabilities?.steering) await window.conductor.structured.steer(activeId, text, settings, sent)
-      else if (queuing) await window.conductor.structured.queue(activeId, text, settings, sent)
-      else await window.conductor.structured.submit(activeId, text, settings, sent)
+      // A runtime's own command waits for the turn to end rather than being steered into it as text.
+      if (queuing && projection.capabilities?.steering && !nativeCommand) await window.conductor.structured.steer(activeId, text, settingsRef.current, sent)
+      else if (queuing) await window.conductor.structured.queue(activeId, text, settingsRef.current, sent)
+      else await window.conductor.structured.submit(activeId, text, settingsRef.current, sent)
       clearSubmitted(draft.revision)
-      if (firstMessage) {
+      if (firstMessage && !nativeCommand && !commandPrompt) {
         const snapshot = await window.conductor.structured.snapshot(activeId)
         // An anonymous tab is never named after what was said in it.
         if (snapshot && activeIdRef.current === activeId && !propsRef.current.anonymous) void propsRef.current.onConversationChange?.({ ...conversationIdentity(snapshot, provider), title: text, auto: true })
@@ -513,6 +551,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
     finally { submitLock.current = false; setSubmitting(false) }
   }
+  const submitRef = useRef(submit); submitRef.current = submit
   const resume = async (): Promise<void> => {
     if (conversationSwitch.current) return
     conversationSwitch.current = true
@@ -1030,20 +1069,118 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const updateSettingsRef = useRef(updateSettings); updateSettingsRef.current = updateSettings
   // Stable, so the re-render each keystroke causes leaves every memoized timeline card alone.
   const switchPermission = useCallback((permission: SessionSettings['permission']): void => updateSettingsRef.current({ plan: false, permission }), [])
-  const chooseCommand = (command: ComposerCommand): void => {
+  const notify = (text: string, tone: 'info' | 'unsupported' = 'info'): void => setCommandNotice({ text, tone })
+  const clickControl = (label: string): boolean => {
+    const control = pane.current?.querySelector<HTMLElement>(`[aria-label="${label}"]`)
+    if (!control || (control as HTMLButtonElement).disabled) return false
+    if (control instanceof HTMLInputElement) control.focus(); else control.click()
+    return true
+  }
+  /** The Conductor control a slash command maps to. True when it used the draft up. */
+  const runSlashAction = async (action: ConductorSlashAction, args: string): Promise<boolean> => {
+    const idle = !activePhases.has(projection.phase)
+    const modes = conversationModes(capabilities)
+    switch (action) {
+      case 'attach': setAddFileOpen(true); return true
+      case 'settings': setSettingsOpen(true); return true
+      case 'history': setHistoryOpen(true); return true
+      case 'connections': void discover(); return true
+      case 'events': setEventsOpen(true); return true
+      case 'diff': setChangesOpen(true); return true
+      case 'export': void copyTranscript(); return true
+      case 'new': window.dispatchEvent(new CustomEvent('conductor:open-runtime', { detail: provider })); return true
+      case 'help': setMessage('/'); setCommandDismissed(false); setCommandIndex(0); composer.current?.focus(); return false
+      case 'copy': {
+        const text = lastAssistantText(projection.items)
+        if (!text) { notify('There is no response to copy yet.'); return false }
+        notify(await copyText(text) ? 'Copied the last response.' : 'The clipboard refused the copy.')
+        return true
+      }
+      case 'status': {
+        const resolved = resolvedComposerSettings(settingsRef.current, capabilities)
+        const current = settingsRef.current
+        const modeId = current.plan ? 'plan' : provider === 'claude' && current.permission === 'auto' && current.claudeGuardedAuto ? 'guarded-auto' : current.permission
+        notify(conversationStatusText({ name, projection, settings: current, modelLabel: resolved.label, resolvedModel: resolved.resolvedModel, modeLabel: modes.find(mode => mode.id === modeId)?.label, parity: permissionParity(current, capabilities), workspace: fileCwd || props.project.path }))
+        return true
+      }
+      case 'stop': if (idle) { notify('Nothing is running.'); return true } stop(); return true
+      case 'resume': if (projection.phase === 'disconnected') void resume(); else setHistoryOpen(true); return true
+      case 'fork':
+        if (!capabilities?.fork) { notify(`${name} conversations cannot be forked from Chat.`, 'unsupported'); return false }
+        if (!idle) { notify('Wait for the current turn to finish before forking.'); return false }
+        void fork(); return true
+      case 'archive':
+        await window.conductor.structured.archive(activeId, !projection.archived)
+        notify(projection.archived ? 'Conversation unarchived.' : 'Conversation archived. /archive again restores it.')
+        return true
+      case 'rename': {
+        const title = args.slice(0, 160).trim()
+        if (!title) { setRename(projection.title || props.title); return true }
+        await window.conductor.structured.rename(activeId, title)
+        setProjection(current => ({ ...current, title }))
+        await propsRef.current.onConversationChange?.({ ...conversationIdentity(projection, provider), title, manual: true })
+        notify(`Renamed to “${title}”.`)
+        return true
+      }
+      case 'edit': updateSettings({ plan: false, ...(provider === 'claude' ? { permission: 'accept-edits' as const } : {}) }); return true
+      case 'plan':
+        if (!capabilities?.plans) { notify(`${name} has no plan mode in Chat.`, 'unsupported'); return false }
+        updateSettings({ plan: true })
+        if (args) { setMessage(args); requestAnimationFrame(() => void submitRef.current()); return false }
+        notify('Plan mode is on for your next message.')
+        return true
+      case 'model': {
+        const models = capabilities?.models ?? []
+        if (!args || !models.length) { clickControl('Model'); if (args) notify('The model list is still loading; choose from it.'); return true }
+        const match = matchModel(models, args)
+        if (!match) { clickControl('Model'); notify(`No ${name} model matches “${args}”. Choose one from the list.`); return true }
+        const supported = modelEfforts(capabilities, match.id)
+        updateSettings({ model: match.id, ...(supported && settingsRef.current.effort && !supported.includes(settingsRef.current.effort) ? { effort: undefined } : {}) })
+        notify(`Model set to ${modelDisplayName(match.label)} for your next message.`)
+        return true
+      }
+      case 'effort': {
+        const efforts = supportedEffortChoices(capabilities, settingsRef.current.model)
+        if (!efforts.length) { notify(`${resolvedComposerSettings(settingsRef.current, capabilities).label} has no effort setting.`, 'unsupported'); return false }
+        const match = args ? matchEffort(efforts, args) : undefined
+        if (match) { updateSettings({ effort: match }); notify(`Effort set to ${match} for your next message.`); return true }
+        clickControl('Reasoning effort')
+        notify(`${args ? `“${args}” is not an effort for this model. ` : ''}Efforts: ${efforts.join(', ')}. Type /effort <level> or use the slider.`)
+        return Boolean(!args)
+      }
+      case 'permissions': {
+        if (modes.length < 2) { notify(modes.length ? `${name} runs in one mode here: ${modes[0]!.label}.` : 'The conversation modes appear once the runtime connects; try again in a moment.', modes.length ? 'unsupported' : 'info'); return false }
+        if (!args) { clickControl('Conversation mode'); return true }
+        const match = matchConversationMode(modes, args)
+        if (!match) { clickControl('Conversation mode'); notify(`“${args}” is not a mode here. Modes: ${modes.map(mode => mode.label).join(', ')}.`); return true }
+        updateSettings(match.change)
+        notify(`Mode set to ${match.label} for your next message.`)
+        return true
+      }
+    }
+  }
+  /** Run a Conductor or protocol slash command; true when the draft was used up. */
+  const runSlashCommand = async (command: string, args: string, handling: Extract<SlashHandling, { kind: 'conductor' | 'protocol' }>): Promise<boolean> => {
+    setCommandNotice(null); setError('')
+    try {
+      if (handling.kind === 'conductor') return await runSlashAction(handling.action, args)
+      if (activePhases.has(projection.phase) && projection.phase !== 'starting') { notify(`Wait for the current turn to finish before /${command}.`); return false }
+      if (connection.current?.sessionId === activeId) await connection.current.promise
+      if (handling.command === 'compact') compactWatch.current = contextResets(projection.items)
+      await window.conductor.structured.command(activeId, handling.command, args).catch((reason: unknown) => { compactWatch.current = null; throw reason })
+      if (handling.command === 'review') notify(`${name} is reviewing ${args ? '“' + args + '”' : 'the uncommitted changes'}; its findings follow in the conversation.`)
+      else if (compactWatch.current !== null) notify(`${name} is compacting this conversation…`)
+      return true
+    } catch (reason) { setError(cleanIpcError(reason instanceof Error ? reason.message : String(reason))); return false }
+  }
+  /** Enter or a click runs the chosen command as if it had been typed and sent; Tab completes one
+   *  that takes arguments in the draft so they can follow. A `$skill` always goes in the draft. */
+  const chooseCommand = (command: ComposerCommand, complete = false): void => {
     setCommandDismissed(true); setCommandIndex(0)
-    setMessage(command.insert ?? '')
-    if (command.insert) { composer.current?.focus(); return }
-    if (command.name === 'attach') setAddFileOpen(true)
-    else if (command.name === 'browser' && command.trigger === '@') activateBrowserMention()
-    else if (command.name === 'settings') setSettingsOpen(true)
-    else if (command.name === 'model') pane.current?.querySelector<HTMLButtonElement>('[aria-label="Model"]')?.click()
-    else if (command.name === 'history') setHistoryOpen(true)
-    else if (command.name === 'plan') updateSettings({ plan: true })
-    else if (command.name === 'edit') updateSettings({ plan: false, ...(provider === 'claude' ? { permission: 'accept-edits' as const } : {}) })
-    else if (command.name === 'stop' && activePhases.has(projection.phase)) stop()
-    else if (command.name === 'resume' && !activePhases.has(projection.phase)) void resume()
-    else if (command.name === 'fork' && !activePhases.has(projection.phase)) void fork()
+    if (command.name === 'browser' && command.trigger === '@') { setMessage(''); activateBrowserMention(); return }
+    if (command.insert?.startsWith('$') || complete && (command.insert || command.argumentHint)) { setMessage(command.insert ?? '/' + command.name + ' '); composer.current?.focus(); return }
+    setMessage('/' + command.name)
+    void submitRef.current()
   }
 
   // The timeline is the expensive part of this pane: hundreds of cards and one scroll container
@@ -1129,6 +1266,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       <QueuedMessageList prompts={queuedPrompts} onRemove={prompt => { void window.conductor.structured.cancelQueued(activeId, prompt.id).then(queued => { if (!queued) return; setMessage(draftRef.current.message ? draftRef.current.message + '\n\n' + queued.text : queued.text); setAttachments(current => [...current, ...queued.attachments].slice(-20)); composer.current?.focus() }).catch((reason: unknown) => setError(String(reason))) }} />
       {attachments.length > 0 && <div className="sa-context-chips">{attachments.map(attachment => <span key={attachment.id}><button type="button" title={canOpenPastedText(attachment) ? 'Open the pasted text as a file' : 'Inspect attached context'} onClick={() => { if (canOpenPastedText(attachment)) void openPastedText(props.project.id, attachment); else setInspectAttachment(attachment) }}>{attachment.kind === 'image' && <PromptImageThumbnail projectId={props.project.id} attachment={attachment} />}{attachment.name}{attachment.startLine ? ':' + attachment.startLine + (attachment.endLine ? '–' + attachment.endLine : '') : ''}</button>{isPastedText(attachment) && <button type="button" aria-label={'Put ' + attachment.name + ' back in the message as text'} title="Put back in the message as text" onClick={() => { const next = unfoldPastedText(draftRef.current.message, draftRef.current.attachments, attachment.id); setDraft(next.message, next.attachments) }}><Undo2 size={11} /></button>}<button type="button" aria-label={'Remove context ' + attachment.name} onClick={() => { if (isPastedText(attachment)) { const next = removePastedText(draftRef.current.message, draftRef.current.attachments, attachment.id); setDraft(next.message, next.attachments) } else setAttachments(current => current.filter(item => item.id !== attachment.id)) }}><X size={11} /></button></span>)}</div>}
       {promptChars > MAX_PROMPT_CHARS * 0.9 && <p className={'sa-prompt-limit' + (sendBlocked === 'oversized' ? ' sa-prompt-limit-over' : '')} role="status">{sendBlocked === 'oversized' ? `Too large to send: ${promptChars.toLocaleString()} of ${MAX_PROMPT_CHARS.toLocaleString()} characters including attachments. Remove or shorten an attachment, or trim the message.` : `${promptChars.toLocaleString()} / ${MAX_PROMPT_CHARS.toLocaleString()} characters`}</p>}
+      {commandNotice && <div className="sa-command-notice" role="status" data-tone={commandNotice.tone}><span>{commandNotice.text}</span><button type="button" aria-label="Dismiss command message" onClick={() => setCommandNotice(null)}><X size={12} /></button></div>}
       {commandsOpen && <CommandAutocomplete id={commandListId} commands={commands} selected={Math.min(commandIndex, commands.length - 1)} loading={commandLoading} onSelect={setCommandIndex} onChoose={chooseCommand} />}
       <ComposerTextarea projectId={props.project.id} sessionId={activeId} textareaRef={composer} aria-autocomplete="list" aria-controls={commandsOpen ? commandListId : undefined} aria-expanded={commandsOpen} aria-activedescendant={commandsOpen ? commandListId + '-' + Math.min(commandIndex, commands.length - 1) : undefined} aria-label={'Message ' + name} placeholder={sendBlocked !== 'empty' ? undefined : succession ? `Continued in ${succession.title}; send messages there` : cliOwned ? 'The native CLI has this conversation. Continue in Chat to send here.' : historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : steering ? (pendingSteering.some(input => input.status === 'sending' || input.status === 'accepted') ? 'Add another message' : 'Message after the next tool use') : activePhases.has(projection.phase) ? 'Queue a message after this turn' : 'Message ' + name} disabled={(!ready && !arriving) || historical || resuming || projection.archived || cliOwned} rows={2} onFocus={() => { if (ready && !historical && !projection.nativeSessionId && !activePhases.has(projection.phase)) void connect().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }} onBlur={() => { setCommandDismissed(true); flushDraft() }} onChange={event => {
         // A long paste or drop folds into a "[Pasted text #N: L lines]" chip, as the Claude CLI does.
@@ -1152,7 +1290,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
         if (commandsOpen) {
           if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); setCommandDismissed(true); return }
           if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); setCommandIndex(current => (current + (event.key === 'ArrowDown' ? 1 : commands.length - 1)) % commands.length); return }
-          if ((event.key === 'Enter' && !event.shiftKey) || event.key === 'Tab') { event.preventDefault(); chooseCommand(commands[Math.min(commandIndex, commands.length - 1)]!); return }
+          if ((event.key === 'Enter' && !event.shiftKey) || event.key === 'Tab') { event.preventDefault(); chooseCommand(commands[Math.min(commandIndex, commands.length - 1)]!, event.key === 'Tab'); return }
         }
         if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submit() }
       }} />
