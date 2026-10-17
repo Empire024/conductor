@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-v2c6-'))
 const output = resolve('artifacts/verify-v2')
@@ -33,7 +34,7 @@ try {
   await page.evaluate(() => window.conductor.projects.create('V2C6'))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'V2C6' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+  await launcherTile(page, 'Claude').click()
   const composer = page.getByRole('textbox', { name: /Message Claude/i })
   await expect(composer).toBeEnabled({ timeout: 15000 })
   const id = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')

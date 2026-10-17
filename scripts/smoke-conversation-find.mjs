@@ -5,6 +5,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-find-'))
 const output = resolve('artifacts/conversation-find')
@@ -25,7 +26,7 @@ const count = page.locator('.sa-find-count')
 const pane = page.locator('.structured-agent-pane').last()
 const search = async (text) => { await findInput.fill(text); await page.waitForTimeout(450) }
 const seed = async (marker) => {
-  await page.locator('.launcher-grid').last().locator('button').filter({ hasText: 'Codex' }).click()
+  await launcherTile(page, 'Codex', { grid: page.locator('.launcher-grid').last() }).click()
   await pane.waitFor()
   const id = await pane.getAttribute('data-structured-session')
   await page.getByRole('textbox', { name: 'Message Codex', exact: true }).last().fill(`synthetic:activity-groups\nFINDABLE MARKER ${marker} lives in this conversation.`)

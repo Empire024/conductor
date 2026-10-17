@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { cleanupFixtureApp, combinedSmokeFailure } from './smoke-fixture-cleanup.mjs'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Production Electron/main/preload/renderer with only the provider boundary replaced by the
 // repository's deterministic fixtures. CONDUCTOR_TEST_USER_DATA keeps every window off-screen.
@@ -92,10 +93,10 @@ const credentials = async () => {
   return { endpoint, token }
 }
 const startPane = async label => {
-  if (await page.locator('.launcher-grid').count()) await page.locator('.launcher-grid button').filter({ hasText: label }).click()
+  if (await page.locator('.launcher-grid').count()) await launcherTile(page, label).click()
   else {
     await page.locator('.pane-add-tab').first().click()
-    await page.locator('.launcher-grid button').filter({ hasText: label }).click()
+    await launcherTile(page, label).click()
   }
   const pane = page.locator('.structured-agent-pane').last()
   await pane.waitFor()

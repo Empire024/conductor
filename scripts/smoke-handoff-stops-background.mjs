@@ -13,6 +13,7 @@ import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-handoff-background-'))
 const output = resolve('artifacts/fx26/handoff-stops-background')
@@ -67,7 +68,7 @@ try {
   await page.evaluate(() => window.conductor.projects.create('Handoff background'))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Handoff background' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).first().click()
+  await launcherTile(page, 'Claude').first().click()
   await expect(page.getByRole('textbox', { name: 'Message Claude Code', exact: true })).toBeEnabled()
   const callerId = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   // The wand first, through the same settings call the composer uses; then the step that arms the loops.

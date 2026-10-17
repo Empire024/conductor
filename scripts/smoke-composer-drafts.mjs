@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Isolated synthetic provider processes; no live credentials, inference, or clipboard.
 const provider = process.argv.includes('--provider=claude') ? 'claude' : 'codex'
@@ -29,7 +30,7 @@ const selectProject = async name => {
   await expect(page.locator('.project-row.active')).toContainText(name)
   if (previousId && !previousProject.includes(name)) await expect(page.locator(`[data-structured-session="${previousId}"]`)).toHaveCount(0)
   await page.locator('.structured-agent-pane:visible, .launcher-grid:visible').first().waitFor()
-  if (!await page.locator('.structured-agent-pane:visible').count()) await page.locator('.launcher-grid:visible button').filter({ hasText: providerName }).click()
+  if (!await page.locator('.structured-agent-pane:visible').count()) await launcherTile(page, providerName, { grid: '.launcher-grid:visible' }).click()
   await expect(composer()).toBeEnabled()
 }
 try {
@@ -58,7 +59,7 @@ try {
   results.checks.push('Project switching restores exact unsent text and attached context without leaking another project draft')
 
   await page.locator('.session-add').click()
-  await page.locator('.launcher-grid button').filter({ hasText: providerName }).click()
+  await launcherTile(page, providerName).click()
   await expect(composer()).toBeEnabled()
   const workspaceId = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   await expect(composer()).toHaveValue('')

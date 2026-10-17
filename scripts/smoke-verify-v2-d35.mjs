@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const events = 10000
 const root = await mkdtemp(join(tmpdir(), 'conductor-v2d35-'))
@@ -36,7 +37,7 @@ try {
   step('creating project + conversation')
   await page.evaluate(() => window.conductor.projects.create('D35 fixture'))
   await page.getByText('D35 fixture', { exact: true }).first().click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude Code' }).first().click()
+  await launcherTile(page, 'Claude Code').first().click()
   const visible = page.locator('.pane-tab-content:visible')
   await visible.locator('.structured-agent-pane').waitFor({ timeout: 30000 })
   const id = await visible.locator('.structured-agent-pane').getAttribute('data-structured-session')

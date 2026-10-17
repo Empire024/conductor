@@ -4,6 +4,7 @@ import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { execFile, spawn } from 'node:child_process'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Claim 5, checked against the installed CLI rather than by reading argv: are the browser tools
 // gated by the permission system, or did wiring an MCP server in create a capability the owner
@@ -48,7 +49,7 @@ try {
   await page.evaluate(() => window.conductor.projects.create('Approval target'))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Approval target' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).filter({ hasNotText: 'Cloud' }).click()
+  await launcherTile(page, 'Claude').click()
   await expect(page.getByRole('textbox', { name: 'Message Claude Code', exact: true })).toBeEnabled()
   const id = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   await page.evaluate(async sessionId => { await window.conductor.structured.connect(sessionId) }, id)

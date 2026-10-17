@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // The composer of a Claude wizard tab with Full Auto on (feature-list wizard-means-wizard): no
 // banner, disclosure or status line above the textbox. Screenshots of the composer area go to
@@ -37,7 +38,7 @@ try {
   await page.evaluate(() => window.conductor.settings.setZoom(1))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Composer clean smoke' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).first().click()
+  await launcherTile(page, 'Claude').first().click()
   const textbox = page.getByRole('textbox', { name: 'Message Claude Code', exact: true })
   await expect(textbox).toBeEnabled()
   const id = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')

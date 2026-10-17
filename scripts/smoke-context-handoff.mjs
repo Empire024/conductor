@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Real Electron main/preload/renderer and the real loopback control broker; only the provider
 // process is synthetic, so no inference happens. CONDUCTOR_TEST_USER_DATA parks the window off
@@ -58,7 +59,7 @@ try {
   const project = await page.evaluate(() => window.conductor.projects.create('Handoff smoke'))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Handoff smoke' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+  await launcherTile(page, 'Claude').click()
   await expect(page.getByRole('textbox', { name: 'Message Claude Code', exact: true })).toBeEnabled()
   const callerId = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   await page.evaluate(async id => {

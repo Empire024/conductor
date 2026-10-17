@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // An agent's request to the owner, end to end through the real HTTP broker, main process and
 // renderer: it is shown once however often the agent repeats it, survives a renderer reload, and
@@ -33,7 +34,7 @@ try {
   const project = await page.evaluate(() => window.conductor.projects.create('Confirm smoke'))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Confirm smoke' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).filter({ hasNotText: 'Cloud' }).click()
+  await launcherTile(page, 'Claude').click()
   await expect(page.getByRole('textbox', { name: 'Message Claude Code', exact: true })).toBeEnabled()
   const sourceId = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   await page.evaluate(async id => { await window.conductor.structured.connect(id); const state = await window.conductor.structured.snapshot(id); await window.conductor.structured.submit(id, 'SYNTHETIC STEER START', { ...state.settings, model: 'synthetic-claude', effort: 'low' }, []) }, sourceId)

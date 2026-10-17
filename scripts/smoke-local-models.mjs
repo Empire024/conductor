@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Live check of the Local provider against the real app and the real llama.cpp servers: both
 // Qwen models open as ordinary Conductor tabs from the ordinary launcher, stream an answer,
@@ -52,7 +53,7 @@ try {
   // Open one model from the launcher exactly the way a person does, and report the tab it made.
   const openLocal = async label => {
     await page.locator('.launcher-grid').first().waitFor({ timeout: 15_000 })
-    await page.locator('.launcher-grid button').filter({ hasText: label }).first().click()
+    await launcherTile(page, label).first().click()
     await visible.locator('.structured-agent-pane').first().waitFor({ timeout: 30_000 })
     return visible.locator('.structured-agent-pane').first().getAttribute('data-structured-session')
   }

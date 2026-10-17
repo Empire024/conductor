@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 const provider = process.argv.includes('--provider=claude') ? 'claude' : 'codex'
 const label = provider === 'claude' ? 'Claude' : 'Codex'
 const root = await mkdtemp(join(tmpdir(), 'conductor-composer-backlog-'))
@@ -25,8 +26,7 @@ try {
   await writeFile(join(project.path, 'beta.txt'), 'Beta context')
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Composer backlog' }).click()
-  // "Claude Cloud" is a toggle (aria-pressed) in the same grid; the runtime tiles are plain buttons.
-  await page.locator('.launcher-grid button:not([aria-pressed])').filter({ hasText: label }).click()
+  await launcherTile(page, label).click()
   const composer = page.getByRole('textbox', { name: provider === 'claude' ? 'Message Claude Code' : 'Message Codex', exact: true })
   await expect(composer).toBeEnabled()
   const id = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')

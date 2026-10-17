@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Based on smoke-conversation-declutter.mjs and smoke-churning-activity.mjs. This drives the
 // production Electron/preload/main path; only the Codex provider is a deterministic offline
@@ -54,7 +55,7 @@ try {
   const project = await page.evaluate(() => window.conductor.projects.create('Conversation fixer'))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Conversation fixer' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+  await launcherTile(page, 'Codex').click()
   const sourceId = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   await page.evaluate(async id => {
     await window.conductor.structured.connect(id)

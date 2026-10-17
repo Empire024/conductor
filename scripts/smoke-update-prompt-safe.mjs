@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-safe-update-')), profile = join(root, 'profile'), feed = join(profile, 'local-updates')
 await mkdir(feed, { recursive: true })
@@ -32,7 +33,7 @@ try {
   await expect.poll(() => page.evaluate(() => window.conductor?.updates.getState()), { timeout: 20000 }).toMatchObject({ source: 'local', phase: 'available', promptAllowed: false })
   await page.locator('.project-row').filter({ hasText: 'Safe update' }).click()
   if (!await page.locator('.launcher-grid').count()) await page.locator('.pane-add-tab').click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude Code' }).first().click()
+  await launcherTile(page, 'Claude Code').first().click()
   const id = await page.locator('.structured-agent-pane').last().getAttribute('data-structured-session')
   await page.getByRole('combobox', { name: 'Model', exact: true }).click()
   await page.getByRole('option').filter({ hasText: 'Synthetic Claude fixture' }).click()

@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // FX15 (feature-list.md 44a4ba26-0ec7-4d40-a1d9-c2634b3b7206): show, Conductor-side, when an agent
 // uses Conductor. A fixture controller opens a coworker, prompts, steers and renames it, reads a few
@@ -56,7 +57,7 @@ try {
   await writeFile(join(project.path, 'README.md'), 'SYNTHETIC fx15 smoke\n'); git('add', 'README.md'); git('commit', '-m', 'SYNTHETIC initial')
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'FX15 smoke' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+  await launcherTile(page, 'Claude').click()
   await expect(page.getByRole('textbox', { name: 'Message Claude Code', exact: true })).toBeEnabled()
   const controllerId = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   await page.evaluate(async id => {

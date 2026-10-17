@@ -12,6 +12,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-grant-interrupt-'))
 const output = resolve('artifacts/h06/grant-interrupt')
@@ -44,7 +45,7 @@ try {
   await page.evaluate(() => window.conductor.projects.create('Grant interrupt'))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Grant interrupt' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).first().click()
+  await launcherTile(page, 'Claude').first().click()
   await expect(page.getByRole('textbox', { name: 'Message Claude Code', exact: true })).toBeEnabled()
   const id = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   await page.evaluate(async value => {

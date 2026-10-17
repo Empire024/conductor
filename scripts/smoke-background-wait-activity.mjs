@@ -8,6 +8,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-background-wait-'))
 const output = resolve('artifacts/background-wait-activity')
@@ -51,8 +52,8 @@ const { app, page, shot, row } = session
 try {
   await row('Render').click()
 
-  if (await page.locator('.launcher-grid').count()) await page.locator('.launcher-grid button').filter({ hasText: 'Claude Code' }).click()
-  else { await page.locator('.pane-add-tab').click(); await page.locator('.launcher-grid button').filter({ hasText: 'Claude Code' }).click() }
+  if (await page.locator('.launcher-grid').count()) await launcherTile(page, 'Claude Code').click()
+  else { await page.locator('.pane-add-tab').click(); await launcherTile(page, 'Claude Code').click() }
   await page.locator('.structured-agent-pane').last().waitFor()
   const agentId = await page.locator('.structured-agent-pane').last().getAttribute('data-structured-session')
   const snapshot = () => page.evaluate((id) => window.conductor.structured.snapshot(id), agentId)

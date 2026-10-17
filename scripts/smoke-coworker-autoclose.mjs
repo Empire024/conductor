@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // FX8 `auto-close-finished-coworkers`: finished coworker tabs close themselves and give their CLI
 // process back. Real Electron main/preload/renderer, the real loopback control broker and a real
@@ -75,7 +76,7 @@ try {
   await page.locator('.project-row').filter({ hasText: 'Autoclose smoke' }).click()
   // Off while the explicit routes are exercised, so the timer cannot act first.
   assert.equal(await setMinutes(0), 0)
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+  await launcherTile(page, 'Claude').click()
   await expect(page.getByRole('textbox', { name: 'Message Claude Code', exact: true })).toBeEnabled()
   const controllerId = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   await page.evaluate(async id => {

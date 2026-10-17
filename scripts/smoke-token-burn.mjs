@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Token burn meter (feature-list codex-credit-burn 2): a Codex tab whose synthetic relay turn
 // reports 6.4M tokens gets the flame badge on the tab strip and a notice, Settings > Usage lists
@@ -36,7 +37,7 @@ try {
   await page.evaluate(() => window.conductor.settings.setZoom(1))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Token burn smoke' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).first().click()
+  await launcherTile(page, 'Codex').first().click()
   const pane = page.locator('.structured-agent-pane').first()
   await expect(pane).toBeVisible()
   const id = await pane.getAttribute('data-structured-session')

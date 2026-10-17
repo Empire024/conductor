@@ -5,6 +5,7 @@ import { copyFile, mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-project-activity-'))
 const output = resolve('artifacts/project-activity')
@@ -47,8 +48,8 @@ session = await launch()
 try {
   const { page, row, shot } = session
   const startClaudePane = async () => {
-    if (await page.locator('.launcher-grid').count()) await page.locator('.launcher-grid button').filter({ hasText: 'Claude Code' }).click()
-    else { await page.locator('.pane-add-tab').click(); await page.locator('.launcher-grid button').filter({ hasText: 'Claude Code' }).click() }
+    if (await page.locator('.launcher-grid').count()) await launcherTile(page, 'Claude Code').click()
+    else { await page.locator('.pane-add-tab').click(); await launcherTile(page, 'Claude Code').click() }
     await page.locator('.structured-agent-pane').last().waitFor()
     return page.locator('.structured-agent-pane').last().getAttribute('data-structured-session')
   }

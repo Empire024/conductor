@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-backlog-'))
 const output = resolve('artifacts/backlog')
@@ -39,7 +40,7 @@ try {
   for (let index = 0; index < 35; index++) await writeFile(join(projects[0].path, 'picker-' + String(index).padStart(2, '0') + '.txt'), 'Keyboard navigation fixture')
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Backlog Alpha' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+  await launcherTile(page, 'Codex').click()
   const composer = page.getByRole('textbox', { name: 'Message Codex', exact: true })
   await expect(composer).toBeEnabled()
   const id = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')

@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-conversation-followup-'))
 const output = resolve('artifacts/backlog-followup')
@@ -22,7 +23,7 @@ try {
   await writeFile(join(project.path, 'context.txt'), 'ATTACHMENT_BODY_MUST_STAY_OUT_OF_VISIBLE_PROMPT')
   await page.reload()
   await page.getByText('Conversation follow-up', { exact: true }).first().click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+  await launcherTile(page, 'Claude').click()
   const composer = page.getByRole('textbox', { name: 'Message Claude Code', exact: true })
   await expect(composer).toBeEnabled()
   await composer.fill('SYNTHETIC QUESTION: choose a theme')

@@ -3,6 +3,7 @@ import { mkdtemp, mkdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-v2b1p-'))
 async function safeClose(app) {
@@ -26,7 +27,7 @@ try {
   await page.evaluate(() => window.conductor.projects.create('B1Probe'))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'B1Probe' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+  await launcherTile(page, 'Codex').click()
   const composer = page.getByRole('textbox', { name: 'Message Codex', exact: true })
   await expect(composer).toBeEnabled({ timeout: 20000 })
   await composer.fill('synthetic:backlog')

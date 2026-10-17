@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { cleanupFixtureApp, combinedSmokeFailure } from './smoke-fixture-cleanup.mjs'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Real Electron/main/preload/renderer coverage with two modes:
 //   default       two isolated app/service instances and deterministic GitHub/provider fixtures
@@ -301,7 +302,7 @@ const deterministicRemote = async () => {
     // The project lives there, so the machine is not a choice to make: it is stated and locked.
     await expect(chooser).toHaveValue(connection.machineId)
     await expect(chooser).toBeDisabled()
-    await controller.page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+    await launcherTile(controller.page, 'Codex').click()
     await expect(controller.page.locator('.structured-agent-pane')).toBeVisible({ timeout: 20000 })
     await expect(controller.page.getByText('Codex · Host fixture', { exact: true }).first()).toBeVisible()
     const localSessionId = await controller.page.locator('.structured-agent-pane').getAttribute('data-structured-session')

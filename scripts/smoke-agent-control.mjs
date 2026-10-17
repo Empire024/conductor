@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Real Electron main/preload/renderers and HTTP broker; only provider processes are synthetic.
 const root = await mkdtemp(join(tmpdir(), 'conductor-control-smoke-'))
@@ -45,7 +46,7 @@ try {
   await writeFile(join(project.path, 'notes.md'), 'Original editor contents\n')
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Control smoke' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: sourceLabel }).click()
+  await launcherTile(page, sourceLabel).click()
   await expect(page.getByRole('textbox', { name: sourceProvider === 'claude' ? 'Message Claude Code' : 'Message Codex', exact: true })).toBeEnabled()
   const sourceId = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   await page.evaluate(async ({ id, provider }) => { await window.conductor.structured.connect(id); const state = await window.conductor.structured.snapshot(id); await window.conductor.structured.submit(id, provider === 'claude' ? 'SYNTHETIC STEER START' : 'synthetic:steer', { ...state.settings, model: provider === 'claude' ? 'synthetic-claude' : 'synthetic-model', effort: 'low' }, []) }, { id: sourceId, provider: sourceProvider })

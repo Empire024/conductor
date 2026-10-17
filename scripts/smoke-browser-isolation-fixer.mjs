@@ -4,6 +4,7 @@ import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Copied from smoke-browser-mcp.mjs. Real Electron, Chromium storage and loopback MCP;
 // only provider launch is synthetic. No paid provider calls.
@@ -63,7 +64,7 @@ const callTool = async (mcp, name, args = {}) => {
 }
 const startSession = async (projectName) => {
   await page.locator('.project-row').filter({ hasText: projectName }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).filter({ hasNotText: 'Cloud' }).click()
+  await launcherTile(page, 'Claude').click()
   await expect(page.getByRole('textbox', { name: 'Message Claude Code', exact: true })).toBeEnabled()
   const id = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   await page.evaluate(async sessionId => { await window.conductor.structured.connect(sessionId) }, id)

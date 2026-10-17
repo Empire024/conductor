@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Long conversations and the CLI drawer, in a parked, offline launch (CONDUCTOR_TEST_USER_DATA: the
 // window sits off every display and never takes focus). A Claude conversation replays the fixture's
@@ -38,7 +39,7 @@ try {
   await page.evaluate(() => window.conductor.projects.create('History fixture'))
   await page.getByText('History fixture', { exact: true }).first().click()
   // A conversation opened the way the owner opens one: the new tab's launcher.
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude Code' }).first().click()
+  await launcherTile(page, 'Claude Code').first().click()
   const visible = page.locator('.pane-tab-content:visible')
   await visible.locator('.structured-agent-pane').waitFor({ timeout: 30_000 })
   const id = await visible.locator('.structured-agent-pane').getAttribute('data-structured-session')

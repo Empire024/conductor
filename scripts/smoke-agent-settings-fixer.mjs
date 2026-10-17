@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Real Electron main/preload/renderer/control broker; only the provider process is synthetic.
 const root = await mkdtemp(join(tmpdir(), 'conductor-agent-settings-fixer-'))
@@ -117,7 +118,7 @@ try {
   const project = await page.evaluate(() => window.conductor.projects.create('Agent settings fixer'))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Agent settings fixer' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+  await launcherTile(page, 'Codex').click()
   const sourcePane = page.locator('.structured-agent-pane')
   await expect(sourcePane.getByRole('textbox', { name: 'Message Codex', exact: true })).toBeEnabled()
   sourceId = await sourcePane.getAttribute('data-structured-session')

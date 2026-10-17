@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-v2b2-'))
 const output = resolve('artifacts/verify-v2')
@@ -71,7 +72,7 @@ async function openClaude(page, name = 'V2B') {
   await page.evaluate((n) => window.conductor.projects.create(n + ' ' + Math.random().toString(36).slice(2)), name)
   await page.reload()
   await page.locator('.project-row').filter({ hasText: name }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+  await launcherTile(page, 'Claude').click()
   const composer = page.getByRole('textbox', { name: /Message Claude/i })
   await expect(composer).toBeEnabled({ timeout: 15000 })
   const id = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
@@ -84,7 +85,7 @@ async function openCodex(page, name = 'V2B') {
   await page.evaluate((n) => window.conductor.projects.create(n + ' ' + Math.random().toString(36).slice(2)), name)
   await page.reload()
   await page.locator('.project-row').filter({ hasText: name }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+  await launcherTile(page, 'Codex').click()
   const composer = page.getByRole('textbox', { name: 'Message Codex', exact: true })
   await expect(composer).toBeEnabled({ timeout: 15000 })
   const id = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')

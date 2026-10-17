@@ -5,6 +5,7 @@ import { _electron as electron } from '@playwright/test'
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-anonymous-control-'))
 const project = 'Anonymous control smoke'
@@ -57,7 +58,7 @@ try {
   await page.screenshot({ path: join(shots, 'off.png') })
 
   // An ordinary launch still creates an ordinary tab.
-  await page.locator('.launcher-grid button').filter({ hasText: 'Ornith 1.5 9B' }).first().click()
+  await launcherTile(page, 'Ornith 1.5 9B').first().click()
   await page.locator('.sa-session-bar').first().waitFor()
   assert.equal(await page.locator('.pane-tab-anonymous').count(), 0)
   console.log('PASS default launch is ordinary')
@@ -72,7 +73,7 @@ try {
   await control.locator('label').click()
   assert.equal(await checkbox.isChecked(), true, 'clicking the label turns it on')
   await page.screenshot({ path: join(shots, 'on.png') })
-  await page.locator('.launcher-grid button').filter({ hasText: 'Ornith 1.5 9B' }).first().click()
+  await launcherTile(page, 'Ornith 1.5 9B').first().click()
   await page.locator('.pane-tab-anonymous').first().waitFor()
   await page.locator('.sa-anonymous-mark').first().waitFor()
   console.log('PASS checked launch is anonymous')

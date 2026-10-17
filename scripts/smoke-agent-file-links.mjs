@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // A synthetic Claude turn whose reply carries the exact link shapes a provider writes for a
 // Windows path: `/C:/…` with %20 spaces, `file:///C:/…`, a native `C:\…` path into a sibling
@@ -70,10 +71,10 @@ try {
 
   await page.reload()
   await page.getByText('Link fixture', { exact: true }).first().click()
-  if (await page.locator('.launcher-grid').count()) await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).filter({ hasNotText: 'Cloud' }).click()
+  if (await page.locator('.launcher-grid').count()) await launcherTile(page, 'Claude').click()
   else if (!await page.locator('.structured-agent-pane').count()) {
     await page.locator('.session-add').click()
-    await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).filter({ hasNotText: 'Cloud' }).click()
+    await launcherTile(page, 'Claude').click()
   }
   await page.locator('.structured-agent-pane').waitFor()
   const sessionId = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')

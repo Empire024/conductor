@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Does an oversized page value take the main process down? There is no uncaughtException handler
 // in this app and BrowserMcpServer dispatches with a bare `void this.handle(...)`, so any throw on
@@ -44,7 +45,7 @@ try {
   await page.evaluate(() => window.conductor.projects.create('Crash target'))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Crash target' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).filter({ hasNotText: 'Cloud' }).click()
+  await launcherTile(page, 'Claude').click()
   await expect(page.getByRole('textbox', { name: 'Message Claude Code', exact: true })).toBeEnabled()
   const id = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   await page.evaluate(async sessionId => { await window.conductor.structured.connect(sessionId) }, id)

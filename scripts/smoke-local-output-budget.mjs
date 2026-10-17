@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Live check of G4 and G5 in a parked Conductor on an isolated profile:
 //  G4 — files.list({query:'usage'}) through real app control, on this checkout, ranks
@@ -45,7 +46,7 @@ try {
 
   at('controller credentials')
   // A synthetic Claude tab (OFFLINE_TESTS) receives the real app-control briefing.
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).first().click()
+  await launcherTile(page, 'Claude').first().click()
   const controllerId = await page.locator('.structured-agent-pane').first().getAttribute('data-structured-session')
   await page.evaluate(async id => { await window.conductor.structured.connect(id); const state = await window.conductor.structured.snapshot(id); await window.conductor.structured.submit(id, 'SYNTHETIC STEER START', { ...state.settings, model: 'synthetic-claude', effort: 'low' }, []) }, controllerId)
   await expect.poll(async () => readFile(capture, 'utf8').then(text => text.includes('Conductor app control:')).catch(() => false), { timeout: 60_000 }).toBe(true)

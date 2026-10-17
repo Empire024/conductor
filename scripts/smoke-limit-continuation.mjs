@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // The whole "Continue agents when their usage limit resets" chain, end to end and unfaked:
 // the owner's own toggle in the workspace bar -> the registered spec in main -> a real Codex
@@ -27,10 +28,10 @@ try {
   await page.evaluate(() => window.conductor.projects.create('Limit continuation fixture'))
   await page.reload()
   await page.getByText('Limit continuation fixture', { exact: true }).first().click()
-  if (await page.locator('.launcher-grid').count()) await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+  if (await page.locator('.launcher-grid').count()) await launcherTile(page, 'Codex').click()
   else if (!await page.locator('.structured-agent-pane').count()) {
     await page.locator('.session-add').click()
-    await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+    await launcherTile(page, 'Codex').click()
   }
   const pane = page.locator('.structured-agent-pane')
   await pane.waitFor()

@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Live check of the app-control repairs in a parked Conductor on an isolated profile:
 //  catalog — tools.list says git.ship is a local commit unless publish: true, jobs.pause interrupts
@@ -77,7 +78,7 @@ try {
   await page.locator('.project-row').filter({ hasText: project.name }).first().click()
 
   at('controller credentials')
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).first().click()
+  await launcherTile(page, 'Claude').first().click()
   const controllerId = await page.locator('.structured-agent-pane').first().getAttribute('data-structured-session')
   await page.evaluate(async id => { await window.conductor.structured.connect(id); const state = await window.conductor.structured.snapshot(id); await window.conductor.structured.submit(id, 'SYNTHETIC STEER START', state.settings) }, controllerId)
   await expect.poll(async () => readFile(capture, 'utf8').then(text => text.includes('Conductor app control:')).catch(() => false), { timeout: 60_000 }).toBe(true)

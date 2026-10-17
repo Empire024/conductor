@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const output = resolve('artifacts/verify-v2')
 await mkdir(output, { recursive: true })
@@ -41,7 +42,7 @@ try {
     await page.evaluate(() => window.conductor.projects.create('A6 fixture'))
     await page.reload()
     await page.locator('.project-row').filter({ hasText: 'A6 fixture' }).click()
-    await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+    await launcherTile(page, 'Claude').click()
     const composer = page.getByRole('textbox', { name: /Message Claude/i })
     await expect(composer).toBeEnabled({ timeout: 15000 })
     step('typing draft')

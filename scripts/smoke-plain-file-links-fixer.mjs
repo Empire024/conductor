@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Derived from smoke-agent-file-links.mjs. This fixture keeps the existing Markdown link and
 // exercises the new plain-prose and inline-code forms without calling a live provider.
@@ -43,8 +44,8 @@ try {
   ].join('\n')
   await page.reload()
   await page.getByText('Plain links fixture', { exact: true }).first().click()
-  if (await page.locator('.launcher-grid').count()) await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
-  else if (!await page.locator('.structured-agent-pane').count()) { await page.locator('.session-add').click(); await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click() }
+  if (await page.locator('.launcher-grid').count()) await launcherTile(page, 'Claude').click()
+  else if (!await page.locator('.structured-agent-pane').count()) { await page.locator('.session-add').click(); await launcherTile(page, 'Claude').click() }
   await page.locator('.structured-agent-pane').waitFor()
   const sessionId = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   await page.getByRole('textbox', { name: /message|prompt/i }).last().fill('SYNTHETIC FILELINKS\n<<<\n' + reply + '\n>>>')

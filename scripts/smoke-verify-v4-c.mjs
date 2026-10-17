@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, writeFile, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-verify-v4-c-'))
 const output = resolve('artifacts/verify-v4/C')
@@ -117,7 +118,7 @@ try {
 
   // ---- C7-C9: tab group close semantics via a real controller+coworker dispatch ----
   await page.locator('.project-row').filter({ hasText: /^V4 Group C$/ }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+  await launcherTile(page, 'Codex').click()
   const mainComposer = page.getByRole('textbox', { name: 'Message Codex', exact: true })
   await expect(mainComposer).toBeEnabled()
   const mainId = await page.locator('.structured-agent-pane').last().getAttribute('data-structured-session')
@@ -152,7 +153,7 @@ try {
   record('C9', tabCountAfterCloseOnly === tabCountBefore - 1 ? 'PASS' : 'FAIL', `tabCountBefore=${tabCountBefore} afterCloseOnly=${tabCountAfterCloseOnly}`, 'closing the controller alone via "Close this tab only" did not close its coworker siblings')
 
   // Re-establish a controller+coworker pair to test full-group close (C7)
-  await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click().catch(() => {})
+  await launcherTile(page, 'Codex').click().catch(() => {})
   const main2Pane = page.locator('.structured-agent-pane').last()
   const main2Id = await main2Pane.getAttribute('data-structured-session')
   await page.evaluate(async id => {

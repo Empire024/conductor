@@ -2,6 +2,7 @@ import { _electron as electron, expect } from '@playwright/test'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { resolve,join } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Actual installed provider path, ordinary composer, no mock/local alternative, hidden window.
 const output=resolve('artifacts/local-files/ui-'+Date.now())
@@ -22,7 +23,7 @@ try{
   for(const name of ['data.txt','data2.txt'])await writeFile(join(project.path,name),await readFile(join(inputs,name)))
   await page.reload()
   await page.getByText('Local file acceptance',{exact:true}).first().click()
-  await page.locator('.launcher-grid button').filter({hasText:'Ornith 1.5 9B'}).first().click()
+  await launcherTile(page, 'Ornith 1.5 9B').first().click()
   const pane=page.locator('.pane-tab-content:visible .structured-agent-pane').first()
   await pane.waitFor({timeout:30000})
   const id=await pane.getAttribute('data-structured-session')

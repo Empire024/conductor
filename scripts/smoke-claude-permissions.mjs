@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Raw offline protocol -> production Claude adapter -> durable IPC -> real React panes.
 // All fixture permissions describe echo commands; none executes a shell command.
@@ -25,7 +26,7 @@ try {
   const project = await page.evaluate(() => window.conductor.projects.create('Claude permission fixture'))
   await page.reload()
   await page.getByText('Claude permission fixture', { exact: true }).first().click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+  await launcherTile(page, 'Claude').click()
   const panes = page.locator('.structured-agent-pane')
   await panes.first().waitFor()
   const sessionId = await panes.first().getAttribute('data-structured-session')

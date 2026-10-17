@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Offline raw Claude protocol -> real adapter/session IPC -> actual React/Escape.
 // No model or native tool execution; the fixture emits deterministic lifecycle frames.
@@ -21,7 +22,7 @@ try {
   await page.evaluate(() => window.conductor.projects.create('Steering fixture'))
   await page.reload()
   await page.getByText('Steering fixture', { exact: true }).first().click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+  await launcherTile(page, 'Claude').click()
   const pane = page.locator('.structured-agent-pane').first()
   await pane.waitFor()
   const id = await pane.getAttribute('data-structured-session')

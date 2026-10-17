@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Real Electron/main/preload/React and the production Codex adapter over a raw synthetic
 // App Server. The fixture reports account limits but never contacts a provider or infers.
@@ -44,7 +45,7 @@ try {
   const project = await page.evaluate(() => window.conductor.projects.create('Usage routing fixture'))
   await page.reload()
   await page.getByText(project.name, { exact: true }).first().click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+  await launcherTile(page, 'Codex').click()
   const codexPane = page.locator('.structured-agent-pane').first()
   const codexId = await codexPane.getAttribute('data-structured-session')
   assert.ok(codexId)
@@ -91,7 +92,7 @@ try {
   results.screenshots.push('artifacts/usage-routing-fixer/auto-fixer-sol.png')
 
   await page.locator('.pane-add-tab').first().click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+  await launcherTile(page, 'Claude').click()
   const claudePane = page.locator('.structured-agent-pane[data-provider="claude"]')
   await expect(claudePane).toBeVisible()
   const claudeId = await claudePane.getAttribute('data-structured-session')

@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Actual Electron main/preload/UI and native session adapters. Provider processes
 // and the Fixer's routing decision are synthetic; this never runs inference.
@@ -69,7 +70,7 @@ try {
   project = await page.evaluate(() => window.conductor.projects.create('Task dispatch smoke'))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: project.name }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+  await launcherTile(page, 'Codex').click()
   await expect(page.getByRole('textbox', { name: 'Message Codex', exact: true })).toBeEnabled()
   const existingId = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   await page.evaluate(id => window.conductor.structured.connect(id), existingId)

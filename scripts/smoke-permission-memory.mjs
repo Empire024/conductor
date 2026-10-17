@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Real production Claude/Codex adapters over the synthetic offline fixtures; no network egress.
 // Confirms the owner's remembered permission mode: a new tab opens on Auto, and switching a Claude tab to Edit must carry into
@@ -36,7 +37,7 @@ try {
   // First Claude tab: opens on Auto (nothing remembered yet, and a new conversation is autonomous
   // until the owner chooses otherwise), then the owner switches it to Edit through the real
   // Conversation-mode menu (a role=menu of role=menuitemradio options, not a plain button).
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+  await launcherTile(page, 'Claude').click()
   await activePane().waitFor()
   const firstId = await activePane().getAttribute('data-structured-session')
   assert.equal((await snapshot(firstId)).settings.permission, 'auto')
@@ -50,7 +51,7 @@ try {
   // Second, manually opened Claude tab: must open already on Edit, without the owner choosing
   // again.
   await page.locator('.pane-add-tab').click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+  await launcherTile(page, 'Claude').click()
   await activePane().waitFor()
   const secondId = await activePane().getAttribute('data-structured-session')
   assert.notEqual(secondId, firstId, 'the launcher must have opened a second, independent conversation')
@@ -62,7 +63,7 @@ try {
   // A Codex tab must never inherit a Claude mode: the memory is per provider. Codex has its own
   // mode picker, carrying its own /permissions presets, and it opens on its own Auto.
   await page.locator('.pane-add-tab').click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+  await launcherTile(page, 'Codex').click()
   await activePane().waitFor()
   const codexId = await activePane().getAttribute('data-structured-session')
   assert.notEqual(codexId, secondId)
@@ -81,7 +82,7 @@ try {
 
   // Per provider, still: a second Codex tab opens on the Codex choice, Claude keeps its own.
   await page.locator('.pane-add-tab').click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+  await launcherTile(page, 'Codex').click()
   await activePane().waitFor()
   const secondCodexId = await activePane().getAttribute('data-structured-session')
   assert.notEqual(secondCodexId, codexId)
@@ -98,7 +99,7 @@ try {
     await restartedPage.waitForFunction(() => Boolean(window.conductor?.structured))
     await restartedPage.getByText('Permission memory fixture', { exact: true }).first().click()
     await restartedPage.locator('.pane-add-tab').click()
-    await restartedPage.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+    await launcherTile(restartedPage, 'Claude').click()
     const restartedPane = restartedPage.locator('.pane-tab-content:visible').locator('.structured-agent-pane')
     await restartedPane.waitFor()
     await expect(restartedPane.getByRole('button', { name: 'Conversation mode', exact: true })).toHaveText('Edit')

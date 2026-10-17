@@ -4,6 +4,7 @@ import { request as httpsRequest } from 'node:https'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Real Electron main/preload/renderer and the real HTTPS phone listener; only the provider
 // process is the synthetic Claude fixture. No model inference happens.
@@ -53,7 +54,7 @@ try {
   const project = await page.evaluate(() => window.conductor.projects.create('Phone smoke'))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Phone smoke' }).click()
-  await expect(page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).filter({ hasNotText: 'Cloud' })).toBeVisible()
+  await expect(launcherTile(page, 'Claude')).toBeVisible()
 
   let desktop = await page.evaluate(() => window.conductor.phone.state())
   assert.equal(desktop.listening, false)

@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Production Electron UI and database with the offline raw provider fixture only.
 const root = await mkdtemp(join(tmpdir(), 'conductor-workspace-restore-'))
@@ -48,7 +49,7 @@ try {
   await page.locator('.session-tab-rename').press('Enter')
   results.checks.push('Top workspace tabs and sidebar share the same context-menu actions')
 
-  await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+  await launcherTile(page, 'Codex').click()
   const composer = () => page.getByRole('textbox', { name: 'Message Codex', exact: true })
   await composer().fill('Draft survives closing, restoration, and restart.')
   const resourceId = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')

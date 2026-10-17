@@ -4,6 +4,7 @@ import { access, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { cleanupFixtureApp, combinedSmokeFailure } from './smoke-fixture-cleanup.mjs'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Offline Codex fixture plus real renderer/IPC/filesystem. It executes no model inference and no
 // provider tools; synthetic prompts are used only for the Stop-state lifecycle assertion.
@@ -37,7 +38,7 @@ try {
   await writeFile(image, Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aP9sAAAAASUVORK5CYII=', 'base64'))
   await page.reload()
   await page.getByText('Composer drop fixture', { exact: true }).first().click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+  await launcherTile(page, 'Codex').click()
   const pane = page.locator('.structured-agent-pane:visible')
   const composer = pane.getByRole('textbox', { name: 'Message Codex', exact: true })
   await expect(composer).toBeEnabled()

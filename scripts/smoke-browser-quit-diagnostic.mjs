@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Narrow lifecycle probe for the hidden main-owned browser host. It creates one idle browser
 // session in an isolated profile, asks Electron to quit through the real app lifecycle, records
@@ -48,7 +49,7 @@ try {
   const project = await page.evaluate(() => window.conductor.projects.create('Browser quit diagnostic'))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: project.name }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+  await launcherTile(page, 'Claude').click()
   const pane = page.locator('.structured-agent-pane:visible')
   await expect(pane.getByRole('textbox', { name: 'Message Claude Code', exact: true })).toBeEnabled()
   const sessionId = await pane.getAttribute('data-structured-session')

@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, writeFile, copyFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Real Electron, real Claude adapter wire protocol, real snapshot layer: a turn that writes a
 // memory file, a sibling project file and one workspace file must leave the conversation clean.
@@ -43,10 +44,10 @@ try {
   const baseline = await readFile(target, 'utf8')
   await page.reload()
   await page.getByText('Snapshot notice fixture', { exact: true }).first().click()
-  if (await page.locator('.launcher-grid').count()) await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+  if (await page.locator('.launcher-grid').count()) await launcherTile(page, 'Claude').click()
   else if (!await page.locator('.structured-agent-pane').count()) {
     await page.locator('.session-add').click()
-    await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+    await launcherTile(page, 'Claude').click()
   }
   await page.locator('.structured-agent-pane').waitFor()
   const sessionId = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')

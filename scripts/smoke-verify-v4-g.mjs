@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, writeFile, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-verify-v4-g-'))
 const output = resolve('artifacts/verify-v4/G')
@@ -55,7 +56,7 @@ try {
   const project = await page.evaluate(() => window.conductor.projects.create('V4 Group G'))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'V4 Group G' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+  await launcherTile(page, 'Codex').click()
   const wComposer = page.getByRole('textbox', { name: 'Message Codex', exact: true })
   await expect(wComposer).toBeEnabled()
   const wId = await page.locator('.structured-agent-pane').last().getAttribute('data-structured-session')

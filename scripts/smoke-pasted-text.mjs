@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // A long paste folds into a "[Pasted text #N: L lines]" chip and is sent as attached context.
 // Isolated synthetic provider; the window is parked off-screen by CONDUCTOR_TEST_USER_DATA.
@@ -25,7 +26,7 @@ try {
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Pasted text project' }).click()
   await page.locator('.structured-agent-pane:visible, .launcher-grid:visible').first().waitFor()
-  if (!await page.locator('.structured-agent-pane:visible').count()) await page.locator('.launcher-grid:visible button').filter({ hasText: 'Codex' }).click()
+  if (!await page.locator('.structured-agent-pane:visible').count()) await launcherTile(page, 'Codex', { grid: '.launcher-grid:visible' }).click()
   await expect(composer()).toBeEnabled()
   const id = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
 

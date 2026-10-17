@@ -11,6 +11,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-mixed-activity-'))
 const output = resolve('artifacts/mixed-project-activity')
@@ -73,8 +74,8 @@ try {
   const workspaceState = (index) => stateOf(page.locator('.sidebar-session-row').nth(index))
 
   const startClaudePane = async () => {
-    if (await page.locator('.launcher-grid').count()) await page.locator('.launcher-grid button').filter({ hasText: 'Claude Code' }).click()
-    else { await page.locator('.pane-add-tab').first().click(); await page.locator('.launcher-grid button').filter({ hasText: 'Claude Code' }).click() }
+    if (await page.locator('.launcher-grid').count()) await launcherTile(page, 'Claude Code').click()
+    else { await page.locator('.pane-add-tab').first().click(); await launcherTile(page, 'Claude Code').click() }
     await page.locator('.structured-agent-pane').last().waitFor()
     return page.locator('.structured-agent-pane').last().getAttribute('data-structured-session')
   }

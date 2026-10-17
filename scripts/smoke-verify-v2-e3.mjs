@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const output = resolve('artifacts/verify-v2')
 await mkdir(output, { recursive: true })
@@ -55,7 +56,7 @@ try {
     await page.evaluate(() => window.conductor.projects.create('E3 fixture'))
     await page.reload()
     await page.locator('.project-row').filter({ hasText: 'E3 fixture' }).click()
-    await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+    await launcherTile(page, 'Claude').click()
     const composer = page.getByRole('textbox', { name: /Message Claude/i })
     await expect(composer).toBeEnabled({ timeout: 20000 })
     const controllerId = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')

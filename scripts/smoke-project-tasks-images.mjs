@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 const provider=process.argv.includes('--provider=claude')?'claude':'codex'
 const root=await mkdtemp(join(tmpdir(),'conductor-tasks-images-'))
 const output=resolve('artifacts/tasks-images/'+provider)
@@ -41,7 +42,7 @@ try {
   await expect(page.locator('.project-task-title').filter({hasText:'Track assigned image work'})).toBeVisible()
   check('Project file is automatic, legacy items import, done items collapse, UI edits preserve surrounding file content')
   await page.locator('.activity-rail').getByRole('button',{name:'Project tasks',exact:true}).click()
-  await page.locator('.launcher-grid button').filter({hasText:provider==='claude'?'Claude':'Codex'}).click()
+  await launcherTile(page, provider==='claude'?'Claude':'Codex').click()
   await expect(composer()).toBeEnabled()
   await composer().focus()
   const id=await page.locator('.structured-agent-pane').getAttribute('data-structured-session')

@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Pasted text opens as a file (feature-list 21b9a1d6): a long paste folds into a chip; clicking
 // it in the composer opens the text read-only in the document strip; after sending, the chip
@@ -38,7 +39,7 @@ try {
   await page.evaluate(() => window.conductor.settings.setZoom(1))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Pasted text smoke' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).first().click()
+  await launcherTile(page, 'Codex').first().click()
   const pane = page.locator('.structured-agent-pane').first()
   const composer = pane.locator('textarea').first()
   await expect(composer).toBeEnabled()

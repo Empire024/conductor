@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { cleanupFixtureApp, combinedSmokeFailure } from './smoke-fixture-cleanup.mjs'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Offline provider fixtures only: exercises the real renderer, IPC, session persistence and raw
 // transport protocol without provider inference or native tool execution.
@@ -41,7 +42,7 @@ try {
   await page.evaluate(async () => { await window.conductor.settings.setZoom(1); await window.conductor.settings.setThemeAuto(false); await window.conductor.settings.setThemeVariant('night'); await window.conductor.projects.create('Protocol fixture') })
   await page.reload()
   await page.getByText('Protocol fixture', { exact: true }).first().click()
-  await page.locator('.launcher-grid button').filter({ hasText: providerName }).click()
+  await launcherTile(page, providerName).click()
   await expect(input()).toBeEnabled()
   id = await pane().getAttribute('data-structured-session')
   await input().focus()

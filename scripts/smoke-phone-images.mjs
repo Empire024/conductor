@@ -6,6 +6,7 @@ import { existsSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { deflateSync } from 'node:zlib'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Images from the phone (feature-list 6528fe02): a paired phone uploads raw image bytes over the
 // real HTTPS listener, they are saved by the real importer (src/main/prompt-images.ts, Electron's
@@ -81,7 +82,7 @@ try {
   const project = await page.evaluate(() => window.conductor.projects.create('Phone images'))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Phone images' }).click()
-  await expect(page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).first()).toBeVisible()
+  await expect(launcherTile(page, 'Claude').first()).toBeVisible()
   const desktop = await page.evaluate(() => window.conductor.phone.setSettings({ enabled: true, port: 0 }))
   assert.ok(desktop.listening, 'listener starts: ' + desktop.message)
   const origin = `https://127.0.0.1:${new URL(desktop.primaryEndpoint).port}`

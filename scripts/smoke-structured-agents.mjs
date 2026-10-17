@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Synthetic raw protocol process -> production adapter -> SQLite -> actual Electron UI.
 const root = await mkdtemp(join(tmpdir(), 'conductor-offline-'))
@@ -30,10 +31,10 @@ try {
   try { execFileSync(process.execPath, ['--test', 'panel.test.mjs'], { cwd: project.path, stdio: 'pipe' }); throw new Error('Baseline unexpectedly passed') } catch (error) { assert.match(String(error.stdout), /contains must not be called/) }
   await page.reload()
   await page.getByText('Structured fixture', { exact: true }).first().click()
-  if (await page.locator('.launcher-grid').count()) await page.locator('.launcher-grid button').filter({ hasText: providerName }).click()
+  if (await page.locator('.launcher-grid').count()) await launcherTile(page, providerName).click()
   else if (!await page.locator('.structured-agent-pane').count()) {
     await page.locator('.session-add').click()
-    await page.locator('.launcher-grid button').filter({ hasText: providerName }).click()
+    await launcherTile(page, providerName).click()
   }
   await page.locator('.structured-agent-pane').waitFor()
   const sessionId = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')

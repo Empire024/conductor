@@ -5,6 +5,7 @@ import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { cleanupFixtureApp, combinedSmokeFailure } from './smoke-fixture-cleanup.mjs'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Real Electron/main-owned WebContentsView and loopback MCP; provider process is the offline
 // fixture. This spends no provider credits and never activates a desktop window.
@@ -65,7 +66,7 @@ try {
   const [projectA, projectB] = await page.evaluate(async () => [await window.conductor.projects.create('Browser project A'), await window.conductor.projects.create('Browser project B')])
   await page.reload()
   await page.locator('.project-row').filter({ hasText: projectA.name }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+  await launcherTile(page, 'Claude').click()
   const pane = page.locator('.structured-agent-pane:visible')
   await expect(pane.getByRole('textbox', { name: 'Message Claude Code', exact: true })).toBeEnabled()
   const sessionId = await pane.getAttribute('data-structured-session')

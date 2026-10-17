@@ -7,6 +7,7 @@ import { _electron as electron } from '@playwright/test'
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-local-model-icons-'))
 const profile = join(root, 'profile'), projectPath = join(root, 'project')
@@ -45,7 +46,7 @@ try {
   await page.screenshot({ path: join(shots, 'launcher-local-icons.png') })
 
   // Open one local model tab: its tab strip and session bar carry that model's glyph too.
-  const tile = page.locator('.launcher-grid button').filter({ hasText: 'Qwen 3.6 35B-A3B' }).first()
+  const tile = launcherTile(page, 'Qwen 3.6 35B-A3B').first()
   await tile.click()
   await page.waitForTimeout(1500)
   const strip = await page.evaluate(() => [...document.querySelectorAll('[role="tab"], .pane-tab, .workspace-tab')]

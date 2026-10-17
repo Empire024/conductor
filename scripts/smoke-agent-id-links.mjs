@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // feature-list.md agent-id-links-and-messages: find a tab by agent id, auto-link ids in
 // conversations, and show agent-to-agent messages as cards. A fixture controller in project A opens
@@ -61,7 +62,7 @@ try {
   await page.locator('.project-row').filter({ hasText: 'Links smoke B' }).click()
   await expect.poll(async () => (await page.evaluate(id => window.conductor.sessions.list(id), projectB.id)).length).toBeGreaterThan(0)
   await page.locator('.project-row').filter({ hasText: 'Links smoke A' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).filter({ hasNotText: 'Cloud' }).first().click()
+  await launcherTile(page, 'Claude').first().click()
   await expect(page.getByRole('textbox', { name: 'Message Claude Code', exact: true })).toBeEnabled()
   const controllerId = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   await page.evaluate(async id => {

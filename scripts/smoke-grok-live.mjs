@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Live Grok check: the real `grok agent stdio` (signed in) -> GrokAdapter -> SQLite -> the real,
 // parked Electron window. Run `npx electron-vite build` first. Costs a few cents of Grok usage.
@@ -37,7 +38,7 @@ try {
   await page.reload()
   await page.getByText('Grok live', { exact: true }).first().click()
   if (!await page.locator('.launcher-grid').count()) await page.locator('.session-add').click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Grok' }).first().click()
+  await launcherTile(page, 'Grok').first().click()
   await page.locator('.structured-agent-pane').waitFor()
   const sessionId = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   results.checks.push('Launcher tile opens a structured Grok conversation')

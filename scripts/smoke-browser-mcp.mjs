@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Proves the owner's report is fixed: a Claude session started by this app is handed a real MCP
 // server at launch, and an agent-side tool call over that server drives the browser view the
@@ -67,7 +68,7 @@ const callTool = async (mcp, name, args = {}) => {
 }
 const startSession = async (projectName) => {
   await page.locator('.project-row').filter({ hasText: projectName }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).filter({ hasNotText: 'Cloud' }).click()
+  await launcherTile(page, 'Claude').click()
   await expect(page.getByRole('textbox', { name: 'Message Claude Code', exact: true })).toBeEnabled()
   const id = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   await page.evaluate(async sessionId => { await window.conductor.structured.connect(sessionId) }, id)

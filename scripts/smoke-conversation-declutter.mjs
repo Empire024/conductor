@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-declutter-'))
 const output = resolve('artifacts/backlog-followup')
@@ -21,7 +22,7 @@ try {
   await page.evaluate(() => window.conductor.projects.create('Conversation clarity'))
   await page.reload()
   await page.getByText('Conversation clarity', { exact: true }).first().click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+  await launcherTile(page, 'Codex').click()
   await page.getByRole('textbox', { name: 'Message Codex', exact: true }).fill('synthetic:activity-groups')
   await page.getByRole('button', { name: 'Send message', exact: true }).click()
   const pane = page.locator('.structured-agent-pane')

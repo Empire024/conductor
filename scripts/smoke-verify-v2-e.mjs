@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-v2e-'))
 const output = resolve('artifacts/verify-v2')
@@ -71,7 +72,7 @@ async function setupControllerWithCoworkers(page, capture, label, running) {
   const project = await page.evaluate((n) => window.conductor.projects.create(n), 'E ' + label)
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'E ' + label }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+  await launcherTile(page, 'Claude').click()
   const composer = page.getByRole('textbox', { name: /Message Claude/i })
   await expect(composer).toBeEnabled()
   const controllerId = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')

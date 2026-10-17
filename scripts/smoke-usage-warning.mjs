@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Raw synthetic Codex protocol -> production adapter -> SQLite -> production Electron renderer.
 // The usage cap itself is written through the real IPC bridge (window.conductor.usageCaps),
@@ -25,10 +26,10 @@ try {
   const project = await page.evaluate(() => window.conductor.projects.create('Usage warning fixture'))
   await page.reload()
   await page.getByText('Usage warning fixture', { exact: true }).first().click()
-  if (await page.locator('.launcher-grid').count()) await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+  if (await page.locator('.launcher-grid').count()) await launcherTile(page, 'Codex').click()
   else if (!await page.locator('.structured-agent-pane').count()) {
     await page.locator('.session-add').click()
-    await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+    await launcherTile(page, 'Codex').click()
   }
   const pane = page.locator('.structured-agent-pane')
   await pane.waitFor()

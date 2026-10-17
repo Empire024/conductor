@@ -4,6 +4,7 @@ import { createServer, request as httpRequest } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { execFile, spawn } from 'node:child_process'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Adversarial probe against the browser MCP bridge. Every entry below is an attack that SHOULD
 // fail; `broke` records the ones that did not. Nothing here asserts-and-aborts: a probe that
@@ -89,7 +90,7 @@ const powershell = script => new Promise((done, fail) =>
 
 const startSession = async (projectName) => {
   await page.locator('.project-row').filter({ hasText: projectName }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).filter({ hasNotText: 'Cloud' }).click()
+  await launcherTile(page, 'Claude').click()
   await expect(page.getByRole('textbox', { name: 'Message Claude Code', exact: true })).toBeEnabled()
   const id = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   await page.evaluate(async sessionId => { await window.conductor.structured.connect(sessionId) }, id)

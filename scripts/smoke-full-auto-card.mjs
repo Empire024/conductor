@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Full Auto state card (feature-list full-auto-ui-redesign): off/on/tab list/disclosure, in a
 // throwaway test profile only. CONDUCTOR_TEST_USER_DATA parks the window off every display and
@@ -38,7 +39,7 @@ try {
   await page.evaluate(() => window.conductor.settings.setZoom(1))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Full Auto card smoke' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).first().click()
+  await launcherTile(page, 'Claude').first().click()
   await expect(page.getByRole('textbox', { name: 'Message Claude Code', exact: true })).toBeEnabled()
   const id = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   await page.evaluate(async id => {

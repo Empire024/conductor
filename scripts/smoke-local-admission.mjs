@@ -5,6 +5,7 @@ import { resolve, join } from 'node:path'
 import assert from 'node:assert/strict'
 import { loadConfig, QWEN_9B, QWEN_35B, readApiKey } from '../src/main/local-models/config.ts'
 import { health, readRunRecord, startServer } from '../src/main/local-models/llama.ts'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // No generation, model startup or server stop is needed: a live 9B must refuse 35B.
 const output = resolve('artifacts/swarm-2026-09-21/local')
@@ -38,7 +39,7 @@ try {
   const project = await page.evaluate(() => window.conductor.projects.create('Local admission'))
   await page.reload()
   await page.getByText('Local admission', { exact: true }).first().click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Qwen 3.6 35B-A3B' }).first().click()
+  await launcherTile(page, 'Qwen 3.6 35B-A3B').first().click()
   // Since 9139839 connecting a local tab validates setup only and never loads weights (the first
   // turn does), so connect can no longer raise the admission refusal. And since 9c1b5da a first
   // turn would stop an idle 9B *this Conductor started* to make room, i.e. actually load the 35B,

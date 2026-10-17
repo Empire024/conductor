@@ -3,6 +3,7 @@ import { mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // A fresh agent tab should name itself from its first message instead of sitting as "Codex"
 // forever, and a manual rename (or a second message) must never move it again. Synthetic raw
@@ -25,7 +26,7 @@ try {
   await page.evaluate(() => window.conductor.projects.create('Tab naming fixture'))
   await page.reload()
   await page.getByText('Tab naming fixture', { exact: true }).first().click()
-  await page.locator('.launcher-grid button').filter({ hasText: providerLabel }).click()
+  await launcherTile(page, providerLabel).click()
   await page.locator('.structured-agent-pane').waitFor()
 
   const tabTitle = page.locator('.pane-tab.active .pane-tab-title')

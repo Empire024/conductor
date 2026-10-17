@@ -13,6 +13,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-board-truth-'))
 const output = resolve('artifacts/processes-board-truth')
@@ -58,8 +59,8 @@ const { app, page, shot, row } = session
 try {
   await row('Board truth').click()
   const startTab = async (prompt) => {
-    if (await page.locator('.launcher-grid').count()) await page.locator('.launcher-grid button').filter({ hasText: 'Claude Code' }).click()
-    else { await page.locator('.pane-add-tab').first().click(); await page.locator('.launcher-grid button').filter({ hasText: 'Claude Code' }).click() }
+    if (await page.locator('.launcher-grid').count()) await launcherTile(page, 'Claude Code').click()
+    else { await page.locator('.pane-add-tab').first().click(); await launcherTile(page, 'Claude Code').click() }
     const pane = page.locator('.structured-agent-pane').last()
     await pane.waitFor()
     const id = await pane.getAttribute('data-structured-session')

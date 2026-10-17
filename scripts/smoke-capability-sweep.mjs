@@ -26,6 +26,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const args = Object.fromEntries(process.argv.slice(2).map(arg => { const m = /^--([^=]+)(?:=(.*))?$/.exec(arg); return m ? [m[1], m[2] ?? true] : [arg, true] }))
 const live = Boolean(args.live)
@@ -68,7 +69,7 @@ async function openTab(provider, buttonText) {
   await page.waitForFunction(() => Boolean(window.conductor?.structured))
   await page.locator('.project-row').first().click()
   if (!await page.locator('.launcher-grid').count()) await page.locator('.session-add').click()
-  await page.locator('.launcher-grid button').filter({ hasText: buttonText }).first().click()
+  await launcherTile(page, buttonText).first().click()
   // The composer is labelled "Message <runtime name>"; the local runtime is named after its model.
   const textbox = provider === 'local' ? page.getByRole('textbox', { name: /^Message / }).last() : page.getByRole('textbox', { name: TEXTBOX[provider], exact: true })
   await expect(textbox).toBeVisible()

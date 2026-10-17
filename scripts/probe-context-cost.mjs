@@ -13,6 +13,7 @@ import { _electron as electron, expect } from '@playwright/test'
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 const args = Object.fromEntries(process.argv.slice(2).map(arg => { const m = /^--([^=]+)(?:=(.*))?$/.exec(arg); return m ? [m[1], m[2] ?? true] : [arg, true] }))
 const label = String(args.label ?? 'probe')
@@ -42,7 +43,7 @@ async function openTab(name, provider) {
   await page.reload()
   await page.waitForFunction(() => Boolean(window.conductor?.structured))
   await page.locator('.project-row').filter({ hasText: name }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: PROVIDER_LABEL[provider] }).click()
+  await launcherTile(page, PROVIDER_LABEL[provider]).click()
   const textbox = page.getByRole('textbox', { name: TEXTBOX[provider], exact: true })
   await expect(textbox).toBeEnabled()
   const pane = page.locator('.structured-agent-pane', { has: textbox }).last()

@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { cleanupFixtureApp, combinedSmokeFailure } from './smoke-fixture-cleanup.mjs'
+import { launcherTile } from './lib/launcher-tile.mjs'
 
 // Actual Electron main/preload/renderers with fixed offline provider fixtures. Every launched
 // window is parked off-screen by CONDUCTOR_TEST_USER_DATA and the process wrapper.
@@ -168,7 +169,7 @@ try {
   await page.reload()
 
   await page.locator('.project-row').filter({ hasText: projectB.name }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+  await launcherTile(page, 'Codex').click()
   const agentPane = page.locator('.structured-agent-pane:visible')
   await expect(agentPane).toBeVisible()
   const runningAgentId = await agentPane.getAttribute('data-structured-session')
@@ -201,7 +202,7 @@ try {
 
   await page.keyboard.press('Control+t')
   await expect(page.locator('.launcher-grid')).toBeVisible()
-  await page.locator('.launcher-grid button').filter({ hasText: 'PowerShell' }).click()
+  await launcherTile(page, 'PowerShell').click()
   await expect(page.locator('.pane-tab').filter({ hasText: 'PowerShell' })).toBeVisible()
   await expect.poll(async () => {
     const sessions = await page.evaluate(id => window.conductor.sessions.list(id), projectA.id)
