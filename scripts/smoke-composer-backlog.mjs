@@ -25,7 +25,8 @@ try {
   await writeFile(join(project.path, 'beta.txt'), 'Beta context')
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Composer backlog' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: label }).click()
+  // "Claude Cloud" is a toggle (aria-pressed) in the same grid; the runtime tiles are plain buttons.
+  await page.locator('.launcher-grid button:not([aria-pressed])').filter({ hasText: label }).click()
   const composer = page.getByRole('textbox', { name: provider === 'claude' ? 'Message Claude Code' : 'Message Codex', exact: true })
   await expect(composer).toBeEnabled()
   const id = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
@@ -90,7 +91,8 @@ try {
   const submit = question.getByRole('button', { name: 'Submit answers', exact: true })
   await expect(submit).toBeDisabled()
   const answer = provider === 'claude' ? question.locator('.sa-custom-answer input') : question.getByRole('radio').first()
-  if (provider === 'claude') await answer.fill('Night')
+  // A question with options shows its free-text field only once "Other" is chosen; the fixture expects "Night".
+  if (provider === 'claude') { await question.getByRole('radio', { name: 'Other', exact: true }).check(); await answer.fill('Night') }
   else await answer.check()
   await expect(submit).toBeEnabled()
   await screenshot('question')
@@ -100,6 +102,7 @@ try {
   check('Enter submits both native choices and custom answers through the real provider response path')
   if (provider === 'codex') {
     const paneId = await page.locator('.pane-tab.active').getAttribute('data-control-tab-id')
+    const tabTitle = (await page.locator('.pane-tab.active').innerText()).trim()
     const savedId = await page.evaluate(id => window.conductor.structured.fork(id), id)
     await page.evaluate(id => window.conductor.structured.rename(id, 'Saved composer conversation'), savedId)
     await composer.fill('/history'); await composer.press('Enter')
@@ -144,13 +147,17 @@ try {
     const forkId = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
     await expect(composer).toBeEnabled()
     await expect(page.locator('.pane-tab.active')).toHaveAttribute('data-control-agent-id', forkId)
-    await expect(page.locator('.pane-tab.active')).toContainText('(fork)')
+    // The tab named itself from its first message, and an auto-named title is locked (conversation-tab.ts,
+    // e06ba5f): the fork's own "(fork)" title stays in its record and the pane keeps its name.
+    await expect(page.locator('.pane-tab.active')).toContainText(tabTitle)
+    assert.match((await page.evaluate(id => window.conductor.structured.snapshot(id), forkId)).title, /[(]fork[)]$/)
     await page.reload()
     await expect(page.locator('.structured-agent-pane')).toHaveAttribute('data-structured-session', forkId)
     await expect(page.locator('.pane-tab.active')).toHaveAttribute('data-control-tab-id', paneId)
     await expect(page.locator('.pane-tab.active')).toHaveAttribute('data-control-agent-id', forkId)
+    await expect(page.locator('.pane-tab.active')).toContainText(tabTitle)
     await expect(composer).toBeEnabled()
-    check('Fork persists its new native runtime and title on the same pane and survives renderer reload')
+    check('Fork persists its new native runtime on the same pane, keeps the locked tab name, and survives renderer reload')
   }
   assert.deepEqual(errors, [])
 } catch (error) { await screenshot('failure'); throw error }
