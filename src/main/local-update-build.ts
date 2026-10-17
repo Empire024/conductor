@@ -62,6 +62,37 @@ export interface LocalUpdateBuildService {
 
 const LOG_LINES = 40
 const SMOKE_TAIL_LINES = 20
+/** Error-output lines a failed smoke's tail keeps even when its regular output was longer. */
+const SMOKE_TAIL_ERROR_LINES = 10
+
+/** The last lines of a smoke's output and error output. They are two pipes with no common order:
+ *  under load the error a smoke printed last can be read before its final output lines, or before
+ *  enough of them to scroll out of one shared window (release run 39024464718). So each stream is
+ *  kept on its own, a line split across chunks is joined again, and the tail ends with the error
+ *  output, where a smoke states why it failed. */
+export class SmokeTail {
+  private readonly kept = { stdout: [] as string[], stderr: [] as string[] }
+  private readonly partial = { stdout: '', stderr: '' }
+
+  add(text: string, stream: 'stdout' | 'stderr'): void {
+    const parts = (this.partial[stream] + text).split(/\r?\n/)
+    this.partial[stream] = parts.pop() ?? ''
+    this.keep(stream, parts)
+  }
+
+  lines(): string[] {
+    for (const stream of ['stdout', 'stderr'] as const) { this.keep(stream, [this.partial[stream]]); this.partial[stream] = '' }
+    const { stdout, stderr } = this.kept
+    const errors = Math.min(stderr.length, Math.max(SMOKE_TAIL_ERROR_LINES, SMOKE_TAIL_LINES - stdout.length))
+    return [...stdout.slice(stdout.length - (SMOKE_TAIL_LINES - errors)), ...stderr.slice(stderr.length - errors)]
+  }
+
+  private keep(stream: 'stdout' | 'stderr', lines: string[]): void {
+    const kept = this.kept[stream]
+    kept.push(...lines.map(line => line.trimEnd()).filter(Boolean).map(line => line.slice(0, 500)))
+    kept.splice(0, Math.max(0, kept.length - SMOKE_TAIL_LINES))
+  }
+}
 const MAX_SMOKES = 12
 const BUILD_TIMEOUT_MS = 45 * 60 * 1000
 const COPY_TIMEOUT_MS = 20 * 60 * 1000
@@ -335,15 +366,11 @@ export class LocalUpdateBuilder implements LocalUpdateBuildService {
     smoke.log = join(directory, `${smoke.name}.log`)
     smoke.state = 'running'
     smoke.startedAt = new Date().toISOString()
-    const tail: string[] = []
+    const tail = new SmokeTail()
     const file = createWriteStream(smoke.log)
     const code = await this.run(node, [join(worktree, 'scripts', 'smoke-lock.mjs'), '--timeout-min', String(SMOKE_RUN_MINUTES), '--', node, join('scripts', `${smoke.name}.mjs`)], worktree, SMOKE_TIMEOUT_MS, {
       env: smokeEnvironment(),
-      onText: text => {
-        file.write(text)
-        tail.push(...text.split(/\r?\n/).map(line => line.trimEnd()).filter(Boolean).map(line => line.slice(0, 500)))
-        tail.splice(0, Math.max(0, tail.length - SMOKE_TAIL_LINES))
-      }
+      onText: (text, stream) => { file.write(text); tail.add(text, stream) }
     })
     await new Promise<void>(done => file.end(done))
     smoke.exitCode = code
@@ -351,7 +378,7 @@ export class LocalUpdateBuilder implements LocalUpdateBuildService {
     // smoke-lock's 3 is "the command passed, but some process could not be accounted for".
     smoke.state = code === 0 ? 'passed' : 'failed'
     if (code === 3) smoke.note = 'Smoke passed but cleanup was not accounted for (exit 3); this candidate is not verified.'
-    if (smoke.state === 'failed') smoke.tail = tail
+    if (smoke.state === 'failed') smoke.tail = tail.lines()
   }
 
   /** scripts/build-local-update.mjs in `cwd`, streamed into the status. */
@@ -368,7 +395,7 @@ export class LocalUpdateBuilder implements LocalUpdateBuildService {
 
   /** Spawns one step and resolves with its exit code, or null when it could not start or was
    *  killed. Its output goes to the status log unless `onText` takes it. */
-  private run(command: string, args: string[], cwd: string, timeoutMs: number, options: { env?: NodeJS.ProcessEnv; onText?: (text: string) => void } = {}): Promise<number | null> {
+  private run(command: string, args: string[], cwd: string, timeoutMs: number, options: { env?: NodeJS.ProcessEnv; onText?: (text: string, stream: 'stdout' | 'stderr') => void } = {}): Promise<number | null> {
     return new Promise(done => {
       const child = spawn(command, args, { cwd, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: options.env ?? process.env })
       // The worktree copy, build, installer and smokes yield to the owner's own window.
@@ -377,9 +404,9 @@ export class LocalUpdateBuilder implements LocalUpdateBuildService {
       const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs)
       timer.unref?.()
       const mine = (): boolean => this.child === child
-      const absorb = (chunk: Buffer): void => { if (!mine()) return; if (options.onText) options.onText(chunk.toString('utf8')); else this.append(chunk.toString('utf8')) }
-      child.stdout?.on('data', absorb)
-      child.stderr?.on('data', absorb)
+      const absorb = (stream: 'stdout' | 'stderr') => (chunk: Buffer): void => { if (!mine()) return; if (options.onText) options.onText(chunk.toString('utf8'), stream); else this.append(chunk.toString('utf8')) }
+      child.stdout?.on('data', absorb('stdout'))
+      child.stderr?.on('data', absorb('stderr'))
       child.on('error', error => {
         if (!mine()) return
         clearTimeout(timer); this.child = null

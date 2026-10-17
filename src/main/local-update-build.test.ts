@@ -3,7 +3,7 @@ import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, realpathSy
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { LocalUpdateBuilder } from './local-update-build'
+import { LocalUpdateBuilder, SmokeTail } from './local-update-build'
 
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 5 }); vi.unstubAllEnvs() })
@@ -90,6 +90,7 @@ describe('local update builds', () => {
     expect(() => builder.offer('wizard', true)).toThrow(/not passed verification/)
     expect(status.smokes.map(smoke => [smoke.name, smoke.state, smoke.exitCode])).toEqual([['smoke-background-windows', 'passed', 0], ['smoke-ok', 'passed', 0], ['smoke-bad', 'failed', 1]])
     expect(status.smokes[2]!.tail!.at(-1)).toBe('FAIL: the grant card never appeared')
+    expect(status.smokes[2]!.tail!.at(-2)).toBe('line 29')
     expect(status.smokes[2]!.tail!.length).toBeLessThanOrEqual(20)
     expect(readFileSync(status.verificationLog!, 'utf8')).toContain('FULL BATCH SUITE PASSED')
     expect(existsSync(status.smokes[0]!.log!)).toBe(true)
@@ -140,5 +141,32 @@ describe('local update builds', () => {
     expect(builder.status().message).toContain(head.slice(0, 10))
     expect(readFileSync(builder.status().verificationLog!, 'utf8')).toContain('FAIL batch regression')
     expect(existsSync(join(feed, 'conductor-local-build.json'))).toBe(false)
+  })
+
+  it("keeps a failed smoke's error line at the end of its tail whatever order its two pipes are read in", () => {
+    // Release run 39024464718: under load the error arrived before the last output lines.
+    const late = new SmokeTail()
+    late.add('line 0\nline 1\n', 'stdout')
+    late.add('FAIL: the grant card never appeared\n', 'stderr')
+    late.add(Array.from({ length: 28 }, (_, i) => 'line ' + (i + 2)).join('\n') + '\n', 'stdout')
+    const lines = late.lines()
+    expect(lines.at(-1)).toBe('FAIL: the grant card never appeared')
+    expect(lines.at(-2)).toBe('line 29')
+    expect(lines).toHaveLength(20)
+
+    // A line split across chunks is one line, and the last unterminated line still counts.
+    const split = new SmokeTail()
+    split.add('checks 2/3 pas', 'stdout'); split.add('sed\r\nstill ', 'stdout'); split.add('waiting', 'stdout')
+    split.add('FAIL: no ', 'stderr'); split.add('card', 'stderr')
+    expect(split.lines()).toEqual(['checks 2/3 passed', 'still waiting', 'FAIL: no card'])
+
+    // Long error output does not crowd out the output entirely, and short output leaves room for it.
+    const noisy = new SmokeTail()
+    for (let i = 0; i < 30; i++) { noisy.add('out ' + i + '\n', 'stdout'); noisy.add('err ' + i + '\n', 'stderr') }
+    expect(noisy.lines()).toEqual([...Array.from({ length: 10 }, (_, i) => 'out ' + (i + 20)), ...Array.from({ length: 10 }, (_, i) => 'err ' + (i + 20))])
+    const quiet = new SmokeTail()
+    quiet.add('out\n', 'stdout')
+    for (let i = 0; i < 30; i++) quiet.add('err ' + i + '\n', 'stderr')
+    expect(quiet.lines()).toEqual(['out', ...Array.from({ length: 19 }, (_, i) => 'err ' + (i + 11))])
   })
 })
