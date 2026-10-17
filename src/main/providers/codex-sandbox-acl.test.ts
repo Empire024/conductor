@@ -102,7 +102,11 @@ describe('repairSandboxReadAccess', () => {
 
   it.runIf(windows)('repairs a real owner-only folder the way Python 3.13 mkdtemp leaves it, files inside included', async () => {
     const root = join(temp(), '.deps')
-    mkdirSync(join(root, 'PIL'), { recursive: true })
+    mkdirSync(root)
+    // A CI runner's temp folder may hand down no inheritable ACEs, which would leave every child
+    // "protected"; give the root one, as a project folder always has.
+    execFileSync('icacls.exe', [root, '/grant', '*S-1-5-32-545:(OI)(CI)RX', '/Q'], { windowsHide: true })
+    mkdirSync(join(root, 'PIL'))
     mkdirSync(join(root, 'requests'))
     writeFileSync(join(root, 'PIL', 'Image.py'), '')
     // tempfile.mkdtemp() on 3.13: D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)
