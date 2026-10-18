@@ -9,6 +9,7 @@ import { DiffEditor, type DiffOnMount } from '@monaco-editor/react'
 import { ArrowDown, ArrowUp, Check, ChevronDown, ChevronRight, ChevronUp, Copy, FileCode2, Maximize2, X } from 'lucide-react'
 import type { ContextAttachment, AgentEventData, DiffArtifact, FileChange, InputQuestion, Json, PendingInteraction, TimelineItem } from '../../../shared/structured-agent'
 import { ANSWERED_IN_CONVERSATION } from '../../../shared/structured-agent'
+import { questionDraftKey, questionDrafts } from './question-drafts'
 import { stripMemoryDirectives } from '../../../shared/memory-directive'
 import { languageForPath, SyntaxCode } from './SyntaxCode'
 import { fileTypeStyle } from '../file-types'
@@ -437,25 +438,35 @@ export function readableAnswerValue(value: string): string {
   const lastSpace = truncated.lastIndexOf(' ')
   return (lastSpace > MAX_ANSWER_VALUE_LENGTH * 0.6 ? truncated.slice(0, lastSpace) : truncated).trimEnd() + '…'
 }
-function InteractionCard({ item, interactive, onRespond, dockedQuestion, onDockQuestion }: ActivityProps): React.JSX.Element | null {
+function InteractionCard({ item, sessionId, interactive, onRespond, dockedQuestion, onDockQuestion }: ActivityProps): React.JSX.Element | null {
   const [submittedAnswers, setSubmittedAnswers] = useState<Record<string, string[]> | null>(null)
   // The answer being typed lives with the row, not the form: a question that closes mid-answer
-  // (answered in the conversation, expired with its turn, its runtime restarted) keeps it.
-  const [draft, setDraft] = useState<QuestionDraft>(emptyQuestionDraft)
+  // (answered in the conversation, expired with its turn, its runtime restarted) keeps it. It is
+  // also kept outside the row (question-drafts.ts), because switching tabs unmounts the whole view.
+  const draftKey = questionDraftKey(sessionId, item.id)
+  const [draft, setDraft] = useState<QuestionDraft>(() => questionDrafts.get(draftKey) ?? emptyQuestionDraft)
   const [late, setLate] = useState<'open' | 'sent' | 'discarded'>('open')
+  const asked = item.data.type === 'interaction' ? item.data.interaction : null
+  const keep = asked !== null && keepsQuestionDraft(asked, interactive, draft, late, submittedAnswers)
+  useEffect(() => {
+    if (keep) questionDrafts.set(draftKey, draft)
+    else questionDrafts.delete(draftKey)
+  }, [draftKey, draft, keep])
   if (item.data.type !== 'interaction') return null
   const request: PendingInteraction = item.data.interaction
   if (request.status === 'pending' && interactive) return <PendingInteractionForm item={item} request={request} docked={Boolean(dockedQuestion)} onDock={onDockQuestion} draft={draft} onDraft={setDraft} onRespond={async (target, decision, answers) => {
     if (answers) setSubmittedAnswers(answers)
     try { await onRespond(target, decision, answers) }
     catch (reason) { setSubmittedAnswers(null); throw reason }
+    // Sent: a view remounted before the answer resolves the card must not offer it again.
+    questionDrafts.delete(draftKey)
   }} />
   const questions = request.questions ?? []
   // Closed with an unsent answer: offer it to the agent as a message. The host sends it with a
   // note that the question had closed (structured-sessions deliverLateAnswer), never as a second
   // answer to a question a card already answered.
   if (closedQuestionKeepsDraft(request, interactive, draft, late, submittedAnswers)) return <PendingInteractionForm item={item} request={request} docked={false} draft={draft} onDraft={setDraft}
-    onDiscard={() => setLate('discarded')} onRespond={async (target, decision, answers) => { await onRespond(target, decision, answers); setLate('sent') }} />
+    onDiscard={() => { questionDrafts.delete(draftKey); setLate('discarded') }} onRespond={async (target, decision, answers) => { await onRespond(target, decision, answers); questionDrafts.delete(draftKey); setLate('sent') }} />
   // A question's own row IS the interaction: once answered, its collapsed heading names the
   // question that was actually asked instead of repeating the generic, now-stale "needs your
   // input" prompt, and its body reads as question/answer text instead of a raw request dump.
@@ -505,6 +516,12 @@ export function lateQuestionAnswers(questions: InputQuestion[], draft: QuestionD
 export function closedQuestionKeepsDraft(request: PendingInteraction, interactive: boolean, draft: QuestionDraft, late: 'open' | 'sent' | 'discarded', submitted: Record<string, string[]> | null): boolean {
   if (request.kind !== 'question' || late !== 'open' || submitted || request.status === 'pending' && interactive) return false
   return Object.keys(lateQuestionAnswers(request.questions ?? [], draft)).length > 0
+}
+/** Whether a card has an answer worth keeping outside itself: an open question with something
+ *  picked or typed and not yet sent, or a closed one still offering its unsent answer. */
+export function keepsQuestionDraft(request: PendingInteraction, interactive: boolean, draft: QuestionDraft, late: 'open' | 'sent' | 'discarded', submitted: Record<string, string[]> | null): boolean {
+  if (request.kind !== 'question' || submitted || draft === emptyQuestionDraft) return false
+  return request.status === 'pending' && interactive ? true : closedQuestionKeepsDraft(request, interactive, draft, late, submitted)
 }
 /** A live request asks one question at a time rather than stacking them all, and pins itself to
  *  the bottom of the conversation while the pane is tall enough to still read the transcript
