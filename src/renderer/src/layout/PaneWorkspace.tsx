@@ -827,7 +827,7 @@ function PaneGroup({
           requestClose(activeTab)
         }}
       >
-        <div className="pane-tabs" ref={tabsRef} aria-multiselectable="true" onKeyDown={(event) => {
+        <div className={`pane-tabs ${stripTabs.some(tab => controlLinks.some(link => link.controllerTabId === tab.id || link.controlledTabId === tab.id)) ? 'has-control-markers' : ''}`} ref={tabsRef} aria-multiselectable="true" onKeyDown={(event) => {
           if ((event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === 'a') { event.preventDefault(); event.stopPropagation(); setSelection(selectAll(stripOrder)); return }
           if (event.key === 'Escape' && selection.ids.size) { event.stopPropagation(); setSelection(EMPTY_SELECTION); return }
           if (event.key === 'Delete' && bulk) { event.preventDefault(); runBulk({ kind: 'close' }) }

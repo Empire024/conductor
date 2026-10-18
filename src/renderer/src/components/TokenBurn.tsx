@@ -43,12 +43,13 @@ export function useTokenBurnRate(agentSessionId: string | undefined): TokenBurnR
   return useSyncExternalStore(subscribe, () => agentSessionId ? byId.get(agentSessionId) : undefined, () => undefined)
 }
 
-/** Shown on a tab only while it burns faster than the owner's alert rate. */
+/** Shown on a tab only while it burns faster than the owner's alert rate: a flame over the provider
+ *  icon that never widens the tab (TokenBurn.css); the rate itself is read by hovering it. */
 export function TokenBurnBadge({ agentSessionId }: { agentSessionId?: string }): React.JSX.Element | null {
   const rate = useTokenBurnRate(agentSessionId)
   if (!rate?.alert) return null
   return <span className="pane-tab-burn" data-token-burn={rate.tokensPerHour} title={`Burning ${formatBurn(rate.tokensPerHour)} over the last hour: ${rate.inputPerHour.toLocaleString()} input (${rate.cachedPerHour.toLocaleString()} cached), ${rate.outputPerHour.toLocaleString()} output, ${rate.reports} calls`} aria-label={`token burn ${formatBurn(rate.tokensPerHour)}`}>
-    <Flame size={11} />{formatBurn(rate.tokensPerHour)}
+    <Flame size={11} aria-hidden="true" /><span>{formatBurn(rate.tokensPerHour)}</span>
   </span>
 }
 

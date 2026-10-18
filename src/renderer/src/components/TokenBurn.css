@@ -1,18 +1,32 @@
-/* Token burn: a flame on a tab spending faster than the owner's alert rate (TokenBurn.tsx). */
+/* Token burn: a flame on a tab spending faster than the owner's alert rate (TokenBurn.tsx). It is
+   laid over the corner of the provider icon, out of flow, and the tab gains a red bottom edge:
+   crossing the alert never changes the tab's width, so a full strip does not reflow or spill.
+   The rate is in the badge's tooltip and accessible name. */
 .pane-tab > .pane-tab-burn {
-  flex: 0 0 auto;
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  padding: 0 4px;
-  border-radius: 6px;
-  background: color-mix(in srgb, var(--danger) 16%, transparent);
-  color: var(--danger);
-  font-size: 8.5px;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  line-height: 14px;
+  position: absolute;
+  left: 17px;
+  top: calc(50% + 1px);
+  z-index: 1;
+  width: 11px;
+  height: 11px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--danger);
+  color: var(--surface-0);
+  box-shadow: 0 0 0 1.5px var(--surface-1);
+  pointer-events: auto;
 }
+.pane-tab > .pane-tab-burn > svg { width: 7px; height: 7px; color: inherit; }
+.pane-tab > .pane-tab-burn > span {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.pane-tab:has(> .pane-tab-burn) { box-shadow: inset 0 -2px color-mix(in srgb, var(--danger) 70%, transparent); }
 
 .token-burn-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
 .token-burn-list > li {

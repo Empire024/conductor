@@ -1941,13 +1941,13 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 
 - [x] clicking left bottom corner usage needs to open up the full usage graph with all info; the 5h window shows how close it is to its reset (time left) <!-- conductor-task:153a7424-aaff-466a-9d5d-58ae14585e70 agent=agent_mvd7if7f_kxkulpb -->
 
-- [ ] visual bug with too many tabs, also when tabs getting red cuz of too many tokens used this happens <!-- conductor-task:73762c1f-531d-4ffe-ab5e-a4656a0230ca -->
+- [x] visual bug with too many tabs, also when tabs getting red cuz of too many tokens used this happens <!-- conductor-task:73762c1f-531d-4ffe-ab5e-a4656a0230ca agent=agent_mvd7if7f_kxkulpb -->
   
   ![image.png](.conductor/prompt-images/7ea43da5-0e29-4839-8424-338bb7b7f726.png)
 
-- [ ] I’m getting spams also  i can barely wrote this on mobile the keyboard goes away l <!-- conductor-task:2c06c074-98d1-443a-ae8a-86af921e5742 -->
+- [~] I’m getting spams also  i can barely wrote this on mobile the keyboard goes away l <!-- conductor-task:2c06c074-98d1-443a-ae8a-86af921e5742 agent=agent_mvd7if7f_kxkulpb -->
 
-- [ ] Here image for spam <!-- conductor-task:650449a0-9714-46fc-8dfc-7c22777a817d -->
+- [~] Here image for spam <!-- conductor-task:650449a0-9714-46fc-8dfc-7c22777a817d agent=agent_mvd7if7f_kxkulpb -->
   
   ![IMG_0385.jpg](.conductor/prompt-images/7e8f915d-1fde-4938-8894-1d4251a22372.jpg)
 
@@ -1965,3 +1965,11 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 - [x] 10. Indexed, bounded cross-project activity feed of outward actions and completed deliveries; trace the Conductor print-shop email. <!-- conductor-task:phone-redesign-activity agent=agent_murrdn5k_umf5k4m -->
 - [x] 11. Compact session composer (owner iPhone, 2026-10-03, f11985f): one row [image][auto-growing 1-5 line textarea][mic][Stop while running][Steer/Send]; the dictation hint and Use keyboard appear only after a dictation attempt fails or speech is unsupported, as a dismissible one-line note; the nav sits on the home-indicator inset once (no bare band under it); the tab bar steps aside while the keyboard is up. Done: CSS row without wrap, field 20px lines up to 5, dictation note hidden until listening/failure with Use keyboard + dismiss, shell height from CSS unless the visual viewport is >120px short (keyboard-open class), standalone max(100vh,100dvh). Tests in phone-shell.test.ts; scripts/smoke-phone-composer.mjs PASS, smoke-phone-shell and smoke-phone-markdown-dictation PASS; screenshots in .conductor-scratch/phone-composer/{before,after}. <!-- conductor-task:phone-compact-composer agent=agent_murw6ivg_097s109 -->
 - [x] Weekly usage report (owner, 2026-10-06): for each past week, was the weekly allowance used up or left on the table? Provider readings are split at each provider’s own reset (Claude seven_day and Fable weekly, Codex weekly; Grok reports none), with peak and final percent, the day it was used up, % left unused at reset, honest gaps (no interpolation), the current week’s projection, and tokens/cost recorded per window. Readings persist in allowance_readings + usage_weeks (26+ weeks, backfilled once from the journal through the accounting index). Desktop: Weekly view on the Processes dashboard; phone: Weekly section on Usage; app control: usage.weekly({provider?,weeks?}). <!-- conductor-task:usage-weekly-report agent=agent_muvy10b2_ezdyxya -->
+
+- [~] Phone: a question card that is no longer pending still shows Submit; submitting fails with "Request is no longer pending" and the typed answer is lost (owner had already replied). Stale cards must resolve live, and a late answer must reach the agent instead of vanishing <!-- conductor-task:phone-stale-question-card agent=agent_mvd7if7f_kxkulpb -->
+  
+  ![IMG_0386.png](.conductor/prompt-images/99173fc0-f244-4847-952a-b0bd03999109.png)
+
+- [~] Phone Tabs view jumps: with several projects running, the list keeps swapping one project/tab for another so the owner cannot follow what is going on. Make the order stable and updates reliable <!-- conductor-task:phone-tabs-list-jumps agent=agent_mvd7if7f_kxkulpb -->
+  
+  ![IMG_0387.png](.conductor/prompt-images/3ad76cd5-5a7f-44a2-b73c-21611ae0ba6c.png)

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { computeControlPopoverPosition, computeMarkers, type ControlRect } from './AgentControlLinks'
+import { computeControlPopoverPosition, computeMarkers, fitMarkerLabel, MARKER_HEIGHT, MARKER_INSET, type ControlRect } from './AgentControlLinks'
 import type { AgentControlLink } from '../../../shared/agent-control'
 
 const rectOf = (x: number, y: number, width = 80, height = 24): ControlRect => ({ x, y, width, height })
@@ -100,5 +100,38 @@ describe('anchored relationship details', () => {
     const position = computeControlPopoverPosition({ x: 500, y: 42 }, { width: 520, height: 740 })
     expect(position).toEqual({ left: 152, top: 56, width: 360, maxHeight: 300 })
     expect(position.left + position.width).toBeLessThanOrEqual(512)
+  })
+})
+
+describe('role markers fit inside their own tab (a full strip shrinks every tab)', () => {
+  it('spells the role out on a tab with room for it', () => {
+    expect(fitMarkerLabel('controller', true, 1, 168)).toMatchObject({ label: 'MAIN', fit: 'full' })
+    expect(fitMarkerLabel('controller', false, 1, 168)).toMatchObject({ label: 'LEAD', fit: 'full' })
+    expect(fitMarkerLabel('controlled', undefined, 1, 118)).toMatchObject({ label: 'COWORKER', fit: 'full' })
+    expect(fitMarkerLabel('both', true, 1, 140)).toMatchObject({ label: 'COWORKER · MAIN', fit: 'full' })
+  })
+  it('shortens to a letter, then a dot, as the tab narrows', () => {
+    expect(fitMarkerLabel('controlled', undefined, 1, 60)).toMatchObject({ label: 'C', fit: 'short' })
+    expect(fitMarkerLabel('both', false, 1, 100)).toMatchObject({ label: 'C·L', fit: 'short' })
+    expect(fitMarkerLabel('controller', true, 12, 60)).toMatchObject({ label: 'M', fit: 'short' })
+    expect(fitMarkerLabel('controlled', undefined, 1, 30)).toMatchObject({ label: '', fit: 'dot' })
+    expect(fitMarkerLabel('controlled', undefined, 1, 0)).toMatchObject({ fit: 'dot', maxWidth: 0 })
+  })
+  it('caps every marker at its tab width less an inset at each side, whatever the label', () => {
+    for (const width of [0, 24, 60, 84, 102, 118, 168, 226]) {
+      for (const role of ['controller', 'controlled', 'both'] as const) {
+        const fit = fitMarkerLabel(role, true, 3, width)
+        expect(fit.maxWidth).toBeLessThanOrEqual(Math.max(0, width - MARKER_INSET * 2))
+      }
+    }
+  })
+  it('anchors the marker inside the tab: right edge inset, top edge below the tab top', () => {
+    const rect = rectOf(300, 10, 118, 37)
+    const [marker] = computeMarkers([link()], id => id === 'tab-b' ? rect : undefined, titleFor)
+    expect(marker).toMatchObject({ label: 'COWORKER', fit: 'full', x: rect.x + rect.width - MARKER_INSET })
+    // translate(-100%, -50%) of an 11px band along the top edge
+    expect(marker!.y - MARKER_HEIGHT / 2).toBeGreaterThanOrEqual(rect.y)
+    expect(marker!.y + MARKER_HEIGHT / 2).toBeLessThanOrEqual(rect.y + 12)
+    expect(marker!.x - marker!.maxWidth).toBeGreaterThanOrEqual(rect.x)
   })
 })

@@ -7,10 +7,31 @@ import { listGroups } from '../layout/layout-operations'
 import './AgentControlLinks.css'
 
 export type ControlRect = { x: number; y: number; width: number; height: number }
-export type ControlMarker = { id: string; tabId: string; role: 'controller' | 'controlled' | 'both'; x: number; y: number; color: string; title: string; count: number; main?: boolean }
+export type ControlRole = 'controller' | 'controlled' | 'both'
+export type MarkerFit = 'full' | 'short' | 'dot'
+export type ControlMarker = { id: string; tabId: string; role: ControlRole; x: number; y: number; color: string; title: string; count: number; main?: boolean; label: string; fit: MarkerFit; maxWidth: number }
 export type ControlPopoverPosition = { left: number; top: number; width: number; maxHeight: number }
 const MARKER_PALETTE = ['--accent', '--blue', '--accent-muted']
 const hashIndex = (id: string, mod: number): number => { let hash = 0; for (let i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) >>> 0; return hash % mod }
+/** A marker keeps this far from both edges of its own tab. */
+export const MARKER_INSET = 6
+/** The marker is a band along its tab's top edge (AgentControlLinks.css), above the tab's content. */
+export const MARKER_HEIGHT = 11
+// Rendered width at the 6.5px label font: letters, plus icon, padding, gap and border, plus the count.
+const markerWidth = (label: string, counted: boolean): number => label.length * 5.2 + 21 + (counted ? 14 : 0)
+/** The widest role label that fits inside a tab this wide: MAIN/COWORKER, then M/C, then a dot.
+ *  A full strip shrinks every tab to its minimum, and a marker wider than its tab used to cover
+ *  the neighbouring tab's title. */
+export function fitMarkerLabel(role: ControlRole, main: boolean | undefined, count: number, tabWidth: number): Pick<ControlMarker, 'label' | 'fit' | 'maxWidth'> {
+  const lead = main === false ? 'LEAD' : 'MAIN'
+  const full = role === 'controller' ? lead : role === 'controlled' ? 'COWORKER' : `COWORKER · ${lead}`
+  const short = role === 'controller' ? lead[0]! : role === 'controlled' ? 'C' : `C·${lead[0]}`
+  const maxWidth = Math.max(0, Math.floor(tabWidth - MARKER_INSET * 2))
+  const counted = role !== 'controlled' && count > 1
+  if (markerWidth(full, counted) <= maxWidth) return { label: full, fit: 'full', maxWidth }
+  if (markerWidth(short, counted) <= maxWidth) return { label: short, fit: 'short', maxWidth }
+  return { label: '', fit: 'dot', maxWidth }
+}
 // One labelled relationship marker per tab replaces the old pile of anonymous dots.
 export function computeMarkers(links: AgentControlLink[], rectFor: (id: string) => ControlRect | undefined, titleFor: (id: string, remote?: string) => string, mainTabId?: string | null): ControlMarker[] {
   const tabIds = [...new Set(links.flatMap(link => [link.controllerTabId, link.controlledTabId]))]
@@ -35,7 +56,9 @@ export function computeMarkers(links: AgentControlLink[], rectFor: (id: string) 
     const identity = related[0]?.targetAgentSessionId ?? tabId
     // One MAIN per workspace (workspace clarity): any other controller leads its own coworkers.
     const main = mainTabId === undefined || mainTabId === tabId
-    return [{ id: `${tabId}:${role}`, tabId, role, main, x: rect.x + rect.width - 8, y: rect.y + 7, color: MARKER_PALETTE[hashIndex(identity, MARKER_PALETTE.length)] ?? '--accent', title, count }]
+    // Anchored by its right edge and vertical centre (translate(-100%, -50%)): its top edge sits
+    // 1px inside the tab, above the title, which .has-control-markers moves down to make room.
+    return [{ id: `${tabId}:${role}`, tabId, role, main, x: rect.x + rect.width - MARKER_INSET, y: rect.y + 1 + MARKER_HEIGHT / 2, color: MARKER_PALETTE[hashIndex(identity, MARKER_PALETTE.length)] ?? '--accent', title, count, ...fitMarkerLabel(role, main, count, rect.width) }]
   })
 }
 
@@ -107,7 +130,7 @@ export function AgentControlLinks({ projectId, sessionId, layout, mainTabId }: {
       const container = header?.closest<HTMLElement>('.pane-tabs')
       if (!container) return null
       const bounds = container.getBoundingClientRect()
-      return createPortal(<button type="button" key={marker.id} className={'agent-control-marker ' + marker.role} style={{ left: marker.x - bounds.left + container.scrollLeft, top: marker.y - bounds.top + container.scrollTop, color: 'var(' + marker.color + ')', borderColor: 'var(' + marker.color + ')' }} title={`${marker.title}. Select for relationship details.`} aria-label={`${marker.title}; show relationship details`} aria-expanded={openMarkerTabId === marker.tabId} onClick={() => setOpenMarkerTabId(current => current === marker.tabId ? null : marker.tabId)}><span aria-hidden="true">{marker.role === 'controlled' ? <Link2 size={8} /> : <Radio size={8} />}</span><b>{marker.role === 'controller' ? (marker.main === false ? 'LEAD' : 'MAIN') : marker.role === 'controlled' ? 'COWORKER' : marker.main === false ? 'COWORKER · LEAD' : 'COWORKER · MAIN'}</b>{marker.role !== 'controlled' && marker.count > 1 && <em>{marker.count}</em>}</button>, container, marker.id)
+      return createPortal(<button type="button" key={marker.id} data-marker-tab-id={marker.tabId} className={`agent-control-marker ${marker.role} ${marker.fit}`} style={{ left: marker.x - bounds.left + container.scrollLeft, top: marker.y - bounds.top + container.scrollTop, maxWidth: marker.maxWidth, color: 'var(' + marker.color + ')', borderColor: 'var(' + marker.color + ')' }} title={`${marker.title}. Select for relationship details.`} aria-label={`${marker.title}; show relationship details`} aria-expanded={openMarkerTabId === marker.tabId} onClick={() => setOpenMarkerTabId(current => current === marker.tabId ? null : marker.tabId)}>{marker.fit !== 'dot' && <><span aria-hidden="true">{marker.role === 'controlled' ? <Link2 size={8} /> : <Radio size={8} />}</span><b>{marker.label}</b>{marker.role !== 'controlled' && marker.count > 1 && <em>{marker.count}</em>}</>}</button>, container, marker.id)
     })}
     {openMarker && popoverPosition && <div className="agent-control-popover" role="dialog" aria-label={`Agent tab relationships for ${titleFor(openMarker.tabId)}`} style={popoverPosition}>
       <header><Link2 size={12} aria-hidden="true" /><strong>{openMarker.role === 'controller' ? 'Main coordinator' : openMarker.role === 'controlled' ? 'Coworker' : 'Coworker and main coordinator'}</strong><button type="button" aria-label="Close agent tab relationships" title="Close relationship details" onClick={() => setOpenMarkerTabId(null)}><X size={12} /></button></header>

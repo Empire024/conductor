@@ -1,6 +1,8 @@
 /* Workspace clarity in the tab strip (src/shared/workspace-clarity.ts): chips keep enough title
    to tell tabs apart; secondary icons give way first, and what has no room goes to "+N". */
-.pane-tabs .pane-tab { min-width: 118px; }
+/* Nothing a tab holds paints over its neighbour: horizontal clip only, so the active rail's glow
+   and the bottom seam still reach past the top and bottom edges. */
+.pane-tabs .pane-tab { min-width: 118px; overflow-x: clip; }
 .pane-tabs .pane-tab > .pane-tab-title { min-width: 52px; }
 .pane-tabs .pane-tab:not(.active) .tab-limit-continuation,
 .pane-tabs .pane-tab:not(.active) .pane-tab-anonymous { display: none; }

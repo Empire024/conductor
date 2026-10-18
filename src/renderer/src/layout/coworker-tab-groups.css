@@ -1,4 +1,7 @@
-.coworker-tab-group { display: flex; align-items: stretch; min-width: 0; }
+/* No min-width:0 here: like .tab-group, the group's automatic min-content floor is what keeps its
+   tabs at their own min-width inside it. With it, a full strip squeezed the group below its tabs
+   and they spilled over the next ones, MAIN/COWORKER markers and all. */
+.coworker-tab-group { display: flex; align-items: stretch; }
 .coworker-tab-group.collapsed { flex: 0 0 auto; border-radius: 5px; background: color-mix(in srgb, var(--blue) 7%, transparent); }
 .coworker-tab-group.collapsed .pane-tab { max-width: 150px; }
 .coworker-tab-group.collapsed .pane-tab.active { max-width: 175px; }
