@@ -1970,6 +1970,8 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
   
   ![IMG_0386.png](.conductor/prompt-images/99173fc0-f244-4847-952a-b0bd03999109.png)
 
+- [x] Desktop question card that closes while the owner is typing an answer drops the draft (follow-up of phone-stale-question-card, which covers a late Submit and the phone). Keep the typed text with Send as message / Discard, like the phone <!-- conductor-task:desktop-stale-question-draft agent=agent_mvdlfzp1_qzvskgr -->
+
 - [x] Phone Tabs view jumps: with several projects running, the list keeps swapping one project/tab for another so the owner cannot follow what is going on. Make the order stable and updates reliable <!-- conductor-task:phone-tabs-list-jumps agent=agent_mvd7if7f_kxkulpb -->
   
   ![IMG_0387.png](.conductor/prompt-images/3ad76cd5-5a7f-44a2-b73c-21611ae0ba6c.png)

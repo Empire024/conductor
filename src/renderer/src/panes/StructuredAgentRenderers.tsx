@@ -439,13 +439,23 @@ export function readableAnswerValue(value: string): string {
 }
 function InteractionCard({ item, interactive, onRespond, dockedQuestion, onDockQuestion }: ActivityProps): React.JSX.Element | null {
   const [submittedAnswers, setSubmittedAnswers] = useState<Record<string, string[]> | null>(null)
+  // The answer being typed lives with the row, not the form: a question that closes mid-answer
+  // (answered in the conversation, expired with its turn, its runtime restarted) keeps it.
+  const [draft, setDraft] = useState<QuestionDraft>(emptyQuestionDraft)
+  const [late, setLate] = useState<'open' | 'sent' | 'discarded'>('open')
   if (item.data.type !== 'interaction') return null
   const request: PendingInteraction = item.data.interaction
-  if (request.status === 'pending' && interactive) return <PendingInteractionForm item={item} request={request} docked={Boolean(dockedQuestion)} onDock={onDockQuestion} onRespond={async (target, decision, answers) => {
+  if (request.status === 'pending' && interactive) return <PendingInteractionForm item={item} request={request} docked={Boolean(dockedQuestion)} onDock={onDockQuestion} draft={draft} onDraft={setDraft} onRespond={async (target, decision, answers) => {
     if (answers) setSubmittedAnswers(answers)
-    await onRespond(target, decision, answers)
+    try { await onRespond(target, decision, answers) }
+    catch (reason) { setSubmittedAnswers(null); throw reason }
   }} />
   const questions = request.questions ?? []
+  // Closed with an unsent answer: offer it to the agent as a message. The host sends it with a
+  // note that the question had closed (structured-sessions deliverLateAnswer), never as a second
+  // answer to a question a card already answered.
+  if (closedQuestionKeepsDraft(request, interactive, draft, late, submittedAnswers)) return <PendingInteractionForm item={item} request={request} docked={false} draft={draft} onDraft={setDraft}
+    onDiscard={() => setLate('discarded')} onRespond={async (target, decision, answers) => { await onRespond(target, decision, answers); setLate('sent') }} />
   // A question's own row IS the interaction: once answered, its collapsed heading names the
   // question that was actually asked instead of repeating the generic, now-stale "needs your
   // input" prompt, and its body reads as question/answer text instead of a raw request dump.
@@ -455,6 +465,7 @@ function InteractionCard({ item, interactive, onRespond, dockedQuestion, onDockQ
     <summary><span>{heading}</span><small>{status}</small></summary>
     <div className="sa-interaction-detail">
       {(request.status === 'expired' || request.outcome === 'Delivery unconfirmed' || request.outcome === ANSWERED_IN_CONVERSATION) && request.outcome && <p>{request.outcome === 'Delivery unconfirmed' ? 'Answer delivery was not confirmed. Check the conversation before sending it again.' : request.outcome}</p>}
+      {late === 'sent' && <p>Your answer was sent to the agent as a message, because the question had closed.</p>}
       {request.kind === 'question' && questions.length
         ? <dl className="sa-question-answers">{questions.map((question) => {
           // The provider records answers by question text on the resolved interaction, so a
@@ -479,24 +490,44 @@ export function combinedQuestionAnswer(question: InputQuestion, selected: string
   if (!customSelected || !text) return selected
   return question.multiSelect ? [...selected, text] : [text]
 }
+/** What the owner picked or typed in a question card, per question id. */
+export interface QuestionDraft { answers: Record<string, string[]>; custom: Record<string, string>; customSelected: Record<string, boolean> }
+export const emptyQuestionDraft: QuestionDraft = { answers: {}, custom: {}, customSelected: {} }
+export const draftAnswer = (question: InputQuestion, draft: QuestionDraft): string[] =>
+  combinedQuestionAnswer(question, draft.answers[question.id] ?? [], Boolean(draft.customSelected[question.id]), draft.custom[question.id] ?? '')
+/** The answers a closed question can still send: only the questions that have one, because a late
+ *  answer goes to the agent as a message and need not be complete. */
+export function lateQuestionAnswers(questions: InputQuestion[], draft: QuestionDraft): Record<string, string[]> {
+  return Object.fromEntries(questions.flatMap((question) => { const answer = draftAnswer(question, draft); return answer.length ? [[question.id, answer]] : [] }))
+}
+/** A question card that can no longer be answered - resolved, expired, or left behind by a runtime
+ *  that restarted - but holds an answer the owner had not sent, and has not sent or discarded it. */
+export function closedQuestionKeepsDraft(request: PendingInteraction, interactive: boolean, draft: QuestionDraft, late: 'open' | 'sent' | 'discarded', submitted: Record<string, string[]> | null): boolean {
+  if (request.kind !== 'question' || late !== 'open' || submitted || request.status === 'pending' && interactive) return false
+  return Object.keys(lateQuestionAnswers(request.questions ?? [], draft)).length > 0
+}
 /** A live request asks one question at a time rather than stacking them all, and pins itself to
  *  the bottom of the conversation while the pane is tall enough to still read the transcript
- *  behind it; on a short pane it stays inline where it was written. */
-function PendingInteractionForm({ item, request, docked, onDock, onRespond }: { item: TimelineItem; request: PendingInteraction; docked: boolean; onDock?: ActivityProps['onDockQuestion']; onRespond: ActivityProps['onRespond'] }): React.JSX.Element {
-  const [answers, setAnswers] = useState<Record<string, string[]>>({})
-  const [custom, setCustom] = useState<Record<string, string>>({})
-  const [customSelected, setCustomSelected] = useState<Record<string, boolean>>({})
+ *  behind it; on a short pane it stays inline where it was written. With onDiscard it is a question
+ *  that closed while being answered: every question shows at once, and the answer goes to the
+ *  agent as a message or is discarded. */
+export function PendingInteractionForm({ item, request, docked, onDock, draft, onDraft, onDiscard, onRespond }: { item: TimelineItem; request: PendingInteraction; docked: boolean; onDock?: ActivityProps['onDockQuestion']; draft: QuestionDraft; onDraft(update: (draft: QuestionDraft) => QuestionDraft): void; onDiscard?(): void; onRespond: ActivityProps['onRespond'] }): React.JSX.Element {
+  const { answers, custom, customSelected } = draft
+  const setAnswers = (update: (value: QuestionDraft['answers']) => QuestionDraft['answers']): void => onDraft((value) => ({ ...value, answers: update(value.answers) }))
+  const setCustom = (update: (value: QuestionDraft['custom']) => QuestionDraft['custom']): void => onDraft((value) => ({ ...value, custom: update(value.custom) }))
+  const setCustomSelected = (update: (value: QuestionDraft['customSelected']) => QuestionDraft['customSelected']): void => onDraft((value) => ({ ...value, customSelected: update(value.customSelected) }))
+  const closed = Boolean(onDiscard)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [step, setStep] = useState(0)
   const [pinned, setPinned] = useState(false)
   const form = useRef<HTMLFormElement>(null)
   const questions = request.questions ?? []
-  const stepped = request.kind === 'question' && questions.length > 1
+  const stepped = !closed && request.kind === 'question' && questions.length > 1
   const current = Math.min(step, Math.max(0, questions.length - 1))
-  const finalAnswer = (question: InputQuestion): string[] => combinedQuestionAnswer(question, answers[question.id] ?? [], Boolean(customSelected[question.id]), custom[question.id] ?? '')
+  const finalAnswer = (question: InputQuestion): string[] => draftAnswer(question, draft)
   const answered = (question: InputQuestion): boolean => finalAnswer(question).length > 0
-  const unanswered = questions.some((question) => !answered(question))
+  const unanswered = closed ? !questions.some(answered) : questions.some((question) => !answered(question))
   const lastStep = !stepped || current === questions.length - 1
   useLayoutEffect(() => {
     const element = form.current
@@ -512,22 +543,23 @@ function PendingInteractionForm({ item, request, docked, onDock, onRespond }: { 
   const respond = async (decision?: string): Promise<void> => {
     if (busy || request.kind === 'question' && unanswered) return
     setBusy(true)
-    try { await onRespond(item, decision, request.kind === 'question' ? Object.fromEntries(questions.map((question) => [question.id, finalAnswer(question)])) : undefined) }
+    try { await onRespond(item, decision, request.kind !== 'question' ? undefined : closed ? lateQuestionAnswers(questions, draft) : Object.fromEntries(questions.map((question) => [question.id, finalAnswer(question)]))) }
     catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); setBusy(false) }
   }
   const proceed = (): void => {
     if (lastStep) { void respond(); return }
     if (answered(questions[current]!)) setStep(current + 1)
   }
-  if (docked && request.kind === 'question') return <form ref={form} className="sa-interaction sa-interaction-docked" aria-label={'Question dock: ' + request.title}>
+  if (docked && !closed && request.kind === 'question') return <form ref={form} className="sa-interaction sa-interaction-docked" aria-label={'Question dock: ' + request.title}>
     <div className="sa-question-dock"><span><strong>{request.title}</strong><small>Question waiting — answers are preserved.</small></span><button type="button" aria-label="Reopen question" title="Reopen question" onClick={() => onDock?.(item.id, false)}><ChevronUp size={14} /></button></div>
   </form>
-  return <form ref={form} className={'sa-interaction needs-attention' + (pinned ? ' sa-interaction-pinned' : '')} aria-label={request.kind + ': ' + request.title} onSubmit={event => { event.preventDefault(); proceed() }} onKeyDown={event => {
+  return <form ref={form} className={'sa-interaction needs-attention' + (closed ? ' sa-interaction-closed' : '') + (pinned ? ' sa-interaction-pinned' : '')} aria-label={(closed ? 'closed question' : request.kind) + ': ' + request.title} onSubmit={event => { event.preventDefault(); proceed() }} onKeyDown={event => {
     if (request.kind !== 'question' || event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing || !(event.target instanceof HTMLInputElement)) return
     event.preventDefault(); event.stopPropagation(); proceed()
   }}>
-    <header><strong>{request.title}</strong><small>{stepped ? 'Question ' + (current + 1) + ' of ' + questions.length : request.kind === 'question' ? 'Choose an answer' : 'Review and continue'}</small>{request.kind === 'question' && <button type="button" className="sa-question-collapse" aria-label="Collapse question to bottom dock" title="Collapse to bottom dock" onClick={() => onDock?.(item.id, true)}><X size={13} /></button>}</header>
-    {request.review && <p role="status">{request.review.phase === 'owner' ? 'The stronger review escalated this to you' : request.review.phase === 'reviewing' ? 'Stronger-model review in progress; you can also answer now' : request.review.phase === 'paused' ? 'Stronger-model review did not run, so this is your decision' : request.review.phase === 'blocked' ? 'Stronger-model review cannot approve this, so this is your decision' : request.review.phase.replaceAll('-', ' ')}{request.review.reviewerModel ? ` · ${request.review.reviewerModel}` : ''}: {request.review.rationale}</p>}
+    <header><strong>{request.title}</strong><small>{closed ? 'Question closed' : stepped ? 'Question ' + (current + 1) + ' of ' + questions.length : request.kind === 'question' ? 'Choose an answer' : 'Review and continue'}</small>{request.kind === 'question' && !closed && <button type="button" className="sa-question-collapse" aria-label="Collapse question to bottom dock" title="Collapse to bottom dock" onClick={() => onDock?.(item.id, true)}><X size={13} /></button>}</header>
+    {closed && <p role="status">This question closed before your answer was sent. Send it to the agent as a message, or discard it.</p>}
+    {request.review && !closed && <p role="status">{request.review.phase === 'owner' ? 'The stronger review escalated this to you' : request.review.phase === 'reviewing' ? 'Stronger-model review in progress; you can also answer now' : request.review.phase === 'paused' ? 'Stronger-model review did not run, so this is your decision' : request.review.phase === 'blocked' ? 'Stronger-model review cannot approve this, so this is your decision' : request.review.phase.replaceAll('-', ' ')}{request.review.reviewerModel ? ` · ${request.review.reviewerModel}` : ''}: {request.review.rationale}</p>}
     {stepped && <ol className="sa-question-steps" aria-hidden="true">{questions.map((question, index) => <li key={question.id} className={index === current ? 'current' : answered(question) ? 'done' : ''} />)}</ol>}
     {request.kind === 'approval' && <p className="sa-request-summary">{typeof record(request.input).description === 'string' ? String(record(request.input).description) : typeof record(request.input).command === 'string' ? commandSummary(String(record(request.input).command)) : typeof record(request.input).file_path === 'string' ? String(record(request.input).file_path) : ''}</p>}
     {(stepped ? questions.slice(current, current + 1) : questions).map((question) => <fieldset key={question.id} disabled={busy}>
@@ -559,8 +591,9 @@ function PendingInteractionForm({ item, request, docked, onDock, onRespond }: { 
     <div className="sa-interaction-actions">{request.kind === 'question'
       ? <>
         {stepped && current > 0 && <button type="button" className="sa-step-back" disabled={busy} onClick={() => setStep(current - 1)}>Back</button>}
+        {closed && <button type="button" disabled={busy} onClick={onDiscard}>Discard</button>}
         {lastStep
-          ? <button type="submit" disabled={busy || unanswered}>Submit answers</button>
+          ? <button type="submit" disabled={busy || unanswered}>{closed ? 'Send as message' : 'Submit answers'}</button>
           : <button type="submit" disabled={busy || !answered(questions[current]!)}>Next question</button>}
       </>
       : request.choices.map((choice) => <button type="button" key={choice.id} disabled={busy || choice.disabled} title={choice.description} onClick={() => void respond(choice.id)}>{choice.label}</button>)}</div>

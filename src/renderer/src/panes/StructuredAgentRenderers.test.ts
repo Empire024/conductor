@@ -2,7 +2,8 @@ import { createElement, type ComponentProps } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import type { AgentEventData, InputQuestion, PendingInteraction, TimelineItem } from '../../../shared/structured-agent'
-import { activityCoalesceTarget, coalescedEditLabel, coalescedEditSummary, combinedQuestionAnswer, commandSummary, groupConversationActivities, interactionOutcome, isAnsweredThroughInteraction, isConversationActivity, isRuntimeHeartbeat, legacyAttachedContext, parentLabelAnchors, readableAnswerValue, rendererKind, safeExternalLink, safeFileTarget, StructuredActivity, StructuredMarkdown, toolInlinePreview, toolPresentation } from './StructuredAgentRenderers'
+import { ANSWERED_IN_CONVERSATION } from '../../../shared/structured-agent'
+import { activityCoalesceTarget, closedQuestionKeepsDraft, coalescedEditLabel, coalescedEditSummary, combinedQuestionAnswer, commandSummary, draftAnswer, emptyQuestionDraft, lateQuestionAnswers, PendingInteractionForm, type QuestionDraft, groupConversationActivities, interactionOutcome, isAnsweredThroughInteraction, isConversationActivity, isRuntimeHeartbeat, legacyAttachedContext, parentLabelAnchors, readableAnswerValue, rendererKind, safeExternalLink, safeFileTarget, StructuredActivity, StructuredMarkdown, toolInlinePreview, toolPresentation } from './StructuredAgentRenderers'
 
 const cwd = 'C:\\work\\My project'
 function renderActivity(data: AgentEventData, expanded = true, overrides: Partial<ComponentProps<typeof StructuredActivity>> = {}): string {
@@ -552,4 +553,57 @@ it('keeps a drive-path link clickable instead of blanking its href, and still dr
     expect(render(target)).toContain('<a href="#">render</a>')
   }
   expect(render('/C:/elsewhere/secret.png')).toBe('<div class="sa-markdown"><p><span>render</span></p></div>')
+})
+
+describe('a desktop question card that closes while its answer is typed (desktop-stale-question-draft)', () => {
+  const questions: InputQuestion[] = [
+    { id: 'look', question: 'Which look?', options: [{ label: 'A' }, { label: 'B' }], allowCustom: true },
+    { id: 'hook', question: 'What are the hook words?', options: [], allowCustom: true }
+  ]
+  const asked = (status: PendingInteraction['status'], outcome?: string): PendingInteraction => ({ id: 'q', kind: 'question', title: 'Codex asked you', status, input: {}, choices: [], questions, ...(outcome ? { outcome } : {}) })
+  const typed: QuestionDraft = { answers: {}, custom: { look: 'Night, handheld' }, customSelected: { look: true } }
+
+  it('keeps an unsent answer once the request can no longer be answered, however it closed', () => {
+    expect(closedQuestionKeepsDraft(asked('pending'), true, typed, 'open', null)).toBe(false)
+    expect(closedQuestionKeepsDraft(asked('expired'), true, typed, 'open', null)).toBe(true)
+    expect(closedQuestionKeepsDraft(asked('resolved', ANSWERED_IN_CONVERSATION), true, typed, 'open', null)).toBe(true)
+    // Still pending in the journal, but asked by a runtime that is gone.
+    expect(closedQuestionKeepsDraft(asked('pending'), false, typed, 'open', null)).toBe(true)
+  })
+  it('keeps nothing when nothing was typed, it was sent or discarded, this card answered it, or it is an approval', () => {
+    expect(closedQuestionKeepsDraft(asked('expired'), true, emptyQuestionDraft, 'open', null)).toBe(false)
+    expect(closedQuestionKeepsDraft(asked('expired'), true, { answers: {}, custom: { look: '  ' }, customSelected: { look: true } }, 'open', null)).toBe(false)
+    expect(closedQuestionKeepsDraft(asked('expired'), true, typed, 'sent', null)).toBe(false)
+    expect(closedQuestionKeepsDraft(asked('expired'), true, typed, 'discarded', null)).toBe(false)
+    expect(closedQuestionKeepsDraft(asked('resolved', 'answered'), true, typed, 'open', { look: ['Night, handheld'] })).toBe(false)
+    expect(closedQuestionKeepsDraft({ ...asked('expired'), kind: 'approval', questions: undefined }, true, typed, 'open', null)).toBe(false)
+  })
+  it('sends only the questions that have an answer, with the Other text as the answer', () => {
+    expect(lateQuestionAnswers(questions, typed)).toEqual({ look: ['Night, handheld'] })
+    expect(lateQuestionAnswers(questions, { answers: { look: ['B'] }, custom: { hook: 'Pump it' }, customSelected: {} })).toEqual({ look: ['B'], hook: ['Pump it'] })
+    expect(draftAnswer(questions[0]!, typed)).toEqual(['Night, handheld'])
+  })
+  it('renders the kept answer as a closed card offering Send as message and Discard, every question at once', () => {
+    const item: TimelineItem = { id: 'item', runtimeId: 'runtime', sequence: 1, timestamp: '2026-09-07T00:00:00Z', data: { type: 'interaction', interaction: asked('expired') } }
+    const html = renderToStaticMarkup(createElement(PendingInteractionForm, { item, request: asked('expired'), docked: true, draft: typed, onDraft: vi.fn(), onDiscard: vi.fn(), onRespond: vi.fn(async () => {}) }))
+    expect(html).toContain('sa-interaction-closed')
+    expect(html).toContain('Question closed')
+    expect(html).toContain('closed before your answer was sent')
+    expect(html).toContain('value="Night, handheld"')
+    expect(html).toContain('Send as message')
+    expect(html).toContain('Discard')
+    // Not stepped and never docked: both questions show, and there is no dock to collapse into.
+    expect(html).toContain('Which look?')
+    expect(html).toContain('What are the hook words?')
+    expect(html).not.toContain('sa-interaction-docked')
+    expect(html).not.toContain('Collapse question')
+    expect(html).not.toContain('Submit answers')
+  })
+  it('an open card is the same form, filled from the kept draft', () => {
+    const item: TimelineItem = { id: 'item', runtimeId: 'runtime', sequence: 1, timestamp: '2026-09-07T00:00:00Z', data: { type: 'interaction', interaction: asked('pending') } }
+    const html = renderToStaticMarkup(createElement(PendingInteractionForm, { item, request: asked('pending'), docked: false, draft: typed, onDraft: vi.fn(), onRespond: vi.fn(async () => {}) }))
+    expect(html).toContain('value="Night, handheld"')
+    expect(html).toContain('Question 1 of 2')
+    expect(html).not.toContain('Send as message')
+  })
 })
