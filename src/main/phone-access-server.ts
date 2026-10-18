@@ -23,6 +23,7 @@ import { isPhoneOs, type PhoneDevice, type PhoneHealth, type PhoneLockState } fr
 import type { TailscaleState } from '../shared/remote-control'
 import { localAddresses } from './network-addresses'
 import { PhoneAccessError, type PhoneAccessService, type PhoneListenerStatus, type PhoneTailnetDetail } from './phone-access'
+import { PhoneFiles } from './phone-files'
 import { PHONE_ICON_SIZES, renderPhoneIcon } from './phone-icon'
 import { PHONE_LOCK_MAX_FAILURES, PhoneLockError } from './phone-lock'
 import { PhoneTerminalError, PhoneTerminals, type PhoneTerminalEvent, type PhoneTerminalRuntime } from './phone-terminal'
@@ -171,6 +172,8 @@ export class PhoneAccessServer {
   private renewTimer: ReturnType<typeof setInterval> | null = null
   private status: PhoneListenerStatus = { listening: false, endpoints: [], message: null, tailscaleCertificate: 'off', tailscaleMessage: null, tailscaleAddress: null, tailscaleDnsName: null }
   private readonly terminals: PhoneTerminals | null
+  /** Project files for the phone: listed through the API, read through capabilities. */
+  readonly files: PhoneFiles
   private readonly routes: PhoneRoute[]
   private readonly openStreams = new Set<OpenStream>()
   private readonly offLocked: () => void
@@ -183,9 +186,13 @@ export class PhoneAccessServer {
       machineName: () => service.machineName(),
       audit: line => service.audit(line)
     }) : null
+    // A capability reads only while its phone could still call /api/state: unlocked when a code
+    // is set. Lock events revoke it too; this check covers the moment between them.
+    this.files = new PhoneFiles({ alive: capability => !service.lock.configured() || (capability.unlockId !== null && service.lock.unlocked(capability.deviceId)) })
     this.routes = this.buildRoutes()
-    // A phone that locks loses its streams and its shells in the same moment.
+    // A phone that locks loses its streams, its shells and its file links in the same moment.
     this.offLocked = service.onLocked((deviceId, unlockId) => {
+      this.files.revoke(deviceId, unlockId)
       if (deviceId === null) { this.terminals?.dispose('phone code changed'); this.closeStreams(null, null); return }
       if (unlockId === null) this.terminals?.deviceRemoved(deviceId)
       else this.terminals?.locked(deviceId, unlockId)
@@ -388,6 +395,7 @@ export class PhoneAccessServer {
 
   async stop(): Promise<void> {
     ++this.intent
+    this.files.clear()
     this.terminals?.dispose('phone access switched off')
     await this.stopSocket()
     this.publish({ listening: false, endpoints: [], message: null, tailscaleCertificate: 'off', tailscaleMessage: null, tailscaleAddress: null, tailscaleDnsName: null })
@@ -396,6 +404,7 @@ export class PhoneAccessServer {
   async dispose(): Promise<void> {
     if (this.renewTimer) { clearInterval(this.renewTimer); this.renewTimer = null }
     this.offLocked()
+    this.files.clear()
     this.terminals?.dispose()
     await this.stop()
   }
@@ -427,6 +436,8 @@ export class PhoneAccessServer {
     const projectTasks = /^\/api\/projects\/([^/]+)\/tasks$/
     const projectImages = /^\/api\/projects\/([^/]+)\/images$/
     const sessionImages = /^\/api\/sessions\/([^/]+)\/images$/
+    const projectFiles = /^\/api\/projects\/([^/]+)\/files$/
+    const projectFileCapability = /^\/api\/projects\/([^/]+)\/files\/capability$/
     const terminal = (action: string): RegExp => new RegExp(`^/api/terminal/([^/]+)/${action}$`)
     return [
       { method: 'GET', path: '/api/me', sample: '/api/me', run: ctx => service.self(ctx.device.id) },
@@ -445,6 +456,10 @@ export class PhoneAccessServer {
       // is the attachment a task or a message then names.
       { method: 'POST', path: projectImages, sample: '/api/projects/project-a/images', run: async ctx => service.importProjectImage(ctx.params[0]!, ctx.query.get('name'), await this.imageBytes(ctx)) },
       { method: 'POST', path: sessionImages, sample: '/api/sessions/session-a/images', run: async ctx => service.importSessionImage(ctx.params[0]!, ctx.query.get('name'), await this.imageBytes(ctx)) },
+      // A project's files, read-only: a folder's listing, and a capability whose URL serves that
+      // folder's files at /files/<capability>/ (src/main/phone-files.ts).
+      { method: 'GET', path: projectFiles, sample: '/api/projects/project-a/files', run: ctx => this.files.list(service.fileRoot(ctx.params[0]).path, ctx.query.get('path') ?? '') },
+      { method: 'POST', path: projectFileCapability, sample: '/api/projects/project-a/files/capability', run: ctx => this.files.grant(service.fileRoot(ctx.params[0]).path, ctx.body.path ?? '', { deviceId: ctx.device.id, unlockId: ctx.unlock?.id ?? null }) },
       { method: 'POST', path: '/api/push/subscribe', sample: '/api/push/subscribe', run: ctx => { service.setSubscription(ctx.device.id, ctx.body.subscription); return { ok: true } } },
       { method: 'POST', path: '/api/push/unsubscribe', sample: '/api/push/unsubscribe', run: ctx => { service.setSubscription(ctx.device.id, null); return { ok: true } } },
       { method: 'POST', path: '/api/push/test', sample: '/api/push/test', run: async ctx => ({ ok: true, ...await service.testNotification(ctx.device.id) }) },
@@ -512,6 +527,9 @@ export class PhoneAccessServer {
         // is dropped unread and sent to the screen that explains the share did not come through.
         if (url.pathname === '/share' && method === 'POST') { request.resume(); response.writeHead(303, { Location: '/#/share', 'Cache-Control': 'no-store' }); response.end(); return }
         if (method !== 'GET' && method !== 'HEAD') { reply(405, { error: 'Method not allowed' }, { Allow: 'GET, HEAD' }); request.resume(); return }
+        // A project file, by a capability that was minted behind the bearer token and the lock
+        // and dies with them; without a live one this is a 404 (src/main/phone-files.ts).
+        if (url.pathname.startsWith('/files/')) { await this.files.serve(url.pathname, url.searchParams, request, response); return }
         if (url.pathname === '/ca.crt') {
           const authority = this.deps.service.certificateAuthority()
           response.writeHead(200, { 'Content-Type': 'application/x-x509-ca-cert', 'Content-Disposition': 'attachment; filename="conductor-phone-ca.crt"', 'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff' })

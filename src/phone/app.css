@@ -1854,3 +1854,19 @@ a.login-link { display: block; text-align: center; text-decoration: none; paddin
 .login-code-input { width: 100%; box-sizing: border-box; font: inherit; font-family: ui-monospace, monospace; padding: 12px; border-radius: 12px; border: 1px solid var(--line, rgba(127, 127, 127, 0.35)); background: var(--surface-2, transparent); color: var(--text); }
 .login-start, .login-token, .login-codex, .login-submit, .login-cancel { width: 100%; margin-top: 8px; }
 .login-banner { border-color: var(--attention, #e5534b); }
+
+/* Project files (src/main/phone-files.ts): folders as rows, files as cards with a thumbnail for
+   images, Open and Download links. A thumbnail grows in place on tap. */
+.files-crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.files-crumbs .chip { min-height: 36px; padding: 6px 12px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.files-crumb-sep { color: var(--text-3); font-size: 13px; }
+.files-list { display: flex; flex-direction: column; gap: 8px; }
+.files-dir { min-height: 52px; }
+.files-dir svg { flex: 0 0 auto; color: var(--accent); }
+.files-file { display: flex; flex-direction: column; gap: 6px; margin: 0; }
+.files-name { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.files-thumb { display: block; width: 100%; max-height: 180px; object-fit: contain; border-radius: 10px; background: var(--surface-2); cursor: zoom-in; }
+.files-thumb.expanded { max-height: none; cursor: zoom-out; }
+.files-actions { display: flex; gap: 8px; }
+a.files-action { flex: 1; display: inline-flex; align-items: center; justify-content: center; text-decoration: none; }
+.files-open { margin-top: -6px; }

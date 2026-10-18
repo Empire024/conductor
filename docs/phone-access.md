@@ -73,6 +73,12 @@ certificate for everything but that one name, so a phone that trusts the authori
   expensive right now, the runtimes Conductor has open, and the provider usage windows (weekly and
   short) as the providers last reported them.
 - **Phone**: the phone's own name, notifications on/off with a test button, and unpair.
+- **Files**: a project's folders and files, read-only, so output an agent wrote on this computer can
+  be looked at from anywhere. Reached from **Files** beside a project's name in Tabs, **Browse
+  files** on Tasks, or More > Project files. Folders are rows with a breadcrumb back up; images show
+  as thumbnails that grow on tap; every file has **Open** (an HTML page opens in a new browser tab
+  with its relative images, styles and scripts working) and **Download**. Only projects on this
+  computer can be browsed; a project on a paired machine says so.
 
 ### Images from the phone
 
@@ -137,9 +143,32 @@ While the app is open, the same events arrive over its live stream as an in-app 
   its own.
 - Pairing codes are single-use, expire in ten minutes, use an alphabet without look-alike characters,
   and an address that fails five times is ignored for ten minutes.
-- The listener serves the app shell and the API and nothing else: no files, no shell, no arbitrary
-  paths. What a phone can do is exactly what the desktop composer can do to a conversation, plus
-  opening a tab the way the launcher does.
+- The listener serves the app shell, the API and, read-only, the files of projects on this computer
+  (`src/main/phone-files.ts`), and nothing else: no arbitrary paths. Apart from those files, what a
+  phone can do is what the desktop composer can do to a conversation, plus opening a tab the way
+  the launcher does (and the terminal, behind the phone code).
+- Project files: `GET /api/projects/:id/files?path=` lists one folder and
+  `POST /api/projects/:id/files/capability {path}` mints a capability for one folder. Both are
+  ordinary API routes, so they need the paired phone's token and, when a code is set, an unlocked
+  phone. The file bytes come from `/files/<capability>/<relative path>`, so an `<img>`, a page's
+  relative links and a download work without the bearer header. A capability is 256 random bits,
+  belongs to one phone and one unlocked session, reads only below its folder, lapses after 15 idle
+  minutes (each read slides it) and after 4 hours at most, ends the moment that phone locks, is
+  unpaired, or a code is set or changed, and is never written to a log. That path never lists a
+  folder.
+- Confinement: every path is resolved with realpath against the project root (or the capability's
+  folder) and must stay inside it, so `..`, absolute paths, drive letters, NUL and control
+  characters, Windows stream and device names, and symlinks or junctions that lead out are refused.
+  Hidden and sensitive entries are neither listed nor served: anything whose name starts with `.`
+  (`.git`, `.env*`, `.ssh`) and `node_modules`, including through a link that lands on one. Files
+  over 256 MiB are refused; others stream, and a single `Range` request is answered with 206.
+- Headers on a file: `Content-Type` from the extension (unknown is `application/octet-stream`),
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` (a page's outbound links do not
+  leak the capability), `Cache-Control: private, no-store`. HTML, XHTML, XML, SVG and unknown types
+  carry `Content-Security-Policy: sandbox allow-scripts; default-src 'self' 'unsafe-inline' data: blob:`:
+  the page runs in an opaque origin without `allow-same-origin`, so it cannot read the phone app's
+  storage, its token or the API. `?download=1` adds `Content-Disposition: attachment`. The app's own
+  CSP already allows `img-src 'self'`, which covers the thumbnails.
 - Under Tailscale exposure the listener binds only the tailnet address and refuses any socket from
   outside the tailnet, even through a local forward.
 - The certificate authority's private key, the server key and the push keys live in the OS
@@ -167,6 +196,13 @@ first while a phone is connected.
   origin enforcement, body limits, the live stream, Tailscale fail-closed, a port clash, and the
   tailnet detail behind the setup steps (phones on the tailnet, HTTPS certificates on or off, Check
   again without a restart).
+- `src/main/phone-files.test.ts`: confinement (absolute, `..`, NUL, stream and device names,
+  dotfiles, `node_modules`, a junction out of the project and one onto `.git`), capability scope,
+  idle and absolute expiry and revocation, and over a real listener: the listing, the 409 for a
+  paired machine's project, file headers (sandbox CSP on HTML and SVG, download, Range and 416), no
+  listing and no escape through the capability path, links that stop the moment the phone locks, is
+  unpaired or a code is set, and no capability in any log. `phone-access-server-lock.test.ts` walks
+  the two new routes with a locked phone like every other route.
 - `src/main/tailscale.test.ts`: each node's OS and the tailnet's CertDomains from
   `tailscale status --json`.
 - `src/phone/phone-shell.test.ts`: boot.js and sw.js exactly as served, in node:vm with a stub

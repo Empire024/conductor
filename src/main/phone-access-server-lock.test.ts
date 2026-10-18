@@ -166,7 +166,9 @@ describe('the phone lock on the listener', () => {
     const early = [...source.matchAll(/url\.pathname(?:\s*===\s*|\.startsWith\()'([^']+)'/g)].map(match => match[1])
     // '/share' is the share target's POST that a service worker did not catch: it is drained
     // unread and redirected to the app's own #/share screen, which then sits behind the gate.
-    expect(new Set(early)).toEqual(new Set(['/api/health', '/api/', '/ca.crt', '/api/pair', '/api/lock/', '/share']))
+    // '/files/' answers only a capability minted by a table route (so behind the gate) and revoked
+    // when that phone locks; phone-files.test.ts proves a locked phone's links stop working.
+    expect(new Set(early)).toEqual(new Set(['/api/health', '/api/', '/files/', '/ca.crt', '/api/pair', '/api/lock/', '/share']))
   })
 
   it('unlocks with the code, counts wrong codes, and backs off', { timeout: 30_000 }, async () => {

@@ -1015,6 +1015,79 @@ class FakeRecognition {
   }
 }
 
+describe('phone project files', () => {
+  const phoneState = {
+    projects: [{ id: 'p1', name: 'miron', machineId: 'local', workspaces: [{ id: 'w1', name: 'Main' }] }, { id: 'p2', name: 'Haftheme', machineId: 'mac-mini', workspaces: [] }],
+    sessions: [{ id: 's1', title: 'Logo swarm', provider: 'claude', projectId: 'p1', projectName: 'miron', workspaceId: 'w1', workspaceName: 'Main', machineId: 'local', tabId: 't1', state: 'idle', archived: false, updatedAt: '2026-10-02T10:00:00.000Z' }],
+    machines: [{ id: 'local', name: 'MAIN', status: 'online' }], providers: [], counts: { attention: 0 }, machineName: 'MAIN'
+  }
+  const capability = '/files/' + 'c'.repeat(43) + '/'
+  const concepts = {
+    path: 'output/haf-logo-concepts', parent: 'output', truncated: false, entries: [
+      { name: 'individual-assets', kind: 'dir', size: null, modifiedAt: null, type: null, image: false },
+      { name: 'contact-sheet-color.png', kind: 'file', size: 2048, modifiedAt: '2026-10-17T10:00:00.000Z', type: 'image/png', image: true },
+      { name: 'haf-lettermarks-delivery.zip', kind: 'file', size: 5_000_000, modifiedAt: '2026-10-17T10:00:00.000Z', type: 'application/zip', image: false },
+      { name: 'index.html', kind: 'file', size: 900, modifiedAt: '2026-10-17T10:00:00.000Z', type: 'text/html; charset=utf-8', image: false }
+    ]
+  }
+  const link = (page: ReturnType<typeof bootApp>, label: string, nth = 0) => page.app.all().filter(node => node.tagName === 'A' && node.textContent === label)[nth] as any
+
+  it('browses a folder: folders as rows, image thumbnails, and Open and Download through the folder capability', async () => {
+    const page = bootApp('#/files?project=p1&path=output%2Fhaf-logo-concepts', call => {
+      if (call.path === '/api/projects/p1/files?path=output%2Fhaf-logo-concepts') return concepts
+      if (call.path === '/api/projects/p1/files/capability') return { url: capability, path: call.body.path, expiresAt: '2026-10-18T01:00:00.000Z' }
+      return {}
+    }, { phoneState })
+    await settleAll()
+    expect(page.posts().find(call => call.path === '/api/projects/p1/files/capability')!.body).toEqual({ path: 'output/haf-logo-concepts' })
+    const thumb = page.app.find(node => node.tagName === 'IMG' && node.className.includes('files-thumb'))!
+    expect(thumb.src).toBe(capability + 'contact-sheet-color.png')
+    thumb.click()
+    expect(thumb.className).toContain('expanded')
+    // An HTML page opens in a new browser tab from its capability URL, so its relative assets load.
+    const open = link(page, 'Open page')
+    expect(open.href).toBe(capability + 'index.html')
+    expect(open.target).toBe('_blank')
+    expect(open.rel).toContain('noopener')
+    const downloads = page.app.all().filter(node => node.tagName === 'A' && node.textContent === 'Download') as any[]
+    expect(downloads.map(node => node.href)).toEqual([capability + 'contact-sheet-color.png?download=1', capability + 'haf-lettermarks-delivery.zip?download=1', capability + 'index.html?download=1'])
+    expect(downloads[1].getAttribute('download')).toBe('haf-lettermarks-delivery.zip')
+    expect(page.app.textContent).toContain('4.8 MB')
+    // The folder breadcrumb leads back up; a folder row goes down.
+    expect(page.app.all().filter(node => node.className.includes('files-crumbs'))[0]!.textContent).toMatch(/miron.*output.*haf-logo-concepts/)
+    page.app.find(node => node.tagName === 'BUTTON' && node.className.includes('files-dir'))!.click()
+    expect(page.window.location.hash).toBe('#/files?project=p1&path=output%2Fhaf-logo-concepts%2Findividual-assets')
+  })
+
+  it('says why a project on another machine cannot be browsed, and offers Files only for local projects', async () => {
+    const page = bootApp('#/files?project=p2', () => ({}), { phoneState })
+    await settleAll()
+    expect(page.app.textContent).toContain('Haftheme lives on another machine.')
+    expect(page.calls.some(call => call.path.startsWith('/api/projects/p2/files'))).toBe(false)
+    const tabs = bootApp('#/tabs', () => ({}), { phoneState })
+    await settleAll()
+    const head = tabs.app.all().find(node => node.className.includes('section-head') && node.textContent.includes('miron'))!
+    head.find(node => node.tagName === 'BUTTON' && node.textContent === 'Files')!.click()
+    expect(tabs.window.location.hash).toBe('#/files?project=p1')
+  })
+
+  it('shows the computer\'s refusal and a retry instead of an empty folder', async () => {
+    let refuse = true
+    const page = bootApp('#/files?project=p1&path=.git', call => {
+      if (refuse && call.path.startsWith('/api/projects/p1/files')) return { __status: 403, body: { error: 'That file is not shared with the phone.' } }
+      if (call.path.startsWith('/api/projects/p1/files?')) return { ...concepts, entries: [] }
+      if (call.path === '/api/projects/p1/files/capability') return { url: capability, path: '', expiresAt: 'x' }
+      return {}
+    }, { phoneState })
+    await settleAll()
+    expect(page.app.textContent).toContain('That file is not shared with the phone.')
+    refuse = false
+    page.app.find(node => node.tagName === 'BUTTON' && node.textContent === 'Try again')!.click()
+    await settleAll()
+    expect(page.app.textContent).toContain('This folder is empty.')
+  })
+})
+
 describe('phone composer dictation', () => {
   const composer = (page: ReturnType<typeof bootApp>) => page.app.find(node => node.tagName === 'TEXTAREA' && node.className.includes('composer-input'))!
   const mic = (page: ReturnType<typeof bootApp>) => page.app.querySelector('composer-mic')!

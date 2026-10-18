@@ -754,6 +754,11 @@
       return { name: 'idea', id: decodeURIComponent(rest), key: 'idea:' + rest }
     }
     if (hash.indexOf('#/idea-runs') === 0) return { name: 'idea-runs', key: 'idea-runs' }
+    if (path === '#/files') {
+      const folderMatch = /[?&]path=([^&]*)/.exec(hash)
+      const folder = folderMatch ? decodeURIComponent(folderMatch[1]) : ''
+      return { name: 'files', projectId: projectId, path: folder, key: 'files:' + projectId + ':' + folder }
+    }
     if (hash.indexOf('#/tasks') === 0) return { name: 'tasks', key: 'tasks' }
     if (hash.indexOf('#/share') === 0) return { name: 'share', key: 'share' }
     if (hash.indexOf('#/new') === 0) return { name: 'new', key: 'new' }
@@ -882,6 +887,7 @@
     if (route.name === 'terminal') return terminalScreen()
     if (route.name === 'session') return conversationScreen(route.id)
     if (route.name === 'tasks') return projectTasksScreen()
+    if (route.name === 'files') return filesScreen(route)
     if (route.name === 'share') return shareScreen()
     if (route.name === 'idea') return ideaEditorScreen(route.id)
     if (route.name === 'ideas') return ideasListScreen(route)
@@ -1750,7 +1756,7 @@
 
   const moreScreen = () => {
     const view = overviewScreen('More', 'more')
-    for (const [title, hash] of [['Project tasks', '#/tasks'], ['Log in', '#/login'], ['Ideas', '#/ideas/list'], ['Idea runs', '#/idea-runs'], ['Usage', '#/usage'], ['Activity', '#/activity'], ['System', '#/system'], ['Terminal', '#/terminal'], ['Phone & security', '#/phone'], ['Connection help', '#diagnose']]) {
+    for (const [title, hash] of [['Project tasks', '#/tasks'], ['Project files', '#/files'], ['Log in', '#/login'], ['Ideas', '#/ideas/list'], ['Idea runs', '#/idea-runs'], ['Usage', '#/usage'], ['Activity', '#/activity'], ['System', '#/system'], ['Terminal', '#/terminal'], ['Phone & security', '#/phone'], ['Connection help', '#diagnose']]) {
       const row = button('more-row', null, () => visit(hash))
       row.appendChild(fill(el('span', 'more-row-main'), [el('span', 'more-row-title', title)]))
       row.appendChild(el('span', 'chev', '›'))
@@ -2025,7 +2031,9 @@
   const renderGroups = (host, sessions) => {
     for (const project of groupSessions(sessions)) {
       const group = el('section', 'group')
-      group.appendChild(el('h2', 'group-title', project.name || 'Project'))
+      /* A project on this computer offers its files next to its name (#/files). */
+      const local = projectById(project.id)
+      group.appendChild(local && local.machineId === 'local' ? sectionHead(project.name || 'Project', 'Files', filesHash(project.id, '')) : el('h2', 'group-title', project.name || 'Project'))
       for (const workspace of project.workspaces) {
         const single = project.workspaces.length === 1 && workspace.name === project.name
         if (!single) group.appendChild(el('h3', 'group-workspace', workspace.name || 'Workspace'))
@@ -3580,6 +3588,8 @@
         form.projectId,
         value => { form.projectId = value; page = { tasks: [], page: { offset: 0, limit: 20, total: 0, hasMore: false } }; draw(); void load(true) }
       )))
+      const chosen = projectById(form.projectId)
+      if (chosen && chosen.machineId === 'local') body.appendChild(button('ghost wide files-open', 'Browse files', () => visit(filesHash(chosen.id, ''))))
 
       const quick = el('section', 'card task-quick-add')
       quick.appendChild(el('h2', 'card-title', 'Quick add'))
@@ -3661,6 +3671,161 @@
     draw()
     if (state.form && state.form.projectId) void load(true)
     return { key: 'tasks', root: root, update: () => { reconcileForm(); draw(); if (state.form && state.form.projectId) void load(true) } }
+  }
+
+  // ------------------------------------------------------------------ project files
+
+  /* A project's files, read-only (src/main/phone-files.ts). The listing is an API call; every file
+     is read through a capability URL the computer mints for the folder, so an <img>, a page's
+     relative assets and a download work without the bearer header. A capability dies when the
+     phone locks, so a fresh one is minted whenever the folder is shown again. */
+  const FILE_CAPABILITY_REFRESH_MS = 10 * 60 * 1000
+  const filesHash = (projectId, folder) => '#/files?project=' + encodeURIComponent(projectId) + (folder ? '&path=' + encodeURIComponent(folder) : '')
+  const fileSize = bytes => bytes < 1024 ? bytes + ' B' : bytes < 1048576 ? Math.round(bytes / 1024) + ' KB' : bytes < 1073741824 ? (bytes / 1048576).toFixed(bytes < 10485760 ? 1 : 0) + ' MB' : (bytes / 1073741824).toFixed(1) + ' GB'
+  const fileUrl = (capability, name, download) => capability.url + encodeURIComponent(name) + (download ? '?download=1' : '')
+  const fileProjects = () => ((state.phone && state.phone.projects) || []).filter(project => project.machineId === 'local')
+
+  const filesScreen = route => {
+    const root = el('div', 'screen')
+    const header = pageHeader('Files')
+    const scroll = scroller()
+    root.appendChild(header)
+    root.appendChild(scroll)
+    const folder = route.path || ''
+    let listing = null
+    let capability = null
+    let mintedAt = 0
+    let loading = false
+    let problem = ''
+    let drewState = false
+
+    const projectId = () => {
+      if (route.projectId) return route.projectId
+      const local = fileProjects()
+      const remembered = state.form && local.some(project => project.id === state.form.projectId) ? state.form.projectId : ''
+      return remembered || (local[0] ? local[0].id : '')
+    }
+
+    const load = async () => {
+      const id = projectId()
+      const project = projectById(id)
+      /* Wait for the computer's project list: a project on a paired machine is explained, not asked for. */
+      if (!id || loading || !project || project.machineId !== 'local') return
+      loading = true
+      problem = ''
+      draw()
+      const base = '/api/projects/' + encodeURIComponent(id) + '/files'
+      try {
+        const answers = await Promise.all([
+          api(base + '?path=' + encodeURIComponent(folder)),
+          api(base + '/capability', { method: 'POST', body: { path: folder } })
+        ])
+        listing = answers[0]
+        capability = answers[1]
+        mintedAt = Date.now()
+      } catch (error) { problem = errorMessage(error); listing = null; capability = null }
+      finally { loading = false; if (screen && screen.key === route.key) draw() }
+    }
+
+    const fileCard = (entry, id) => {
+      const card = el('article', 'card files-file')
+      const kind = /^text\/html/.test(entry.type || '') ? 'page' : entry.image ? 'image' : 'file'
+      if (entry.image && capability) {
+        /* Tapping the thumbnail grows it in place; the same element, so nothing is fetched again. */
+        const thumb = el('img', 'files-thumb')
+        thumb.src = fileUrl(capability, entry.name)
+        thumb.alt = entry.name
+        thumb.setAttribute('loading', 'lazy')
+        thumb.addEventListener('click', () => {
+          const open = !thumb.classList.contains('expanded')
+          thumb.classList.toggle('expanded', open)
+          thumb.setAttribute('aria-expanded', open ? 'true' : 'false')
+        })
+        card.appendChild(thumb)
+      }
+      card.appendChild(el('strong', 'files-name', entry.name))
+      card.appendChild(el('span', 'card-note', dotRow([entry.size !== null ? fileSize(entry.size) : '', entry.modifiedAt ? relativeTime(entry.modifiedAt) : ''])))
+      if (capability) {
+        const actions = el('div', 'files-actions')
+        const openLink = linkButton('ghost files-action', kind === 'page' ? 'Open page' : 'Open', fileUrl(capability, entry.name))
+        openLink.target = '_blank'
+        openLink.rel = 'noopener noreferrer'
+        actions.appendChild(openLink)
+        const download = linkButton('ghost files-action', 'Download', fileUrl(capability, entry.name, true))
+        download.setAttribute('download', entry.name)
+        actions.appendChild(download)
+        card.appendChild(actions)
+      }
+      return card
+    }
+
+    const draw = () => {
+      const top = scroll.scrollTop
+      clear(scroll)
+      const phone = state.phone
+      if (!phone) { scroll.appendChild(emptyNote('Reading this computer…')); return }
+      drewState = true
+      const body = el('div', 'form files-phone')
+      const id = projectId()
+      const local = fileProjects()
+      const project = projectById(id)
+      if (project && project.machineId !== 'local') {
+        body.appendChild(emptyNote(project.name + ' lives on another machine.', 'Only projects on ' + (phone.machineName || 'this computer') + ' can be browsed from the phone for now.'))
+        scroll.appendChild(body)
+        return
+      }
+      if (!local.length) { body.appendChild(emptyNote('No project on this computer to browse.')); scroll.appendChild(body); return }
+      body.appendChild(field('Project', select(local.map(entry => ({ value: entry.id, label: entry.name })), id, value => go(filesHash(value, '')))))
+
+      /* Where this folder is: the project, then each folder down to here, each one a way back up. */
+      const crumbs = el('nav', 'files-crumbs')
+      crumbs.setAttribute('aria-label', 'Folder')
+      const parts = folder ? folder.split('/') : []
+      crumbs.appendChild(button('chip' + (parts.length ? '' : ' selected'), project ? project.name : 'Project', () => go(filesHash(id, ''))))
+      parts.forEach((part, index) => {
+        crumbs.appendChild(el('span', 'files-crumb-sep', '/'))
+        const here = index === parts.length - 1
+        crumbs.appendChild(button('chip' + (here ? ' selected' : ''), part, () => { if (!here) go(filesHash(id, parts.slice(0, index + 1).join('/'))) }))
+      })
+      body.appendChild(crumbs)
+
+      if (problem) {
+        body.appendChild(el('p', 'pending-error', problem))
+        body.appendChild(button('ghost wide', 'Try again', () => { void load() }))
+      }
+      if (loading && !listing) body.appendChild(emptyNote('Reading files…'))
+      if (listing) {
+        const list = el('div', 'files-list')
+        for (const entry of listing.entries || []) {
+          if (entry.kind === 'dir') {
+            const row = button('more-row files-dir', null, () => go(filesHash(id, (folder ? folder + '/' : '') + entry.name)))
+            row.appendChild(icon(['M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z'], 22))
+            row.appendChild(fill(el('span', 'more-row-main'), [el('span', 'more-row-title', entry.name)]))
+            row.appendChild(el('span', 'chev', '›'))
+            list.appendChild(row)
+          } else list.appendChild(fileCard(entry, id))
+        }
+        if (!(listing.entries || []).length) list.appendChild(emptyNote('This folder is empty.', 'Hidden files such as .git, .env and node_modules are never shown.'))
+        body.appendChild(list)
+        if (listing.truncated) body.appendChild(el('p', 'muted-note', 'Showing the first ' + listing.entries.length + ' entries.'))
+      }
+      scroll.appendChild(body)
+      scroll.scrollTop = top
+    }
+
+    draw()
+    void load()
+    return {
+      key: route.key, root: root,
+      /* The stream's state updates land here; the listing only reloads when it is missing or its
+         capability is getting old, so a busy computer does not refetch every thumbnail. */
+      update: () => {
+        if (!drewState && state.phone) draw()
+        if (loading) return
+        if (!listing && !problem) { void load(); return }
+        if (mintedAt && Date.now() - mintedAt > FILE_CAPABILITY_REFRESH_MS) void load()
+      }
+    }
   }
 
   // ------------------------------------------------------------------ new task screen

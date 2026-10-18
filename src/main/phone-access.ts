@@ -1129,6 +1129,19 @@ export class PhoneAccessService {
     return { cwd: project.path, projectName: project.name, workspaceName: workspace.name }
   }
 
+  /**
+   * The folder a phone may browse for a project (src/main/phone-files.ts): only a project that
+   * lives on this machine. A paired machine's project is refused with a reason, not hidden.
+   */
+  fileRoot(projectId: unknown): { path: string; name: string } {
+    if (typeof projectId !== 'string' || !projectId || projectId.length > 160) throw new PhoneAccessError('Choose a project that is open in Conductor.', 404)
+    const project = this.deps.database.getProject(projectId)
+    if (!project) throw new PhoneAccessError('Choose a project that is open in Conductor.', 404)
+    if (project.remote) throw new PhoneAccessError(`${project.name} lives on ${project.remote.machineName || 'another machine'}; the phone can only browse files of projects on ${this.deps.machineName()} for now.`, 409)
+    if (!project.path) throw new PhoneAccessError('This project has no folder on this computer.', 404)
+    return { path: project.path, name: project.name }
+  }
+
   dispose(): void {
     this.disposed = true
     if (this.refreshTimer) { clearTimeout(this.refreshTimer); this.refreshTimer = null }
