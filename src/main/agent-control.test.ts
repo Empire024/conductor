@@ -4012,3 +4012,69 @@ describe('a coworker\'s approval card wakes whoever can answer it', () => {
     } finally { setCurrentApprovalPolicy(defaultApprovalPolicy()) }
   })
 })
+
+// conductor-task:sibling-coworker-messaging: coworkers of one controller talk directly.
+describe('sibling coworkers', () => {
+  const siblings = async (f: ReturnType<typeof fixture>) => {
+    const first = await f.control.call(f.scope, 'tabs.open', { title: 'Phone tabs' }) as AgentControlTab
+    const second = await f.control.call(f.scope, 'tabs.open', { title: 'Phone push' }) as AgentControlTab
+    return { first, second, firstScope: { ...f.scope, agentSessionId: first.resourceId! }, secondScope: { ...f.scope, agentSessionId: second.resourceId! } }
+  }
+  const stampPeer = (f: ReturnType<typeof fixture>, agentSessionId: string) => {
+    const current = f.database.getSession(f.workspace.id)!
+    if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+    const tab = current.layout.root.tabs.find(candidate => candidate.resourceId === agentSessionId)!
+    tab.state = { ...tab.state, remotePeerId: 'peer-1', remoteMachineName: 'Render Desktop' }
+    f.database.saveSession(f.workspace.id, current.layout, null, [])
+  }
+
+  it('lets two coworkers of one controller message each other without taking control', async () => {
+    const f = fixture()
+    const { first, second, firstScope, secondScope } = await siblings(f)
+    const sent = await f.control.call(firstScope, 'agents.steer', { agentSessionId: second.resourceId, prompt: 'I edit app.js only around render(); where are you?' }) as Record<string, unknown>
+    expect(sent).toMatchObject({ agentSessionId: second.resourceId, controlled: false, sibling: true, delivery: 'started' })
+    const delivered = f.submissions.at(-1)!
+    expect(delivered.prompt).toContain(`[From Phone tabs (${first.resourceId}), a fellow coworker of "Controller" (controller)] I edit app.js only around render(); where are you?`)
+    expect(delivered.prompt).toContain(`Reply with send_message to ${first.resourceId}.`)
+    // The reply comes back the same way, and agents.submit is the same message.
+    expect(await f.control.call(secondScope, 'agents.steer', { agentSessionId: first.resourceId, prompt: 'Only the push code.' })).toMatchObject({ agentSessionId: first.resourceId, sibling: true, controlled: false })
+    expect(f.submissions.at(-1)!.prompt).toContain(`[From Phone push (${second.resourceId}), a fellow coworker of "Controller" (controller)] Only the push code.`)
+    await vi.waitFor(() => expect(f.database.structured.snapshot(second.resourceId!)!.phase).toBe('completed'))
+    expect(await f.control.call(firstScope, 'agents.submit', { agentSessionId: second.resourceId, prompt: 'Again' })).toMatchObject({ sibling: true, note: expect.stringMatching(/takes no control/) })
+    // Both stay the controller's coworkers.
+    const links = f.control.listLinks(f.project.id, f.workspace.id)
+    for (const tab of [first, second]) expect(links.find(link => link.targetAgentSessionId === tab.resourceId)?.controllerAgentSessionId).toBe('controller')
+  })
+
+  it('still leaves a sibling’s settings and interrupts to the controller', async () => {
+    const f = fixture()
+    const { second, firstScope } = await siblings(f)
+    await expect(f.control.call(firstScope, 'agents.configure', { agentSessionId: second.resourceId, effort: 'high' })).rejects.toThrow(/Another agent already controls this tab/)
+    await expect(f.control.call(firstScope, 'agents.interrupt', { agentSessionId: second.resourceId })).rejects.toThrow(/Another agent already controls this tab/)
+    expect(f.control.listLinks(f.project.id, f.workspace.id).find(link => link.targetAgentSessionId === second.resourceId)?.controllerAgentSessionId).toBe('controller')
+  })
+
+  it('refuses a coworker of another controller, a sibling in another project and a paired-machine conversation', async () => {
+    const f = fixture()
+    const { second, firstScope, secondScope } = await siblings(f)
+    // Another controller's coworker in the same workspace is reached through that controller.
+    const lead = agentIn(f, f.project.id, f.workspace.id, 'other-lead')
+    const stranger = await f.control.call(lead, 'tabs.open', { title: 'Stranger' }) as AgentControlTab
+    const strangerScope = { ...lead, agentSessionId: stranger.resourceId! }
+    await expect(f.control.call(firstScope, 'agents.steer', { agentSessionId: stranger.resourceId, prompt: 'Hi' })).rejects.toThrow(/Another agent already controls this tab/)
+    await expect(f.control.call(strangerScope, 'agents.steer', { agentSessionId: second.resourceId, prompt: 'Hi' })).rejects.toThrow(/Another agent already controls this tab/)
+    // A coworker the same controller opened in a co-open project gets no new reach from it.
+    const other = sibling(f)
+    const away = await f.control.call(f.scope, 'tabs.open', { projectId: other.project.id, provider: 'claude', title: 'Theme worker' }) as AgentControlTab
+    await expect(f.control.call(firstScope, 'agents.steer', { agentSessionId: away.resourceId, prompt: 'Hi' })).rejects.toThrow()
+    // A conversation a paired machine drives neither sends to nor receives from a sibling.
+    stampPeer(f, second.resourceId!)
+    await expect(f.control.call(firstScope, 'agents.steer', { agentSessionId: second.resourceId, prompt: 'Hi' })).rejects.toThrow(/paired machine/)
+    await expect(f.control.call(secondScope, 'agents.steer', { agentSessionId: firstScope.agentSessionId, prompt: 'Hi' })).rejects.toThrow(/paired machine/)
+    // A read-only coworker sends nothing.
+    const state = f.database.structured.snapshot(firstScope.agentSessionId)!
+    f.database.structured.update(firstScope.agentSessionId, { settings: { ...state.settings, permission: 'read-only' } })
+    const third = await f.control.call(f.scope, 'tabs.open', { title: 'Third' }) as AgentControlTab
+    await expect(f.control.call(firstScope, 'agents.steer', { agentSessionId: third.resourceId, prompt: 'Hi' })).rejects.toThrow(/read-only|planning/i)
+  })
+})

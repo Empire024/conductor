@@ -275,7 +275,7 @@ const toolSignatures = {
   'agents.configure': '({agentSessionId,model,effort?}) — while the controlled coworker is idle with no queued input, persist an exact models.list model/effort for its next turn and update its visible tab; provider and permissions never change',
   'agents.grant': '({agentSessionId,repository?,research?}) — switch a local-model coworker’s per-conversation grants: repository (the sandbox may commit and branch, and a plain git push runs for it on the host) and research (web_search plus a larger tool-round budget). These are the conversation’s durable settings, the same toggles as its composer, so its own buttons show the change and it applies from its next turn. Only a non-local coworker may grant, only to a provider-local tab it already controls on this machine, never to itself or an ancestor; an omitted field is left alone, false revokes; returns what is now on and off',
   'agents.submit': '({agentSessionId,prompt}) — dispatch to a visible native tab with its existing permission settings; a coworker this caller dispatched whose tab closed as finished (or, for the owner or a wizard, any closed conversation of its own workspace) is reopened in the background first (reopened:true)',
-  'agents.steer': '({agentSessionId,prompt}) — what the user composer does with a message: while a turn is running (or waiting on an approval or a question) it steers the message into that turn where the provider can, else queues it behind the turn; while the conversation is idle, finished, failed, disconnected or interrupted it starts a turn with it exactly as agents.submit does (one turn, same settings, same control link); awaitReply:true (send_message’s awaitReply) also records that you wait for the recipient’s reply, as agents.await does; while a turn is still stopping it is refused, so send it again once it has stopped. A coworker this caller dispatched that finished and closed its tab (or, for the owner or a wizard, any closed conversation of its own workspace) is reopened in the background first (reopened:true). The result says which: delivery "started" for a new turn, "steered" for a message the provider took into the running turn, "queued" for one held behind it. A conversation of this project open in another workspace that nobody controls, or that messaged you first, receives it as a message headed with your id that takes no control (acrossWorkspaces:true), so no relay tab is needed',
+  'agents.steer': '({agentSessionId,prompt}) — what the user composer does with a message: while a turn is running (or waiting on an approval or a question) it steers the message into that turn where the provider can, else queues it behind the turn; while the conversation is idle, finished, failed, disconnected or interrupted it starts a turn with it exactly as agents.submit does (one turn, same settings, same control link); awaitReply:true (send_message’s awaitReply) also records that you wait for the recipient’s reply, as agents.await does; while a turn is still stopping it is refused, so send it again once it has stopped. A coworker this caller dispatched that finished and closed its tab (or, for the owner or a wizard, any closed conversation of its own workspace) is reopened in the background first (reopened:true). The result says which: delivery "started" for a new turn, "steered" for a message the provider took into the running turn, "queued" for one held behind it. A conversation of this project open in another workspace that nobody controls, or that messaged you first, receives it as a message headed with your id that takes no control (acrossWorkspaces:true), so no relay tab is needed; so does a fellow coworker of your own controller in this project (sibling:true), which still leaves its settings, interrupts and the rest to that controller',
   'agents.interrupt': '({agentSessionId,expedite?,dropQueued?}) — stops the running turn, including one waiting on an approval; queued messages stay held above its composer, as after the owner’s Stop. expedite:true is the owner’s Esc instead: what waits in its queue (an approved retry, a steered message) is sent straight after the stop, which is how a wizard releases an approved retry by hand. dropQueued:true discards the queued messages first (a stale "retry it now" that must not run again). Interrupting a turn stuck in \'interrupting\' again ends it within seconds. Interrupting does not take control, here or in a sibling project',
   'agents.resume': '({agentSessionId}) — reopen a live orphan in this workspace without restarting its turn, or reconnect an idle/disconnected native conversation with its existing settings; outside this workspace only a coworker this caller controls. Resuming a failed, interrupted or disconnected one is a recovery: three per conversation in six hours (the owner is not counted), never while it waits on a request, never once it is superseded',
   'agents.supersede': '({agentSessionId,by,reason}) - mark a stopped coworker whose work another conversation (by) took over and delivered, so it reads as superseded rather than unfinished work and is not resumed again; reason up to 300 characters, e.g. what accepted the replacement',
@@ -1394,6 +1394,41 @@ export class AgentControl {
     return { agentSessionId: id, tabId: tab.id, uri: tab.uri, projectId: spec.projectId, workspaceId: spec.sessionId, phase: database.structured.snapshot(id)?.phase, delivery, controlled: false, acrossWorkspaces: true, ...forwarded, ...(method === 'agents.submit' ? { note: 'A message to another workspace is steered like agents.steer and takes no control' } : {}) }
   }
 
+  /** agents.steer/submit between two coworkers of the same controller in this project
+   *  (sibling-coworker-messaging): delivered as a message that takes no control, so coworkers that
+   *  share files settle overlap directly instead of every note being relayed by their controller.
+   *  Only the message: agents.configure, interrupt, finish and the rest still need control, which
+   *  stays with the controller. Ancestors and successors keep their own delivery further on. */
+  private messagesSibling(scope: AgentControlScope, named: string): boolean {
+    if (scope.owner || named === scope.agentSessionId) return false
+    const mine = this.linkFor(scope.agentSessionId)
+    if (!mine) return false
+    const id = this.successorOf(scope.projectId, named)
+    if (id === scope.agentSessionId || this.ancestorsOf(scope.agentSessionId).includes(id)) return false
+    if (this.deps.database.structured.spec<AgentSpec>(id)?.projectId !== scope.projectId) return false
+    return this.linkFor(id)?.controllerAgentSessionId === mine.controllerAgentSessionId
+  }
+
+  private async messageSibling(scope: AgentControlScope, method: string, args: Args): Promise<unknown> {
+    const { database, sessions } = this.deps
+    const named = text(args, 'agentSessionId', 160), prompt = text(args, 'prompt', MAX_PROMPT_CHARS)
+    const id = this.successorOf(scope.projectId, named)
+    const forwarded = id !== named ? { forwardedFrom: named } : {}
+    const spec = database.structured.spec<AgentSpec>(id)!, state = database.structured.snapshot(id)
+    if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly('send_message (agents.steer) to a sibling coworker'))
+    const sender = this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)
+    if (sender?.state?.remotePeerId) throw new Error('This conversation is driven by a paired machine; it reaches its controller with report, not its sibling coworkers')
+    const tab = this.tabs({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: scope.agentSessionId }).find(candidate => candidate.kind === 'agent' && candidate.resourceId === id)
+    if (!tab || !state) throw new Error('That sibling coworker has no open tab any more; report to your controller instead')
+    if (tab.state?.remotePeerId) throw new Error('That conversation is driven by a paired machine; only that machine steers it')
+    if (anonymousConversations.has(scope.agentSessionId) && !anonymousConversations.has(id)) throw new Error('This conversation is anonymous and that one keeps a history, so nothing of it may be sent there; the owner reads it in its tab')
+    const title = sender?.title || database.structured.spec<AgentSpec>(scope.agentSessionId)?.title || 'A sibling coworker'
+    const controller = this.linkFor(id)!.controllerAgentSessionId
+    const message = `[From ${title} (${scope.agentSessionId}), a fellow coworker of ${this.agentLabel(controller)}] ${prompt}\n\n(Sent by another coworker of your controller; it gives the sender no control over this tab. Reply with ${spec.provider === 'claude' || spec.provider === 'codex' ? 'send_message' : 'agents.steer'} to ${scope.agentSessionId}.)`
+    const delivery = await sessions.steerOrStart(id, message, state.settings, [], { agentSessionId: scope.agentSessionId, label: title })
+    return { agentSessionId: id, tabId: tab.id, uri: tab.uri, projectId: spec.projectId, workspaceId: spec.sessionId, phase: database.structured.snapshot(id)?.phase, delivery, controlled: false, sibling: true, ...forwarded, ...(method === 'agents.submit' ? { note: 'A message to a sibling coworker is steered like agents.steer and takes no control' } : {}) }
+  }
+
   /** agents.steer/submit({projectId,prompt}) with no agentSessionId: a message to a project
    *  rather than to one conversation, routed as tabs.open({projectId,prompt}) is. */
   private async toProject(scope: AgentControlScope, source: AgentSpec, method: string, args: Args): Promise<unknown> {
@@ -2044,6 +2079,7 @@ export class AgentControl {
     if ((method === 'agents.steer' || method === 'agents.submit') && source.provider !== 'local') {
       if (args.agentSessionId === undefined && args.projectId !== undefined) return this.toProject(scope, source, method, args)
       if (typeof args.agentSessionId === 'string' && this.messagesAcross(scope, args.agentSessionId)) return this.messageAcross(scope, method, args)
+      if (typeof args.agentSessionId === 'string' && this.messagesSibling(scope, args.agentSessionId)) return this.messageSibling(scope, method, args)
       if (typeof args.agentSessionId === 'string' && this.messagesAcrossWorkspaces(scope, args.agentSessionId)) return this.messageAcrossWorkspaces(scope, method, args)
     }
     // Naming another project is only meaningful for the methods that were opened to a sibling;
