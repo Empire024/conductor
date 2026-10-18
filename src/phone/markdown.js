@@ -311,7 +311,15 @@
     return nodes
   }
 
-  const parse = source => parseBlocks(String(source === null || source === undefined ? '' : source).replace(/\r\n?/g, '\n').split('\n'))
+  /* Codex cites files as its own directive, :codex-file-citation{path="..."}; the phone opens no
+   * local files, so a citation reads as the file's name in code (the desktop makes it a link). */
+  const citations = text => text.replace(/:codex-file-citation(?:\[[^\]\n]*\])?\{([^}\n]*)\}/g, (whole, body) => {
+    const match = /path\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"']+))/.exec(body)
+    const path = match ? (match[1] || match[2] || match[3] || '').trim() : ''
+    const name = path.replace(/\\/g, '/').split('/').filter(Boolean).pop()
+    return name ? '`' + name.replace(/`/g, '') + '`' : ''
+  })
+  const parse = source => parseBlocks(citations(String(source === null || source === undefined ? '' : source)).replace(/\r\n?/g, '\n').split('\n'))
 
   // ------------------------------------------------------------------ DOM
 

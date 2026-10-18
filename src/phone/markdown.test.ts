@@ -123,4 +123,7 @@ describe('markdown.js inline', () => {
     expect(draw(null as unknown as string).children).toEqual([])
     expect(draw('a\r\nb').html()).toBe('<div><p class="text-block md-p">a<br>b</p></div>')
   })
+  it('shows a Codex file citation as the file name in code', () => {
+    expect(draw('Created :codex-file-citation{path="C:/a/b/report.pdf" purpose="output"} ok').html()).toBe('<div><p class="text-block md-p">Created <code class="md-code">report.pdf</code> ok</p></div>')
+  })
 })

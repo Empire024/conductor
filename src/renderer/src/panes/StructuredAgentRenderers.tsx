@@ -11,6 +11,7 @@ import type { ContextAttachment, AgentEventData, DiffArtifact, FileChange, Input
 import { ANSWERED_IN_CONVERSATION } from '../../../shared/structured-agent'
 import { questionDraftKey, questionDrafts } from './question-drafts'
 import { stripMemoryDirectives } from '../../../shared/memory-directive'
+import { codexDirectivesToMarkdown } from '../../../shared/codex-directives'
 import { languageForPath, SyntaxCode } from './SyntaxCode'
 import { fileTypeStyle } from '../file-types'
 import { copyText } from '../clipboard'
@@ -189,7 +190,9 @@ type MarkdownComponents = NonNullable<React.ComponentProps<typeof ReactMarkdown>
 const MarkdownBlock = memo(function MarkdownBlock({ text, plugins, urlTransform, components }: { text: string; plugins: React.ComponentProps<typeof ReactMarkdown>['remarkPlugins']; urlTransform(url: string): string; components: MarkdownComponents }): React.JSX.Element {
   return <ReactMarkdown remarkPlugins={plugins} skipHtml urlTransform={urlTransform} components={components}>{text}</ReactMarkdown>
 })
-export const StructuredMarkdown = memo(function StructuredMarkdown({ text, cwd, projectId, machineId, onOpenFile }: { text: string; cwd: string; projectId?: string; machineId?: string; onOpenFile(path: string, line?: number): void }): React.JSX.Element {
+export const StructuredMarkdown = memo(function StructuredMarkdown({ text: written, cwd, projectId, machineId, onOpenFile }: { text: string; cwd: string; projectId?: string; machineId?: string; onOpenFile(path: string, line?: number): void }): React.JSX.Element {
+  // Codex's own file-citation directives become ordinary file links (codex-directives.ts).
+  const text = useMemo(() => codexDirectivesToMarkdown(written), [written])
   const contextualMachineId = useContext(AgentFileMachineContext)
   machineId ??= contextualMachineId
   const [linkError, setLinkError] = useState('')
