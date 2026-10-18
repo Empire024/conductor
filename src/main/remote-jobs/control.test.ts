@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { callNodeMethod, withNodes, type NodeCaller } from './control.ts'
 import { RemoteJobService } from './service.ts'
 import { RemoteJobStore } from './store.ts'
@@ -69,6 +69,37 @@ describe('nodes.* control', () => {
     await expect(callNodeMethod(service, { ...agent, agentSessionId: 'agent_c' }, 'nodes.cancel', { jobId: job.id })).rejects.toThrow(/Only the owner/)
     await callNodeMethod(service, agent, 'nodes.cancel', { jobId: job.id, reason: 'done' })
     expect(await service.wait(job.id, 2000)).toMatchObject({ status: 'cancelled', cancelReason: 'done' })
+  })
+
+  // conductor-task:cross-project-cleanup-guardrails
+  it('a wizard of another project cancels a job only through the cross-project guard', async () => {
+    await callNodeMethod(service, owner, 'nodes.register', { id: 'mac-mini', host: 'jurajs-mac-mini', user: 'juraj' })
+    fake.handler = (command, run) => {
+      if (command.includes('kv hostname')) { run.stdout('os=Darwin\narch=arm64\n'); run.end(0); return }
+      if (FakeNodes.job(command)) { run.mark('started pid=3'); run.onStdinClosed(() => { run.mark('reason=cancelled'); run.mark('exit=143'); run.end(143) }); return }
+      run.end(0)
+    }
+    const job = await callNodeMethod(service, agent, 'nodes.run', { command: 'sleep 100', nodeId: 'mac-mini' }) as { id: string }
+    // A wizard tab of p2 holds owner: true (sovereign) but is p2's, not the owner, in p1.
+    const refusal = new Error('Refused: remote job belongs to project p1')
+    const refuse = vi.fn(async () => { throw refusal })
+    const wizard: NodeCaller = { ...agent, projectId: 'p2', agentSessionId: 'wizard_p2', owner: true, crossProject: refuse }
+    await expect(callNodeMethod(service, wizard, 'nodes.cancel', { jobId: job.id, reason: 'release the mac' })).rejects.toBe(refusal)
+    expect(refuse).toHaveBeenCalledWith({ projectId: 'p1', label: `remote job ${job.id}`, action: 'cancel', call: `nodes.cancel({jobId:"${job.id}"})`, ownerApproval: false, reason: 'release the mac' })
+    expect((await callNodeMethod(service, agent, 'nodes.job', { jobId: job.id }) as { status: string }).status).not.toBe('cancelled')
+    await expect(callNodeMethod(service, { ...wizard, crossProject: undefined }, 'nodes.cancel', { jobId: job.id })).rejects.toThrow(/belongs to another project/)
+    await expect(callNodeMethod(service, wizard, 'nodes.cancel', { jobId: job.id, ownerApproval: 'yes' })).rejects.toThrow(/ownerApproval must be true or false/)
+    // Approved (the guard resolves): the cancel goes through.
+    const approve = vi.fn(async () => {})
+    await callNodeMethod(service, { ...wizard, crossProject: approve }, 'nodes.cancel', { jobId: job.id, ownerApproval: true })
+    expect(approve).toHaveBeenCalledWith(expect.objectContaining({ projectId: 'p1', ownerApproval: true }))
+    expect(await service.wait(job.id, 2000)).toMatchObject({ status: 'cancelled' })
+    // The job's own project never meets the guard.
+    const own = await callNodeMethod(service, agent, 'nodes.run', { command: 'sleep 100', nodeId: 'mac-mini' }) as { id: string }
+    const untouched = vi.fn(async () => { throw refusal })
+    await callNodeMethod(service, { ...owner, crossProject: untouched }, 'nodes.cancel', { jobId: own.id })
+    expect(untouched).not.toHaveBeenCalled()
+    expect(await service.wait(own.id, 2000)).toMatchObject({ status: 'cancelled' })
   })
 
   it('a detached run with artifacts lands them in the caller\'s project; nodes.log follows it by offset', async () => {

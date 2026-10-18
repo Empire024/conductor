@@ -13,7 +13,7 @@ import {
 } from './sandbox.ts'
 import {
   adoptRunningServer, describeStartupFailure, findFreePort, llamaServerArgs, logFile, portBindable,
-  inspectAdmission, processAlive, processControl, readRunRecord, startServer, validateExtraArgs
+  inspectAdmission, processAlive, processControl, readRunRecord, serverProtection, setServerProtection, startServer, validateExtraArgs
 } from './llama.ts'
 import { StreamAccumulator } from './client.ts'
 import { repairToolProtocol, RESPONSE_RESERVE_TOKENS, trimMessages } from './agent.ts'
@@ -510,6 +510,31 @@ describe('llama.cpp server lifecycle', () => {
     await expect(startServer('must-never-spawn', large, key, { release })).rejects.toThrow('was not started by this Conductor')
     expect(release).not.toHaveBeenCalled()
     expect(orphan.server.listening).toBe(true)
+  })
+
+  // conductor-task:cross-project-cleanup-guardrails
+  it('never stops a protected server to make room, whoever asks, and keeps its protection in the run record', async () => {
+    scratchRoot()
+    vi.spyOn(resources, 'runningLlamaProcesses').mockReturnValue([])
+    const orphan = await fakeOrphan(QWEN_9B)
+    const small = { ...defaultModelConfig(QWEN_9B), port: orphan.port }
+    const large = { ...defaultModelConfig(QWEN_35B), port: await findFreePort(small) }
+    const owner = { projectId: 'p-miron', projectName: 'miron', agentSessionId: 'miron-local', title: 'Rosin watch' }
+    writeFileSync(runFile(small), JSON.stringify({ pid: process.pid, port: orphan.port, model: small.id, file: small.file, startedAt: '2026-10-18', owner }))
+    const protection = { projectId: 'p-miron', projectName: 'miron', reason: 'standing instructions: keep it up', at: '2026-10-18T10:00:00.000Z' }
+    expect(setServerProtection(small.id, process.pid, protection)).toMatchObject({ owner, protection })
+    expect(serverProtection(small.id, process.pid)).toEqual(protection)
+    expect(serverProtection(small.id, 4242)).toBeNull()
+    expect(() => setServerProtection(small.id, 4242, protection)).toThrow(/no run record any more/)
+    const release = vi.fn(async () => 'idle' as const)
+    await expect(startServer('must-never-spawn', large, key, { release })).rejects.toThrow(`${small.id} (pid ${process.pid}) is protected by project miron (p-miron): standing instructions: keep it up`)
+    expect(release).not.toHaveBeenCalled()
+    expect(orphan.server.listening).toBe(true)
+    expect(readRunRecord(small)).toMatchObject({ pid: process.pid, owner, protection })
+    // Lifted, the same server is only busy-checked again, as before.
+    setServerProtection(small.id, process.pid, null)
+    expect(readRunRecord(small)).not.toHaveProperty('protection')
+    await expect(startServer('must-never-spawn', large, key, { release: async () => '1 conversation is mid-turn on it' })).rejects.toThrow('is busy (1 conversation is mid-turn on it)')
   })
 
   it('does not let a stale record whose pid now belongs to something else keep every model off the machine', async () => {

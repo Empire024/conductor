@@ -17,6 +17,8 @@ import type { ProjectIdentity } from '../shared/project-identity'
 import type { AgentEventData, ProviderCapabilities, SessionProjection, StructuredProvider } from '../shared/structured-agent'
 import { PROVIDER_USAGE_LIMIT } from '../shared/structured-agent'
 import type { AdapterOptions, ProviderAdapter } from './providers/adapter'
+import type { LocalServerEntry, LocalStopRequest } from './local-models/servers'
+import type { ServerProtection } from './local-models/llama'
 import { FakeDurableJobsService } from '../shared/durable-jobs-fake'
 import type { DurableJobEvent, DurableJobSummary } from '../shared/durable-jobs'
 import { assertLocalControlAllowed, assertToolAllowed, toolSpecs } from './local-models/tools'
@@ -194,7 +196,7 @@ describe('authorized native app control', () => {
     const localState = f.database.structured.snapshot(local.id)!
     f.database.structured.update(local.id, { settings: { ...localState.settings, model: 'local/dolphin-x1-8b' } })
     expect(Object.keys(await control.call(f.scope, 'tools.list', {}) as object)).toEqual(expect.arrayContaining(['local.servers', 'local.stop']))
-    expect(await control.call(f.scope, 'local.servers', {})).toEqual([{ ...server, conversations: [{ agentSessionId: local.id, title: 'Local worker', phase: expect.any(String), inTurn: false }] }])
+    expect(await control.call(f.scope, 'local.servers', {})).toEqual([{ ...server, ownerProject: null, startedBy: null, protected: false, protection: null, users: [{ agentSessionId: local.id, title: 'Local worker', projectId: f.project.id, projectName: f.project.name, phase: expect.any(String), inTurn: false }], conversations: [{ agentSessionId: local.id, title: 'Local worker', phase: expect.any(String), inTurn: false }] }])
     await expect(control.call(f.scope, 'local.stop', {})).rejects.toThrow(/model or pid/)
     await expect(control.call({ ...f.scope, agentSessionId: local.id }, 'local.stop', { model: 'dolphin-x1-8b' })).rejects.toThrow(/sandboxed local conversation/)
     // Busy: refused without force; force asks the owner, and a refusal stops nothing.
@@ -204,7 +206,7 @@ describe('authorized native app control', () => {
     expect(f.confirm).toHaveBeenCalledTimes(1)
     f.confirm.mockResolvedValueOnce(true as never)
     expect(await control.call(f.scope, 'local.stop', { pid: 62380, force: true })).toMatchObject({ stopped: true, forced: true })
-    expect(stop).toHaveBeenLastCalledWith({ pid: 62380, force: true })
+    expect(stop).toHaveBeenLastCalledWith({ pid: 62380, force: true, guard: expect.any(Function) })
     // Idle: one call, no dialog.
     busy = false
     expect(await control.call(f.scope, 'local.stop', { model: 'local/dolphin-x1-8b' })).toMatchObject({ stopped: true, forced: false })
@@ -1192,6 +1194,20 @@ describe('steering an uncontrolled tab in a co-opened project', () => {
     await expect(f.control.call(astra, 'agents.interrupt', { agentSessionId: f.spec.id })).resolves.toMatchObject({ interrupted: true })
   })
 
+  // conductor-task:cross-project-cleanup-guardrails
+  it('refuses a wizard of a sibling project that interrupts a tab it does not control: next door it is not the owner', async () => {
+    const { f, astra } = withAstra()
+    const state = f.database.structured.snapshot('astra')!
+    f.database.structured.update('astra', { settings: { ...state.settings, wizard: true, model: 'gpt-6-astra' } })
+    const interrupt = vi.spyOn(f.sessions, 'interrupt')
+    await expect(f.control.call(astra, 'agents.interrupt', { agentSessionId: f.spec.id })).rejects.toThrow(/A wizard tab of another project is not the owner/)
+    expect(f.confirm).not.toHaveBeenCalled()
+    // ownerApproval raises the owner's dialog even for a wizard, and a decline stops nothing.
+    await expect(f.control.call(astra, 'agents.interrupt', { agentSessionId: f.spec.id, ownerApproval: true })).rejects.toThrow('declined')
+    expect(f.confirm).toHaveBeenCalledTimes(1)
+    expect(interrupt).not.toHaveBeenCalled()
+  })
+
   it('hides a sibling-project tab another agent controls and refuses to read or steer it', async () => {
     const { f, astra } = withAstra()
     const child = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', title: 'Owned worker' }) as AgentControlTab
@@ -1266,9 +1282,16 @@ describe('steering an uncontrolled tab in a co-opened project', () => {
       expect(f.database.structured.snapshot('worker')!.phase).toBe('interrupting')
     }
     expect(interrupt).toHaveBeenCalledTimes(2)
-    // An uncontrolled tab next door can be stopped, and stays uncontrolled, as inside one workspace.
+    // An uncontrolled tab next door is that project's to stop (cleanup-guard.ts): refused, naming
+    // the project and how to ask it, unless the owner approves the dialog; it stays uncontrolled.
     const idle = agentIn(f, f.project.id, f.workspace.id, 'bystander')
-    await control.call(astra, 'agents.interrupt', { agentSessionId: idle.agentSessionId })
+    await expect(control.call(astra, 'agents.interrupt', { agentSessionId: idle.agentSessionId })).rejects.toThrow(`bystander (bystander) belongs to project ${f.project.name} (${f.project.id})`)
+    await expect(control.call(astra, 'agents.interrupt', { agentSessionId: idle.agentSessionId })).rejects.toThrow(`send_message({projectId:"${f.project.id}", text})`)
+    expect(interrupt).toHaveBeenCalledTimes(2)
+    f.confirm.mockResolvedValueOnce(true as never)
+    await control.call(astra, 'agents.interrupt', { agentSessionId: idle.agentSessionId, ownerApproval: true })
+    expect(f.confirm).toHaveBeenLastCalledWith(expect.objectContaining({ agentSessionId: 'astra' }), expect.stringContaining(`Started by project ${f.project.name} (${f.project.id})`))
+    expect(interrupt).toHaveBeenCalledTimes(3)
     expect(f.database.getSetting('agentControlParent:bystander')).toBeFalsy()
   })
 
@@ -4076,5 +4099,144 @@ describe('sibling coworkers', () => {
     f.database.structured.update(firstScope.agentSessionId, { settings: { ...state.settings, permission: 'read-only' } })
     const third = await f.control.call(f.scope, 'tabs.open', { title: 'Third' }) as AgentControlTab
     await expect(f.control.call(firstScope, 'agents.steer', { agentSessionId: third.resourceId, prompt: 'Hi' })).rejects.toThrow(/read-only|planning/i)
+  })
+})
+
+// conductor-task:cross-project-cleanup-guardrails
+describe('cross-project cleanup guardrails', () => {
+  const QWEN = 'local/qwen3.5-9b'
+  const qwen = (claims: Partial<LocalServerEntry> = {}): LocalServerEntry => ({ model: QWEN, label: 'Qwen 3.5 9B', pid: 35800, port: 51438, startedAt: '2026-10-18T10:00:00.000Z', startedByConductor: true, ...claims })
+  /** A local conversation on Qwen with a visible tab in the given workspace. */
+  const localIn = (f: ReturnType<typeof fixture>, projectId: string, sessionId: string, id: string): void => {
+    f.sessions.ensure({ id, projectId, sessionId, cwd: f.database.getProject(projectId)!.path, provider: 'local', title: id, model: QWEN })
+    const state = f.database.structured.snapshot(id)!
+    f.database.structured.update(id, { settings: { ...state.settings, model: QWEN } })
+    const current = f.database.getSession(sessionId)!
+    if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+    current.layout.root.tabs.push({ id: 'tab-' + id, kind: 'agent', resourceId: id, title: id, state: { provider: 'local', model: QWEN } })
+    f.database.saveSession(sessionId, current.layout, null, [])
+  }
+  /** This project (haf-stuff's place in the incident) beside miron, one Qwen server with the claims given. */
+  const world = (claims: (ids: { miron: string; here: string }) => Partial<LocalServerEntry>) => {
+    const f = fixture(), miron = sibling(f, 'miron')
+    const servers = [qwen(claims({ miron: miron.project.id, here: f.project.id }))]
+    const stop = vi.fn(async (request: LocalStopRequest) => { request.guard?.(servers[0]!); return { stopped: true, model: servers[0]!.model, pid: servers[0]!.pid, forced: false } })
+    const protect = vi.fn((_target: { model: string; pid: number }, protection: ServerProtection | null) => {
+      const { protection: _old, ...rest } = servers[0]!
+      servers[0] = protection ? { ...rest, protection } : rest
+    })
+    const control = new AgentControl({ ...f.deps, localModels: { availability: async () => ({ available: true }), servers: () => servers, stop, protect } })
+    const mironAgent = agentIn(f, miron.project.id, miron.workspace.id, 'miron-agent')
+    const wizard = (): AgentControlScope => {
+      const state = f.database.structured.snapshot(f.spec.id)!
+      f.database.structured.update(f.spec.id, { settings: { ...state.settings, wizard: true, model: 'gpt-6-astra' } })
+      return f.scope
+    }
+    return { f, miron, servers, stop, protect, control, mironAgent, wizard }
+  }
+  const keepUp = (projectId: string) => ({ projectId, reason: 'standing instructions: keep Qwen 9B up', agentSessionId: 'miron-local', title: 'Rosin watch', at: '2026-10-18T10:00:00.000Z' })
+
+  it('refuses the incident: a wizard of another project cannot stop the server miron protected, even with force', async () => {
+    const { f, miron, stop, control, wizard } = world(ids => ({ owner: { projectId: ids.miron, agentSessionId: 'miron-local', title: 'Rosin watch' }, protection: keepUp(ids.miron) }))
+    const scope = wizard()
+    await expect(control.call(scope, 'local.stop', { pid: 35800 })).rejects.toThrow(`Qwen 3.5 9B (pid 35800) is protected by project miron (${miron.project.id}): standing instructions: keep Qwen 9B up`)
+    await expect(control.call(scope, 'local.stop', { model: QWEN, force: true, reason: 'release my GPUs' })).rejects.toThrow(`send_message({projectId:"${miron.project.id}", text})`)
+    expect(stop).not.toHaveBeenCalled()
+    expect(f.confirm).not.toHaveBeenCalled()
+  })
+
+  it('stops it once the owner approves the dialog, which a wizard tab never answers for itself', async () => {
+    const { f, miron, stop, control, wizard } = world(ids => ({ owner: { projectId: ids.miron }, protection: keepUp(ids.miron) }))
+    const scope = wizard()
+    await expect(control.call(scope, 'local.stop', { pid: 35800, ownerApproval: true, reason: 'release my GPUs' })).rejects.toThrow('declined')
+    expect(f.confirm).toHaveBeenLastCalledWith(expect.objectContaining({ agentSessionId: f.spec.id }), expect.stringContaining(`Protected by project miron (${miron.project.id}): standing instructions: keep Qwen 9B up. Reason given: release my GPUs`))
+    expect(stop).not.toHaveBeenCalled()
+    f.confirm.mockResolvedValueOnce(true as never)
+    expect(await control.call(scope, 'local.stop', { pid: 35800, ownerApproval: true })).toMatchObject({ stopped: true })
+    expect(stop).toHaveBeenCalledTimes(1)
+    await expect(control.call(scope, 'local.stop', { pid: 35800, ownerApproval: 'yes' })).rejects.toThrow(/ownerApproval must be true or false/)
+  })
+
+  it('lets the owner credential stop another project\'s protected server without a dialog', async () => {
+    const { f, stop, control } = world(ids => ({ owner: { projectId: ids.miron }, protection: keepUp(ids.miron) }))
+    expect(await control.call(control.ownerScope({ projectId: f.project.id }), 'local.stop', { pid: 35800 })).toMatchObject({ stopped: true })
+    expect(stop).toHaveBeenCalledTimes(1)
+    expect(f.confirm).not.toHaveBeenCalled()
+  })
+
+  it('refuses a server another project started even unprotected, and keeps this project\'s own stop unchanged', async () => {
+    const other = world(ids => ({ owner: { projectId: ids.miron } }))
+    await expect(other.control.call(other.f.scope, 'local.stop', { pid: 35800 })).rejects.toThrow(`belongs to project miron (${other.miron.project.id}), which started it`)
+    expect(other.stop).not.toHaveBeenCalled()
+    // Started here, or by a Conductor that recorded no owner: one call, no dialog, as before.
+    for (const claims of [(ids: { here: string }) => ({ owner: { projectId: ids.here } }), () => ({})]) {
+      const own = world(claims)
+      expect(await own.control.call(own.f.scope, 'local.stop', { pid: 35800 })).toMatchObject({ stopped: true })
+      expect(own.f.confirm).not.toHaveBeenCalled()
+    }
+  })
+
+  it('makes the project that protected a server pass force:true with a reason to stop it', async () => {
+    const { f, stop, control } = world(ids => ({ owner: { projectId: ids.here }, protection: keepUp(ids.here) }))
+    await expect(control.call(f.scope, 'local.stop', { pid: 35800 })).rejects.toThrow(/protected by this project: standing instructions: keep Qwen 9B up\. To stop it anyway pass force:true with a reason/)
+    await expect(control.call(f.scope, 'local.stop', { pid: 35800, force: true })).rejects.toThrow(/force:true with a reason/)
+    expect(stop).not.toHaveBeenCalled()
+    expect(await control.call(f.scope, 'local.stop', { pid: 35800, force: true, reason: 'switching to the 35B for the eval' })).toMatchObject({ stopped: true })
+  })
+
+  it('refuses the stop when the server\'s claims changed between the check and the stop', async () => {
+    const { f, miron, stop, control } = world(ids => ({ owner: { projectId: ids.here } }))
+    stop.mockImplementationOnce(async (request: LocalStopRequest) => { request.guard?.(qwen({ owner: { projectId: f.project.id }, protection: keepUp(miron.project.id) })); return { stopped: true, model: QWEN, pid: 35800, forced: false } })
+    await expect(control.call(f.scope, 'local.stop', { pid: 35800 })).rejects.toThrow(/owner or protection changed while this stop was being checked, so nothing was stopped/)
+  })
+
+  it('local.protect: the starting project protects and lifts; another project cannot, and sees who owns and protects it', async () => {
+    const { f, miron, protect, control, mironAgent } = world(ids => ({ owner: { projectId: ids.here, agentSessionId: 'here-local', title: 'Here local' } }))
+    expect(Object.keys(await control.call(f.scope, 'tools.list', {}) as object)).toContain('local.protect')
+    await expect(control.call(f.scope, 'local.protect', { pid: 35800 })).rejects.toThrow(/reason is required/)
+    expect(await control.call(f.scope, 'local.protect', { pid: 35800, reason: 'eval in progress' })).toMatchObject({ protected: true, protection: { projectId: f.project.id, projectName: f.project.name, reason: 'eval in progress', agentSessionId: f.spec.id } })
+    expect(protect).toHaveBeenLastCalledWith({ model: QWEN, pid: 35800 }, expect.objectContaining({ projectId: f.project.id, reason: 'eval in progress' }))
+    const listed = await control.call(mironAgent, 'local.servers', {}) as Array<Record<string, unknown>>
+    expect(listed[0]).toMatchObject({ ownerProject: { id: f.project.id, name: f.project.name }, startedBy: { agentSessionId: 'here-local', title: 'Here local' }, protected: true, protection: { projectId: f.project.id, projectName: f.project.name, reason: 'eval in progress' } })
+    await expect(control.call(mironAgent, 'local.protect', { pid: 35800, protect: false })).rejects.toThrow(`protected by project ${f.project.name} (${f.project.id}): eval in progress. Only that project, or the owner, lifts it`)
+    await expect(control.call(mironAgent, 'local.protect', { pid: 35800, reason: 'mine' })).rejects.toThrow(/already protected by project/)
+    await expect(control.call(mironAgent, 'local.stop', { pid: 35800 })).rejects.toThrow(/is protected by project/)
+    expect(await control.call(f.scope, 'local.protect', { pid: 35800, protect: false })).toMatchObject({ protected: false, lifted: { reason: 'eval in progress' } })
+    await expect(control.call(mironAgent, 'local.protect', { pid: 35800, reason: 'mine' })).rejects.toThrow(`was started by project ${f.project.name} (${f.project.id}); only the project that started a server may protect it`)
+    // The owner credential may protect for any project.
+    expect(await control.call(control.ownerScope({ projectId: miron.project.id }), 'local.protect', { pid: 35800, reason: 'owner: keep it' })).toMatchObject({ protected: true, protection: { projectId: miron.project.id, reason: 'owner: keep it' } })
+  })
+
+  it('local.protect on a server that predates owner records: a project with a conversation on it may claim it', async () => {
+    const { f, miron, control, mironAgent } = world(() => ({}))
+    await expect(control.call(mironAgent, 'local.protect', { pid: 35800, reason: 'keep it' })).rejects.toThrow(/no conversation of this project uses it/)
+    localIn(f, miron.project.id, miron.workspace.id, 'miron-local')
+    expect(await control.call(mironAgent, 'local.protect', { pid: 35800, reason: 'keep it' })).toMatchObject({ protected: true, protection: { projectId: miron.project.id } })
+    const listed = await control.call(f.scope, 'local.servers', {}) as Array<{ ownerProject: unknown; users: Array<{ agentSessionId: string; projectId: string; projectName: string | null }>; conversations: unknown[] }>
+    expect(listed[0]!.ownerProject).toBeNull()
+    expect(listed[0]!.users).toEqual([expect.objectContaining({ agentSessionId: 'miron-local', projectId: miron.project.id, projectName: 'miron' })])
+    expect(listed[0]!.conversations).toEqual([])
+    await expect(control.call(f.scope, 'local.stop', { pid: 35800 })).rejects.toThrow(`is protected by project miron (${miron.project.id}): keep it`)
+    await expect(control.call({ ...mironAgent, agentSessionId: 'miron-local' }, 'local.protect', { pid: 35800, protect: false })).rejects.toThrow(/sandboxed local conversation cannot protect/)
+  })
+
+  it('production: a wizard pauses or cancels a co-open project\'s audit only through the guard', async () => {
+    const f = fixture(), other = sibling(f)
+    const pause = vi.fn(() => ({ id: 'run-1' })), cancel = vi.fn(() => ({ id: 'run-1' })), summary = vi.fn((run: unknown) => run)
+    const control = new AgentControl({ ...f.deps, production: { pause, cancel, summary } as never })
+    const wizard = { ...f.scope, wizard: true as const }
+    await expect(control.call(wizard, 'production.pause', { projectId: other.project.id, runId: 'run-1' })).rejects.toThrow(`production audit run run-1 belongs to project Theme (${other.project.id})`)
+    await expect(control.call(wizard, 'production.cancel', { projectId: other.project.id, runId: 'run-1', reason: 'mine now' })).rejects.toThrow(/A wizard tab of another project is not the owner/)
+    expect(pause).not.toHaveBeenCalled()
+    expect(cancel).not.toHaveBeenCalled()
+    f.confirm.mockResolvedValueOnce(true as never)
+    await control.call(wizard, 'production.pause', { projectId: other.project.id, runId: 'run-1', ownerApproval: true })
+    expect(pause).toHaveBeenCalledWith(other.project.id, 'run-1', expect.any(String))
+    await control.call(control.ownerScope({ projectId: f.project.id }), 'production.cancel', { projectId: other.project.id, runId: 'run-1', reason: 'owner' })
+    expect(cancel).toHaveBeenCalledTimes(1)
+    await control.call(wizard, 'production.pause', { runId: 'run-2' })
+    expect(pause).toHaveBeenLastCalledWith(f.project.id, 'run-2', expect.any(String))
+    await expect(control.call(wizard, 'production.profile.get', { ownerApproval: true })).rejects.toThrow(/ownerApproval is for/)
+    expect(f.confirm).toHaveBeenCalledTimes(1)
   })
 })

@@ -73,6 +73,7 @@ const APP_LABELS: Record<string, { label: string; kind: ControlActionKind; appWi
   'app.update.authorize': { label: 'Authorized app.update', kind: 'decide', appWide: false },
   'app.quit.confirm': { label: 'Answered the quit dialog', kind: 'decide', appWide: true },
   'local.stop': { label: 'Stopped a local model server', kind: 'app', appWide: true },
+  'local.protect': { label: 'Protected a local model server', kind: 'app', appWide: true },
   'projects.open': { label: 'Opened a project', kind: 'open', appWide: false }
 }
 const OTHER_LABELS: Record<string, { label: string; kind: ControlActionKind }> = {

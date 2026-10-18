@@ -3,7 +3,9 @@ import { ACTIVITY_KINDS, ACTIVITY_WINDOW_MS } from './phone-activity'
 import type { PhoneActivityKind } from '../shared/phone-activity'
 import { repointRestart, RESTART_INITIATOR_KEY, RESTART_REQUEST_KEY, type RestartInitiator, type RestartRequest } from './restart-initiator'
 import type { PendingStopConfirmation } from './stop-confirmation'
-import { localModelId, LocalServerBusy, type LocalServerEntry, type LocalStopRequest } from './local-models/servers'
+import { localModelId, LocalServerBusy, matchLocalServer, type LocalServerEntry, type LocalStopRequest } from './local-models/servers'
+import type { ServerProtection } from './local-models/llama'
+import { cleanupVerdict, ownerApprovalMessage, projectLabel, type CleanupClaims, type CleanupRequest, type CrossProjectCleanupGuard } from './cleanup-guard'
 import { anonymousConversations } from './local-models/anonymous'
 import { LOCAL_SWARM_LIMITS, planLocalCoworker, watchLocalCoworker } from './local-models/swarm'
 import { AsyncLocalStorage } from 'node:async_hooks'
@@ -276,7 +278,7 @@ const toolSignatures = {
   'agents.grant': '({agentSessionId,repository?,research?}) — switch a local-model coworker’s per-conversation grants: repository (the sandbox may commit and branch, and a plain git push runs for it on the host) and research (web_search plus a larger tool-round budget). These are the conversation’s durable settings, the same toggles as its composer, so its own buttons show the change and it applies from its next turn. Only a non-local coworker may grant, only to a provider-local tab it already controls on this machine, never to itself or an ancestor; an omitted field is left alone, false revokes; returns what is now on and off',
   'agents.submit': '({agentSessionId,prompt}) — dispatch to a visible native tab with its existing permission settings; a coworker this caller dispatched whose tab closed as finished (or, for the owner or a wizard, any closed conversation of its own workspace) is reopened in the background first (reopened:true)',
   'agents.steer': '({agentSessionId,prompt}) — what the user composer does with a message: while a turn is running (or waiting on an approval or a question) it steers the message into that turn where the provider can, else queues it behind the turn; while the conversation is idle, finished, failed, disconnected or interrupted it starts a turn with it exactly as agents.submit does (one turn, same settings, same control link); awaitReply:true (send_message’s awaitReply) also records that you wait for the recipient’s reply, as agents.await does; while a turn is still stopping it is refused, so send it again once it has stopped. A coworker this caller dispatched that finished and closed its tab (or, for the owner or a wizard, any closed conversation of its own workspace) is reopened in the background first (reopened:true). The result says which: delivery "started" for a new turn, "steered" for a message the provider took into the running turn, "queued" for one held behind it. A conversation of this project open in another workspace that nobody controls, or that messaged you first, receives it as a message headed with your id that takes no control (acrossWorkspaces:true), so no relay tab is needed; so does a fellow coworker of your own controller in this project (sibling:true), which still leaves its settings, interrupts and the rest to that controller',
-  'agents.interrupt': '({agentSessionId,expedite?,dropQueued?}) — stops the running turn, including one waiting on an approval; queued messages stay held above its composer, as after the owner’s Stop. expedite:true is the owner’s Esc instead: what waits in its queue (an approved retry, a steered message) is sent straight after the stop, which is how a wizard releases an approved retry by hand. dropQueued:true discards the queued messages first (a stale "retry it now" that must not run again). Interrupting a turn stuck in \'interrupting\' again ends it within seconds. Interrupting does not take control, here or in a sibling project',
+  'agents.interrupt': '({agentSessionId,expedite?,dropQueued?,ownerApproval?}) — a tab of another project that you do not control is refused (a wizard tab of this project is not the owner there) unless the owner credential calls, or ownerApproval:true and the owner approves the dialog; stops the running turn, including one waiting on an approval; queued messages stay held above its composer, as after the owner’s Stop. expedite:true is the owner’s Esc instead: what waits in its queue (an approved retry, a steered message) is sent straight after the stop, which is how a wizard releases an approved retry by hand. dropQueued:true discards the queued messages first (a stale "retry it now" that must not run again). Interrupting a turn stuck in \'interrupting\' again ends it within seconds. Interrupting does not take control, here or in a sibling project',
   'agents.resume': '({agentSessionId}) — reopen a live orphan in this workspace without restarting its turn, or reconnect an idle/disconnected native conversation with its existing settings; outside this workspace only a coworker this caller controls. Resuming a failed, interrupted or disconnected one is a recovery: three per conversation in six hours (the owner is not counted), never while it waits on a request, never once it is superseded',
   'agents.supersede': '({agentSessionId,by,reason}) - mark a stopped coworker whose work another conversation (by) took over and delivered, so it reads as superseded rather than unfinished work and is not resumed again; reason up to 300 characters, e.g. what accepted the replacement',
   'agents.fork': '({agentSessionId,title?}) — fork supported idle native history into a visible linked tab, opened in the workspace that holds the original; outside this workspace only a coworker this caller controls',
@@ -306,8 +308,9 @@ const toolSignatures = {
   'git.status': '() — branch, ahead/behind, head and changed files of this project’s repository, and whether a release workflow is verified after a push',
   'git.ship': '({message,paths?,publish?,mac?,waitSeconds?}) — deliver finished work in one call. Conductor freezes changed paths as Git blobs, verifies that snapshot with parallel tests/build, and commits those exact blobs as a local commit on the host with the owner’s credentials; later disk edits stay uncommitted and are reported. Nothing is pushed or released unless publish: true — for the owner, a wizard tab or a controller publishing a finished batch, never a dispatched coworker — also pushes, starts the release workflow (with the Mac build unless mac: false) and checks its Windows and Mac assets. Never escalate your sandbox for git/gh or run these steps yourself. Returns the run; waitSeconds (max ' + SHIP_WAIT_SECONDS + MCP_WAIT_NOTE + ', capped with waitCapped in the result) blocks until it settles or that time passes, then keep polling git.ship.status. A ship while another delivery of this project runs is queued, never refused: it returns status:"queued" with runId, behind (the run ahead of it) and position, starts by itself when that settles, and runs its own preflight then. Only a failed stage carries its log (last 15 lines); a running test stage carries passedFiles, failedFiles and its failing lines so far, another running stage its last 15 lines',
   'git.ship.status': '({runId?,waitSeconds?}) — your own most recent delivery in this project (the project\'s latest, with a note, if you have none); runId reads any of the project\'s last 10 runs, queued, running or finished: each stage (log only for a failed stage, last 15 lines; a running test stage gives passedFiles, failedFiles and failing lines so far, another running stage its last 15 lines), commit, release tag and error, and status:"queued" with behind and position while it waits its turn; waitSeconds (max ' + SHIP_WAIT_SECONDS + MCP_WAIT_NOTE + ', capped with waitCapped in the result) long-polls until the run settles',
-  'local.servers': '() — the local model (llama.cpp) servers running on this machine: model, pid, port, start time, whether this Conductor started them, and which conversations of this project use each and whether one is mid-turn. The machine holds one at a time; this is where to look before starting or stopping one',
-  'local.stop': '({model?,pid?,force?}) — stop one running local model server this Conductor started, named by model or pid (both from local.servers), in one call. Refused while a turn is using it unless force:true, which asks the owner first (a wizard tab is the owner) and fails that turn; a server Conductor did not start is never stopped. The next local turn starts its server again',
+  'local.servers': '() — the local model (llama.cpp) servers running on this machine: model, pid, port, start time, whether this Conductor started them, ownerProject {id,name} and startedBy {agentSessionId,title} (the project and conversation whose turn started it), protected and protection {projectId,projectName,reason,agentSessionId,title,at} (local.protect), users (every project\'s local conversations on that model, with projectId and whether mid-turn) and conversations (this project\'s). The machine holds one at a time; this is where to look before starting or stopping one',
+  'local.stop': '({model?,pid?,force?,reason?,ownerApproval?}) — stop one running local model server this Conductor started, named by model or pid (both from local.servers), in one call. Refused while a turn is using it unless force:true, which asks the owner first (a wizard tab is the owner) and fails that turn; a server Conductor did not start is never stopped. A server another project started or protects is refused, naming that project and how to ask it (send_message({projectId})): a wizard tab of this project is not the owner there; only the owner credential, or ownerApproval:true with the owner approving the dialog, stops it. A server this project protected itself needs force:true and a reason. The next local turn starts its server again',
+  'local.protect': '({model?,pid?,reason,protect?}) — mark a local model server this project started as protected (protect:true, the default, with a reason another project is shown) or lift that (protect:false). Kept in the server\'s run record, so it survives a restart of Conductor and ends with the server. A protected server is never stopped to make room for another model, and local.stop from another project is refused naming this project and the reason. Only the project that started it may protect it (a server started before Conductor recorded that: a project with a conversation on it), only the protecting project lifts it, and the owner credential may do either',
   'usage.weekly': '({provider?, weeks?}) — zero-turn weekly allowance report, so you can see before dispatching whether a provider’s weekly allowance is being used or left on the table: one row per provider window (split by the provider’s own reported reset, not calendar weeks; Claude seven_day and Fable weekly, Codex weekly), newest first, weeks (default 8, max 52) closed or current windows per bucket. Each row: status closed|current|no-data, startsAt/endsAt, peakPercent, finalPercent (last reading before the reset), usedUp and usedUpAt, unusedPercent, coverage complete|partial|none with notes (a stretch without readings is said to have none; nothing is interpolated), the current window’s projection at its pace so far, and tokens: processed/total tokens and cost Conductor recorded per model in that window (cost only where the provider reported one). Also recordedSince (earliest reading held) and unknown providers (Grok reports no allowance)',
   'usage.limits': '({provider?}) — zero-turn read of the newest account allowance each provider reported: per provider and bucket (Claude five_hour, seven_day and model windows such as Fable weekly; Codex primary/secondary per limit bucket with its credits), usedPercent, resetsAt, windowMinutes, observedAt with its age and the conversation that reported it. A window whose resetsAt has passed says state "reset" (its current use is unknown until the provider reports again); a provider that reported nothing, or does not report an allowance at all (Grok), says status "unknown" and why. Figures are the provider’s own; nothing is estimated. Also carries localSavings: the conductor-local MCP tools\' (run_and_summarize, local_ask, summarize_file) measured frontier-token savings over the last 7 days — calls, modelCalls, localInputTokens/localOutputTokens and tokensSaved — or null where local assist is not wired',
   'loops.list': '() — validated .conductor/loops/*.md definitions in this project, with version, triggers, inputs, budget and step count',
@@ -386,6 +389,8 @@ const supervisorSignatures: Record<string, string> = {
 const supervisorMethods = new Set(Object.keys(supervisorSignatures))
 /** The owner's authority, from either source: the credential file, or a wizard conversation. */
 const sovereign = (scope: AgentControlScope): boolean => scope.owner === true || scope.wizard === true
+/** production.* calls that stop or withdraw something, guarded across projects (cleanup-guard.ts). */
+const PRODUCTION_CLEANUP_METHODS = new Set(['production.pause', 'production.cancel', 'production.waivers.revoke', 'production.writes.revoke'])
 
 /** Durable overnight jobs on a local model (docs/durable-jobs.md). Listed only where the job
  *  controller is running. Reading is open to the whole project; changing a job is the owner's,
@@ -490,6 +495,8 @@ export interface AgentControlDependencies {
     servers?(): LocalServerEntry[]
     /** Stop one Conductor-started server; throws LocalServerBusy while a turn uses it unless forced. */
     stop?(request: LocalStopRequest): Promise<unknown>
+    /** Set (or with null, lift) a project's protection in the run record of the server `model` runs as `pid` (local.protect). */
+    protect?(server: { model: string; pid: number }, protection: ServerProtection | null): void
     /** The card's total VRAM in GB, for routing's fits-VRAM filter; null when unknown. */
     vramTotalGb?(): number | null
   }
@@ -2140,7 +2147,7 @@ export class AgentControl {
       if (!this.deps.usageWeeks) throw new Error('usage.weekly is not wired in this Conductor build; read usage.limits for the current week')
       return this.deps.usageWeeks.report({ ...(args.provider ? { provider: args.provider as StructuredProvider } : {}), ...(typeof args.weeks === 'number' ? { weeks: args.weeks } : {}) })
     }
-    if (method === 'local.servers' || method === 'local.stop') return this.localServers(scope, source, method, args)
+    if (method === 'local.servers' || method === 'local.stop' || method === 'local.protect') return this.localServers(scope, source, method, args)
     if (scope.owner && !scope.projectId) throw new Error(`${method} needs a project: none is open in this Conductor yet. Register one with projects.open({path}) and pass its id as scope.projectId`)
     if (method === 'app.state') return { observedAt: new Date().toISOString(), projectId: scope.projectId, workspaceId: scope.sessionId, project: database.getProject(scope.projectId), workspace: database.getSession(scope.sessionId), tabs: this.tabs(scope), relationships: this.listLinks(scope.projectId, scope.sessionId).map(link => ({ agentSessionId: link.targetAgentSessionId, controllerAgentSessionId: link.controllerAgentSessionId })), machineId: this.callerMachineId(scope), machines: this.machines(), projects: this.projects(scope), ...(sovereign(scope) ? { owner: scope.owner === true, wizard: scope.wizard === true, appVersion: this.deps.host?.version ?? null, pid: this.deps.host?.pid ?? null, updates: this.deps.host?.updates?.state() ?? null, restartRequest: this.deps.host?.restartRequest?.() ?? null, pendingQuitConfirmation: this.deps.host?.stopConfirmation?.pending() ?? null, claudeHooks: claudeHookHealth() } : {}) }
     if (method === 'machines.list') {
@@ -2350,8 +2357,14 @@ export class AgentControl {
       }
       if (method === 'agents.release') { this.relationship(scope, target, tab, 'detached'); return { released: true } }
       if (method === 'agents.interrupt') {
-        const { expedite, dropQueued } = validateArgs(method, args, ['agentSessionId', 'expedite', 'dropQueued'], { aliases: { expediteSubmittedInput: 'expedite' }, ignore: ['projectId', 'workspaceId'] })
+        const { expedite, dropQueued, ownerApproval } = validateArgs(method, args, ['agentSessionId', 'expedite', 'dropQueued', 'ownerApproval'], { aliases: { expediteSubmittedInput: 'expedite' }, ignore: ['projectId', 'workspaceId'] })
         if (expedite !== undefined && typeof expedite !== 'boolean') throw new ArgumentError('expedite must be true or false')
+        if (ownerApproval !== undefined && typeof ownerApproval !== 'boolean') throw new ArgumentError('ownerApproval must be true or false')
+        // An uncontrolled tab of another project is that project's to stop; the tab a controller
+        // opened there is its own (cleanup-guard.ts).
+        if (target.projectId !== scope.projectId && this.linkFor(id)?.controllerAgentSessionId !== scope.agentSessionId) {
+          await this.guardCleanup(scope, source.title, { owner: { projectId: target.projectId, ...(this.projectName(target.projectId) ? { projectName: this.projectName(target.projectId)! } : {}) } }, { label: `${state.title || id} (${id})`, action: 'interrupt', call: `agents.interrupt({agentSessionId:"${id}"})` }, ownerApproval === true)
+        }
         if (dropQueued !== undefined && typeof dropQueued !== 'boolean') throw new ArgumentError('dropQueued must be true or false')
         if (expedite === true && dropQueued === true) throw new ArgumentError('expedite sends the queued messages and dropQueued discards them; pass one of them')
         // dropQueued discards what waits in the queue first (a stale approved retry that must not
@@ -2725,12 +2738,20 @@ export class AgentControl {
 
   /** production.* (src/main/production/control.ts): who may call what is decided there from these
    *  facts, which come from the authorized scope and durable settings, never from the caller. */
-  private productionMethod(scope: AgentControlScope, source: AgentSpec, method: string, args: Args): Promise<unknown> {
+  private async productionMethod(scope: AgentControlScope, source: AgentSpec, method: string, rawArgs: Args): Promise<unknown> {
     const service = this.deps.production
     if (!service) throw new Error('Production audits are unavailable in this Conductor')
     const settings = scope.owner ? undefined : this.deps.database.structured.snapshot(scope.agentSessionId)?.settings
     // invoke() lets only the owner or a wizard name another project here.
-    const projectId = args.projectId === undefined ? scope.projectId : this.sibling(scope, { projectId: args.projectId }).projectId
+    const projectId = rawArgs.projectId === undefined ? scope.projectId : this.sibling(scope, { projectId: rawArgs.projectId }).projectId
+    // Stopping another project's audit, or withdrawing its waivers and write grants, is that
+    // project's or the owner's: a wizard of this project is not the owner there (cleanup-guard.ts).
+    const { ownerApproval, ...args } = rawArgs
+    if (ownerApproval !== undefined && (typeof ownerApproval !== 'boolean' || !PRODUCTION_CLEANUP_METHODS.has(method))) throw new Error(`ownerApproval is for ${[...PRODUCTION_CLEANUP_METHODS].join(', ')} on another project, and is true or false`)
+    if (projectId !== scope.projectId && PRODUCTION_CLEANUP_METHODS.has(method)) {
+      const id = typeof args.runId === 'string' ? args.runId : typeof args.waiverId === 'string' ? args.waiverId : typeof args.authorizationId === 'string' ? args.authorizationId : ''
+      await this.crossProjectGuard(scope, source.title)({ projectId, label: `${method === 'production.waivers.revoke' ? 'production waiver' : method === 'production.writes.revoke' ? 'production write authorization' : 'production audit run'} ${id}`.trim(), action: method === 'production.pause' ? 'pause' : method === 'production.cancel' ? 'cancel' : 'revoke', call: `${method}({projectId:"${projectId}", …})`, ownerApproval: ownerApproval === true })
+    }
     return productionCall(service, {
       projectId, agentSessionId: scope.owner ? '' : scope.agentSessionId, title: source.title, owner: scope.owner === true, wizard: scope.wizard === true,
       sovereign: sovereign(scope), local: !scope.owner && source.provider === 'local', readOnly: !scope.owner && restricted(settings)
@@ -2755,7 +2776,7 @@ export class AgentControl {
     const settings = scope.owner ? undefined : this.deps.database.structured.snapshot(scope.agentSessionId)?.settings
     return service.call({
       projectId: scope.projectId, agentSessionId: scope.agentSessionId, title: source.title, owner: scope.owner === true,
-      sovereign: sovereign(scope), readOnly: source.provider === 'local' || restricted(settings)
+      sovereign: sovereign(scope), readOnly: source.provider === 'local' || restricted(settings), crossProject: this.crossProjectGuard(scope, source.title)
     }, method, args)
   }
 
@@ -2849,7 +2870,7 @@ export class AgentControl {
     const refusal = sovereign(scope) ? null
       : source.provider === 'local' ? 'A sandboxed local conversation cannot run commands on another machine; the owner, a wizard tab or a non-local coworker can'
         : restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings) ? readOnly(method) : null
-    return callNodeMethod(service, { projectId: scope.projectId, projectPath: project && !project.remote ? project.path : null, agentSessionId: scope.agentSessionId, owner: sovereign(scope), refusal }, method, args)
+    return callNodeMethod(service, { projectId: scope.projectId, projectPath: project && !project.remote ? project.path : null, agentSessionId: scope.agentSessionId, owner: sovereign(scope), refusal, crossProject: this.crossProjectGuard(scope, source.title) }, method, args)
   }
 
   /** The job a jobs.* call names, only when it belongs to the caller's project. Another project's
@@ -3030,9 +3051,11 @@ export class AgentControl {
    * owner makes in the app.
    */
   /** Asks the owner and throws unless they allowed it, saying whether they declined or were never reached. */
-  private async ask(scope: AgentControlScope, message: string, action: string): Promise<void> {
+  private async ask(scope: AgentControlScope, message: string, action: string, ownerOnly = false): Promise<void> {
     // The owner's own credential, or a wizard tab, is the owner answering: nobody else to ask.
-    if (sovereign(scope)) return
+    // ownerOnly: a target of another project, where a wizard tab is its own project and not the
+    // owner, so the dialog is raised for it too and only the owner's own window answers it.
+    if (ownerOnly ? scope.owner === true : sovereign(scope)) return
     const method = this.callContext.getStore()?.method
     const release = method ? this.markAwaiting(scope.agentSessionId, method) : undefined
     let answer: Awaited<ReturnType<AgentControlDependencies['confirm']>>
@@ -3191,35 +3214,132 @@ export class AgentControl {
     return id
   }
 
-  /** local.servers / local.stop: the one llama.cpp server this machine holds, found and stopped
-   *  in one call each instead of a hunt through the CLI and the stack's scripts. */
+  /** local.servers / local.stop / local.protect: the one llama.cpp server this machine holds,
+   *  found, claimed and stopped in one call each instead of a hunt through the CLI and the stack's
+   *  scripts. A server records the project that started it and any project's protection, and a stop
+   *  of one another project owns or protects goes through the cleanup guard (cleanup-guard.ts). */
   private async localServers(scope: AgentControlScope, source: AgentSpec, method: string, args: Args): Promise<unknown> {
     const local = this.deps.localModels
     if (!local?.servers || !local.stop) throw new Error('Local model servers are unavailable in this Conductor')
     if (method === 'local.servers') {
       if (Object.keys(args).length) throw new Error('local.servers takes no arguments')
-      const conversations = scope.projectId ? this.deps.database.listProcesses(scope.projectId).filter(process => process.kind === 'agent' && process.provider === 'local') : []
-      return local.servers().map(server => ({ ...server, conversations: conversations.flatMap(process => {
-        const state = this.deps.database.structured.snapshot(process.id)
-        if (localModelId(state?.settings.model || process.model || '') !== server.model) return []
-        return [{ agentSessionId: process.id, title: process.title, phase: state?.phase ?? null, inTurn: Boolean(state && ['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'].includes(state.phase)) }]
-      }) }))
+      const users = this.localUsers(scope)
+      return local.servers().map(server => {
+        const { owner, protection, ...rest } = server as Partial<LocalServerEntry> & LocalServerEntry
+        const on = users.filter(user => user.model === server.model).map(({ model: _model, ...user }) => user)
+        return {
+          ...rest,
+          ownerProject: owner ? { id: owner.projectId, name: this.projectName(owner.projectId) ?? owner.projectName ?? null } : null,
+          startedBy: owner?.agentSessionId ? { agentSessionId: owner.agentSessionId, title: owner.title ?? null } : null,
+          protected: Boolean(protection),
+          protection: protection ? { ...protection, projectName: this.projectName(protection.projectId) ?? protection.projectName ?? null } : null,
+          users: on,
+          conversations: on.filter(user => user.projectId === scope.projectId).map(({ projectId: _projectId, projectName: _projectName, ...user }) => user)
+        }
+      })
     }
-    validateArgs('local.stop', args, ['model', 'pid', 'force'])
+    if (method === 'local.protect') return this.protectLocalServer(scope, source, args)
+    validateArgs('local.stop', args, ['model', 'pid', 'force', 'reason', 'ownerApproval'])
     if (args.model === undefined && args.pid === undefined) throw new Error('Name the server to stop: model or pid, from local.servers')
     if (args.pid !== undefined && (!Number.isInteger(args.pid) || (args.pid as number) <= 0)) throw new Error('pid must be a positive integer')
     if (args.force !== undefined && typeof args.force !== 'boolean') throw new Error('force must be true or false')
-    if (!sovereign(scope)) {
-      if (source.provider === 'local') throw new Error('A sandboxed local conversation cannot stop a model server; its controller, a wizard tab or the owner can')
-      if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly(method))
-    }
+    if (args.ownerApproval !== undefined && typeof args.ownerApproval !== 'boolean') throw new Error('ownerApproval must be true or false')
+    const reason = args.reason === undefined ? undefined : text(args, 'reason', 500)
+    this.mayManageLocalServers(scope, source, method)
     const request: LocalStopRequest = { ...(args.model === undefined ? {} : { model: text(args, 'model', 200) }), ...(args.pid === undefined ? {} : { pid: args.pid as number }) }
+    let entry: LocalServerEntry | null = null
+    try { entry = matchLocalServer(local.servers(), request) } catch { /* None or several: the stop itself says which. */ }
+    if (entry) {
+      const label = `${entry.label} (pid ${entry.pid ?? 'unknown'})`
+      const claims = this.serverClaims(entry)
+      const call = `local.stop({${entry.pid !== null ? `pid:${entry.pid}` : `model:"${entry.model}"`}})`
+      await this.guardCleanup(scope, source.title, claims, { label, action: 'stop', call, force: args.force === true, ...(reason ? { reason } : {}) }, args.ownerApproval === true)
+      // The verdict holds for the server the stop finds only while its claims are the ones checked.
+      const checked = { owner: entry.owner?.projectId ?? null, protection: entry.protection?.projectId ?? null }
+      request.guard = server => {
+        if ((server.owner?.projectId ?? null) !== checked.owner || (server.protection?.projectId ?? null) !== checked.protection) throw new Error(`${label}: its owner or protection changed while this stop was being checked, so nothing was stopped. Call local.servers and decide again.`)
+      }
+    }
     try { return await local.stop(request) }
     catch (error) {
       if (!(error instanceof LocalServerBusy) || args.force !== true) throw error
       await this.ask(scope, `${source.title} wants to stop ${error.label} although ${error.reason}; that turn fails.`, 'stop a busy local model server')
       return await local.stop({ ...request, force: true })
     }
+  }
+
+  /** Who may stop or protect a model server at all: not a sandboxed local conversation, not a read-only one. */
+  private mayManageLocalServers(scope: AgentControlScope, source: AgentSpec, method: string): void {
+    if (sovereign(scope)) return
+    if (source.provider === 'local') throw new Error(`A sandboxed local conversation cannot ${method === 'local.protect' ? 'protect' : 'stop'} a model server; its controller, a wizard tab or the owner can`)
+    if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly(method))
+  }
+
+  /** Every project's local conversations with the model each uses (local.servers users): this
+   *  project's whole history, other projects' active or recent ones. */
+  private localUsers(scope: AgentControlScope): Array<{ model: string; agentSessionId: string; title: string; projectId: string; projectName: string | null; phase: string | null; inTurn: boolean }> {
+    const own = scope.projectId ? this.deps.database.listProcesses(scope.projectId) : []
+    const processes = [...own, ...this.deps.database.listProcesses().filter(process => process.projectId !== scope.projectId)].filter(process => process.kind === 'agent' && process.provider === 'local')
+    return processes.map(process => {
+      const state = this.deps.database.structured.snapshot(process.id)
+      return { model: localModelId(state?.settings.model || process.model || ''), agentSessionId: process.id, title: process.title, projectId: process.projectId, projectName: this.projectName(process.projectId), phase: state?.phase ?? null, inTurn: Boolean(state && ['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'].includes(state.phase)) }
+    })
+  }
+
+  private projectName(projectId: string): string | null { return this.deps.database.getProject(projectId)?.name ?? null }
+
+  /** A server's claims as the cleanup guard reads them, with current project names. */
+  private serverClaims(server: Pick<LocalServerEntry, 'owner' | 'protection'>): CleanupClaims {
+    const named = <T extends { projectId: string; projectName?: string }>(claim: T): T => ({ ...claim, projectName: this.projectName(claim.projectId) ?? claim.projectName })
+    return { owner: server.owner ? named(server.owner) : null, protection: server.protection ? named(server.protection) : null }
+  }
+
+  /** local.protect: a project's claim, in the run record, that a server it started stays up. */
+  private protectLocalServer(scope: AgentControlScope, source: AgentSpec, args: Args): unknown {
+    const local = this.deps.localModels!
+    if (!local.protect) throw new Error('Protecting a local model server is unavailable in this Conductor')
+    validateArgs('local.protect', args, ['model', 'pid', 'reason', 'protect'])
+    if (args.model === undefined && args.pid === undefined) throw new Error('Name the server: model or pid, from local.servers')
+    if (args.pid !== undefined && (!Number.isInteger(args.pid) || (args.pid as number) <= 0)) throw new Error('pid must be a positive integer')
+    if (args.protect !== undefined && typeof args.protect !== 'boolean') throw new Error('protect must be true or false')
+    if (!scope.projectId) throw new Error('local.protect needs a project: pass the project the protection is for as scope.projectId')
+    this.mayManageLocalServers(scope, source, 'local.protect')
+    const server = matchLocalServer(local.servers?.() ?? [], { ...(args.model === undefined ? {} : { model: text(args, 'model', 200) }), ...(args.pid === undefined ? {} : { pid: args.pid as number }) })
+    const label = `${server.label} (pid ${server.pid ?? 'unknown'})`
+    if (!server.startedByConductor || server.pid === null) throw new Error(`${label} was not started by this Conductor, so there is no run record to keep a protection in; it is never stopped from here anyway.`)
+    const claims = this.serverClaims(server)
+    const ask = (project: { projectId: string; projectName?: string }): string => `Ask that project with send_message({projectId:"${project.projectId}", text}).`
+    if (args.protect === false) {
+      if (!claims.protection) return { protected: false, model: server.model, pid: server.pid, note: 'It was not protected.' }
+      if (claims.protection.projectId !== scope.projectId && !scope.owner) throw new Error(`Refused: ${label} is protected by project ${projectLabel(claims.protection)}: ${claims.protection.reason}. Only that project, or the owner, lifts it. ${ask(claims.protection)}`)
+      local.protect({ model: server.model, pid: server.pid }, null)
+      return { protected: false, model: server.model, pid: server.pid, lifted: claims.protection }
+    }
+    const reason = text(args, 'reason', 500)
+    if (!scope.owner) {
+      if (claims.protection && claims.protection.projectId !== scope.projectId) throw new Error(`Refused: ${label} is already protected by project ${projectLabel(claims.protection)}: ${claims.protection.reason}. ${ask(claims.protection)}`)
+      if (claims.owner && claims.owner.projectId !== scope.projectId) throw new Error(`Refused: ${label} was started by project ${projectLabel(claims.owner)}; only the project that started a server may protect it. ${ask(claims.owner)}`)
+      if (!claims.owner && !this.localUsers(scope).some(user => user.projectId === scope.projectId && user.model === server.model)) throw new Error(`Refused: ${label} records no project that started it (it predates that record), and no conversation of this project uses it; a project with a conversation on that model may protect it.`)
+    }
+    const projectName = this.projectName(scope.projectId)
+    const protection: ServerProtection = { projectId: scope.projectId, ...(projectName ? { projectName } : {}), reason, ...(scope.owner ? {} : { agentSessionId: scope.agentSessionId, title: source.title }), at: new Date().toISOString() }
+    local.protect({ model: server.model, pid: server.pid }, protection)
+    return { protected: true, model: server.model, pid: server.pid, protection, note: 'Kept in its run record: it survives a Conductor restart and ends with the server. local.protect({pid, protect:false}) lifts it.' }
+  }
+
+  /** The cross-project cleanup rule (cleanup-guard.ts) for one target: resolves when the caller may
+   *  go ahead and throws the refusal otherwise. ownerApproval:true raises the owner's own dialog,
+   *  which a wizard tab never answers for itself: across projects it is its project, not the owner. */
+  private async guardCleanup(scope: AgentControlScope, asker: string, claims: CleanupClaims, request: CleanupRequest, ownerApproval: boolean): Promise<void> {
+    const verdict = cleanupVerdict(claims, { projectId: scope.projectId, owner: scope.owner === true }, request)
+    if (verdict.allowed) return
+    if (verdict.kind !== 'other-project' || !ownerApproval) throw new Error(verdict.message)
+    await this.ask(scope, ownerApprovalMessage(claims, request, asker), `${request.action} ${request.label}`, true)
+  }
+
+  /** The same rule for a target another module found in another project (remote jobs, idea runs). */
+  private crossProjectGuard(scope: AgentControlScope, asker: string): CrossProjectCleanupGuard {
+    return target => this.guardCleanup(scope, asker, { owner: { projectId: target.projectId, ...(this.projectName(target.projectId) ? { projectName: this.projectName(target.projectId)! } : {}) } }, { label: target.label, action: target.action, call: target.call, ...(target.reason ? { reason: target.reason } : {}) }, target.ownerApproval)
   }
 
   private requestRestart(scope: AgentControlScope, host: AgentControlHost, args: Args): unknown {

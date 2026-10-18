@@ -92,8 +92,46 @@ export interface ProcessIdentity { creationTime: string; executable: string }
  *  ours (it serves our model id and enforces our API key) but not which process it is, so nothing here may try
  *  to kill it. `generation` and `identity` are written at launch; a record without them (an older
  *  Conductor's, or one rewritten on adoption) names a process nothing here can prove is ours, so it
- *  is never stopped either. `startedAt` is the record's own time, not the OS creation time. */
-export interface RunRecord { pid: number | null; port: number; model: string; file: string; startedAt: string; generation?: string; identity?: ProcessIdentity }
+ *  is never stopped either. `startedAt` is the record's own time, not the OS creation time.
+ *  `owner` names the project and conversation whose turn started the server, and `protection` a
+ *  project's standing claim that it stays up (local.protect): both live here so they survive a
+ *  restart of Conductor, and both end with the server, whose record goes with it. */
+export interface RunRecord { pid: number | null; port: number; model: string; file: string; startedAt: string; generation?: string; identity?: ProcessIdentity; owner?: ServerOwner; protection?: ServerProtection }
+/** Who started a server: a project, and the conversation in it whose turn asked for it. */
+export interface ServerOwner { projectId: string; projectName?: string; agentSessionId?: string; title?: string }
+/** A project's claim that a server stays up, with the reason another project is shown. */
+export interface ServerProtection { projectId: string; projectName?: string; reason: string; agentSessionId?: string; title?: string; at: string }
+
+const validOwner = (value: unknown): value is ServerOwner => Boolean(value) && typeof value === 'object' && typeof (value as ServerOwner).projectId === 'string' && Boolean((value as ServerOwner).projectId)
+const validProtection = (value: unknown): value is ServerProtection => validOwner(value) && typeof (value as ServerProtection).reason === 'string' && Boolean((value as ServerProtection).reason.trim())
+
+/** The owner and protection a record carries, malformed fields dropped (an older Conductor's record has neither). */
+export function recordClaims(record: RunRecord | null): { owner: ServerOwner | null; protection: ServerProtection | null } {
+  return { owner: validOwner(record?.owner) ? record!.owner! : null, protection: validProtection(record?.protection) ? record!.protection! : null }
+}
+
+/** How a protected server is named in a refusal: the project, and its reason. */
+export const describeProtection = (protection: ServerProtection): string => `protected by project ${protection.projectName ? `${protection.projectName} (${protection.projectId})` : protection.projectId}: ${protection.reason}`
+
+/** Set or clear a project's protection on the server `model` runs as `pid`, in its run record. The
+ *  record is rewritten whole and only while it still names that pid, so a claim never lands on a
+ *  server started since. Returns the record as written. */
+export function setServerProtection(model: string, pid: number, protection: ServerProtection | null): RunRecord {
+  const file = recordFileFor(model, pid)
+  if (!file) throw new Error(`${model} (pid ${pid}) has no run record any more; it was stopped or restarted. local.servers shows what runs now.`)
+  const record = JSON.parse(readFileSync(file, 'utf8')) as RunRecord
+  const next: RunRecord = { ...record }
+  if (protection) next.protection = protection
+  else delete next.protection
+  writeFileSync(file, JSON.stringify(next, null, 2), 'utf8')
+  return next
+}
+
+/** The protection on the server `model` runs as `pid`, read from its record; null when none. */
+export function serverProtection(model: string, pid: number | null): ServerProtection | null {
+  const file = recordFileFor(model, pid)
+  return file ? recordClaims(readRecordFile(file)).protection : null
+}
 
 export function readRunRecord(model: LocalModelConfig): RunRecord | null {
   const path = runFile(model)
@@ -417,6 +455,8 @@ export interface StartOptions {
    *  is busy and becomes the refusal. Without it, another running model is refused as before,
    *  which is what the CLI and the tests expect. */
   release?: (running: BlockingServer) => Promise<'idle' | string>
+  /** The project and conversation asking for the server, written into its run record. */
+  owner?: ServerOwner
 }
 
 /** One llama.cpp server at a time is a VRAM rule, not a claim on the owner's attention: a server
@@ -425,10 +465,16 @@ export interface StartOptions {
 async function makeRoom(model: LocalModelConfig, running: BlockingServer, release: NonNullable<StartOptions['release']>): Promise<string> {
   const rule = 'This machine runs one llama.cpp server at a time (12 GB VRAM).'
   if (!running.ours || running.pid === null) throw new Error(`Cannot start ${model.id}: ${running.model} is running on this machine but was not started by this Conductor, so it is left alone. ${rule} Use ${running.model}, or stop it yourself before switching.`)
+  // A protected server never gives way to make room, whoever asks: its project said it stays up.
+  const protection = serverProtection(running.model, running.pid)
+  if (protection) throw new Error(`Cannot start ${model.id}: ${running.model} (pid ${running.pid}) is ${describeProtection(protection)}. ${rule} Use ${running.model}, or ask that project with send_message({projectId:"${protection.projectId}"}). Conductor has not stopped it.`)
   const verdict = await release(running)
   if (verdict !== 'idle') throw new Error(`Cannot start ${model.id}: ${running.model} is busy (${verdict}). ${rule} Wait for that work to finish, or use ${running.model} instead. Conductor has not stopped it.`)
   const file = recordFileFor(running.model, running.pid)
   if (!file) throw new Error(`Cannot start ${model.id}: the run record for ${running.model} (pid ${running.pid}) changed before it could be stopped, so it was left alone. ${rule}`)
+  // The protection is read again under the same record: one set since the check above still holds.
+  const late = recordClaims(readRecordFile(file)).protection
+  if (late) throw new Error(`Cannot start ${model.id}: ${running.model} (pid ${running.pid}) is ${describeProtection(late)}. ${rule} Conductor has not stopped it.`)
   const outcome = await stopOwnedServer(defaultStopDeps(file, running.model), { expectedPid: running.pid })
   if (outcome.status !== 'stopped') throw new Error(`Cannot start ${model.id}: ${outcome.message} No second server was started. ${rule}`)
   return `stopped idle ${running.model} to make room`
@@ -743,7 +789,7 @@ async function startAdmittedServer(executable: string, model: LocalModelConfig, 
     child.kill() // our own child, through Node's handle: never a pid lookup
     throw new Error(`llama.cpp started as pid ${child.pid} but its process identity could not be read (${identity.detail}), so it was stopped rather than left running unstoppable`)
   }
-  writeFileSync(runFile(model), JSON.stringify({ pid: child.pid, port, model: model.id, file: model.file, startedAt: new Date().toISOString(), generation: randomBytes(12).toString('hex'), identity: { creationTime: identity.creationTime, executable: identity.executable } } satisfies RunRecord, null, 2), 'utf8')
+  writeFileSync(runFile(model), JSON.stringify({ pid: child.pid, port, model: model.id, file: model.file, startedAt: new Date().toISOString(), generation: randomBytes(12).toString('hex'), identity: { creationTime: identity.creationTime, executable: identity.executable }, ...(opts.owner ? { owner: opts.owner } : {}) } satisfies RunRecord, null, 2), 'utf8')
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (spawnError || !processAlive(child.pid)) throw new Error(spawnError || describeStartupFailure(model, port))

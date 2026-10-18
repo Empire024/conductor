@@ -103,7 +103,7 @@ import { recordTabOpener, registerTabArchiveIpc, reopenedConversation, uncollect
 import { TabArchiver } from './tab-archive-eligibility'
 import { randomUUID } from 'node:crypto'
 import { createCloud, type CloudRegistration } from './cloud/register'
-import { health as llamaHealth, processAlive as llamaProcessAlive, readRunRecord, stopServer as stopLlamaServer } from './local-models/llama'
+import { health as llamaHealth, processAlive as llamaProcessAlive, readRunRecord, setServerProtection, stopServer as stopLlamaServer } from './local-models/llama'
 import { resourceRequirements, runningLlamaProcesses } from './local-models/resource-guard'
 import { dockerAvailable, sandboxImageExists } from './local-models/sandbox'
 import { createLocalModelRunner, realRunnerPorts } from './local-assist/model-runner'
@@ -3016,7 +3016,7 @@ app.whenReady().then(async () => {
       alertOwner: async ({ title, body, agentSessionId }) => phoneAccess ? phoneAccess.announce({ id: randomUUID(), kind: 'attention', sessionId: agentSessionId ?? null, title, body, at: new Date().toISOString(), url: agentSessionId ? `/#/session/${encodeURIComponent(agentSessionId)}` : '/#/' }) : 'Phone access is not running.'
     },
     delivery,
-    localModels: { availability: localModelAvailability, servers: localServersWithDecider, stop: stopRunningLocalServer, vramTotalGb: () => vramTotalGb() },
+    localModels: { availability: localModelAvailability, servers: localServersWithDecider, stop: stopRunningLocalServer, protect: (server, protection) => { setServerProtection(server.model, server.pid, protection) }, vramTotalGb: () => vramTotalGb() },
     tabArchive: { archive: (projectId, sessionId, tabIds) => { if (!tabArchiver) throw new Error('The tab archive is still starting; try again in a moment'); return tabArchiver.archive(projectId, sessionId, tabIds) } },
     // A tab an agent opens remembers who opened it, for its "opened by" / "continued from" line.
     providers: () => agents.listProviders(), ui: request => { recordTabOpener(database, request); const reopened = reopenedConversation(request); if (reopened) agents.structured.endArchive(reopened); return agentControlUi!.request(request) },

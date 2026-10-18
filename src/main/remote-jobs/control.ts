@@ -1,5 +1,6 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import type { CrossProjectCleanupGuard } from '../cleanup-guard.ts'
 import type { RemoteJobService } from './service.ts'
 import type { LogStream } from './store.ts'
 import type { NodeSummary, RemoteJob, RemoteJobStatus } from './types.ts'
@@ -19,7 +20,7 @@ export const nodeSignatures = {
   'nodes.job': '({jobId,waitSeconds?}) — one job with the last 16 KB of stdout and stderr; waitSeconds (up to 100) waits for it to end',
   'nodes.log': '({jobId,stream?:"stdout"|"stderr",bytes?,offset?,waitSeconds?}) — without offset: the end of a job\'s full log (default 64 KB, up to 1 MB) and the log file path. With offset: up to bytes from that byte offset as {text,nextOffset,done}; waitSeconds (up to 50) waits for new output when there is none yet. Follow a run by passing nextOffset back until done',
   'nodes.fetch': '({jobId,path:string|string[]}) — bring files or globs under the job\'s working directory on its node back into this project\'s .conductor-scratch/remote-artifacts/<jobId>/ (tar over ssh, 512 MiB cap; nothing outside the working directory, no symbolic links); returns {dir,files,bytes,skipped,missing,error}',
-  'nodes.cancel': '({jobId,reason?}) — stop a job: the node stops its whole process group; the owner, a wizard tab or the conversation that started it',
+  'nodes.cancel': '({jobId,reason?,ownerApproval?}) — stop a job: the node stops its whole process group; the owner, a wizard tab or the conversation that started it. A job of another project is refused (a wizard tab of this project is not the owner there) unless the owner credential calls, or ownerApproval:true and the owner approves the dialog',
   'nodes.register': '({id,host,user,identityFile?,port?,name?,labels?:string[],root?,maxConcurrentJobs?,peerMachineId?}) — owner only: add or update a node; host is its Tailscale name, identityFile the private key here whose public half the node authorizes (default ~/.ssh/conductor_mac_ed25519)',
   'nodes.remove': '({nodeId}) — owner only: forget a node that has no jobs running'
 } as const
@@ -36,7 +37,7 @@ const allowedKeys: Record<string, string[]> = {
   'nodes.job': ['jobId', 'waitSeconds'],
   'nodes.log': ['jobId', 'stream', 'bytes', 'offset', 'waitSeconds'],
   'nodes.fetch': ['jobId', 'path'],
-  'nodes.cancel': ['jobId', 'reason'],
+  'nodes.cancel': ['jobId', 'reason', 'ownerApproval'],
   'nodes.register': ['id', 'host', 'user', 'identityFile', 'port', 'name', 'labels', 'root', 'maxConcurrentJobs', 'peerMachineId'],
   'nodes.remove': ['nodeId']
 }
@@ -52,6 +53,8 @@ export interface NodeCaller {
   refusal: string | null
   /** Default key for nodes.register. */
   defaultIdentityFile?: string
+  /** The cross-project cleanup rule (src/main/cleanup-guard.ts) for a job of another project. */
+  crossProject?: CrossProjectCleanupGuard
 }
 
 type Args = Record<string, unknown>
@@ -161,7 +164,14 @@ export async function callNodeMethod(service: RemoteJobService, caller: NodeCall
     mayAct()
     const job = ownJob()
     if (!caller.owner && job.createdBy !== caller.agentSessionId) throw new Error('Only the owner, a wizard tab or the conversation that started this job may cancel it')
-    return service.cancel(job.id, str(args, 'reason', 500, false))
+    if (args.ownerApproval !== undefined && typeof args.ownerApproval !== 'boolean') throw new Error('ownerApproval must be true or false')
+    const reason = str(args, 'reason', 500, false)
+    if (job.projectId && job.projectId !== caller.projectId) {
+      // Only reachable for the owner or a wizard (ownJob): the wizard is its own project's, not this one's.
+      if (!caller.crossProject) throw new Error(`Remote job ${job.id} belongs to another project; cancel it from that project`)
+      await caller.crossProject({ projectId: job.projectId, label: `remote job ${job.id}`, action: 'cancel', call: `nodes.cancel({jobId:"${job.id}"})`, ownerApproval: args.ownerApproval === true, ...(reason ? { reason } : {}) })
+    }
+    return service.cancel(job.id, reason)
   }
   if (method === 'nodes.register') {
     ownerOnly()

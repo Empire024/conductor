@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { IdeaRunRule } from '../../shared/idea-runs'
 import type { SessionPhase } from '../../shared/structured-agent'
 import { ConductorDatabase } from '../database'
@@ -307,6 +307,28 @@ describe('the idea run controller', () => {
     await expect(ideaRunsCall(h.controller, { ...agent, readOnly: true }, 'ideas.runs', { runId: run.id })).resolves.toMatchObject({ status: 'awaiting-approval' })
     await expect(ideaRunsCall(h.controller, { ...agent, owner: true, agentSessionId: '' }, 'ideas.run.approve', { runId: run.id })).resolves.toMatchObject({ status: 'running' })
     await expect(ideaRunsCall(h.controller, agent, 'ideas.run', { ideaId: h.idea.id, extra: 1 })).rejects.toThrow(/does not accept extra/)
+  })
+
+  // conductor-task:cross-project-cleanup-guardrails
+  it('app control: pausing or stopping another project\'s run goes through the cross-project guard', async () => {
+    const h = harness({ respond: scripted })
+    const agent = { projectId: h.project.id, agentSessionId: 'agent-1', title: 'Wizard', owner: false, sovereign: true, readOnly: false }
+    const run = await ideaRunsCall(h.controller, agent, 'ideas.run', { ideaId: h.idea.id, dryRun: true }) as { id: string }
+    await h.controller.tick()
+    const refusal = new Error('Refused: idea run belongs to another project')
+    const refuse = vi.fn(async () => { throw refusal })
+    const neighbour = { ...agent, projectId: 'project-next-door', agentSessionId: 'next-door-wizard', crossProject: refuse }
+    for (const method of ['ideas.run.pause', 'ideas.run.stop']) await expect(ideaRunsCall(h.controller, neighbour, method, { runId: run.id })).rejects.toBe(refusal)
+    expect(refuse).toHaveBeenCalledWith({ projectId: h.project.id, label: `idea run ${run.id}`, action: 'stop', call: `ideas.run.stop({runId:"${run.id}"})`, ownerApproval: false })
+    expect(h.controller.get(run.id).status).toBe('awaiting-approval')
+    await expect(ideaRunsCall(h.controller, { ...neighbour, crossProject: undefined }, 'ideas.run.pause', { runId: run.id })).rejects.toThrow(/belongs to another project/)
+    // The run's own project is never asked; an approved neighbour goes through.
+    const untouched = vi.fn(async () => { throw refusal })
+    await expect(ideaRunsCall(h.controller, { ...agent, crossProject: untouched }, 'ideas.run.pause', { runId: run.id })).resolves.toBeTruthy()
+    expect(untouched).not.toHaveBeenCalled()
+    const approve = vi.fn(async () => {})
+    await expect(ideaRunsCall(h.controller, { ...neighbour, crossProject: approve }, 'ideas.run.stop', { runId: run.id, ownerApproval: true })).resolves.toBeTruthy()
+    expect(approve).toHaveBeenCalledWith(expect.objectContaining({ action: 'stop', ownerApproval: true }))
   })
 })
 

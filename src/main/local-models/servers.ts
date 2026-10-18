@@ -1,6 +1,6 @@
 import { localModelLabel } from '../../shared/local-models'
 import type { LocalModelConfig } from './config'
-import type { RunRecord } from './llama'
+import { recordClaims, type RunRecord, type ServerOwner, type ServerProtection } from './llama'
 import type { BlockingServer, ServerProcess } from './resource-guard'
 
 /** One llama.cpp server running on this machine, as app control's local.servers reports it. */
@@ -12,6 +12,11 @@ export interface LocalServerEntry {
   startedAt: string | null
   /** Only a server this Conductor started (a run record with a live pid) can be stopped here. */
   startedByConductor: boolean
+  /** The project and conversation whose turn started it, from its run record; absent for a server
+   *  an older Conductor started, or one not started here. */
+  owner?: ServerOwner | null
+  /** A project's claim that it stays up (local.protect), from its run record. */
+  protection?: ServerProtection | null
 }
 
 export interface LocalServerSources {
@@ -21,6 +26,12 @@ export interface LocalServerSources {
   /** The machine-wide llama-server process list; may throw where it cannot be read. Omitted by a
    *  caller that cannot afford the query, which then trusts run records with a live pid. */
   inventory?(): ServerProcess[]
+}
+
+/** The owner and protection a record carries, each only when it has one. */
+function presentClaims(record: RunRecord): Pick<LocalServerEntry, 'owner' | 'protection'> {
+  const { owner, protection } = recordClaims(record)
+  return { ...(owner ? { owner } : {}), ...(protection ? { protection } : {}) }
 }
 
 /** Local model ids are 'local/<id>' everywhere (stack config, run records, conversations); a
@@ -41,7 +52,7 @@ export function listLocalServers(sources: LocalServerSources): LocalServerEntry[
     const record = sources.record(model)
     if (!record || record.pid === null || !sources.alive(record.pid)) continue
     if (inventory && !inventory.some(process => process.pid === record.pid)) continue
-    entries.push({ model: model.id, label: localModelLabel(model.id), pid: record.pid, port: record.port, startedAt: record.startedAt, startedByConductor: true })
+    entries.push({ model: model.id, label: localModelLabel(model.id), pid: record.pid, port: record.port, startedAt: record.startedAt, startedByConductor: true, ...presentClaims(record) })
   }
   for (const process of inventory ?? []) {
     if (entries.some(entry => entry.pid === process.pid)) continue
@@ -50,12 +61,30 @@ export function listLocalServers(sources: LocalServerSources): LocalServerEntry[
   return entries
 }
 
+/** The one server a request names by model and/or pid; throws naming what runs when none or
+ *  several match. */
+export function matchLocalServer(servers: LocalServerEntry[], request: Pick<LocalStopRequest, 'model' | 'pid'>): LocalServerEntry {
+  const wanted = request.model === undefined ? undefined : localModelId(request.model)
+  const matches = servers.filter(server => (wanted === undefined || server.model === wanted) && (request.pid === undefined || server.pid === request.pid))
+  if (!matches.length) {
+    const running = servers.length ? servers.map(server => `${server.model} (pid ${server.pid ?? 'unknown'})`).join(', ') : 'none'
+    throw new Error(`No running local model server matches ${wanted ?? ''}${request.pid !== undefined ? ` pid ${request.pid}` : ''}. Running: ${running}.`)
+  }
+  if (matches.length > 1) throw new Error(`Several servers match (${matches.map(server => `${server.model} pid ${server.pid}`).join(', ')}); name the model or the pid.`)
+  return matches[0]!
+}
+
 /** A stop refused because a turn is using the server; the caller may ask the owner and force it. */
 export class LocalServerBusy extends Error {
   constructor(readonly label: string, readonly reason: string) { super(`${label} is busy: ${reason}. Wait for that turn to finish, or pass force:true to stop it anyway (the turn fails).`) }
 }
 
-export interface LocalStopRequest { model?: string; pid?: number; force?: boolean }
+export interface LocalStopRequest {
+  model?: string; pid?: number; force?: boolean
+  /** Runs on the exact entry about to be stopped and throws to refuse it: the cross-project check
+   *  made before the stop holds for the server the stop found (src/main/cleanup-guard.ts). */
+  guard?(server: LocalServerEntry): void
+}
 export interface LocalStopPorts {
   /** 'idle', or why the server is busy (a turn mid-flight here, or its slots generating). */
   busy(server: BlockingServer): Promise<'idle' | string>
@@ -65,14 +94,8 @@ export interface LocalStopPorts {
 /** Stop one Conductor-started server. Refuses a server this Conductor did not start, and one a
  *  turn is using unless forced; the next local turn simply starts it again. */
 export async function stopLocalServer(servers: LocalServerEntry[], request: LocalStopRequest, ports: LocalStopPorts): Promise<{ stopped: true; model: string; pid: number | null; port: number | null; forced: boolean; interrupted?: string; message: string }> {
-  const wanted = request.model === undefined ? undefined : localModelId(request.model)
-  const matches = servers.filter(server => (wanted === undefined || server.model === wanted) && (request.pid === undefined || server.pid === request.pid))
-  if (!matches.length) {
-    const running = servers.length ? servers.map(server => `${server.model} (pid ${server.pid ?? 'unknown'})`).join(', ') : 'none'
-    throw new Error(`No running local model server matches ${wanted ?? ''}${request.pid !== undefined ? ` pid ${request.pid}` : ''}. Running: ${running}.`)
-  }
-  if (matches.length > 1) throw new Error(`Several servers match (${matches.map(server => `${server.model} pid ${server.pid}`).join(', ')}); name the model or the pid.`)
-  const server = matches[0]!
+  const server = matchLocalServer(servers, request)
+  request.guard?.(server)
   if (!server.startedByConductor) throw new Error(`${server.label} (pid ${server.pid ?? 'unknown'}) was not started by this Conductor, so it is left alone. Stop it where it was started.`)
   const verdict = await ports.busy({ model: server.model, port: server.port ?? undefined, pid: server.pid, ours: true })
   if (verdict !== 'idle' && !request.force) throw new LocalServerBusy(server.label, verdict)

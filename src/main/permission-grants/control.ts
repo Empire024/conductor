@@ -36,6 +36,9 @@ export async function callPermissions(grants: PermissionGrants, scope: Permissio
   const target = (): string => {
     const named = text(args.agentSessionId, 'agentSessionId')
     if (named && named !== scope.agentSessionId && !sovereign) throw new Error('Only the owner or a wizard tab may name another conversation')
+    // A wizard reaches the conversations it answers for (agents.approve's set), not every project's:
+    // revoking another project's grant is that project's, or the owner's (src/main/cleanup-guard.ts).
+    if (named && named !== scope.agentSessionId && !scope.owner && scope.answers && !scope.answers(named)) throw new Error('That conversation is neither in this project, one of your coworkers, nor a co-open project\'s wizard or its coworkers; its own project, or the owner, may change its permissions')
     return named ?? scope.agentSessionId
   }
   if (method === 'permissions.request') {

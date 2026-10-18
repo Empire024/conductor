@@ -56,6 +56,9 @@ export interface AdapterOptions {
    *  (policyNotice) instead of a card, and journaled by the host with answeredBy "policy". Null:
    *  the request goes its normal way. Absent (reviewers, evaluation turns, tests): never asked. */
   approvalPolicy?(request: import('../approval-policy').PolicyRequest, native: { requestId: string; tool: string; input: Json }): import('../approval-policy').PolicyDecision
+  /** The project and conversation a local server this adapter starts is recorded as started by
+   *  (local.servers ownerProject / startedBy). Host-set from the registered spec, never from input. */
+  localOwner?: import('../local-models/llama').ServerOwner
   /** Trusted, registered-session broker for the Local runtime only. Never a bearer token. */
   localControl?(method: string, args: Record<string, unknown>): Promise<unknown>
   /** Continue this provider process instead of starting one: start() restores the state and

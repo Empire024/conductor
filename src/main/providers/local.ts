@@ -11,7 +11,7 @@ import { localEnergyNotice } from '../../shared/local-energy.ts'
 import { startLocalEnergyMeter } from '../local-energy.ts'
 import { endpointFor, loadConfig, modelFilePath, readApiKey } from '../local-models/config.ts'
 import type { LocalModelConfig, LocalStackConfig } from '../local-models/config.ts'
-import { inspectAdmission, startServer } from '../local-models/llama.ts'
+import { describeProtection, inspectAdmission, serverProtection, startServer, type ServerOwner } from '../local-models/llama.ts'
 import { AdmissionRefusal, type BlockingServer } from '../local-models/resource-guard.ts'
 import { DockerSandbox } from '../local-models/sandbox.ts'
 import { LOCAL_TOOLS, type LocalGrants } from '../local-models/tools.ts'
@@ -153,6 +153,8 @@ export async function localModelAvailability(modelId: string): Promise<{ availab
     const running = error.running
     const rule = 'This machine runs one llama.cpp server at a time.'
     if (!running.ours) return { available: false, reason: `${localModelLabel(running.model)} (${running.model}) is running on this machine but was not started by this Conductor, so it is left alone. ${rule} Use ${running.model} for this task, or stop that server yourself before switching.` }
+    const protection = running.pid === null ? null : serverProtection(running.model, running.pid)
+    if (protection) return { available: false, reason: `${localModelLabel(running.model)} (${running.model}) is ${describeProtection(protection)}. ${rule} Use ${running.model} for this task, or ask that project with send_message({projectId:"${protection.projectId}"}).` }
     const verdict = await releaseVerdict(running, apiKey)
     if (verdict === 'idle') return { available: true, note: `${localModelLabel(running.model)} is idle and will be stopped to make room for ${localModelLabel(modelId)}` }
     return { available: false, reason: `${localModelLabel(running.model)} (${running.model}) is busy: ${verdict}. ${rule} Wait for that work to finish and try again, or use ${running.model} for this task instead.` }
@@ -163,7 +165,7 @@ export async function localModelAvailability(modelId: string): Promise<{ availab
  *  another tab is still using, and the stack's own `stop` command stays the way servers are shut
  *  down by hand; the one thing a start may stop is an idle server of another model that this
  *  Conductor started, because the machine holds one model at a time. */
-async function ensureServer(stack: LocalStackConfig, model: LocalModelConfig, apiKey: string, onStart: () => void): Promise<void> {
+async function ensureServer(stack: LocalStackConfig, model: LocalModelConfig, apiKey: string, onStart: () => void, owner?: ServerOwner): Promise<void> {
   // Reuse must pass the same model identity and anonymous-key-refusal checks as startup.
   // Only startServer may allocate; it repeats admission under the cross-process lock.
   if (!startingServers.has(model.id)) {
@@ -174,7 +176,7 @@ async function ensureServer(stack: LocalStackConfig, model: LocalModelConfig, ap
   let pending = startingServers.get(model.id)
   const first = !pending
   if (!pending) {
-    pending = startServer(stack.llamaServer, model, apiKey, { release: running => releaseVerdict(running, apiKey) }).then(() => undefined)
+    pending = startServer(stack.llamaServer, model, apiKey, { release: running => releaseVerdict(running, apiKey), ...(owner ? { owner } : {}) }).then(() => undefined)
     startingServers.set(model.id, pending)
     void pending.catch(() => { /* Reported to whoever awaited it. */ }).finally(() => { if (startingServers.get(model.id) === pending) startingServers.delete(model.id) })
   }
@@ -301,7 +303,7 @@ export class LocalAdapter implements ProviderAdapter {
     await ensureServer(this.stack!, model, this.key(), () => {
       announced = true
       this.emit({ turnId, data: { type: 'notice', message: `Starting ${localModelLabel(model.id)} locally; the first start loads the model into memory and can take a few minutes.` } })
-    })
+    }, this.options.localOwner)
     if (announced) this.emit({ turnId, data: { type: 'notice', message: `${localModelLabel(model.id)} is ready.` } })
     this.endpointContext = await probeLocalContext(endpointOf(model), this.key(), model.id, model.contextTokens)
     this.emit({ turnId, data: { type: 'notice', message: 'Local endpoint context and template diagnostics', payload: { localEndpointContext: this.endpointContext as unknown as Json } } })
