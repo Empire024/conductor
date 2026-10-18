@@ -122,7 +122,8 @@ const showPush = async event => {
   const title = typeof payload.title === 'string' && payload.title ? payload.title : 'Conductor'
   await self.registration.showNotification(title, {
     body: typeof payload.body === 'string' ? payload.body : '',
-    tag: sessionId || (typeof payload.id === 'string' ? payload.id : 'conductor'),
+    /* A shared tag (one provider's usage limit across several tabs) replaces the last one rather than stacking. */
+    tag: (typeof payload.tag === 'string' && payload.tag) || sessionId || (typeof payload.id === 'string' ? payload.id : 'conductor'),
     renotify: true,
     data: { url: typeof payload.url === 'string' && payload.url ? payload.url : '/#/' },
     icon: '/icon-192.png',

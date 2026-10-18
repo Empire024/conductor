@@ -11,7 +11,7 @@ import type { AgentSpec } from '../shared/models'
 import type { StructuredProvider } from '../shared/structured-agent'
 import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './providers/adapter'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, PromptOrigin, ProviderCapabilities, SessionSettings } from '../shared/structured-agent'
-import { MAX_PROMPT_CHARS, PROVIDER_AUTH_EXPIRED } from '../shared/structured-agent'
+import { ANSWERED_IN_CONVERSATION, MAX_PROMPT_CHARS, PROVIDER_AUTH_EXPIRED } from '../shared/structured-agent'
 import { LocalSetupError } from './providers/local'
 import { LOCAL_MODEL_SETUP_ERROR_CODE, LOCAL_MODEL_SETUP_URL } from '../shared/local-models'
 import { composeLocalPrompt, LOCAL_BACKGROUND_OPEN, splitLocalPrompt } from './local-models/briefing'
@@ -496,6 +496,85 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     await sending
     expect(f.current.submissions).toHaveLength(1)
     expect(f.database.structured.snapshot(f.spec.id)?.items.find(item => item.data.type === 'interaction')?.data).toMatchObject({ interaction: { status: 'resolved', outcome: 'answered' } })
+  })
+
+  describe('a question card closes wherever it was answered, and a late answer still reaches the agent', () => {
+    const asyncQuestion = (native: string, item: string) => ({ id: `codex-async:${native}:${item}`, kind: 'question' as const, title: 'Codex asked you',
+      input: { protocol: 'codex-async-question', threadId: native, itemId: item }, choices: [], status: 'pending' as const,
+      questions: [{ id: `${item}:0`, question: 'Which look?', options: [{ label: 'A' }, { label: 'B' }], allowCustom: true },
+        { id: `${item}:1`, question: 'What are the hook words?', options: [], allowCustom: true }] })
+    const card = (f: ReturnType<typeof fixture>, id: string) => f.database.structured.snapshot(f.spec.id)?.items.find(item => item.data.type === 'interaction' && item.data.interaction.id === id)?.data
+
+    it('an ordinary message after a Codex async question closes its card (the message is its answer)', async () => {
+      const f = fixture('codex')
+      await f.manager.submit(f.spec.id, 'First turn', settings)
+      const native = f.database.structured.snapshot(f.spec.id)!.nativeSessionId!
+      const asked = asyncQuestion(native, 'ask-c')
+      f.current.emit({ itemId: 'ask-c', requestId: asked.id, data: { type: 'interaction', interaction: asked } })
+      f.current.finish()
+      // The turn ended and the question is still open: Codex waits for the next user message.
+      expect(card(f, asked.id)).toMatchObject({ interaction: { status: 'pending' } })
+      await f.manager.submit(f.spec.id, 'B, and the hook is "pump it louder"', settings)
+      expect(card(f, asked.id)).toMatchObject({ interaction: { status: 'resolved', outcome: ANSWERED_IN_CONVERSATION } })
+      // Codex restating the same item cannot reopen it.
+      f.current.emit({ itemId: 'ask-c', requestId: asked.id, data: { type: 'interaction', interaction: asked } })
+      expect(card(f, asked.id)).toMatchObject({ interaction: { status: 'resolved' } })
+    })
+
+    it('a steer delivered into the running turn closes the card too', async () => {
+      const f = fixture('codex')
+      await f.manager.submit(f.spec.id, 'First turn', settings)
+      f.current.capabilities.steering = true
+      f.current.emit({ data: { type: 'session', phase: 'running', capabilities: f.current.capabilities } })
+      const native = f.database.structured.snapshot(f.spec.id)!.nativeSessionId!
+      const asked = asyncQuestion(native, 'ask-s')
+      f.current.emit({ itemId: 'ask-s', requestId: asked.id, data: { type: 'interaction', interaction: asked } })
+      await f.manager.steer(f.spec.id, 'I already replied: B', settings)
+      expect(card(f, asked.id)).toMatchObject({ interaction: { status: 'resolved', outcome: ANSWERED_IN_CONVERSATION } })
+    })
+
+    it('a late answer to a card the conversation closed goes to the agent as a message with a note, once', async () => {
+      const f = fixture('codex')
+      await f.manager.submit(f.spec.id, 'First turn', settings)
+      const runtime = f.current, native = f.database.structured.snapshot(f.spec.id)!.nativeSessionId!
+      const asked = asyncQuestion(native, 'ask-l')
+      runtime.emit({ itemId: 'ask-l', requestId: asked.id, data: { type: 'interaction', interaction: asked } })
+      runtime.finish()
+      await f.manager.submit(f.spec.id, 'Answered here first', settings)
+      runtime.finish()
+      const late = { sessionId: f.spec.id, runtimeId: runtime.options.runtimeId, requestId: asked.id, answers: { 'ask-l:0': ['Other words'], 'ask-l:1': ['Pump it'] } }
+      await expect(f.manager.answer(late)).resolves.toMatchObject({ delivered: 'message' })
+      const sent = runtime.submissions.at(-1)!.text
+      expect(sent).toContain('question had closed')
+      expect(sent).toContain('Which look?\nAnswer: Other words')
+      expect(sent).toContain('What are the hook words?\nAnswer: Pump it')
+      expect(runtime.responses).toHaveLength(0)
+      await expect(f.manager.respond(late)).rejects.toThrow('already submitted')
+      expect(runtime.submissions).toHaveLength(3)
+    })
+
+    it('a late answer to an expired synchronous question is sent as a message; an approval or a card-answered question is not resent', async () => {
+      const f = fixture('codex')
+      await f.manager.submit(f.spec.id, 'First turn', settings)
+      const runtime = f.current
+      runtime.emit({ itemId: 'q-tool', requestId: 'q-sync', data: { type: 'interaction', interaction: { id: 'q-sync', kind: 'question', title: 'Codex needs your input', input: null, choices: [], status: 'pending',
+        questions: [{ id: 'look', question: 'Which look?', options: [{ label: 'A' }], allowCustom: true }] } } })
+      runtime.approval('appr')
+      runtime.emit({ data: { type: 'session', phase: 'interrupted' } })
+      expect(card(f, 'q-sync')).toMatchObject({ interaction: { status: 'expired' } })
+      const base = { sessionId: f.spec.id, runtimeId: runtime.options.runtimeId }
+      await expect(f.manager.answer({ ...base, requestId: 'q-sync', answers: { look: ['typed late'] } })).resolves.toEqual({ delivered: 'message', reason: 'it had expired' })
+      expect(runtime.submissions.at(-1)!.text).toContain('Which look?\nAnswer: typed late')
+      await expect(f.manager.respond({ ...base, requestId: 'appr', decision: 'allow' })).rejects.toThrow('no longer pending')
+      // A question a card already answered is never answered twice.
+      const answered = f.current
+      answered.emit({ itemId: 'q2-tool', requestId: 'q-2', data: { type: 'interaction', interaction: { id: 'q-2', kind: 'question', title: 'Q', input: null, choices: [], status: 'pending', questions: [{ id: 'x', question: 'X?', options: [], allowCustom: true }] } } })
+      answered.emit({ data: { type: 'session', phase: 'waiting_input' } })
+      await f.manager.respond({ sessionId: f.spec.id, runtimeId: answered.options.runtimeId, requestId: 'q-2', answers: { x: ['first'] } })
+      const submissions = answered.submissions.length
+      await expect(f.manager.respond({ sessionId: f.spec.id, runtimeId: answered.options.runtimeId, requestId: 'q-2', answers: { x: ['again'] } })).rejects.toThrow()
+      expect(answered.submissions).toHaveLength(submissions)
+    })
   })
 
   it('resumes the same native conversation for a new message, sends it once, and ignores stale callbacks', async () => {

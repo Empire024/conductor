@@ -764,6 +764,9 @@ textarea.input { resize: none; line-height: 1.45; }
   background: color-mix(in srgb, var(--amber) 5%, transparent);
 }
 .pending.busy { opacity: .6; pointer-events: none; }
+/* A question that closed while its answer was typed: kept, but plainly no longer waiting. */
+.pending.pending-closed { border-style: dashed; border-color: var(--border); background: var(--surface-1); }
+.pending.pending-closed .pending-kind { color: var(--text-2); }
 .pending-kind { font-size: 10.5px; letter-spacing: .5px; text-transform: uppercase; color: var(--amber); }
 .pending-title { margin: 0; font-size: 15px; font-weight: 600; }
 .pending-input {

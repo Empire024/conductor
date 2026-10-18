@@ -300,6 +300,14 @@ export interface InteractionResponse {
   decision?: string
   answers?: Record<string, string[]>
 }
+/** What became of a response: delivered to its request, or, for a question whose card had already
+ *  closed, sent to the agent as an ordinary message so the typed answer is never dropped. */
+export type InteractionResponseResult = { delivered: 'answer' } | { delivered: 'message'; reason: string }
+/** Codex's request_user_input_async is answered by the next user message; a card it raised that
+ *  closed because such a message reached the thread carries this outcome. */
+export const ANSWERED_IN_CONVERSATION = 'Answered in the conversation'
+export const isAsyncQuestion = (interaction: { input?: unknown }): boolean =>
+  (interaction.input as { protocol?: string } | null | undefined)?.protocol === 'codex-async-question'
 export interface StructuredAgentBridge {
   bindWorkspace(id: string, sessionId: string): Promise<void>
   steer(id: string, text: string, settings: SessionSettings, attachments?: ContextAttachment[]): Promise<void>

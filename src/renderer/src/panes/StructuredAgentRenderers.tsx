@@ -8,6 +8,7 @@ import remarkGfm from 'remark-gfm'
 import { DiffEditor, type DiffOnMount } from '@monaco-editor/react'
 import { ArrowDown, ArrowUp, Check, ChevronDown, ChevronRight, ChevronUp, Copy, FileCode2, Maximize2, X } from 'lucide-react'
 import type { ContextAttachment, AgentEventData, DiffArtifact, FileChange, InputQuestion, Json, PendingInteraction, TimelineItem } from '../../../shared/structured-agent'
+import { ANSWERED_IN_CONVERSATION } from '../../../shared/structured-agent'
 import { stripMemoryDirectives } from '../../../shared/memory-directive'
 import { languageForPath, SyntaxCode } from './SyntaxCode'
 import { fileTypeStyle } from '../file-types'
@@ -453,7 +454,7 @@ function InteractionCard({ item, interactive, onRespond, dockedQuestion, onDockQ
   return <details className="sa-interaction sa-interaction-resolved" aria-label={request.kind + ': ' + request.title}>
     <summary><span>{heading}</span><small>{status}</small></summary>
     <div className="sa-interaction-detail">
-      {(request.status === 'expired' || request.outcome === 'Delivery unconfirmed') && request.outcome && <p>{request.outcome === 'Delivery unconfirmed' ? 'Answer delivery was not confirmed. Check the conversation before sending it again.' : request.outcome}</p>}
+      {(request.status === 'expired' || request.outcome === 'Delivery unconfirmed' || request.outcome === ANSWERED_IN_CONVERSATION) && request.outcome && <p>{request.outcome === 'Delivery unconfirmed' ? 'Answer delivery was not confirmed. Check the conversation before sending it again.' : request.outcome}</p>}
       {request.kind === 'question' && questions.length
         ? <dl className="sa-question-answers">{questions.map((question) => {
           // The provider records answers by question text on the resolved interaction, so a

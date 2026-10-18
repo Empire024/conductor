@@ -59,11 +59,21 @@ certificate for everything but that one name, so a phone that trusts the authori
   state - needs you, working, limited, failed, disconnected, stopped, done, idle - the provider and
   model, the computer it runs on, how long the current turn has been going, and the last thing it
   said. Filters for what needs attention and what is working. Conversations whose tab is closed sit
-  in a collapsed "Not open" section; they can be read but never ask for anything.
+  in a collapsed "Not open" section; they can be read but never ask for anything. The order is the
+  computer's - the owner's project order, then workspace order, then tab order - and never follows
+  activity, so busy projects do not swap places; the filters hide, they never reorder. Cards keep
+  their elements across updates, and each state snapshot carries the run's `instance` and a growing
+  `revision`, so a stream frame or `/api/state` answer older than the one on screen is dropped.
 - **A conversation**: the timeline the desktop shows, trimmed for a phone; a pending question or
   approval as a card with its choices; a composer whose button says Send, Steer or Queue depending on
   what the provider allows mid-turn; Stop while a turn runs; Resume when the conversation was
-  interrupted or disconnected.
+  interrupted or disconnected. Only a request that can still be answered is a card (the desktop's
+  rule, `answerableInteractions`): one from the attached runtime, or a Codex async question of the
+  current thread, which any later message in the conversation answers and closes. A card follows
+  its request live: answered on the desktop, by policy or a wizard, expired with its turn or
+  cancelled by the provider, it goes. A question that closes while an answer is being typed stays,
+  marked closed, until "Send as message" (the host sends the answer as an ordinary message with a
+  note, `deliverLateAnswer`) or Discard; a question a card already answered is never sent twice.
 - **New**: start a task - project, workspace, the computer it runs on, provider, model, effort and
   the first message. A project belongs to exactly one computer, so "run on" is stated rather than
   chosen; a project that lives on a paired machine runs there, through the same placement the

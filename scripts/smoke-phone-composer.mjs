@@ -12,6 +12,8 @@ import assert from 'node:assert/strict'
 // `npm.cmd run build`, one smoke at a time:
 //   node scripts/smoke-lock.mjs -- node scripts/smoke-phone-composer.mjs [--before]
 // --before only takes screenshots (for a build that predates the compact composer).
+// Last, typing must survive a live stream: with state events arriving every 150 ms, as they do
+// while agents work, the composer and the Tasks quick-add field keep their node, focus and text.
 // Screenshots and report.json go to .conductor-scratch/phone-composer/<after|before>/.
 const before = process.argv.includes('--before')
 const root = await mkdtemp(join(tmpdir(), 'conductor-phone-composer-'))
@@ -83,9 +85,28 @@ const STAND_INS = `(() => {
     pending: [], queued: [], canSteer: true, canAttachImages: true
   })
   const real = window.fetch.bind(window)
+  /* Once switched on, the next stream connection is the computer's own state, re-sent every 150 ms. */
+  window.__liveStream = false
+  window.__ticks = 0
+  const liveStream = async init => {
+    const state = await (await real('/api/state', { headers: init && init.headers })).json()
+    const encoder = new TextEncoder()
+    let timer = null
+    const body = new ReadableStream({
+      start(controller) {
+        const send = () => { window.__ticks += 1; controller.enqueue(encoder.encode('event: state\\ndata: ' + JSON.stringify(state) + '\\n\\n')) }
+        send()
+        timer = setInterval(send, 150)
+        if (init && init.signal) init.signal.addEventListener('abort', () => { clearInterval(timer); try { controller.close() } catch (error) { /* already closed */ } })
+      },
+      cancel() { clearInterval(timer) }
+    })
+    return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+  }
   window.fetch = async (path, init) => {
     const url = String(path)
     const json = body => new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+    if (url === '/api/stream' && window.__liveStream) return liveStream(init)
     if (url.startsWith('/api/sessions/smoke-cmp')) {
       if (init && init.method === 'POST') return json({ ok: true })
       return json(conversation())
@@ -250,6 +271,44 @@ try {
     assertInsetOnce(closed, 'keyboard closed')
     check('With the keyboard up the composer sits on it and the nav steps aside; closing it brings the nav back on the bottom edge')
   }
+
+  /* Typing while the computer streams: each keystroke goes to whatever has focus, as a keyboard's
+     does, so a field that is rebuilt or blurred under it loses the rest of the sentence. */
+  await tab.run("window.__liveStream = true; window.dispatchEvent(new Event('online')); true")
+  await until(() => tab.run('window.__ticks'), ticks => ticks >= 3, 'the live stream ticking')
+  const SENTENCE = 'the keyboard stays up while agents stream'
+  const typeWhileStreaming = async (selector, label) => {
+    const result = await tab.run(`(async () => {
+      const field = document.querySelector(${JSON.stringify(selector)})
+      if (!field) return { missing: true }
+      field.focus()
+      const ticks = window.__ticks
+      for (const char of ${JSON.stringify(SENTENCE)}) {
+        await new Promise(resolve => setTimeout(resolve, 60))
+        const target = document.activeElement
+        if (!target || (target.tagName !== 'TEXTAREA' && target.tagName !== 'INPUT')) continue
+        if (!document.execCommand('insertText', false, char)) { target.value += char; target.dispatchEvent(new Event('input', { bubbles: true })) }
+      }
+      return { connected: field.isConnected, focused: document.activeElement === field, value: field.value, ticks: window.__ticks - ticks }
+    })()`)
+    report.metrics['typing-' + label] = result
+    if (!before) {
+      assert.ok(!result.missing, label + ': field found')
+      assert.ok(result.ticks >= 10, label + ': the state streamed while typing (' + result.ticks + ' events)')
+      assert.equal(result.connected, true, label + ': the field was not replaced')
+      assert.equal(result.focused, true, label + ': the field kept focus')
+      assert.equal(result.value, SENTENCE, label + ': every keystroke landed')
+    }
+  }
+  await openSession('Steer')
+  await tab.run("document.querySelector('.composer-input').value = ''; document.querySelector('.composer-input').dispatchEvent(new Event('input')); true")
+  await typeWhileStreaming('.composer-input', 'composer')
+  await tab.run("document.activeElement && document.activeElement.blur(); true")
+  await tab.go('#/tasks')
+  await until(() => tab.run('Boolean(document.querySelector(\'textarea[aria-label="New project task"]\'))'), Boolean, 'the Tasks quick-add field')
+  await typeWhileStreaming('textarea[aria-label="New project task"]', 'tasks')
+  await tab.shot('typing-tasks-390-dark')
+  if (!before) check('While state streams every 150 ms, typing in the conversation composer and the Tasks quick-add keeps the field, its focus and every keystroke')
 
   const phoneErrors = (await tab.consoleErrors()).filter(text => /Uncaught|Content Security Policy/.test(text))
   assert.deepEqual(phoneErrors, [], 'no uncaught error or CSP violation in the phone window')

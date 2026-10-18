@@ -1186,3 +1186,68 @@ describe('phone composer dictation', () => {
     expect(page.window.location.hash).toBe('#/session/s1')
   })
 })
+
+describe('phone typing survives live updates', () => {
+  const phoneState = {
+    projects: [{ id: 'p1', name: 'Conductor', machineId: 'local', workspaces: [{ id: 'w1', name: 'Main' }] }],
+    sessions: [{ id: 's1', title: 'Chat', provider: 'claude', projectId: 'p1', projectName: 'Conductor', workspaceId: 'w1', workspaceName: 'Main', machineId: 'local', tabId: 't1', state: 'working', archived: false, updatedAt: '2026-10-18T00:38:00.000Z' }],
+    machines: [{ id: 'local', name: 'MAIN', status: 'online' }], providers: [], counts: { attention: 0 }
+  }
+  const respond = (call: AppCall) => {
+    if (call.path.startsWith('/api/projects/p1/tasks?')) return { projectId: 'p1', tasks: [{ id: 't-1', title: 'Existing', kind: 'bug', status: 'todo', priority: 'normal', weight: 'medium' }], page: { offset: 0, limit: 20, total: 1, hasMore: false } }
+    if (call.path === '/api/sessions/s1') return { summary: { id: 's1', title: 'Chat', phase: 'running', state: 'working', provider: 'claude', model: 'opus' }, items: [], pending: [], queued: [], canAttachImages: true }
+    return {}
+  }
+  /* The fake stream sends one state event and ends; each reconnect a second later sends it again,
+     as the computer does several times a second while agents work. */
+  const streamTicks = async (page: ReturnType<typeof bootApp>, count: number) => {
+    const before = page.streams.length
+    for (let tick = 0; tick < count; tick += 1) { page.advance(1000); await settleAll() }
+    expect(page.streams.length).toBeGreaterThanOrEqual(before + count)
+  }
+
+  it('keeps the Tasks quick-add field, its text and its focus while the state streams in', async () => {
+    const page = bootApp('#/tasks', respond, { phoneState })
+    await settleAll()
+    const report = page.app.find(node => node.tagName === 'TEXTAREA' && node.getAttribute('aria-label') === 'New project task')!
+    report.focus()
+    report.typeText('Keyboard goes away while I type')
+    const reads = page.calls.filter(call => call.path.startsWith('/api/projects/p1/tasks?')).length
+    await streamTicks(page, 3)
+    expect(page.app.find(node => node.tagName === 'TEXTAREA' && node.getAttribute('aria-label') === 'New project task')).toBe(report)
+    expect(page.document.activeElement).toBe(report)
+    expect(report.value).toBe('Keyboard goes away while I type')
+    // The list is still shown, and a stream tick does not read it again every time.
+    expect(page.app.querySelector('phone-task')!.textContent).toContain('Existing')
+    expect(page.calls.filter(call => call.path.startsWith('/api/projects/p1/tasks?')).length).toBe(reads)
+  })
+
+  it('keeps the conversation composer and its focus while the conversation streams', async () => {
+    const page = bootApp('#/session/s1', respond, { phoneState })
+    await settleAll()
+    const input = page.app.querySelector('composer-input')!
+    input.focus()
+    input.typeText('Half a thought')
+    await streamTicks(page, 3)
+    expect(page.app.querySelector('composer-input')).toBe(input)
+    expect(page.document.activeElement).toBe(input)
+    expect(input.value).toBe('Half a thought')
+  })
+
+  it('holds a redraw of a screen that rebuilds its fields until the field lets go', async () => {
+    const page = bootApp('#/phone', respond, { phoneState })
+    await settleAll()
+    const nameField = () => page.app.find(node => node.tagName === 'INPUT' && node.className === 'input' && node.type === 'text')
+    const name = nameField()!
+    name.focus()
+    name.typeText('Juraj phone')
+    await streamTicks(page, 2)
+    expect(nameField()).toBe(name)
+    expect(page.document.activeElement).toBe(name)
+    // Let go: the held update lands a moment later.
+    name.blur()
+    page.advance(400)
+    await settleAll()
+    expect(nameField()).not.toBe(name)
+  })
+})

@@ -255,6 +255,11 @@ for await (const line of input) {
       emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263', permissionMode })
       text('SYNTHETIC: understood; not retrying it.'); finish(); continue
     }
+    // A question answered after its card closed arrives as Conductor's own message (deliverLateAnswer).
+    if (typeof prompt === 'string' && prompt.startsWith('[Conductor: this question had closed')) {
+      emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263', permissionMode })
+      text('SYNTHETIC: late answer received.'); finish(); continue
+    }
     if (typeof prompt !== 'string' || !prompt.startsWith('SYNTHETIC ')) throw new Error('Fixture accepts explicitly synthetic prompts only')
     if (prompt.startsWith('SYNTHETIC CLASSIFIER PLAN ')) {
       const planned = /^SYNTHETIC CLASSIFIER PLAN (WRITE|OTHER|HOLD)\b/.exec(prompt)?.[1]

@@ -410,6 +410,9 @@ export interface PhoneUsageWindow {
 
 export interface PhoneState {
   observedAt: string
+  /** This run of the computer; revision counts its snapshots, so the phone can drop one that arrives out of order. */
+  instance: string
+  revision: number
   machineName: string
   projects: Array<{ id: string; name: string; machineId: string; workspaces: Array<{ id: string; name: string }> }>
   machines: Array<{ id: string; name: string; kind: 'local' | 'peer'; status: 'online' | 'offline' | 'revoked'; projectIds: string[] }>
@@ -536,6 +539,10 @@ export interface PhoneNotification {
   /** A dispatched coworker's conversation rather than a controller or main task; drives which
    *  device wants a 'done' notification about it. Absent for kinds other than 'done'. */
   isCoworker?: boolean
+  /** A replace-key shared by notifications that say the same thing about several conversations
+   *  (one provider's usage limit): the phone swaps the old one for the new one instead of stacking.
+   *  Absent, a notification replaces only the previous one about its own conversation. */
+  tag?: string
 }
 
 /** What PushSubscription.toJSON() gives the app, stored per phone. */

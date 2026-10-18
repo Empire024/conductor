@@ -136,11 +136,12 @@ describe('phone navigation and task defaults', () => {
     expect(page.api.state.form.prompt).toBe('')
     expect(JSON.parse(page.stored.get('conductor.phone.lastAgent')!)).toEqual({ provider: 'claude', model: 'opus' })
   })
-  it('shows project and phase on every row, and orders groups by newest activity', () => {
+  it('shows project and phase on every row, and orders groups by the computer project order, not activity', () => {
     const { api } = harness()
     const old = { id: 'old', projectId: 'a', projectName: 'Alpha', state: 'done', updatedAt: '2026-01-01T00:00:00Z' }
     const latest = { ...old, id: 'new', projectId: 'b', projectName: 'Beta', state: 'working', updatedAt: '2026-10-03T00:00:00Z' }
-    expect(api.groupSessions([old, latest]).map((row: any) => row.id)).toEqual(['b', 'a'])
+    expect(api.groupSessions([old, latest], [{ id: 'a', workspaces: [] }, { id: 'b', workspaces: [] }]).map((row: any) => row.id)).toEqual(['a', 'b'])
+    expect(api.groupSessions([old, latest], [{ id: 'b', workspaces: [] }, { id: 'a', workspaces: [] }]).map((row: any) => row.id)).toEqual(['b', 'a'])
     const row = api.sessionRow(latest)
     expect(row.querySelector('.project-badge').textContent).toBe('Beta')
     expect(row.querySelector('.phase-badge').textContent).toBe('Running')

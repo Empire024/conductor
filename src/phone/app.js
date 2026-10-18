@@ -32,6 +32,8 @@
   const MAX_COMPOSER_LINES = 5
   /* The smallest on-screen keyboard is well over this; browser toolbars and rounding are under it. */
   const KEYBOARD_MIN_HEIGHT = 120
+  /* The Tasks list is read again on a stream tick at most this often. */
+  const TASKS_RELOAD_MS = 15000
   /* The unlock token rides on every call once the phone is unlocked (src/main/phone-lock.ts). */
   const UNLOCK_HEADER = 'X-Conductor-Unlock'
   const LOCK_TOUCH_MS = 20000
@@ -126,6 +128,11 @@
     expandedCoworkers: {},
     /* In-progress answers per pending interaction id, same reason as drafts. */
     answers: {},
+    /* Questions that closed while their answer was being typed, per conversation id: their cards
+       stay, marked closed, until that answer is sent as a message or discarded. */
+    closedQuestions: {},
+    /* Request ids whose answer is on its way, so their own closing is not read as a late one. */
+    answering: {},
     form: null,
     /* The hash a page like #diagnose returns to. */
     returnTo: '',
@@ -639,7 +646,7 @@
 
   const onStreamEvent = (name, data) => {
     if (name === 'state') {
-      if (!data || state.locked || !state.authReady) return
+      if (!data || state.locked || !state.authReady || stalePhoneState(state.phone, data)) return
       phoneRevision += 1
       state.phone = data
       state.stale = false
@@ -664,6 +671,13 @@
     /* 'ping' only proves the pipe is alive, which lastEventAt already recorded. */
   }
 
+  /* Each picture of the computer carries its run (instance) and a revision that grows with every
+     snapshot it takes. A stream frame, a reconnect's first frame and an /api/state answer can
+     cross on the way; one older than, or the same as, the picture on screen is dropped, so the
+     list never steps back to a state it already moved past. A new run starts its count again. */
+  const stalePhoneState = (current, next) => Boolean(current && next && current.instance && current.instance === next.instance &&
+    typeof current.revision === 'number' && typeof next.revision === 'number' && next.revision <= current.revision)
+
   let stateRead = null
   let phoneRevision = 0
   const refreshPhoneState = async () => {
@@ -674,7 +688,7 @@
     const revision = phoneRevision
     try {
       const phone = await api('/api/state', { signal: controller.signal })
-      if (stateRead !== controller || revision !== phoneRevision || !state.authReady || state.locked || !phone || !Array.isArray(phone.projects) || !Array.isArray(phone.sessions)) return
+      if (stateRead !== controller || revision !== phoneRevision || !state.authReady || state.locked || !phone || !Array.isArray(phone.projects) || !Array.isArray(phone.sessions) || stalePhoneState(state.phone, phone)) return
       state.phone = phone
       state.stale = false
       state.cachedAt = Date.now()
@@ -743,7 +757,7 @@
     if (path === '#/tabs' || path === '#/attention') return { name: path.slice(2), projectId: projectId, key: path.slice(2) + ':' + projectId }
     for (const name of ['more', 'usage', 'activity']) if (path === '#/' + name) return { name: name, key: name }
     const session = /^#\/session\/(.+)$/.exec(hash)
-    if (session) return { name: 'session', id: decodeURIComponent(session[1]), key: 'session:' + session[1] }
+    if (session) return { name: 'session', id: decodeURIComponent(session[1]), key: 'session:' + decodeURIComponent(session[1]) }
     /* #/ideas is a new note (bookmarkable: open, type, leave); #/ideas/<id> is the same editor on
        one idea; #/ideas/list and #/ideas/search are the list, the latter with the search field up. */
     const idea = /^#\/ideas(?:\/([^?]*))?$/.exec(hash)
@@ -860,7 +874,9 @@
     const open = OPEN_ROUTES.indexOf(wanted.name) >= 0
     const route = !state.token && !open ? { name: 'pair', key: 'pair' } : state.token && state.locked && !open ? { name: 'lock', key: 'lock' } : state.token && !state.authReady && !open ? { name: 'connecting', key: 'connecting' } : wanted
     if (screen && screen.key === route.key) {
-      if (screen.update) screen.update(route)
+      const typing = screen.update && !screen.keepsFields ? typingField(screen.root) : null
+      if (typing) holdUpdate(typing)
+      else if (screen.update) screen.update(route)
       updateTabBar(route)
       paintConnection()
       return
@@ -878,6 +894,29 @@
     if (overlayPill) overlayPill.hidden = state.connected || !state.token || state.locked
     /* A field can only take focus once it is in the page. */
     if (screen.onShown) screen.onShown()
+  }
+
+  /* A field the owner is typing in inside root, or null. */
+  const typingField = root => {
+    const active = document.activeElement
+    if (!active || !isTextField(active)) return null
+    for (let node = active; node; node = node.parentNode) if (node === root) return active
+    return null
+  }
+
+  /* Most screens redraw their fields on update, and the stream updates them several times a second
+     while agents work; a phone keyboard closes with the field it was typing in. So the update waits
+     until the field lets go, and a little longer, so a button that tap pressed is not redrawn under
+     it. A screen whose update leaves its fields alone says keepsFields and is updated as usual. */
+  let heldField = null
+  const holdUpdate = field => {
+    if (heldField === field) return
+    heldField = field
+    field.addEventListener('blur', () => {
+      if (heldField !== field) return
+      heldField = null
+      setTimeout(() => { if (appRoot) render() }, 350)
+    }, { once: true })
   }
 
   const buildScreen = route => {
@@ -2005,39 +2044,40 @@
     return node
   }
 
-  /* Grouped the way the desktop sidebar is: project, then workspace, in the order the state
-     listed them, so the same conversation sits in the same place on both screens. */
-  const groupSessions = sessions => {
-    const projects = []
+  /* Grouped the way the desktop sidebar is: project, then workspace, then tab, in the order the
+     computer lists them (the owner's project order, each project's workspace order, each
+     workspace's tab order), so the same conversation sits in the same place on both screens.
+     Nothing here sorts by activity: running tabs tick several times a second, and sorting by
+     their last activity made whole projects and cards leapfrog each other on every update.
+     A coworker sits under the tab that controls it, and that tab keeps its own place. */
+  const groupSessions = (sessions, projects) => {
+    const projectRank = {}, workspaceRank = {}
+    ;(projects || []).forEach((project, index) => {
+      projectRank[project.id] = index
+      ;(project.workspaces || []).forEach((workspace, place) => { workspaceRank[workspace.id] = place })
+    })
+    const ranked = (rank, id, fallback) => rank[id] === undefined ? Number.MAX_SAFE_INTEGER - 1e6 + fallback : rank[id]
+    const groups = []
     const byProject = {}
-    for (const session of recentSessions(sessions)) {
+    for (const session of sessions) {
       let project = byProject[session.projectId]
       if (!project) {
-        project = { id: session.projectId, name: session.projectName, workspaces: [], byWorkspace: {} }
+        project = { id: session.projectId, name: session.projectName, workspaces: [], byWorkspace: {}, seen: groups.length }
         byProject[session.projectId] = project
-        projects.push(project)
+        groups.push(project)
       }
       let workspace = project.byWorkspace[session.workspaceId]
       if (!workspace) {
-        workspace = { id: session.workspaceId, name: session.workspaceName, sessions: [] }
+        workspace = { id: session.workspaceId, name: session.workspaceName, sessions: [], seen: project.workspaces.length }
         project.byWorkspace[session.workspaceId] = workspace
         project.workspaces.push(workspace)
       }
       workspace.sessions.push(session)
     }
-    return projects
-  }
-
-  const renderGroups = (host, sessions) => {
-    for (const project of groupSessions(sessions)) {
-      const group = el('section', 'group')
-      /* A project on this computer offers its files next to its name (#/files). */
-      const local = projectById(project.id)
-      group.appendChild(local && local.machineId === 'local' ? sectionHead(project.name || 'Project', 'Files', filesHash(project.id, '')) : el('h2', 'group-title', project.name || 'Project'))
+    groups.sort((a, b) => ranked(projectRank, a.id, a.seen) - ranked(projectRank, b.id, b.seen))
+    for (const project of groups) {
+      project.workspaces.sort((a, b) => ranked(workspaceRank, a.id, a.seen) - ranked(workspaceRank, b.id, b.seen))
       for (const workspace of project.workspaces) {
-        const single = project.workspaces.length === 1 && workspace.name === project.name
-        if (!single) group.appendChild(el('h3', 'group-workspace', workspace.name || 'Workspace'))
-        const list = el('div', 'list')
         const byId = {}
         for (const session of workspace.sessions) byId[session.id] = session
         const rootId = session => {
@@ -2048,34 +2088,92 @@
           }
           return current.id
         }
-        const roots = workspace.sessions.filter(session => rootId(session) === session.id).sort((a, b) => {
-          const latest = root => Math.max(...workspace.sessions.filter(row => rootId(row) === root.id).map(activityTime))
-          return latest(b) - latest(a)
-        })
-        for (const root of roots) {
-          list.appendChild(sessionRow(root, false))
-          const coworkers = workspace.sessions.filter(session => session.id !== root.id && rootId(session) === root.id)
-          if (!coworkers.length) continue
-          const expanded = state.expandedCoworkers[root.id] === true
-          const working = coworkers.filter(session => session.state === 'working').length
-          const waiting = coworkers.filter(session => session.state === 'attention').length
+        workspace.entries = workspace.sessions.filter(session => rootId(session) === session.id).map(root => ({
+          session: root,
+          coworkers: workspace.sessions.filter(session => session.id !== root.id && rootId(session) === root.id)
+        }))
+      }
+    }
+    return groups
+  }
+
+  /* The Tabs list keeps its nodes across updates. keep(key, signature, build) hands back the node
+     drawn last time for that key while what it shows (signature) is unchanged, and re-arms its
+     ticks; a card whose content changed is rebuilt and moved into the old card element, so a card
+     keeps its identity (spinner, press and scroll anchoring) however often the stream ticks.
+     sync(host, nodes) then puts children in order, touching only nodes that are out of place. */
+  const keyedNodes = () => {
+    let kept = new Map(), next = new Map()
+    const keep = (key, signature, build, patch) => {
+      const old = kept.get(key)
+      if (old && old.signature === signature) {
+        next.set(key, old)
+        for (const fn of old.ticks) onTick(fn)
+        return old.node
+      }
+      const before = tickers.length
+      let node = build()
+      const ticks = tickers.slice(before)
+      if (old && patch && old.node.tagName === node.tagName) {
+        old.node.className = node.className
+        while (old.node.firstChild) old.node.removeChild(old.node.firstChild)
+        while (node.firstChild) old.node.appendChild(node.firstChild)
+        node = old.node
+      }
+      next.set(key, { signature: signature, node: node, ticks: ticks })
+      return node
+    }
+    const sync = (host, nodes) => {
+      for (let index = 0; index < nodes.length; index += 1) {
+        if (host.childNodes[index] !== nodes[index]) host.insertBefore(nodes[index], host.childNodes[index] || null)
+      }
+      while (host.childNodes.length > nodes.length) host.removeChild(host.childNodes[host.childNodes.length - 1])
+      return host
+    }
+    /* Called once per draw, after every keep(): nodes not asked for this time are forgotten. */
+    const done = () => { kept = next; next = new Map() }
+    return { keep: keep, sync: sync, done: done }
+  }
+
+  const keptSessionRow = (nodes, session, compact) => nodes.keep('row:' + (compact ? 'c:' : '') + session.id, JSON.stringify(session), () => {
+    const node = sessionRow(session, compact)
+    node.dataset.sessionId = session.id
+    return node
+  }, true)
+
+  const renderGroups = (nodes, sessions, projects) => groupSessions(sessions, projects).map(project => {
+    /* A project on this computer offers its files next to its name (#/files). */
+    const local = projectById(project.id)
+    const files = Boolean(local && local.machineId === 'local')
+    const head = nodes.keep('head:' + project.id, JSON.stringify([project.name, files]), () => files ? sectionHead(project.name || 'Project', 'Files', filesHash(project.id, '')) : el('h2', 'group-title', project.name || 'Project'))
+    const children = [head]
+    for (const workspace of project.workspaces) {
+      const single = project.workspaces.length === 1 && workspace.name === project.name
+      if (!single) children.push(nodes.keep('workspace:' + workspace.id, workspace.name || '', () => el('h3', 'group-workspace', workspace.name || 'Workspace')))
+      const rows = []
+      for (const entry of workspace.entries) {
+        const root = entry.session, coworkers = entry.coworkers
+        rows.push(keptSessionRow(nodes, root, false))
+        if (!coworkers.length) continue
+        const expanded = state.expandedCoworkers[root.id] === true
+        const working = coworkers.filter(session => session.state === 'working').length
+        const waiting = coworkers.filter(session => session.state === 'attention').length
+        rows.push(nodes.keep('toggle:' + root.id, JSON.stringify([expanded, coworkers.length, working, waiting]), () => {
           const toggle = button('coworker-toggle', null, () => { state.expandedCoworkers[root.id] = !expanded; render() })
           toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false')
           toggle.appendChild(el('span', 'coworker-toggle-label', coworkers.length + (coworkers.length === 1 ? ' coworker' : ' coworkers')))
           toggle.appendChild(el('span', 'coworker-toggle-state', dotRow([waiting ? waiting + ' waiting' : '', working ? working + ' working' : ''])))
           toggle.appendChild(el('span', 'chev' + (expanded ? ' down' : ''), '›'))
-          list.appendChild(toggle)
-          if (expanded) {
-            const children = el('div', 'coworker-list')
-            for (const coworker of coworkers) children.appendChild(sessionRow(coworker, true))
-            list.appendChild(children)
-          }
-        }
-        group.appendChild(list)
+          return toggle
+        }))
+        if (expanded) rows.push(nodes.sync(nodes.keep('coworkers:' + root.id, '', () => el('div', 'coworker-list')), coworkers.map(coworker => keptSessionRow(nodes, coworker, true))))
       }
-      host.appendChild(group)
+      children.push(nodes.sync(nodes.keep('list:' + workspace.id, '', () => el('div', 'list')), rows))
     }
-  }
+    const group = nodes.sync(nodes.keep('project:' + project.id, '', () => el('section', 'group')), children)
+    group.dataset.projectId = project.id
+    return group
+  })
 
   /* The stream has been down for 20 seconds of the owner actually looking at the phone. */
   const unreachableTooLong = () => {
@@ -2166,17 +2264,22 @@
       header.appendChild(chips)
     }
 
+    /* Every update re-renders through nodes, so unchanged cards stay the same elements in the same
+       place; see keyedNodes. */
+    const nodes = keyedNodes()
     const drawList = () => {
       const top = scroll.scrollTop
       beginTicks()
-      clear(scroll)
       const phone = state.phone
       if (!phone) {
-        scroll.appendChild(safeSkeleton('Reading this computer…', 'The list appears as soon as the computer connects.'))
+        nodes.sync(scroll, [nodes.keep('skeleton', '', () => safeSkeleton('Reading this computer…', 'The list appears as soon as the computer connects.'))])
+        nodes.done()
         return
       }
-      if (state.offerInstall && state.installPrompt) scroll.appendChild(installCard())
-      const all = recentSessions((phone.sessions || []).filter(session => !route.projectId || session.projectId === route.projectId))
+      const children = []
+      if (state.offerInstall && state.installPrompt) children.push(nodes.keep('install', '', installCard))
+      /* In the computer's order; the filters only hide, they never reorder. */
+      const all = (phone.sessions || []).filter(session => !route.projectId || session.projectId === route.projectId)
       const matches = session => route.name === 'attention' ? sessionPhase(session).id === 'attention' : matchesFilter(session)
       const open = all.filter(session => session.tabId !== null && matches(session))
       const closed = all.filter(session => session.tabId === null && matches(session))
@@ -2185,30 +2288,32 @@
         const hint = state.filter === 'all'
           ? 'Start one from the New tab; it runs on the computer, not on this phone.'
           : 'Nothing matches this filter right now.'
-        scroll.appendChild(emptyNote(state.filter === 'all' ? 'No conversations yet.' : 'Nothing here.', hint))
+        const title = state.filter === 'all' ? 'No conversations yet.' : 'Nothing here.'
+        children.push(nodes.keep('empty', title + hint, () => emptyNote(title, hint)))
       } else {
-        renderGroups(scroll, open)
+        for (const group of renderGroups(nodes, open, phone.projects)) children.push(group)
       }
 
       if (closed.length) {
-        const section = el('section', 'group closed-group')
-        const toggle = button('closed-toggle', null, () => {
-          state.showClosed = !state.showClosed
-          drawList()
-        })
-        toggle.appendChild(el('span', 'closed-word', 'Not open · ' + closed.length))
-        toggle.appendChild(el('span', 'chev' + (state.showClosed ? ' down' : ''), '›'))
-        toggle.setAttribute('aria-expanded', state.showClosed ? 'true' : 'false')
-        section.appendChild(toggle)
+        const sectionChildren = [nodes.keep('closed-toggle', JSON.stringify([closed.length, state.showClosed]), () => {
+          const toggle = button('closed-toggle', null, () => {
+            state.showClosed = !state.showClosed
+            drawList()
+          })
+          toggle.appendChild(el('span', 'closed-word', 'Not open · ' + closed.length))
+          toggle.appendChild(el('span', 'chev' + (state.showClosed ? ' down' : ''), '›'))
+          toggle.setAttribute('aria-expanded', state.showClosed ? 'true' : 'false')
+          return toggle
+        })]
         if (state.showClosed) {
-          section.appendChild(el('p', 'closed-hint', 'History on this computer, with no tab open. Opening one from the phone is not possible yet.'))
-          const list = el('div', 'list')
-          for (const session of closed) list.appendChild(sessionRow(session))
-          section.appendChild(list)
+          sectionChildren.push(nodes.keep('closed-hint', '', () => el('p', 'closed-hint', 'History on this computer, with no tab open. Opening one from the phone is not possible yet.')))
+          sectionChildren.push(nodes.sync(nodes.keep('closed-list', '', () => el('div', 'list')), closed.map(session => keptSessionRow(nodes, session, false))))
         }
-        scroll.appendChild(section)
+        children.push(nodes.sync(nodes.keep('closed', '', () => el('section', 'group closed-group')), sectionChildren))
       }
-      scroll.scrollTop = top
+      nodes.sync(scroll, children)
+      nodes.done()
+      if (scroll.scrollTop !== top) scroll.scrollTop = top
     }
 
     drawHeader()
@@ -2589,6 +2694,18 @@
     return store
   }
 
+  /* Anything the owner picked or typed for this request that has not been sent yet. */
+  const hasDraftAnswer = interaction => {
+    const store = state.answers[interaction.id]
+    if (!store || state.answering[interaction.id]) return false
+    return Object.keys(store).some(key => store[key].selected.length > 0 || Boolean((store[key].custom || '').trim()))
+  }
+
+  const closedQuestions = id => {
+    if (!state.closedQuestions[id]) state.closedQuestions[id] = {}
+    return state.closedQuestions[id]
+  }
+
   const questionState = (interaction, question) => {
     const store = answerStore(interaction)
     let entry = store[question.id]
@@ -2615,10 +2732,13 @@
     return ''
   }
 
-  const pendingCard = (interaction, respond) => {
-    const card = el('section', 'pending')
-    card.appendChild(el('span', 'pending-kind', interaction.kind === 'approval' ? 'Approval needed' : 'Question'))
+  /* discard is given only for a question that closed while its answer was being typed: the card
+     stays so the answer is not lost, and Submit sends it to the agent as a message instead. */
+  const pendingCard = (interaction, respond, discard) => {
+    const card = el('section', 'pending' + (discard ? ' pending-closed' : ''))
+    card.appendChild(el('span', 'pending-kind', discard ? 'Question closed' : interaction.kind === 'approval' ? 'Approval needed' : 'Question'))
     card.appendChild(el('h3', 'pending-title', interaction.title || (interaction.kind === 'approval' ? 'Allow this?' : 'Answer needed')))
+    if (discard) card.appendChild(el('p', 'pending-hint', 'This question closed before your answer was sent. Send it to the agent as a message, or discard it.'))
 
     const problem = el('p', 'pending-error')
     problem.hidden = true
@@ -2737,18 +2857,25 @@
       paint()
     }
 
-    const send = button('primary', 'Submit', () => {
+    const send = button('primary', discard ? 'Send as message' : 'Submit', () => {
       const payload = { requestId: interaction.id, answers: {} }
-      for (const question of questions) payload.answers[question.id] = combinedAnswer(question, questionState(interaction, question))
+      /* A closed question sends what was answered; an open one needs every answer. */
+      for (const question of questions) {
+        const answer = combinedAnswer(question, questionState(interaction, question))
+        if (answer.length || !discard) payload.answers[question.id] = answer
+      }
       void submit(payload)
     })
     const refresh = () => {
-      const unanswered = questions.some(question => combinedAnswer(question, questionState(interaction, question)).length === 0)
+      const unanswered = discard
+        ? questions.every(question => combinedAnswer(question, questionState(interaction, question)).length === 0)
+        : questions.some(question => combinedAnswer(question, questionState(interaction, question)).length === 0)
       send.disabled = unanswered
     }
     for (const paint of redraw) paint()
     refresh()
     card.appendChild(send)
+    if (discard) card.appendChild(button('ghost', 'Discard', discard))
     card.appendChild(problem)
     return card
   }
@@ -3034,8 +3161,17 @@
     }
 
     const respond = async payload => {
-      await api('/api/sessions/' + encodeURIComponent(id) + '/respond', { method: 'POST', body: payload })
+      state.answering[payload.requestId] = true
+      let result
+      try {
+        result = await api('/api/sessions/' + encodeURIComponent(id) + '/respond', { method: 'POST', body: payload })
+      } finally {
+        delete state.answering[payload.requestId]
+      }
       delete state.answers[payload.requestId]
+      delete closedQuestions(id)[payload.requestId]
+      /* The question had closed on the computer; the answer still reached the agent, as a message. */
+      if (result && result.delivered === 'message') showToast({ kind: 'done', title: 'Sent as a message', body: 'The question had already closed, so your answer went to the agent as a message.', url: null })
       await loadConversation(id, true)
     }
 
@@ -3139,17 +3275,36 @@
     }
 
     let pendingKey = null
+    /* The request cards currently on screen, open or closed. */
+    let shownCards = []
     const drawFooter = () => {
       const conversation = state.conversation
 
       const live = ((conversation && conversation.pending) || []).filter(interaction => !interaction.status || interaction.status === 'pending')
-      const key = live.map(interaction => interaction.id).join(',')
+      /* A question that closes while its answer is half typed (answered in the conversation, its
+         turn ended, answered on the computer) keeps its card, marked closed, until that answer is
+         sent as a message or discarded: the owner's words are never dropped silently. */
+      const closedHere = closedQuestions(id)
+      if (conversation) {
+        const asked = shownCards.concat((conversation.items || []).filter(item => item.data && item.data.type === 'interaction').map(item => item.data.interaction))
+        for (const interaction of asked) {
+          if (interaction.kind === 'question' && !live.some(open => open.id === interaction.id) && hasDraftAnswer(interaction)) closedHere[interaction.id] = interaction
+        }
+      }
+      const closed = Object.keys(closedHere).map(key => closedHere[key]).filter(interaction => !live.some(open => open.id === interaction.id))
+      shownCards = live.concat(closed)
+      const key = live.map(interaction => interaction.id).join(',') + '|' + closed.map(interaction => interaction.id).join(',')
       /* Rebuilding these cards on every stream tick would steal focus from a half-typed answer,
          so they are only rebuilt when the set of open requests actually changes. */
       if (key !== pendingKey) {
         pendingKey = key
         clear(pendingHost)
         for (const interaction of live) pendingHost.appendChild(pendingCard(interaction, respond))
+        for (const interaction of closed) pendingHost.appendChild(pendingCard(interaction, respond, () => {
+          delete closedHere[interaction.id]
+          delete state.answers[interaction.id]
+          drawFooter()
+        }))
       }
 
       clear(queuedHost)
@@ -3235,6 +3390,8 @@
     return {
       key: 'session:' + id,
       root: root,
+      /* The composer and the open request cards are built once; updates redraw around them. */
+      keepsFields: true,
       update: update,
       destroy: () => {
         destroyed = true
@@ -3556,6 +3713,7 @@
     let loading = false
     let adding = false
     let problem = ''
+    let loadedAt = 0
     const expanded = {}
 
     const load = async reset => {
@@ -3563,6 +3721,7 @@
       const form = state.form
       if (!form || !form.projectId || loading) return
       loading = true
+      loadedAt = Date.now()
       problem = ''
       const projectId = form.projectId
       const offset = reset ? 0 : page.tasks.length
@@ -3575,42 +3734,55 @@
       finally { loading = false; if (screen && screen.key === 'tasks') draw() }
     }
 
-    const draw = () => {
-      reconcileForm()
-      const top = scroll.scrollTop
-      clear(scroll)
+    /* The project picker and Quick add are built once and kept. The stream's state lands here
+       several times a second while agents work, and redrawing the field being typed in closes a
+       phone keyboard mid-word; only the list under them is redrawn. */
+    const body = el('div', 'form project-tasks-phone')
+    let pickerNodes = []
+    let pickerKey = null
+    let listNodes = []
+    let quick = null
+    let paintAdd = () => undefined
+
+    const drawPicker = () => {
       const phone = state.phone
-      if (!phone) { scroll.appendChild(emptyNote('Reading this computer…')); return }
       const form = state.form
-      const body = el('div', 'form project-tasks-phone')
-      body.appendChild(field('Project', select(
+      const chosen = projectById(form.projectId)
+      const key = JSON.stringify([(phone.projects || []).map(entry => [entry.id, entry.name]), form.projectId, chosen ? chosen.machineId : ''])
+      if (key === pickerKey) return
+      pickerKey = key
+      for (const node of pickerNodes) if (node.parentNode === body) body.removeChild(node)
+      pickerNodes = [field('Project', select(
         (phone.projects || []).map(entry => ({ value: entry.id, label: entry.name })),
         form.projectId,
         value => { form.projectId = value; page = { tasks: [], page: { offset: 0, limit: 20, total: 0, hasMore: false } }; draw(); void load(true) }
-      )))
-      const chosen = projectById(form.projectId)
-      if (chosen && chosen.machineId === 'local') body.appendChild(button('ghost wide files-open', 'Browse files', () => visit(filesHash(chosen.id, ''))))
+      ))]
+      if (chosen && chosen.machineId === 'local') pickerNodes.push(button('ghost wide files-open', 'Browse files', () => visit(filesHash(chosen.id, ''))))
+      for (const node of pickerNodes) body.insertBefore(node, quick)
+    }
 
-      const quick = el('section', 'card task-quick-add')
-      quick.appendChild(el('h2', 'card-title', 'Quick add'))
+    const buildQuick = () => {
+      const form = state.form
+      const section = el('section', 'card task-quick-add')
+      section.appendChild(el('h2', 'card-title', 'Quick add'))
       const report = el('textarea', 'input prompt')
       report.rows = 3
       report.placeholder = 'Add a task, bug, feature, or idea'
       report.setAttribute('aria-label', 'New project task')
-      report.maxLength = phone.projectTaskMaxLength || 200000
+      report.maxLength = state.phone.projectTaskMaxLength || 200000
       report.value = form.taskTitle
       report.addEventListener('input', () => { form.taskTitle = report.value; paintAdd() })
-      quick.appendChild(report)
+      section.appendChild(report)
       const scales = el('div', 'task-scales')
       const taskKind = select(['task', 'bug', 'feature', 'idea'].map(value => ({ value: value, label: value.charAt(0).toUpperCase() + value.slice(1) })), form.taskKind, value => { form.taskKind = value })
       const taskPriority = select(['high', 'normal', 'low'].map(value => ({ value: value, label: value.charAt(0).toUpperCase() + value.slice(1) })), form.taskPriority, value => { form.taskPriority = value })
       const taskWeight = select(['heavy', 'medium', 'light'].map(value => ({ value: value, label: value.charAt(0).toUpperCase() + value.slice(1) })), form.taskWeight, value => { form.taskWeight = value })
       taskKind.setAttribute('aria-label', 'Task type'); taskPriority.setAttribute('aria-label', 'Task priority'); taskWeight.setAttribute('aria-label', 'Task weight')
       scales.appendChild(taskKind); scales.appendChild(taskPriority); scales.appendChild(taskWeight)
-      quick.appendChild(scales)
+      section.appendChild(scales)
       /* Images ride the task as Markdown lines, the way the desktop task pane embeds them. */
       const tray = imageTray(state.taskImages, { onChange: () => paintAdd() })
-      quick.appendChild(tray.node)
+      section.appendChild(tray.node)
       const add = button('primary wide', 'Add task', async () => {
         if (adding || !form.taskTitle.trim()) return
         adding = true; paintAdd(); problem = ''
@@ -3620,28 +3792,44 @@
           for (const image of state.taskImages) images.push(await uploadImage(base, image))
           const created = await api(base + '/tasks', { method: 'POST', body: { title: form.taskTitle, kind: form.taskKind, priority: form.taskPriority, weight: form.taskWeight, images: images } })
           form.taskTitle = ''
+          report.value = ''
           state.taskImages.length = 0
+          tray.paint()
           showToast({ kind: 'done', title: 'Project task added', body: created && created.title, url: '#/tasks' })
           page = { tasks: [], page: { offset: 0, limit: 20, total: 0, hasMore: false } }
           adding = false
+          paintAdd()
           await load(true)
-        } catch (error) { problem = errorMessage(error); adding = false; draw() }
+        } catch (error) { problem = errorMessage(error); adding = false; paintAdd(); draw() }
       })
-      const paintAdd = () => {
+      paintAdd = () => {
         const count = state.taskImages.length
         add.disabled = adding || !form.projectId || !form.taskTitle.trim()
         add.textContent = adding ? 'Adding…' : count ? 'Add task with ' + count + (count === 1 ? ' image' : ' images') : 'Add task'
         report.placeholder = count ? 'Describe what the image shows' : 'Add a task, bug, feature, or idea'
       }
-      paintAdd()
-      quick.appendChild(add)
-      body.appendChild(quick)
+      section.appendChild(add)
+      return section
+    }
 
+    const draw = () => {
+      reconcileForm()
+      const top = scroll.scrollTop
+      const phone = state.phone
+      if (!phone) { clear(scroll); scroll.appendChild(emptyNote('Reading this computer…')); return }
+      if (body.parentNode !== scroll) { clear(scroll); scroll.appendChild(body) }
+      if (!quick) { quick = buildQuick(); body.appendChild(quick) }
+      drawPicker()
+      paintAdd()
+
+      for (const node of listNodes) if (node.parentNode === body) body.removeChild(node)
+      listNodes = []
+      const form = state.form
       const project = projectById(form.projectId)
       const heading = el('div', 'task-list-head')
       heading.appendChild(el('h2', 'card-title', project ? project.name : 'Project tasks'))
       heading.appendChild(el('span', 'muted-note', page.page.total + ' open'))
-      body.appendChild(heading)
+      listNodes.push(heading)
       const list = el('div', 'phone-task-list')
       for (const task of page.tasks || []) {
         const card = el('article', 'card phone-task')
@@ -3657,11 +3845,11 @@
         list.appendChild(card)
       }
       if (!page.tasks.length && !loading) list.appendChild(emptyNote('No open tasks in this project.'))
-      body.appendChild(list)
-      if (page.page.hasMore) body.appendChild(button('ghost wide task-more', loading ? 'Loading…' : 'Load more', () => { if (!loading) void load(false) }))
-      if (loading && !page.tasks.length) body.appendChild(emptyNote('Loading tasks…'))
-      if (problem) body.appendChild(el('p', 'pending-error', problem))
-      scroll.appendChild(body)
+      listNodes.push(list)
+      if (page.page.hasMore) listNodes.push(button('ghost wide task-more', loading ? 'Loading…' : 'Load more', () => { if (!loading) void load(false) }))
+      if (loading && !page.tasks.length) listNodes.push(emptyNote('Loading tasks…'))
+      if (problem) listNodes.push(el('p', 'pending-error', problem))
+      for (const node of listNodes) body.appendChild(node)
       scroll.scrollTop = top
     }
 
@@ -3670,7 +3858,15 @@
     })
     draw()
     if (state.form && state.form.projectId) void load(true)
-    return { key: 'tasks', root: root, update: () => { reconcileForm(); draw(); if (state.form && state.form.projectId) void load(true) } }
+    return {
+      key: 'tasks', root: root, keepsFields: true,
+      /* A stream tick redraws the list in place; the list itself is read again at most every few
+         seconds, and not while more than its first page is shown, which a reload would cut back. */
+      update: () => {
+        draw()
+        if (state.form && state.form.projectId && Date.now() - loadedAt > TASKS_RELOAD_MS && page.tasks.length <= 20) void load(true)
+      }
+    }
   }
 
   // ------------------------------------------------------------------ project files
@@ -4614,6 +4810,7 @@
     const self = {
       key: id ? 'idea:' + id : 'idea:new',
       root: root,
+      keepsFields: true,
       update: () => { if (!sheet.hidden) drawSheet() },
       onShown: () => { if (!id) input.focus() },
       onVisibility: visible => {
@@ -5021,6 +5218,7 @@
     return {
       key: 'ideas',
       root: root,
+      keepsFields: true,
       onShown: () => { if (searching) search.focus() },
       update: next => {
         /* Every stream tick lands here; only a move from the list to #/ideas/search focuses. */
@@ -5847,6 +6045,8 @@
     else window.location.hash = '#/'
   }
 
+  const isTextField = node => Boolean(node && (node.tagName === 'TEXTAREA' || (node.tagName === 'INPUT' && !/^(button|checkbox|radio|submit|reset|file|range|color)$/i.test(node.type || '')) || node.isContentEditable))
+
   const applyViewport = () => {
     /* iOS shrinks the visual viewport for the keyboard but not the layout viewport, which would
        hide a bottom-pinned composer behind it. Safari also scrolls the layout viewport to bring a
@@ -5864,8 +6064,7 @@
     else root.style.removeProperty('--app-height')
     root.style.setProperty('--app-offset', Math.round(offset) + 'px')
     /* While typing the tab bar steps aside and its home-indicator inset sits under the keyboard. */
-    const active = document.activeElement
-    const typing = Boolean(active && (active.tagName === 'TEXTAREA' || (active.tagName === 'INPUT' && !/^(button|checkbox|radio|submit|reset|file|range|color)$/i.test(active.type || '')) || active.isContentEditable))
+    const typing = isTextField(document.activeElement)
     root.classList.toggle('keyboard-open', shrunk && typing)
     if (window.scrollTo) window.scrollTo(0, 0)
   }

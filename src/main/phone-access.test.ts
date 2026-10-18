@@ -6,8 +6,8 @@ import type { AgentActivityPhase, AgentProviderInfo, DetachedWindowRecord, PaneT
 import { LOCAL_CONNECTION, LOCAL_MACHINE_ID, type MachineDescriptor } from '../shared/remote-control'
 import type { AgentEventData, SessionProjection, TimelineItem } from '../shared/structured-agent'
 import type { PhoneNotification } from '../shared/phone-access'
-import { normalizePairingCode, normalizePhoneSettings, PhoneAccessError, PhoneAccessService, recommendEndpoint, trimItem, type PhoneDatabase, type PhoneRemoteSessions, type PhoneSessions } from './phone-access'
-import { describeTransition, phoneSessionState } from './phone-notifications'
+import { answerableInteractions, normalizePairingCode, normalizePhoneSettings, PhoneAccessError, PhoneAccessService, recommendEndpoint, trimItem, type PhoneDatabase, type PhoneRemoteSessions, type PhoneSessions } from './phone-access'
+import { describeTransition, NOTIFICATION_BATCH_MS, phoneSessionState } from './phone-notifications'
 import { autoModeDenialMessage, autoModeDenialPayload } from '../shared/auto-mode-denial'
 import { MemoryVault, type SecretKeyValueStore } from './secret-store'
 
@@ -299,6 +299,11 @@ describe('what the phone sees', () => {
     ])
     fix.store.setSetting('agentControlParent:agent-2', JSON.stringify({ controllerAgentSessionId: 'agent-1' }))
     expect(fix.service.phoneState().sessions.find(session => session.id === 'agent-2')?.controllerId).toBe('agent-1')
+    // Every snapshot is numbered within this run, so a phone can drop one that arrives late.
+    const later = fix.service.phoneState()
+    expect(later.instance).toBe(state.instance)
+    expect(later.revision).toBeGreaterThan(state.revision)
+    expect(fixture().service.phoneState().instance).not.toBe(state.instance)
   })
 
   it('trims a conversation to what a phone can show and reports what it may do next', () => {
@@ -382,13 +387,40 @@ describe('driving a conversation', () => {
 
   it('answers only a question that is still pending, with the runtime it belongs to', async () => {
     const fix = fixture()
-    openConversation(fix, 'agent-1', { phase: 'waiting_input', runtimeId: 'rt-9', items: [item(1, { type: 'interaction', interaction: { id: 'q-1', kind: 'approval', title: 'Run rm -rf build?', input: null, choices: [{ id: 'yes', label: 'Yes' }, { id: 'no', label: 'No' }], status: 'pending' } })] })
+    openConversation(fix, 'agent-1', { phase: 'waiting_input', runtimeId: 'rt-9', items: [item(1, { type: 'interaction', interaction: { id: 'q-1', kind: 'approval', title: 'Run rm -rf build?', input: null, choices: [{ id: 'yes', label: 'Yes' }, { id: 'no', label: 'No' }], status: 'pending' } }, { runtimeId: 'rt-9' })] })
     await fix.service.respond('agent-1', { requestId: 'q-1', decision: 'yes' })
     expect(fix.sessions.respond).toHaveBeenCalledWith({ sessionId: 'agent-1', runtimeId: 'rt-9', requestId: 'q-1', decision: 'yes' })
     await fix.service.respond('agent-1', { requestId: 'q-1', answers: { db: 'Postgres', extra: ['a', 5, 'b'] } })
     expect(fix.sessions.respond).toHaveBeenLastCalledWith(expect.objectContaining({ answers: { db: ['Postgres'], extra: ['a', 'b'] } }))
-    await expect(fix.service.respond('agent-1', { requestId: 'q-2' })).rejects.toThrow(/no longer waiting/)
+    await expect(fix.service.respond('agent-1', { requestId: 'q-2' })).rejects.toThrow(/not part of this conversation/)
     await expect(fix.service.respond('agent-1', { requestId: '' })).rejects.toThrow(/Name the question/)
+  })
+
+  it('offers only the requests that can still be answered, and answers each with its own runtime', async () => {
+    const fix = fixture()
+    const question = (id: string, input: unknown, status: 'pending' | 'resolved' | 'expired' = 'pending') => ({ type: 'interaction' as const, interaction: { id, kind: 'question' as const, title: 'Codex asked you', input: input as never, choices: [], questions: [{ id: `${id}:0`, question: 'Which look?', options: [{ label: 'A' }] }], status } })
+    openConversation(fix, 'agent-1', { phase: 'running', runtimeId: 'rt-2', nativeSessionId: 'thread-1', items: [
+      // Left pending by a runtime that restarted: nothing can answer it any more.
+      item(1, question('old-sync', null), { runtimeId: 'rt-1' }),
+      // Codex's async question outlives the runtime that asked it, on its own thread only.
+      item(2, question('async-1', { protocol: 'codex-async-question', threadId: 'thread-1', itemId: 'm1' }), { runtimeId: 'rt-1' }),
+      item(3, question('async-other-thread', { protocol: 'codex-async-question', threadId: 'thread-0', itemId: 'm0' }), { runtimeId: 'rt-1' }),
+      item(4, question('closed', null, 'resolved'), { runtimeId: 'rt-2' }),
+      item(5, question('live-sync', null), { runtimeId: 'rt-2' })
+    ] })
+    expect(fix.service.conversation('agent-1').pending.map(entry => entry.id)).toEqual(['async-1', 'live-sync'])
+    expect(answerableInteractions(fix.projections.get('agent-1')!).map(entry => entry.id)).toEqual(['async-1', 'live-sync'])
+    // The async question goes with the runtime its item carries, which is what the host matches.
+    await fix.service.respond('agent-1', { requestId: 'async-1', answers: { 'async-1:0': 'A' } })
+    expect(fix.sessions.respond).toHaveBeenLastCalledWith({ sessionId: 'agent-1', runtimeId: 'rt-1', requestId: 'async-1', answers: { 'async-1:0': ['A'] } })
+    // A closed question with a typed answer still reaches the host, which sends it on as a message.
+    const answer = vi.fn(async () => ({ delivered: 'message' as const, reason: 'it had expired' }))
+    Object.assign(fix.sessions, { answer })
+    await expect(fix.service.respond('agent-1', { requestId: 'closed', answers: { 'closed:0': 'Late words' } })).resolves.toMatchObject({ delivered: 'message' })
+    // A closed approval is never replayed.
+    fix.projections.get('agent-1')!.items.push(item(6, { type: 'interaction', interaction: { id: 'gone', kind: 'approval', title: 'Run it?', input: null, choices: [{ id: 'yes', label: 'Yes' }], status: 'expired' } }, { runtimeId: 'rt-2' }))
+    await expect(fix.service.respond('agent-1', { requestId: 'gone', decision: 'yes' })).rejects.toThrow(/no longer waiting/)
+    expect(answer).toHaveBeenCalledTimes(1)
   })
 
   it('refuses to drive a provider the structured backend does not journal', async () => {
@@ -572,6 +604,9 @@ describe('notifications', () => {
     fix.activity.set('agent-1', 'complete')
     fix.service.noteActivity('agent-1')
     await vi.advanceTimersByTimeAsync(500)
+    // A finish waits out the burst window, in case its siblings finish with it.
+    expect(fix.push).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(NOTIFICATION_BATCH_MS)
     expect(fix.push).toHaveBeenCalledTimes(1)
     const [subscription, payload, options] = fix.push.mock.calls[0] as [unknown, string, { urgency: string; topic?: string }]
     expect(subscription).toMatchObject({ endpoint: 'https://push.example/sub' })
@@ -593,6 +628,32 @@ describe('notifications', () => {
     expect((fix.push.mock.calls[1] as [unknown, string, { urgency: string }])[2].urgency).toBe('high')
     unsubscribe()
     expect(fix.service.streamCount()).toBe(0)
+  })
+
+  it('pushes one usage-limit notification when a swarm hits the same provider window, and none for a tab that joins it later', async () => {
+    const fix = fixture()
+    const phone = pairPhone(fix.service)
+    fix.service.setSubscription(phone.id, { endpoint: 'https://push.example/sub', keys: { p256dh: 'BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8', auth: 'BTBZMqHH6r4Tts7J_aSIgg' } })
+    const ids = ['agent-1', 'agent-2', 'agent-3', 'agent-4', 'agent-5', 'agent-6']
+    for (const id of ids) { openConversation(fix, id, { phase: 'running' }); fix.activity.set(id, 'working') }
+    fix.service.observeEvents(ids.map((id, index) => ({ sessionId: id, sequence: index + 1, data: { type: 'session' } })))
+    await vi.advanceTimersByTimeAsync(500)
+    const resumeAt = new Date(Date.now() + 3 * 3600_000).toISOString()
+    const limit = (id: string) => {
+      fix.projections.set(id, projection(id, { phase: 'idle', limitResumeAt: resumeAt } as Partial<SessionProjection>))
+      fix.activity.set(id, 'limited')
+      fix.service.noteActivity(id)
+    }
+    // Five tabs reach the limit over about two seconds, across several refreshes.
+    for (const id of ids.slice(0, 5)) { limit(id); await vi.advanceTimersByTimeAsync(450) }
+    await vi.advanceTimersByTimeAsync(NOTIFICATION_BATCH_MS)
+    expect(fix.push).toHaveBeenCalledTimes(1)
+    const [, payload, options] = fix.push.mock.calls[0] as [unknown, string, { topic?: string }]
+    expect(JSON.parse(payload) as PhoneNotification).toMatchObject({ kind: 'limited', sessionId: null, tag: 'usage-limit-claude', title: expect.stringContaining('Usage limit: 5 tabs (Claude)') })
+    expect(options.topic).toMatch(/^[A-Za-z0-9_-]{1,32}$/)
+    limit('agent-6')
+    await vi.advanceTimersByTimeAsync(500 + NOTIFICATION_BATCH_MS)
+    expect(fix.push).toHaveBeenCalledTimes(1)
   })
 
   it('holds a claude auto-mode classifier denial and pushes it only once the turn stops on it asking the owner, never twice', async () => {
@@ -621,8 +682,11 @@ describe('notifications', () => {
     fix.activity.set('agent-1', 'complete')
     fix.service.observeEvents([{ sessionId: 'agent-1', sequence: 3, data: { type: 'notice' } }])
     await vi.advanceTimersByTimeAsync(500)
-    expect(fix.push.mock.calls.map(call => (JSON.parse(call[1] as string) as PhoneNotification).kind)).toEqual(['done', 'attention'])
-    const [, payload, options] = fix.push.mock.calls[1] as [unknown, string, { urgency: string }]
+    // The refusal it stopped on goes out at once; the finish waits out the burst window.
+    expect(fix.push.mock.calls.map(call => (JSON.parse(call[1] as string) as PhoneNotification).kind)).toEqual(['attention'])
+    await vi.advanceTimersByTimeAsync(NOTIFICATION_BATCH_MS)
+    expect(fix.push.mock.calls.map(call => (JSON.parse(call[1] as string) as PhoneNotification).kind)).toEqual(['attention', 'done'])
+    const [, payload, options] = fix.push.mock.calls[0] as [unknown, string, { urgency: string }]
     expect(JSON.parse(payload) as PhoneNotification).toMatchObject({ kind: 'attention', sessionId: 'agent-1', title: 'Needs you: Tab tab-agent-1', body: 'Auto mode refused Edit: Security Weaken' })
     expect(options.urgency).toBe('high')
     fix.service.observeEvents([{ sessionId: 'agent-1', sequence: 3, data: { type: 'notice' } }])

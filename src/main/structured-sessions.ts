@@ -7,8 +7,8 @@ import { mkdirSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentActivityPhase, AgentSpec, LayoutNode, RuntimeEnsureResult } from '../shared/models'
-import { isFrontierModel, MAX_PROMPT_CHARS, PROVIDER_AUTH_EXPIRED, PROVIDER_SAFEGUARD_REFUSAL, PROVIDER_USAGE_LIMIT, settingsForRuntime, WIZARD_MODEL_HINT, wizardActive } from '../shared/structured-agent'
-import type { ActivityStatus, AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, Json, PendingSteering, PromptDispatchAuthority, PromptOrigin, QueuedPrompt, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
+import { ANSWERED_IN_CONVERSATION, isAsyncQuestion, isFrontierModel, MAX_PROMPT_CHARS, PROVIDER_AUTH_EXPIRED, PROVIDER_SAFEGUARD_REFUSAL, PROVIDER_USAGE_LIMIT, settingsForRuntime, WIZARD_MODEL_HINT, wizardActive } from '../shared/structured-agent'
+import type { ActivityStatus, AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, InteractionResponseResult, Json, PendingSteering, SessionProjection, PromptDispatchAuthority, PromptOrigin, QueuedPrompt, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import type { AgentChangeHistory, RevertOutcome, RevertScope } from '../shared/agent-change-history'
 import type { ConductorDatabase } from './database'
 import { AgentArtifacts, workspacePath } from './agent-artifacts'
@@ -1066,6 +1066,7 @@ export class StructuredSessions {
       this.setSteering(live, prompts.filter(prompt => prompt.id !== inputId), source.native)
       live.expediteInput?.delete(inputId)
       this.emit(live, { turnId: input.turnId, itemId: inputId, data: { type: 'text', role: 'user', text: input.text, mode: 'snapshot', ...(input.attachments.length ? { attachments: this.sentAttachments(live, input.attachments) } : {}), ...(input.origin ? { origin: input.origin } : {}) }, native: source.native })
+      this.closeAnsweredAsyncQuestions(live)
     } else {
       this.setSteering(live, prompts.map(prompt => prompt.id === inputId ? { ...prompt, status } : prompt), source.native)
     }
@@ -1251,6 +1252,7 @@ export class StructuredSessions {
       store.update(id, { settings, title: state.title || (anonymousConversations.has(id) ? '' : deriveConversationTitle(text)) })
       // Keep expanded file bytes and recalled context in the provider request, outside the user's message.
       if (!refusalRetry) this.emit(live, { itemId: userItemId, data: { type: 'text', role: 'user', text: text.trim(), mode: 'snapshot', ...(attachments.length ? { attachments: this.sentAttachments(live, attachments) } : {}), ...(origin ? { origin } : {}) } })
+      if (!refusalRetry) this.closeAnsweredAsyncQuestions(live)
       this.emit(live, { data: { type: 'session', phase: 'running' } })
       if (process.env.CONDUCTOR_LIVE_TESTS === '1') live.budget = new LiveRuntimeBudget(boundary => this.stopLive(live, boundary === 'active-runtime' ? 'Live prompt reached its 90 second active runtime allowance' : 'Live prompt reached its 30 second cumulative human-input wait allowance'))
       const dispatch = live.adapter.submit(submitted, settings, attachments.filter(item => item.kind === 'image'))
@@ -1369,15 +1371,27 @@ export class StructuredSessions {
     const allowed = validateLiveTurn(live.spec.provider as StructuredProvider, live.spec.cwd, text, settings)
     this.database.structured.reserveLive(allowed.suiteId, live.spec.provider as StructuredProvider, 2, 4, allowed.prompt)
   }
-  async respond(response: InteractionResponse, reviewedAutomatically = false): Promise<void> {
+  async respond(response: InteractionResponse, reviewedAutomatically = false): Promise<void> { await this.answer(response, reviewedAutomatically) }
+  /** respond, saying what became of the response: delivered to its request, or sent as a message
+   *  because the question had already closed (deliverLateAnswer). */
+  async answer(response: InteractionResponse, reviewedAutomatically = false): Promise<InteractionResponseResult> {
     if (!response || typeof response.requestId !== 'string' || typeof response.runtimeId !== 'string') throw new Error('Invalid response')
     const live = this.get(response.sessionId), state = this.database.structured.snapshot(response.sessionId)!
     if (live.responses.has(response.requestId)) throw new Error('This request is stale or already submitted')
     const candidate = state.items.find(item => item.data.type === 'interaction' && item.data.interaction.id === response.requestId && item.data.interaction.status === 'pending')
-    const candidateAsync = candidate?.data.type === 'interaction' && (candidate.data.interaction.input as { protocol?: string } | null)?.protocol === 'codex-async-question'
-    if (!candidateAsync && (live.runtimeId !== response.runtimeId || state.runtimeId !== response.runtimeId)) throw new Error('This request is stale or already submitted')
-    const item = state.items.find(item => item.runtimeId === response.runtimeId && item.data.type === 'interaction' && item.data.interaction.id === response.requestId && item.data.interaction.status === 'pending')
-    if (!item || item.data.type !== 'interaction') throw new Error('Request is no longer pending')
+    const candidateAsync = candidate?.data.type === 'interaction' && isAsyncQuestion(candidate.data.interaction)
+    if (!candidateAsync && (live.runtimeId !== response.runtimeId || state.runtimeId !== response.runtimeId)) {
+      const late = await this.deliverLateAnswer(live, state, response, reviewedAutomatically)
+      if (late) return late
+      throw new Error('This request is stale or already submitted')
+    }
+    // An async question is one card for the whole thread, whichever runtime last restated it.
+    const item = candidateAsync ? candidate : state.items.find(item => item.runtimeId === response.runtimeId && item.data.type === 'interaction' && item.data.interaction.id === response.requestId && item.data.interaction.status === 'pending')
+    if (!item || item.data.type !== 'interaction') {
+      const late = await this.deliverLateAnswer(live, state, response, reviewedAutomatically)
+      if (late) return late
+      throw new Error('Request is no longer pending')
+    }
     const interaction = item.data.interaction
     const asyncQuestion = (interaction.input as { protocol?: string } | null)?.protocol === 'codex-async-question'
     if (!asyncQuestion && (!live.adapter || live.runtimeId !== response.runtimeId || state.runtimeId !== response.runtimeId)) throw new Error('This request is stale or already submitted')
@@ -1413,6 +1427,7 @@ export class StructuredSessions {
       if (review) this.approvalGate.finish(review, true)
       const current = this.database.structured.snapshot(response.sessionId)?.items.find(entry => (!asyncQuestion ? entry.runtimeId === response.runtimeId : true) && entry.data.type === 'interaction' && entry.data.interaction.id === response.requestId)
       if (current?.data.type === 'interaction' && (asyncQuestion || current.data.interaction.status === 'pending')) this.emit(live, { requestId: response.requestId, itemId: item.nativeItemId, data: { type: 'interaction', interaction: { ...interaction, status: 'resolved', outcome: response.decision ?? 'answered', ...(asyncQuestion ? { answers: answerRecord } : {}) } } })
+      return { delivered: 'answer' }
     } catch (error) {
       if (review) this.approvalGate.finish(review, false)
       if (error instanceof InteractionResponseRejectedError) {
@@ -1422,6 +1437,40 @@ export class StructuredSessions {
       // Uncertain transport delivery cannot be retried automatically or double submitted.
       this.emit(live, { requestId: response.requestId, data: { type: 'interaction', interaction: { ...interaction, status: 'expired', outcome: 'Response delivery uncertain' } } })
       throw error
+    }
+  }
+  /** A question answer that arrives after its card closed (answered in the conversation, expired with
+   *  its turn, cancelled by the provider, or left behind by a restarted runtime) is still the owner's
+   *  words: it goes to the agent as an ordinary message with a note instead of being dropped. An
+   *  approval is never replayed this way, and neither is a question a card already answered. */
+  private async deliverLateAnswer(live: LiveSession, state: SessionProjection, response: InteractionResponse, reviewedAutomatically: boolean): Promise<InteractionResponseResult | undefined> {
+    if (reviewedAutomatically || !response.answers || typeof response.answers !== 'object') return undefined
+    const found = [...state.items].reverse().find(item => item.data.type === 'interaction' && item.data.interaction.id === response.requestId)
+    if (found?.data.type !== 'interaction' || found.data.interaction.kind !== 'question') return undefined
+    const interaction = found.data.interaction
+    if (interaction.status === 'resolved' && interaction.outcome !== ANSWERED_IN_CONVERSATION) throw new Error('This question was already answered from a card; nothing was sent again')
+    // Still open in the live runtime: the caller named the wrong runtime, and the card can be answered.
+    if (interaction.status === 'pending' && found.runtimeId === live.runtimeId && live.adapter) return undefined
+    const answered = (interaction.questions ?? []).flatMap(question => {
+      const values = response.answers![question.id]
+      const kept = Array.isArray(values) ? values.filter((value): value is string => typeof value === 'string' && Boolean(value.trim())).map(value => value.trim().slice(0, 16_384)) : []
+      return kept.length ? [`${question.question}\nAnswer: ${kept.join(', ')}`] : []
+    })
+    if (!answered.length) return undefined
+    const reason = interaction.status === 'pending' ? 'its runtime had restarted' : interaction.status === 'expired' ? 'it had expired' : 'a message in the conversation had already answered it'
+    live.responses.add(response.requestId)
+    try {
+      await this.steerOrStart(response.sessionId, `[Conductor: this question had closed before the answer was submitted (${reason}); the answer is sent as a message instead.]\n\n${answered.join('\n\n')}`, state.settings)
+    } catch (error) { live.responses.delete(response.requestId); throw error }
+    return { delivered: 'message', reason }
+  }
+  /** Codex's request_user_input_async is answered by the next user message, from whatever screen or
+   *  agent it came: once one is part of the thread, no card may go on offering the question. */
+  private closeAnsweredAsyncQuestions(live: LiveSession): void {
+    if (live.spec.provider !== 'codex') return
+    for (const item of this.database.structured.snapshot(live.spec.id)?.items ?? []) {
+      if (item.data.type !== 'interaction' || item.data.interaction.status !== 'pending' || !isAsyncQuestion(item.data.interaction)) continue
+      this.emit(live, { requestId: item.data.interaction.id, itemId: item.nativeItemId, data: { type: 'interaction', interaction: { ...item.data.interaction, status: 'resolved', outcome: ANSWERED_IN_CONVERSATION } } })
     }
   }
   async interrupt(id: string, expediteSubmittedInput = false): Promise<void> {

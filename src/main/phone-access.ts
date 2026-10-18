@@ -5,8 +5,8 @@ import { makeId, type AgentProviderInfo, type AgentSpec, type DetachedWindowReco
 import type { MachineDescriptor } from '../shared/remote-control'
 import { LOCAL_MACHINE_ID } from '../shared/remote-control'
 import { PROJECT_TASK_MAX_LENGTH, projectTaskKinds, projectTaskPriorities, projectTaskWeights, type ProjectTaskKind, type ProjectTaskPriority, type ProjectTaskWeight } from '../shared/project-backlog'
-import type { ContextAttachment, InteractionResponse, PromptOrigin, SessionProjection, SessionSettings, StructuredProvider, TimelineItem } from '../shared/structured-agent'
-import { settingsForRuntime } from '../shared/structured-agent'
+import type { ContextAttachment, InteractionResponse, InteractionResponseResult, PendingInteraction, PromptOrigin, SessionProjection, SessionSettings, StructuredProvider, TimelineItem } from '../shared/structured-agent'
+import { isAsyncQuestion, settingsForRuntime } from '../shared/structured-agent'
 import type { SystemMetricsSnapshot } from '../shared/system-metrics'
 import { normalizeUsageWindows, summarizeUsage, updatedSequence, usageWindowAppliesToModel, type UsageWindow } from '../shared/usage-accounting'
 import {
@@ -19,7 +19,7 @@ import { rememberedPermission } from './app-settings'
 import type { AgentActivityRow } from './project-activity'
 import { tabMachineId } from './machines'
 import { AttentionGate } from './attention-log'
-import { autoModeDenials, describeDenialMoments, describeTransition, lastMessage, pendingInteraction, phoneSessionState, previewText, type PhoneActivity } from './phone-notifications'
+import { autoModeDenials, describeDenialMoments, describeTransition, lastMessage, NotificationBatcher, phoneSessionState, previewText, type NotificationMoment, type PhoneActivity } from './phone-notifications'
 import { createCertificateAuthority, issueServerCertificate, tlsIdentityUsable, type CertificateAuthority } from './remote-tls'
 import type { SecretKeyValueStore, SecretVault } from './secret-store'
 import { generateVapidKeys, isValidVapidKeys, sendWebPush, type VapidKeys } from './web-push'
@@ -110,6 +110,8 @@ export interface PhoneSessions {
   steer(id: string, text: string, settings: SessionSettings, attachments?: ContextAttachment[], origin?: PromptOrigin): Promise<unknown>
   queue(id: string, text: string, settings: SessionSettings, attachments?: ContextAttachment[], origin?: PromptOrigin): Promise<void>
   respond(response: InteractionResponse): Promise<void>
+  /** respond, saying whether a question that had closed was sent on as a message instead. */
+  answer?(response: InteractionResponse): Promise<InteractionResponseResult>
   interrupt(id: string, expediteSubmittedInput?: boolean): Promise<void>
   resume(id: string, settings?: SessionSettings): Promise<void>
 }
@@ -267,7 +269,12 @@ export class PhoneAccessService {
   private latest = new Map<string, PhoneSessionSummary>()
   /** "Needs you" waits out a grace period and goes out only if still blocked (attention-log.ts). */
   readonly attention: AttentionGate
+  /** Several tabs finishing or hitting one usage limit together buzz the phone once. */
+  private readonly batcher: NotificationBatcher
   private seeded = false
+  /** Each snapshot is numbered within this run, so a phone drops one that arrives after a newer one. */
+  private readonly stateInstance = randomUUID()
+  private stateRevision = 0
   private refreshTimer: ReturnType<typeof setTimeout> | null = null
   private touched = new Set<string>()
   private usageCache = new Map<string, { sequence: number; windows: UsageWindow[]; reportedAt: string; summary: PhoneSessionSummary['usage'] }>()
@@ -277,6 +284,7 @@ export class PhoneAccessService {
   readonly lock: PhoneLock
 
   constructor(private readonly deps: PhoneAccessDependencies) {
+    this.batcher = new NotificationBatcher({ emit: notification => this.deliver(notification), now: () => this.now(), nextId: randomUUID, providerLabel: id => providerLabels[id] ?? id })
     this.attention = new AttentionGate({
       view: id => {
         const summary = this.latest.get(id)
@@ -593,7 +601,7 @@ export class PhoneAccessService {
     let changed = false
     for (const device of targets) {
       try {
-        const result = await send(device.subscription!, lockConfigured && !this.lock.unlocked(device.id) ? redacted : payload, { keys, subject: 'https://github.com/Empire024/conductor', ttl: 24 * 3600, urgency: notification.kind === 'attention' ? 'high' : 'normal', topic: notification.sessionId ? topicFor(notification.sessionId) : undefined })
+        const result = await send(device.subscription!, lockConfigured && !this.lock.unlocked(device.id) ? redacted : payload, { keys, subject: 'https://github.com/Empire024/conductor', ttl: 24 * 3600, urgency: notification.kind === 'attention' ? 'high' : 'normal', topic: notification.tag ? topicFor(notification.tag) : notification.sessionId ? topicFor(notification.sessionId) : undefined })
         if (result.gone) { device.subscription = null; device.pushFailures = 0; changed = true; problems.push(`${device.name}: the phone dropped its subscription; turn notifications on again there.`) }
         else if (result.status >= 200 && result.status < 300) { sent += 1; if (device.pushFailures) { device.pushFailures = 0; changed = true } }
         else { device.pushFailures += 1; changed = true; problems.push(`${device.name}: push service answered ${result.status}.`) }
@@ -678,7 +686,7 @@ export class PhoneAccessService {
     let state: PhoneState
     try { state = this.phoneState() } catch (error) { this.log('Phone state unavailable', error); return }
     const at = new Date(this.now()).toISOString()
-    const notifications: PhoneNotification[] = []
+    const moments: NotificationMoment[] = []
     const seen = new Set<string>()
     this.latest.clear()
     for (const summary of state.sessions) {
@@ -689,7 +697,7 @@ export class PhoneAccessService {
         const transition = this.seeded ? describeTransition(this.known.get(summary.id), summary, at, randomUUID()) : null
         // "Needs you" is held: it goes out only if the turn is still blocked after the grace period.
         if (transition?.kind === 'attention') this.attention.offer({ sessionId: summary.id, title: summary.title, kind: summary.needs === 'question' ? 'question' : 'approval', detail: this.askedText(summary.id) ?? transition.body, ...(summary.pendingId ? { pendingId: summary.pendingId } : {}), notification: transition })
-        else if (transition) notifications.push(transition)
+        else if (transition) moments.push({ notification: transition, title: summary.title || 'Conversation', provider: summary.provider, resumeAt: summary.limitResumeAt })
         if (this.seeded) for (const { denial, notification } of describeDenialMoments(this.known.get(summary.id), summary, at, randomUUID)) {
           this.attention.offer({ sessionId: summary.id, title: summary.title, kind: 'denial', detail: notification.body, denialItemId: denial.id, notification })
         }
@@ -699,13 +707,14 @@ export class PhoneAccessService {
     for (const id of [...this.known.keys()]) if (!seen.has(id)) this.known.delete(id)
     this.seeded = true
     if (this.streams.size) this.broadcast('state', state)
-    for (const notification of notifications) this.deliver(notification)
+    for (const moment of moments) this.batcher.offer(moment)
     this.attention.review()
   }
 
   /** The question itself, for the attention log, where the interaction title is only "Claude needs your input". */
   private askedText(id: string): string | undefined {
-    const asked = pendingInteraction(this.deps.database.structured.snapshot(id)?.items ?? [])?.questions?.map(question => question.question).filter(Boolean).join(' / ')
+    const projection = this.deps.database.structured.snapshot(id)
+    const asked = (projection ? answerableInteractions(projection).at(-1) : undefined)?.questions?.map(question => question.question).filter(Boolean).join(' / ')
     return asked ? previewText(asked, 160) : undefined
   }
 
@@ -777,6 +786,8 @@ export class PhoneAccessService {
     }
     return {
       observedAt: new Date(this.now()).toISOString(),
+      instance: this.stateInstance,
+      revision: ++this.stateRevision,
       machineName: this.deps.machineName(),
       projects: projects.map(project => ({ id: project.id, name: project.name, machineId: project.remote?.machineId ?? LOCAL_MACHINE_ID, workspaces: this.deps.database.listSessions(project.id).map(workspace => ({ id: workspace.id, name: workspace.name })) })),
       machines: machines.map(machine => ({
@@ -826,7 +837,8 @@ export class PhoneAccessService {
     // read them loosely so a tree without those fields still builds and simply reports neither.
     const extra = (projection ?? {}) as { limitResumeAt?: string | null; backgroundTasks?: number }
     const items = projection?.items ?? []
-    const pending = pendingInteraction(items)
+    // Only a card the phone can answer makes the conversation need the owner.
+    const pending = projection ? answerableInteractions(projection).at(-1) : undefined
     const denials = autoModeDenials(items)
     const last = lastMessage(items)
     const machineId = tab ? tabMachineId(tab) : spec?.machineId ?? project.remote?.machineId ?? LOCAL_MACHINE_ID
@@ -899,7 +911,7 @@ export class PhoneAccessService {
       summary,
       sequence: projection?.sequence ?? 0,
       items: kept.map(trimItem),
-      pending: items.flatMap(item => item.data.type === 'interaction' && item.data.interaction.status === 'pending' ? [item.data.interaction] : []),
+      pending: projection ? answerableInteractions(projection) : [],
       queued: (projection?.queuedPrompts ?? (projection?.queued ? [projection.queued] : [])).map(prompt => ({ id: prompt.id, text: previewText(prompt.text, 400) })),
       inputDeliveries: phoneInputDeliveries(projection),
       truncated: Boolean(projection?.truncated) || kept.length < roots.length,
@@ -991,16 +1003,23 @@ export class PhoneAccessService {
     return { phase: this.deps.database.structured.snapshot(id)?.phase ?? projection.phase, mode }
   }
 
-  async respond(id: string, input: { requestId: unknown; decision?: unknown; answers?: unknown }): Promise<{ phase: SessionProjection['phase'] }> {
+  async respond(id: string, input: { requestId: unknown; decision?: unknown; answers?: unknown }): Promise<{ phase: SessionProjection['phase']; delivered: InteractionResponseResult['delivered'] }> {
     const { projection, remote } = this.structuredOnly(id)
     const requestId = typeof input.requestId === 'string' ? input.requestId : ''
     if (!requestId) throw new PhoneAccessError('Name the question being answered.')
-    const pending = projection.items.find(item => item.data.type === 'interaction' && item.data.interaction.id === requestId && item.data.interaction.status === 'pending')
-    if (!pending) throw new PhoneAccessError('That question is no longer waiting; refresh the conversation.', 409)
     const answers = normalizeAnswers(input.answers)
-    const response: InteractionResponse = { sessionId: id, runtimeId: projection.runtimeId, requestId, ...(typeof input.decision === 'string' ? { decision: input.decision.slice(0, 200) } : {}), ...(answers ? { answers } : {}) }
-    await (remote ? this.deps.remote!.respond(response) : this.deps.sessions.respond(response))
-    return { phase: this.deps.database.structured.snapshot(id)?.phase ?? projection.phase }
+    // The card's own item, open or closed: a question that closed while its answer was being typed
+    // is still answered, as a message (structured-sessions deliverLateAnswer); an approval is not.
+    const asked = [...projection.items].reverse().find(item => item.data.type === 'interaction' && item.data.interaction.id === requestId)
+    if (!asked || asked.data.type !== 'interaction') throw new PhoneAccessError('That question is not part of this conversation; refresh it.', 404)
+    if (asked.data.interaction.status !== 'pending' && (asked.data.interaction.kind !== 'question' || !answers)) throw new PhoneAccessError('That request is no longer waiting; refresh the conversation.', 409)
+    // The item's runtime, not the conversation's: an async Codex question outlives the runtime that asked it.
+    const response: InteractionResponse = { sessionId: id, runtimeId: asked.runtimeId, requestId, ...(typeof input.decision === 'string' ? { decision: input.decision.slice(0, 200) } : {}), ...(answers ? { answers } : {}) }
+    let result: InteractionResponseResult | undefined
+    if (remote) await this.deps.remote!.respond(response)
+    else if (this.deps.sessions.answer) result = await this.deps.sessions.answer(response)
+    else await this.deps.sessions.respond(response)
+    return { phase: this.deps.database.structured.snapshot(id)?.phase ?? projection.phase, delivered: result?.delivered ?? 'answer' }
   }
 
   async interrupt(id: string): Promise<{ phase: SessionProjection['phase']; held: number }> {
@@ -1148,6 +1167,7 @@ export class PhoneAccessService {
     this.streams.clear()
     this.lock.dispose()
     this.attention.dispose()
+    this.batcher.dispose()
   }
 }
 
@@ -1160,8 +1180,23 @@ export function redactNotification(notification: PhoneNotification): PhoneNotifi
 
 const fingerprintOf = (certificatePem: string): string => new X509Certificate(certificatePem).fingerprint256
 
-/** A push topic collapses queued notifications about one conversation; it must be short and URL-safe. */
+/** A push topic collapses queued notifications about one conversation (or one shared tag); it must be short and URL-safe. */
 const topicFor = (sessionId: string): string => createHash('sha256').update(sessionId).digest('base64url').slice(0, 32)
+
+/** The requests a phone may offer as open cards, by the desktop's rule: one asked by the runtime that
+ *  is attached now, or a Codex async question of the conversation's current thread (that one is
+ *  answered by a later message, so it outlives the runtime that asked it). A pending item left behind
+ *  by an earlier runtime can no longer be answered and is not offered. */
+export function answerableInteractions(projection: SessionProjection): PendingInteraction[] {
+  return projection.items.flatMap(item => {
+    if (item.data.type !== 'interaction' || item.data.interaction.status !== 'pending') return []
+    const interaction = item.data.interaction
+    const open = isAsyncQuestion(interaction)
+      ? (interaction.input as { threadId?: string } | null)?.threadId === projection.nativeSessionId
+      : item.runtimeId === projection.runtimeId
+    return open ? [interaction] : []
+  })
+}
 
 const windowOrder: PhoneUsageWindow['kind'][] = ['weekly', 'short', 'other']
 const stateOrder: PhoneSessionSummary['state'][] = ['attention', 'limited', 'failed', 'working', 'disconnected', 'done', 'stopped', 'idle']
