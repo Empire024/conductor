@@ -1939,6 +1939,18 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 - [x] Smokes pick the launcher's Claude tile with `.filter({ hasText: 'Claude' })` alone (~54 uses in scripts/smoke-*.mjs), which also matches the "Claude Cloud" toggle (aria-pressed) since it joined the launcher grid (found by the smoke-composer-backlog fix, adaa219). Give the smokes one shared launcher-tile helper (e.g. `.launcher-grid button:not([aria-pressed])`) and verify a sample of the affected smokes. <!-- conductor-task:smoke-claude-tile-locator-20261017 priority=normal agent=agent_mvcfk0cp_oo0jj2j -->
 - [x] Wizard successor churn (miron rosin, 2026-10-17 18:00-19:00): the Codex Astra rosin wizard chain handed itself on every 5-10 minutes, each tab after only 1-2 turns at 24-33% context (agent_mvc71rsk_ghxrsiy -> mvcpolxt -> mvcpyrfi -> mvcq8xs5 -> mvcqlqr2 -> mvcqr50d -> mvcqzxjz -> mvcr94jp), well under the ~25 turns / 40% succession rule; every successor re-reads the brief and costs tokens. Find what drives it (turn counter inherited across successors or counting coworker prompts/reports, the succession nudge firing on a wrong count, or prompt wording making the model hand off after each step) and fix it so a successor hands on only when the rule is really met. Also: an agents.await on a wizard should follow its successor chain instead of waking only on the deadline. <!-- conductor-task:wizard-successor-churn-20261017 priority=high agent=agent_mvcrbbyz_icaa0yl -->
 
+- [x] clicking left bottom corner usage needs to open up the full usage graph with all info; the 5h window shows how close it is to its reset (time left) <!-- conductor-task:153a7424-aaff-466a-9d5d-58ae14585e70 agent=agent_mvd7if7f_kxkulpb -->
+
+- [ ] visual bug with too many tabs, also when tabs getting red cuz of too many tokens used this happens <!-- conductor-task:73762c1f-531d-4ffe-ab5e-a4656a0230ca -->
+  
+  ![image.png](.conductor/prompt-images/7ea43da5-0e29-4839-8424-338bb7b7f726.png)
+
+- [ ] I’m getting spams also  i can barely wrote this on mobile the keyboard goes away l <!-- conductor-task:2c06c074-98d1-443a-ae8a-86af921e5742 -->
+
+- [ ] Here image for spam <!-- conductor-task:650449a0-9714-46fc-8dfc-7c22777a817d -->
+  
+  ![IMG_0385.jpg](.conductor/prompt-images/7e8f915d-1fde-4938-8894-1d4251a22372.jpg)
+
 ## Phone WebApp: ultimate, snappy control suite (2026-10-03)
 
 - [x] 1. Repair phone dictation and explain iOS/Android browser, permission and PWA limitations with keyboard fallback. <!-- conductor-task:phone-redesign-dictation agent=agent_murrdn5k_umf5k4m -->

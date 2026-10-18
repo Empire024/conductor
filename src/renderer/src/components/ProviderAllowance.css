@@ -1,8 +1,12 @@
 /* Provider allowance strip (ProviderAllowance.tsx): one 16px row per provider, as compact as the process summary. */
-.provider-allowance { display: flex; flex-direction: column; gap: 1px; padding: 5px 10px 5px 12px; border-top: 1px solid var(--border-soft); }
+.provider-allowance { border-top: 1px solid var(--border-soft); }
+/* The whole strip is one button: a click (Enter/Space) opens the full usage view (UsageOverview.tsx). */
+.provider-allowance-open { width: 100%; display: flex; flex-direction: column; gap: 1px; padding: 5px 10px 5px 12px; border: 0; border-radius: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.provider-allowance-open:hover, .provider-allowance-open[aria-expanded="true"] { background: var(--surface-2); }
+.provider-allowance-open:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
 .provider-allowance-row { height: 16px; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 8px; font-size: 10px; color: var(--text-2); }
 .provider-allowance-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.provider-allowance-gauge { display: inline-flex; align-items: center; gap: 3px; min-width: 76px; justify-content: flex-end; cursor: default; }
+.provider-allowance-gauge { position: relative; display: inline-flex; align-items: center; gap: 3px; min-width: 76px; justify-content: flex-end; }
 .provider-allowance-gauge.empty { visibility: hidden; }
 .provider-allowance-gauge svg { flex: none; overflow: visible; }
 .provider-allowance-gauge svg .track { stroke: var(--border-soft); stroke-width: 1; }
@@ -22,3 +26,7 @@
 .provider-allowance-left { min-width: 17px; font-style: normal; font-size: 8px; color: var(--text-3); font-variant-numeric: tabular-nums; text-align: right; }
 .provider-allowance-gauge.waste-warn b, .provider-allowance-gauge.waste-warn .provider-allowance-left { color: #f08a3c; }
 .provider-allowance-gauge.waste-high b, .provider-allowance-gauge.waste-high .provider-allowance-left { color: var(--danger); font-weight: 700; }
+/* Short (5h) window: time left to its reset, and a hairline under the gauge filled by the elapsed part of the window. */
+.provider-allowance-reset { min-width: 24px; white-space: nowrap; }
+.provider-allowance-elapsed { position: absolute; left: 0; right: 0; bottom: -1px; height: 1.5px; border-radius: 1px; background: var(--border-soft); overflow: hidden; }
+.provider-allowance-elapsed > span { display: block; height: 100%; background: color-mix(in srgb, var(--text-3) 80%, transparent); }

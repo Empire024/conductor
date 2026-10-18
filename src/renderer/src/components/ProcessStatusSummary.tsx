@@ -167,7 +167,7 @@ export function createProcessUsageLoader(sources: ProcessUsageSources = {
 /** Ultra-minified replacement for the old static "Local status / Local workspace" footer: this is
  *  a status bar corner, not a panel, so it shows only aggregate counts and cost per project and
  *  hands off to ProcessDashboardPane (via onOpen) for anything more detailed. */
-export function ProcessStatusSummary({ projects, onOpen }: { projects: ProjectRecord[]; onOpen(): void }): React.JSX.Element {
+export function ProcessStatusSummary({ projects, onOpen, onOpenUsage, usageExpanded = false }: { projects: ProjectRecord[]; onOpen(): void; onOpenUsage?(anchor: HTMLElement): void; usageExpanded?: boolean }): React.JSX.Element {
   const [snapshot, setSnapshot] = useState<{ processes: RuntimeProcessSummary[]; usageByProcessId: Map<string, ProcessUsage>; observedAt?: number }>({ processes: [], usageByProcessId: new Map() })
   const [refreshFailed, setRefreshFailed] = useState(false)
 
@@ -200,14 +200,15 @@ export function ProcessStatusSummary({ projects, onOpen }: { projects: ProjectRe
   const freshness = processSummaryFreshness(refreshFailed, snapshot.observedAt)
 
   return (
-    <div
-      className="process-status-summary"
-      role="button"
-      tabIndex={0}
-      title="Open the process dashboard"
-      onClick={onOpen}
-      onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onOpen() } }}
-    >
+    <div className="process-status-summary">
+      <div
+        className="process-status-summary-open"
+        role="button"
+        tabIndex={0}
+        title="Open the process dashboard"
+        onClick={onOpen}
+        onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onOpen() } }}
+      >
       <div className="process-status-summary-head">
         <Gauge size={13} strokeWidth={1.75} />
         <strong>Processes</strong>
@@ -242,7 +243,21 @@ export function ProcessStatusSummary({ projects, onOpen }: { projects: ProjectRe
         </div>
       )}
       {visible.length === 0 && <div className="process-status-summary-rows"><div className="process-status-summary-row process-status-summary-empty"><span>No retained processes</span></div></div>}
-      <WeeklyUsage compact />
+      </div>
+      {onOpenUsage
+        ? <div
+            className="process-status-summary-usage"
+            role="button"
+            tabIndex={0}
+            aria-haspopup="dialog"
+            aria-expanded={usageExpanded}
+            title="Open the full usage view"
+            onClick={(event) => onOpenUsage(event.currentTarget)}
+            onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onOpenUsage(event.currentTarget) } }}
+          >
+            <WeeklyUsage compact />
+          </div>
+        : <WeeklyUsage compact />}
     </div>
   )
 }

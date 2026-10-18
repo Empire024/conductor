@@ -7,10 +7,12 @@
   gap: 4px;
   padding: 7px 12px 9px;
   border-top: 1px solid var(--border-soft);
-  cursor: pointer;
 }
-.process-status-summary:hover { background: var(--surface-2); }
-.process-status-summary:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+/* Two click targets: the counts open the process dashboard, the 7-day bar the full usage view. */
+.process-status-summary-open { display: flex; flex-direction: column; gap: 4px; }
+.process-status-summary-open, .process-status-summary-usage { margin: -3px -6px; padding: 3px 6px; border-radius: 6px; cursor: pointer; }
+.process-status-summary-open:hover, .process-status-summary-usage:hover, .process-status-summary-usage[aria-expanded="true"] { background: var(--surface-2); }
+.process-status-summary-open:focus-visible, .process-status-summary-usage:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
 
 .process-status-summary-head {
   display: flex;

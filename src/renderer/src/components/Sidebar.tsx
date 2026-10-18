@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import { WorkspaceTabList, WorkspaceTabToggle } from './WorkspaceTabList'
 import { workspaceDropHandlers } from './workspace-tab-drop'
@@ -7,6 +7,7 @@ import { RemoveProjectDialog } from './RemoveProjectDialog'
 import { ProcessStatusSummary } from './ProcessStatusSummary'
 import { NeedsAttention } from './NeedsAttention'
 import { ProviderAllowance } from './ProviderAllowance'
+import { UsageOverview } from './UsageOverview'
 import type { TabGroupAction } from '../layout/tab-groups'
 import type { BulkTabAction } from '../layout/tab-selection'
 import type { WorkspaceTabAction } from '../layout/workspace-tab-actions'
@@ -149,6 +150,10 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
     return saved === 'explorer' || saved === 'browser' ? saved : 'workspace'
   })
   const [tabListOverrides, setTabListOverrides] = useState<Record<string, boolean>>({})
+  // The usage corner (allowance strip or the 7-day bar) that opened the full usage view, if open.
+  const [usageAnchor, setUsageAnchor] = useState<HTMLElement | null>(null)
+  const toggleUsage = useCallback((anchor: HTMLElement) => setUsageAnchor(current => current === anchor ? null : anchor), [])
+  const closeUsage = useCallback(() => setUsageAnchor(null), [])
   const [sidebarWidth, setSidebarWidth] = useState<number>(readStoredSidebarWidth)
   const resizeState = useRef<{ startX: number; startWidth: number } | null>(null)
   const [resizing, setResizing] = useState(false)
@@ -502,8 +507,8 @@ ${project.path} (on ${project.remote!.machineName})` : project.path}
         </section>
 
         <NeedsAttention />
-        <ProviderAllowance />
-        <ProcessStatusSummary projects={props.projects} onOpen={() => props.onUtilityPanel(props.utilityPanel === 'processes' ? null : 'processes')} />
+        <ProviderAllowance onOpen={toggleUsage} expanded={Boolean(usageAnchor?.classList.contains('provider-allowance-open'))} />
+        <ProcessStatusSummary projects={props.projects} onOpen={() => props.onUtilityPanel(props.utilityPanel === 'processes' ? null : 'processes')} onOpenUsage={toggleUsage} usageExpanded={Boolean(usageAnchor?.classList.contains('process-status-summary-usage'))} />
           </>}
         />
       </aside>
@@ -526,6 +531,7 @@ ${project.path} (on ${project.remote!.machineName})` : project.path}
           }}
         />
       )}
+      {usageAnchor && <UsageOverview anchor={usageAnchor} onClose={closeUsage} />}
       {confirmingRemoval && <RemoveProjectDialog project={confirmingRemoval} onRemove={() => props.onRemoveProject(confirmingRemoval.id)} onDismiss={() => setConfirmingRemoval(null)} />}
       {menu && createPortal(
         <div

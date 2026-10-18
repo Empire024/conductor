@@ -4,6 +4,7 @@ import { allowancePacing, formatTimeLeft, pacingHint } from '../../../shared/all
 import './ProviderAllowance.css'
 
 const W = 34, H = 11
+const MINUTE_MS = 60_000
 
 /** Pixel x for a point at `share` (0-1 fraction of the *whole* window), once the axis is
  *  rescaled to only the elapsed-so-far part of the window (0-`elapsed`) so it fills the slot.
@@ -36,7 +37,7 @@ export function allowanceLevel(percent: number | null): 'ok' | 'warn' | 'high' |
   return percent >= 90 ? 'high' : percent >= 70 ? 'warn' : 'ok'
 }
 
-function relative(ms: number): string {
+export function relative(ms: number): string {
   const minutes = Math.round(Math.abs(ms) / 60_000)
   if (minutes < 60) return `${minutes} min`
   const hours = Math.floor(minutes / 60)
@@ -50,34 +51,49 @@ export function gaugeTitle(name: string, gauge: AllowanceGauge, now = Date.now()
   return `${name} ${gauge.label.toLowerCase()}: ${used}${reset} · reported ${relative(now - Date.parse(gauge.observedAt))} ago`
 }
 
-function Gauge({ name, gauge, fallback, pacing: withPacing }: { name: string; gauge: AllowanceGauge | undefined; fallback: string; pacing?: boolean }): React.JSX.Element {
-  if (!gauge) return <span className="provider-allowance-gauge empty" />
-  const level = allowanceLevel(gauge.usedPercent)
-  const path = sparklinePath(gauge)
-  // Weekly only: unused allowance against time left. Its orange/red marks tokens about to be
-  // lost at the reset, a separate signal from the near-limit level colour of the line.
-  const pacing = withPacing ? allowancePacing(gauge) : null
-  const hint = pacing && pacingHint(pacing)
-  const waste = pacing?.state === 'waste-high' || pacing?.state === 'waste-warn' ? ` ${pacing.state}` : ''
-  const title = hint ? `${hint}\n${gaugeTitle(name, gauge)}` : gaugeTitle(name, gauge)
-  return <span className={`provider-allowance-gauge ${level}${waste}`} title={title} data-window={fallback} data-pacing={pacing?.state}>
-    <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} aria-hidden="true">
-      <line x1="0" x2={W} y1={H - 0.5} y2={H - 0.5} className="track" />
-      {path && <path className="area" d={`${path} V${H - 0.5} H${sparklineStart(gauge)} Z`} />}
-      {path && <path className="line" d={path} />}
-      {gauge.usedPercent !== null && <circle cx={sparklineX(Math.max(gauge.points.at(-1)?.[0] ?? 0, gauge.elapsed), gauge.elapsed)} cy={H - Math.min(100, gauge.usedPercent) / 100 * (H - 1) - 0.5} r="1.6" />}
-    </svg>
-    <b>{gauge.usedPercent === null ? '–' : `${Math.round(gauge.usedPercent)}%`}</b>
-    <small>{windowShortLabel(gauge.windowMinutes, fallback)}</small>
-    {pacing && <i className="provider-allowance-left">{pacing.leftMs !== null && pacing.unusedPercent !== null ? formatTimeLeft(pacing.leftMs) : ''}</i>}
-  </span>
+/** "1h 42m", "42m", "3d 4h": a stretch of a window (time to its reset, time elapsed), to the minute. */
+export function formatDuration(ms: number): string {
+  const minutes = Math.floor(ms / MINUTE_MS)
+  if (minutes < 1) return '<1m'
+  const hours = Math.floor(minutes / 60)
+  if (hours >= 48) return `${Math.floor(hours / 24)}d ${hours % 24}h`
+  return hours ? `${hours}h ${minutes % 60}m` : `${minutes}m`
 }
 
-/** Sidebar strip between "Needs attention" and the process summary: each recently used paid
- *  provider's weekly and short-window allowance. It reads only what conversations already report
- *  (no provider call, no token spent) and re-reads when one reports, or when a window resets. */
-export const ProviderAllowance = memo(function ProviderAllowance(): React.JSX.Element | null {
-  const [rows, setRows] = useState<ProviderAllowanceRow[]>([])
+export interface WindowProgress { leftMs: number; spanMs: number; elapsedShare: number }
+
+/** Where `now` falls in a window, from the reset time the provider reported: null when the reset
+ *  or the window length is not reported, or the window already rolled over (its use is unknown
+ *  until the next report, and the strip re-reads right after the reset). */
+export function windowProgress(gauge: Pick<AllowanceGauge, 'resetsAt' | 'windowMinutes' | 'usedPercent'>, now = Date.now()): WindowProgress | null {
+  if (!gauge.resetsAt || !gauge.windowMinutes || gauge.usedPercent === null) return null
+  const reset = Date.parse(gauge.resetsAt)
+  if (!Number.isFinite(reset) || reset <= now) return null
+  const spanMs = gauge.windowMinutes * MINUTE_MS
+  const leftMs = Math.min(spanMs, reset - now)
+  return { leftMs, spanMs, elapsedShare: 1 - leftMs / spanMs }
+}
+
+/** Re-renders once a minute on the minute, so countdowns tick without polling anything. Read the
+ *  time with Date.now() in the render: a render caused by a new report then counts from that
+ *  moment, not from the last tick. */
+export function useMinuteClock(): void {
+  const [, setNow] = useState(Date.now)
+  useEffect(() => {
+    let timer: number | undefined
+    const schedule = (): void => { timer = window.setTimeout(() => { setNow(Date.now()); schedule() }, MINUTE_MS - Date.now() % MINUTE_MS + 50) }
+    schedule()
+    return () => window.clearTimeout(timer)
+  }, [])
+}
+
+/** The last rows read, so a view mounted later (the usage overview) starts from them instead of empty. */
+let lastRows: ProviderAllowanceRow[] = []
+
+/** Each recently used paid provider's allowance rows. It reads only what conversations already
+ *  report (no provider call, no token spent) and re-reads when one reports, or when a window resets. */
+export function useProviderAllowance(): ProviderAllowanceRow[] {
+  const [rows, setRows] = useState<ProviderAllowanceRow[]>(() => lastRows)
   useEffect(() => {
     const usage = window.conductor.usage
     if (!usage?.limits) return
@@ -89,6 +105,7 @@ export const ProviderAllowance = memo(function ProviderAllowance(): React.JSX.El
       try {
         const next = await usage.limits()
         if (disposed) return
+        lastRows = next
         setRows(previous => JSON.stringify(previous) === JSON.stringify(next) ? previous : next)
         window.clearTimeout(resetTimer)
         const reset = nextAllowanceReset(next)
@@ -101,12 +118,67 @@ export const ProviderAllowance = memo(function ProviderAllowance(): React.JSX.El
     const off = usage.onLimitsChanged(() => { void refresh() })
     return () => { disposed = true; off(); window.clearTimeout(resetTimer) }
   }, [])
+  return rows
+}
+
+/** Spoken name of the strip button: the same figures the strip shows, then what a click does. */
+export function allowanceButtonLabel(rows: readonly ProviderAllowanceRow[], now = Date.now()): string {
+  const percent = (gauge: AllowanceGauge): string => gauge.usedPercent === null ? 'unknown' : `${Math.round(gauge.usedPercent)}%`
+  const parts = rows.map(row => {
+    const windows: string[] = []
+    if (row.weekly) windows.push(`weekly ${percent(row.weekly)}`)
+    if (row.short) {
+      const progress = windowProgress(row.short, now)
+      windows.push(`${windowShortLabel(row.short.windowMinutes, 'short')} ${percent(row.short)}${progress ? `, resets in ${formatDuration(progress.leftMs)}` : ''}`)
+    }
+    return `${row.name} ${windows.join(', ')}`
+  })
+  return `Usage: ${parts.join('; ')}. Open the full usage view`
+}
+
+function Gauge({ name, gauge, fallback, now, pacing: withPacing, countdown }: { name: string; gauge: AllowanceGauge | undefined; fallback: string; now: number; pacing?: boolean; countdown?: boolean }): React.JSX.Element {
+  if (!gauge) return <span className="provider-allowance-gauge empty" />
+  const level = allowanceLevel(gauge.usedPercent)
+  const path = sparklinePath(gauge)
+  // Weekly only: unused allowance against time left. Its orange/red marks tokens about to be
+  // lost at the reset, a separate signal from the near-limit level colour of the line.
+  const pacing = withPacing ? allowancePacing(gauge, now) : null
+  const hint = pacing && pacingHint(pacing)
+  const waste = pacing?.state === 'waste-high' || pacing?.state === 'waste-warn' ? ` ${pacing.state}` : ''
+  // Short window only: how close its end is, as time left and an elapsed bar under the gauge.
+  const progress = countdown ? windowProgress(gauge, now) : null
+  const elapsed = progress ? ` · ${Math.round(progress.elapsedShare * 100)}% of the window elapsed` : ''
+  const title = `${hint ? `${hint}\n` : ''}${gaugeTitle(name, gauge, now)}${elapsed}`
+  return <span className={`provider-allowance-gauge ${level}${waste}`} title={title} data-window={fallback} data-pacing={pacing?.state}>
+    <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} aria-hidden="true">
+      <line x1="0" x2={W} y1={H - 0.5} y2={H - 0.5} className="track" />
+      {path && <path className="area" d={`${path} V${H - 0.5} H${sparklineStart(gauge)} Z`} />}
+      {path && <path className="line" d={path} />}
+      {gauge.usedPercent !== null && <circle cx={sparklineX(Math.max(gauge.points.at(-1)?.[0] ?? 0, gauge.elapsed), gauge.elapsed)} cy={H - Math.min(100, gauge.usedPercent) / 100 * (H - 1) - 0.5} r="1.6" />}
+    </svg>
+    <b>{gauge.usedPercent === null ? '–' : `${Math.round(gauge.usedPercent)}%`}</b>
+    <small>{windowShortLabel(gauge.windowMinutes, fallback)}</small>
+    {pacing && <i className="provider-allowance-left">{pacing.leftMs !== null && pacing.unusedPercent !== null ? formatTimeLeft(pacing.leftMs) : ''}</i>}
+    {countdown && <i className="provider-allowance-left provider-allowance-reset">{progress ? formatDuration(progress.leftMs) : ''}</i>}
+    {progress && <span className="provider-allowance-elapsed" aria-hidden="true"><span style={{ width: `${(progress.elapsedShare * 100).toFixed(1)}%` }} /></span>}
+  </span>
+}
+
+/** Sidebar strip between "Needs attention" and the process summary: each recently used paid
+ *  provider's weekly and short-window allowance, with the short window's time to its reset. The
+ *  whole strip is one button that opens the full usage view (UsageOverview). */
+export const ProviderAllowance = memo(function ProviderAllowance({ onOpen, expanded = false }: { onOpen?(anchor: HTMLElement): void; expanded?: boolean }): React.JSX.Element | null {
+  const rows = useProviderAllowance()
+  useMinuteClock()
+  const now = Date.now()
   if (!rows.length) return null
   return <section className="provider-allowance" aria-label="Provider allowance">
-    {rows.map(row => <div key={row.provider} className="provider-allowance-row" data-provider={row.provider}>
-      <span className="provider-allowance-name" title={row.planType ? `${row.name} (${row.planType} plan)` : row.name}>{row.name}</span>
-      <Gauge name={row.name} gauge={row.weekly} fallback="wk" pacing />
-      <Gauge name={row.name} gauge={row.short} fallback="short" />
-    </div>)}
+    <button type="button" className="provider-allowance-open" aria-haspopup="dialog" aria-expanded={expanded} aria-label={allowanceButtonLabel(rows, now)} onClick={event => onOpen?.(event.currentTarget)}>
+      {rows.map(row => <span key={row.provider} className="provider-allowance-row" data-provider={row.provider}>
+        <span className="provider-allowance-name" title={row.planType ? `${row.name} (${row.planType} plan)` : row.name}>{row.name}</span>
+        <Gauge name={row.name} gauge={row.weekly} fallback="wk" now={now} pacing />
+        <Gauge name={row.name} gauge={row.short} fallback="short" now={now} countdown />
+      </span>)}
+    </button>
   </section>
 })

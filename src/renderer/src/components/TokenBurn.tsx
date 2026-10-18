@@ -54,6 +54,18 @@ export function TokenBurnBadge({ agentSessionId }: { agentSessionId?: string }):
 
 const label = (value: number): string => value === 0 ? 'Off' : `${formatBurn(value).replace('/h', '')} tokens/hour`
 
+/** Every live tab's last hour, highest first (Settings and the usage view). */
+export function TokenBurnList({ rates }: { rates: readonly TokenBurnRate[] }): React.JSX.Element {
+  return <ul className="token-burn-list" aria-label="Token burn by tab">
+    {rates.length === 0 && <li className="token-burn-empty">No live tab reported usage in the last hour.</li>}
+    {rates.slice(0, 12).map(rate => <li key={rate.agentSessionId} className={rate.alert ? 'alert' : ''} data-agent-session-id={rate.agentSessionId}>
+      <span className="token-burn-title" title={rate.title}>{rate.title}</span>
+      <span className="token-burn-provider">{rate.provider}</span>
+      <span className="token-burn-rate">{formatBurn(rate.tokensPerHour)}</span>
+    </li>)}
+  </ul>
+}
+
 /** Settings: the alert rate, and the meter itself - every live tab's last hour, highest first. */
 export function TokenBurnSetting(): React.JSX.Element {
   const snapshot = useTokenBurn()
@@ -64,7 +76,6 @@ export function TokenBurnSetting(): React.JSX.Element {
     setError(undefined); setAlert(value)
     window.conductor.tokenBurn.setAlertPerHour(value).then(setAlert).catch(reason => setError(reason instanceof Error ? reason.message : String(reason)))
   }
-  const rates = snapshot?.rates ?? []
   return <section className="token-burn-setting">
     <div className="settings-section-title"><Flame size={14} /><div><strong>Token burn</strong><span>Tokens each live tab used in the last hour, input with cache reads plus output.</span></div></div>
     <label className="usage-cap-setting">
@@ -74,13 +85,6 @@ export function TokenBurnSetting(): React.JSX.Element {
       </select>
     </label>
     {error && <p className="usage-cap-error">{error}</p>}
-    <ul className="token-burn-list" aria-label="Token burn by tab">
-      {rates.length === 0 && <li className="token-burn-empty">No live tab reported usage in the last hour.</li>}
-      {rates.slice(0, 12).map(rate => <li key={rate.agentSessionId} className={rate.alert ? 'alert' : ''} data-agent-session-id={rate.agentSessionId}>
-        <span className="token-burn-title" title={rate.title}>{rate.title}</span>
-        <span className="token-burn-provider">{rate.provider}</span>
-        <span className="token-burn-rate">{formatBurn(rate.tokensPerHour)}</span>
-      </li>)}
-    </ul>
+    <TokenBurnList rates={snapshot?.rates ?? []} />
   </section>
 }
