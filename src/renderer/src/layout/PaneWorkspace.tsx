@@ -9,6 +9,7 @@ import { ProviderIcon } from '../components/ProviderIcon'
 import { PaneTabMenu, SelectionTabMenu, TabGroupMenu } from '../components/PaneTabMenu'
 import { TabActivityIndicator } from '../components/TabActivityIndicator'
 import { applyTabGroupAction, applyWorkspaceTabAction } from './workspace-tab-actions'
+import { revealTabInStrip, TAB_REVEAL_EVENT } from './tab-strip-reveal'
 import { mountedTabIds, touchRecentTabs } from './tab-keep-alive'
 import { clearNewTab, useNewTabMarks } from './new-tab-marks'
 import { useSuspendedConversations } from './use-suspended-conversations'
@@ -416,8 +417,31 @@ function PaneGroup({
   const showTab = (tabId: string): void => {
     setOverflowMenu(null)
     workspace.onLayout(layout => markTabsSeen(activateTab(layout, group.id, tabId), [tabId, activeTab.id]))
-    requestAnimationFrame(() => tabsRef.current?.querySelector<HTMLElement>(`[data-control-tab-id="${CSS.escape(tabId)}"]`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' }))
+    requestAnimationFrame(() => { if (tabsRef.current) revealTabInStrip(tabsRef.current, tabId) })
   }
+  // A tab that becomes active, from anywhere (its chip, the sidebar, a notification, tabs.focus), is
+  // brought whole into this strip; TAB_REVEAL_EVENT does the same for one that already was active.
+  // The first reveal after mount jumps instead of animating.
+  const revealedRef = useRef(false)
+  useEffect(() => {
+    const strip = tabsRef.current
+    if (!strip) return
+    const instant = !revealedRef.current
+    revealedRef.current = true
+    // Once the activation is painted, and again once a new chip's open animation and the coworker
+    // row's reordering have settled.
+    const frame = requestAnimationFrame(() => revealTabInStrip(strip, activeTab.id, { instant }))
+    const settle = window.setTimeout(() => revealTabInStrip(strip, activeTab.id, { instant }), 180)
+    return () => { cancelAnimationFrame(frame); clearTimeout(settle) }
+  }, [activeTab.id])
+  useEffect(() => {
+    const reveal = (event: Event): void => {
+      const tabId = (event as CustomEvent<{ tabId?: string }>).detail?.tabId
+      if (tabId && tabsRef.current) revealTabInStrip(tabsRef.current, tabId)
+    }
+    window.addEventListener(TAB_REVEAL_EVENT, reveal)
+    return () => window.removeEventListener(TAB_REVEAL_EVENT, reveal)
+  }, [])
 
   useEffect(() => {
     if (!menuPosition) return

@@ -2,8 +2,10 @@
 // MAIN, its coworkers (one of them leading its own coworker, one burning past the token alert) and
 // plain owner tabs - every tab keeps its own box: no two tabs overlap, nothing a tab holds sticks
 // out of it, every MAIN/COWORKER marker sits inside its own tab, the burn flame does not change the
-// tab's width, and what has no room goes to "+N". Parked Electron window, synthetic Claude CLI (no
-// inference). Screenshots: artifacts/verification/tab-strip-crowded/*.png.
+// tab's width, and what has no room goes to "+N". S3 (tabs-focus-scroll-into-view): focusing an
+// off-strip tab - tabs.focus, again once it is active, a sidebar row - brings it fully into the strip
+// without focusing the parked window. Parked Electron window, synthetic Claude CLI (no inference).
+// Screenshots: artifacts/verification/tab-strip-crowded/*.png.
 //   node scripts/smoke-lock.mjs --timeout-min 15 -- node scripts/smoke-tab-strip-crowded.mjs
 // CONDUCTOR_SMOKE_MAIN points at another build's main entry (default out/main/index.js).
 import assert from 'node:assert/strict'
@@ -191,6 +193,47 @@ try {
   const widths = layout => layout.tabs.map(tab => [tab.id, Math.round(tab.box.width * 10) / 10])
   assert.deepEqual(widths(burning), widths(calm), 'every tab keeps its width when the flame goes away')
   record('S2', 'PASS', { burnerWidth: burning.tabs.find(tab => tab.id === burner.id)?.box.width }, 'the active burner and every other tab have identical widths with and without the burn flame')
+
+  step('S3 focusing a tab off the strip brings it fully into view, without focusing the window')
+  const windowFocused = () => inst.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isFocused())
+  const focusedBefore = await windowFocused()
+  const stripState = () => view.evaluate(() => {
+    const strip = document.querySelector('.pane-tabs'), bounds = strip.getBoundingClientRect()
+    const tabs = [...strip.querySelectorAll('.pane-tab[data-control-tab-id]')].map(node => { const r = node.getBoundingClientRect(); return { id: node.dataset.controlTabId, active: node.classList.contains('active'), left: r.left, right: r.right, inside: r.left >= bounds.left - 0.5 && r.right <= bounds.right + 0.5 } })
+    return { scrollLeft: strip.scrollLeft, tabs, overflow: document.querySelector('.pane-overflow-button')?.textContent ?? '' }
+  })
+  const revealed = (tabId, label) => poll(async () => { const state = await stripState(); const tab = state.tabs.find(entry => entry.id === tabId); return tab?.active && tab.inside ? state : null }, { timeoutMs: 5000, intervalMs: 100, label })
+  await call('tabs.focus', { tabId: wizard.id })
+  await revealed(wizard.id, 'the wizard shown at the start of the strip')
+  const before = await stripState()
+  const last = [...before.tabs].sort((a, b) => b.left - a.left).find(tab => !tab.inside)
+  assert.ok(last, 'a tab sits off the strip: ' + JSON.stringify(before.tabs.map(tab => [tab.id, tab.inside])))
+  const startedAt = Date.now()
+  await call('tabs.focus', { tabId: last.id })
+  const afterFocus = await revealed(last.id, 'tabs.focus revealed the last off-strip tab')
+  const revealMs = Date.now() - startedAt
+  await shot('tab-strip-crowded-focus-revealed')
+  record('S3-tabs.focus', 'PASS', { scrollLeft: Math.round(afterFocus.scrollLeft), ms: revealMs, overflow: afterFocus.overflow }, `the last off-strip tab ${last.id} is active and fully inside the strip after tabs.focus`)
+
+  // Already active, scrolled away by hand: focusing it again changes no layout and still reveals it.
+  await view.evaluate(() => { document.querySelector('.pane-tabs').scrollLeft = 0 })
+  await poll(async () => !(await stripState()).tabs.find(tab => tab.id === last.id)?.inside, { timeoutMs: 3000, label: 'scrolled away from the active tab' })
+  await call('tabs.focus', { tabId: last.id })
+  await revealed(last.id, 'tabs.focus revealed the already-active tab')
+  record('S3-already-active', 'PASS', {}, 'tabs.focus on the active tab that the strip had scrolled away from brings it back into view')
+
+  // The sidebar: another off-strip tab, picked from its row.
+  await view.evaluate(() => { document.querySelector('.pane-tabs').scrollLeft = 0 })
+  const offStrip = (await poll(async () => { const state = await stripState(); return state.scrollLeft === 0 ? state : null }, { timeoutMs: 3000, label: 'strip at its start' })).tabs.filter(tab => !tab.inside && tab.id !== last.id)
+  const sidebarTarget = []
+  for (const tab of offStrip) if (await view.locator(`.session-tree [data-clarity-row="${tab.id}"] .workspace-tab-select`).count()) { sidebarTarget.push(tab); break }
+  assert.ok(sidebarTarget.length, 'an off-strip tab has a sidebar row')
+  await view.locator(`.session-tree [data-clarity-row="${sidebarTarget[0].id}"] .workspace-tab-select`).click()
+  await revealed(sidebarTarget[0].id, 'the sidebar row revealed its tab')
+  record('S3-sidebar', 'PASS', {}, `selecting ${sidebarTarget[0].id} in the sidebar brings its off-strip tab fully into view`)
+
+  assert.equal(await windowFocused(), focusedBefore, 'revealing tabs never changes whether the parked window has focus')
+  record('S3-window-focus', 'PASS', { focused: focusedBefore }, 'the parked window kept its focus state through every reveal')
 
   assert.deepEqual(inst.errors, [], 'no renderer errors')
 } catch (error) {

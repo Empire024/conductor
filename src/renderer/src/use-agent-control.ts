@@ -5,6 +5,7 @@ import type { PaneTab, SessionRecord, WorkspaceLayout } from '../../shared/model
 import { makeLauncherTab } from '../../shared/models'
 import { activateTab, addTab, findGroup, listGroups, splitGroup, updateTab } from './layout/layout-operations'
 import { applyWorkspaceTabAction } from './layout/workspace-tab-actions'
+import { requestTabReveal } from './layout/tab-strip-reveal'
 import { announceAgentControlGrants, announceAgentControlSettings } from './agent-control-settings'
 import { hasComposerDraft } from './panes/use-composer-draft'
 import { markNewTab } from './layout/new-tab-marks'
@@ -178,5 +179,7 @@ export async function handleAgentControlRequest(request: AgentControlUiRequest, 
     }
   }
   await host.commit(next, focusedGroupId, reveal)
+  // tabs.focus on a tab that already was active changes no layout, so its strip is asked directly.
+  if (request.action === 'tabs.focus' && tab) requestTabReveal(tab.id)
   return result
 }

@@ -33,6 +33,7 @@ import { setLiveWorkspaces } from './conversation-directory'
 import { SettingsPanel } from './components/SettingsPanel'
 import { PaneWorkspace } from './layout/PaneWorkspace'
 import { applyTabGroupAction, applyWorkspaceTabAction, type WorkspaceTabAction } from './layout/workspace-tab-actions'
+import { requestTabReveal } from './layout/tab-strip-reveal'
 import { moveTabsToWorkspace, type WorkspaceTabDrag } from './layout/workspace-tab-move'
 import { closePlacedTab } from './layout/machine-placement'
 import { CloseWorkConfirm } from './layout/CloseWorkConfirm'
@@ -1298,6 +1299,7 @@ export function App(): React.JSX.Element {
       if (action === 'close') closePlacedTab(tab, setToast)
       setSessions(current => current.map(item => item.id === sessionId ? result.session : item))
       if (action !== 'detach' && action !== 'show') { selectSession(result.session); setFocusedGroupId(result.focusedGroupId); setUtilityPanel(null) }
+      if (action === 'focus') requestTabReveal(tabId)
       if (action === 'show') setToast(`${tab.title} is shown in a floating window. Close it to return the tab to its workspace.`)
       if (action === 'close') offerUndo(working, sessionId, groupId, [tabId])
     } catch (reason) { setToast(reason instanceof Error ? reason.message : String(reason)) }

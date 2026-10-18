@@ -1973,3 +1973,7 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 - [~] Phone Tabs view jumps: with several projects running, the list keeps swapping one project/tab for another so the owner cannot follow what is going on. Make the order stable and updates reliable <!-- conductor-task:phone-tabs-list-jumps agent=agent_mvd7if7f_kxkulpb -->
   
   ![IMG_0387.png](.conductor/prompt-images/3ad76cd5-5a7f-44a2-b73c-21611ae0ba6c.png)
+
+- [x] tabs.focus (and clicking a tab in a list) does not scroll a tab that sits off the visible tab strip into view <!-- conductor-task:tabs-focus-scroll-into-view agent=agent_mvd7if7f_kxkulpb -->
+
+- [x] Coworkers of the same controller cannot send_message each other ("you control their tabs"), so every overlap coordination has to be relayed by the controller; let siblings under one controller message each other directly <!-- conductor-task:sibling-coworker-messaging agent=agent_mvd7if7f_kxkulpb -->
