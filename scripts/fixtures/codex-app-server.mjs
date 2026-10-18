@@ -26,6 +26,15 @@ const changes = [{ path: 'panel.mjs', kind: { type: 'update', move_path: null },
 const command = (id, status = 'inProgress', output = null, exitCode = null) => ({ type: 'commandExecution', id, command: 'pwsh.exe -NoProfile -Command "Write-Output café"', cwd: process.cwd(), source: 'agent', status, aggregatedOutput: output, exitCode, durationMs: exitCode === null ? null : 4, commandActions: [], pluginId: null, scriptPath: null, processId: null })
 const finish = (status = 'completed') => notify('turn/completed', { threadId, turn: { id: currentTurn, items: [], status, error: status === 'failed' ? { message: 'synthetic failure' } : null } })
 const usageRouting = process.env.CONDUCTOR_TEST_USAGE_ROUTING === '1'
+/* OpenAI out of capacity, as Codex reported it on 2026-10-19: the error notification, then the
+   failed turn stating the same refusal, with no codexErrorInfo. synthetic:at-capacity refuses that
+   turn; CONDUCTOR_TEST_CODEX_AT_CAPACITY=N refuses the first N turns of any prompt. */
+let capacityRefusals = Number(process.env.CONDUCTOR_TEST_CODEX_AT_CAPACITY || 0)
+const refuseAtCapacity = () => {
+  const error = { message: 'Selected model is at capacity. Please try a different model.', codexErrorInfo: null, additionalDetails: null }
+  notify('error', { threadId, turnId: currentTurn, error, willRetry: false })
+  notify('turn/completed', { threadId, turn: { id: currentTurn, items: [], status: 'failed', error } })
+}
 const defaults = () => ({ thread: { id: threadId, status: { type: 'idle' }, turns: [], cwd: process.cwd() }, model: usageRouting ? 'gpt-6-astra' : 'synthetic-model', reasoningEffort: usageRouting ? 'xhigh' : 'low', modelProvider: 'openai', approvalPolicy: 'on-request', approvalsReviewer: 'user', sandbox: { type: 'workspaceWrite', writableRoots: [process.cwd()], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false }, instructionSources: [] })
 
 readline.createInterface({ input: process.stdin }).on('line', line => {
@@ -191,6 +200,8 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   notify('turn/started', { threadId, turn: { id: currentTurn, status: 'inProgress', items: [], error: null } })
   if (process.env.CONDUCTOR_TEST_TURN_ACK_DELAY === '1') setTimeout(() => send({ id: message.id, result: { turn: { id: currentTurn, status: 'inProgress', items: [], error: null } } }), 150)
   else send({ id: message.id, result: { turn: { id: currentTurn, status: 'inProgress', items: [], error: null } } })
+  if (scenario.startsWith('synthetic:at-capacity')) { refuseAtCapacity(); return }
+  if (capacityRefusals > 0) { capacityRefusals -= 1; refuseAtCapacity(); return }
   if (scenario.startsWith('synthetic:images')) {
     const images = message.params.input.filter(item => item.type === 'localImage')
     if (!images.length || images.some(item => readFileSync(item.path).subarray(0,8).toString('hex') !== '89504e470d0a1a0a')) throw new Error('Synthetic image bytes did not reach Codex')

@@ -7,7 +7,7 @@ import { mkdirSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentActivityPhase, AgentSpec, LayoutNode, RuntimeEnsureResult } from '../shared/models'
-import { ANSWERED_IN_CONVERSATION, isAsyncQuestion, isFrontierModel, MAX_PROMPT_CHARS, PROVIDER_AUTH_EXPIRED, PROVIDER_SAFEGUARD_REFUSAL, PROVIDER_USAGE_LIMIT, settingsForRuntime, WIZARD_MODEL_HINT, wizardActive } from '../shared/structured-agent'
+import { ANSWERED_IN_CONVERSATION, isAsyncQuestion, isFrontierModel, MAX_PROMPT_CHARS, PROVIDER_AUTH_EXPIRED, PROVIDER_OVERLOADED, PROVIDER_SAFEGUARD_REFUSAL, PROVIDER_USAGE_LIMIT, settingsForRuntime, WIZARD_MODEL_HINT, wizardActive } from '../shared/structured-agent'
 import type { ActivityStatus, AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, InteractionResponseResult, Json, PendingSteering, SessionProjection, PromptDispatchAuthority, PromptOrigin, QueuedPrompt, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import type { AgentChangeHistory, RevertOutcome, RevertScope } from '../shared/agent-change-history'
 import type { ConductorDatabase } from './database'
@@ -19,6 +19,7 @@ import type { RuntimeDetachment } from './providers/adapter'
 import { settled } from './providers/adapter-state'
 import { validateLiveTurn } from './live-test-policy'
 import { activeUsageCap, isUsageLimitMessage, parseUsageLimitReset, usageCapKey } from './usage-limit'
+import { isProviderOverloadedMessage, OVERLOAD_CONTINUE_PROMPT, OVERLOAD_RETRY_DELAYS_MS, overloadExhaustedMessage, overloadRetryNotice, turnProducedOutput } from './provider-overload'
 import { isPastedText } from '../shared/pasted-text'
 import { carriesAccountLimits, describeAccountLimits, describeUsageCap, evaluateUsageCap, recordAccountLimits, summarizeContext, summarizeUsageRun, type AccountLimitRecord, type AccountLimitsReport, type UsageCapStatus } from '../shared/usage-accounting'
 import { recordAllowanceHistory, summarizeProviderAllowance, type AllowanceHistory, type ProviderAllowanceRow } from '../shared/provider-allowance'
@@ -89,7 +90,13 @@ interface LiveSession {
   authStop?: string
   /** Which login the failed turn used (claude-login.ts), when the adapter knows. */
   authStopSource?: 'token' | 'login'
-  currentTurn?: { text: string; settings: SessionSettings; attachments: ContextAttachment[]; origin?: PromptOrigin; fallbackAttempted: boolean }
+  currentTurn?: { text: string; settings: SessionSettings; attachments: ContextAttachment[]; origin?: PromptOrigin; fallbackAttempted: boolean; sequence?: number }
+  /** The provider's capacity refusal of the turn under way (provider-overload.ts); decided once it settles. */
+  overloadStop?: string
+  /** Every retry was refused too; a late restatement of the refusal is dropped until the next turn. */
+  overloadSpent?: boolean
+  /** Automatic retries of capacity-refused turns: how many went out, and the one waiting to. */
+  overload?: { attempts: number; timer?: ReturnType<typeof setTimeout>; plan?: { text: string; settings: SessionSettings; attachments: ContextAttachment[]; origin?: PromptOrigin; sameTurn: boolean }; dispatching?: boolean }
   refusalFallback?: { text: string; settings: SessionSettings; attachments: ContextAttachment[]; origin?: PromptOrigin; model: string; notice: string }
 }
 type Factory = (provider: StructuredProvider, options: AdapterOptions) => ProviderAdapter
@@ -540,6 +547,7 @@ export class StructuredSessions {
       // The owner's auto-approve policy, asked before a native card is raised (approval-policy.ts).
       ...(!isolated && (live.spec.provider === 'claude' || live.spec.provider === 'codex') ? { approvalPolicy: (request, native) => this.policyAnswer(live, runtimeId, request, native) } : {}),
       ...(live.spec.provider === 'local' ? { localTaskId: id,
+        localOwner: { projectId: live.spec.projectId, agentSessionId: id, ...(live.spec.title ? { title: live.spec.title } : {}) },
         localCheckpoint: sessionCheckpoint(this.database, { projectId: live.spec.projectId, taskId: id }, () => {
           if (live.closed || live.runtimeId !== runtimeId || this.live.get(id) !== live) throw new Error('Local checkpoint is unavailable for this runtime')
           this.validateSpec(live.spec)
@@ -1181,6 +1189,8 @@ export class StructuredSessions {
     // Any new turn ends the wait, whether Conductor sent it on the timer or the owner got there
     // first. Leaving the record pending would relabel the next settled turn as limited.
     if (live.limitResumeAt) this.clearUsageLimit(live)
+    if (live.overload && !live.overload.dispatching) this.cancelOverloadRetry(live)
+    live.overloadSpent = undefined
     live.submitting = true
     let resumedIntoActiveTurn = false
     try {
@@ -1227,7 +1237,7 @@ export class StructuredSessions {
       this.assertPromptWithinLimit(submitted.length)
       if (!refusalRetry) {
         live.refusalFallback = undefined
-        live.currentTurn = { text: text.trim(), settings: structuredClone(settings), attachments: structuredClone(attachments), ...(origin ? { origin: structuredClone(origin) } : {}), fallbackAttempted: false }
+        live.currentTurn = { text: text.trim(), settings: structuredClone(settings), attachments: structuredClone(attachments), ...(origin ? { origin: structuredClone(origin) } : {}), fallbackAttempted: false, sequence: state.sequence }
       }
       // A queued message may have captured settings before the owner revoked browser access.
       // Never let that per-message snapshot overwrite the explicit, newer session authority.
@@ -1476,7 +1486,10 @@ export class StructuredSessions {
   async interrupt(id: string, expediteSubmittedInput = false): Promise<void> {
     const live = this.get(id), state = this.database.structured.snapshot(id)!
     if (live.interrupting) return live.interrupting
-    if (!active.has(state.phase)) return
+    if (!active.has(state.phase)) {
+      if (live.overload?.timer) this.cancelOverloadRetry(live, 'Stopped: the automatic retry after the capacity refusal was cancelled.')
+      return
+    }
     // Nothing attached can end this turn or report it ended, so it is ended here.
     if (!live.adapter) { this.settleStuckTurn(live, 'No provider runtime is attached to this turn, so Conductor ended it here.'); return }
     // Already stopping and asked again: the stop before this one never settled.
@@ -1710,6 +1723,78 @@ export class StructuredSessions {
     }
   }
 
+  /* --- Provider capacity refusals (provider-overload.ts) --------------- *
+   * Transient: the same turn goes through a few minutes later, so it is retried here with
+   * backoff. Unlike a usage-limit wait, nothing is persisted: a restart drops the retry and the
+   * tab keeps the refusal it settled on.
+   * ---------------------------------------------------------------------- */
+
+  private isOverloadRefusal(live: LiveSession, data: { message: string; code?: string }): boolean {
+    if (live.spec.provider === 'local') return false
+    if (data.code === PROVIDER_OVERLOADED) return true
+    return !data.code && !isUsageLimitMessage(data.message) && isProviderOverloadedMessage(data.message)
+  }
+
+  private afterOverloadRefusal(live: LiveSession, refusal: string): void {
+    const overload = live.overload ??= { attempts: 0 }
+    if (overload.attempts >= OVERLOAD_RETRY_DELAYS_MS.length) { live.overload = undefined; live.overloadSpent = true; this.reportOverloadExhausted(live, refusal); return }
+    const delay = OVERLOAD_RETRY_DELAYS_MS[overload.attempts]!
+    overload.attempts += 1
+    const state = this.database.structured.snapshot(live.spec.id)!
+    const turn = live.currentTurn
+    // Sent again as it was only if the provider refused it before it did anything; a turn that
+    // answered or ran tools is asked to continue, so nothing it did is done twice.
+    overload.plan = turn && turn.sequence !== undefined && !turnProducedOutput(state.items, turn.sequence)
+      ? { text: turn.text, settings: structuredClone(turn.settings), attachments: structuredClone(turn.attachments), ...(turn.origin ? { origin: structuredClone(turn.origin) } : {}), sameTurn: true }
+      : { text: OVERLOAD_CONTINUE_PROMPT, settings: structuredClone(state.settings), attachments: [], sameTurn: false }
+    overload.timer = setTimeout(() => { void this.runOverloadRetry(live) }, delay)
+    overload.timer.unref?.()
+  }
+
+  private async runOverloadRetry(live: LiveSession): Promise<void> {
+    const overload = live.overload
+    if (!overload?.plan || this.live.get(live.spec.id) !== live || live.closed) return
+    overload.timer = undefined
+    const plan = overload.plan
+    overload.plan = undefined
+    const state = this.database.structured.snapshot(live.spec.id)
+    // Someone got there first; their turn is the one that runs.
+    if (!state || active.has(state.phase) || live.submitting || live.steering) { live.overload = undefined; return }
+    overload.dispatching = true
+    try {
+      await this.submit(live.spec.id, plan.text, plan.settings, plan.attachments, plan.origin, plan.sameTurn)
+    } catch (error) {
+      live.overload = undefined
+      this.emit(live, { data: { type: 'notice', message: `The automatic retry could not be sent: ${error instanceof Error ? error.message : String(error)}` } })
+      this.recordActivityPhase(live, 'failed')
+      this.flush()
+    } finally { overload.dispatching = false }
+  }
+
+  private cancelOverloadRetry(live: LiveSession, notice?: string): void {
+    const overload = live.overload
+    live.overload = undefined
+    if (!overload?.timer) return
+    clearTimeout(overload.timer)
+    if (!notice) return
+    this.emit(live, { data: { type: 'notice', message: notice } })
+    this.recordActivityPhase(live, 'failed')
+    this.flush()
+  }
+
+  /** Every retry was refused too: the tab has ended failed on the message that says to switch
+   *  model, and the conversation that dispatched it is told, so it does not wait on a report. */
+  private reportOverloadExhausted(live: LiveSession, refusal: string): void {
+    let controllerId: string | undefined
+    try { controllerId = this.controllerOf?.(live.spec.id) } catch { controllerId = undefined }
+    if (!controllerId || controllerId === live.spec.id || !this.live.has(controllerId)) return
+    const controllerState = this.database.structured.snapshot(controllerId)
+    if (!controllerState) return
+    const title = this.database.structured.snapshot(live.spec.id)?.title || live.spec.title || 'Coworker'
+    const body = `[Conductor] Your coworker "${title}" (${live.spec.id}, ${live.spec.provider}) stopped: its provider kept refusing the model as at capacity after ${OVERLOAD_RETRY_DELAYS_MS.length} automatic retries ("${refusal.replace(/\s+/g, ' ').trim().slice(0, 200)}"). Do not wait on its report: switch it to another model with agents.configure and send it "continue", or hand the work to another coworker.`
+    queueMicrotask(() => { void this.steerOrStart(controllerId!, body, controllerState.settings, [], { agentSessionId: live.spec.id, label: `${title} (provider at capacity)` }).catch(() => undefined) })
+  }
+
   private clearUsageLimit(live: LiveSession): void {
     live.limitResumeAt = undefined
     this.cancelContinuation(live.spec.id)
@@ -1836,6 +1921,19 @@ export class StructuredSessions {
     // Every lifecycle event restates the wait rather than relying on one event the renderer
     // might have missed, so a reconnecting or replaying view never shows a stale reset time.
     if (data.type === 'session' && data.limitResumeAt === undefined) data = { ...data, limitResumeAt: live.limitResumeAt ?? null }
+    // A provider at capacity (provider-overload.ts): its refusal reads as one notice while a retry
+    // remains, Codex's second statement of the same refusal is dropped, and only the last refusal,
+    // with every retry spent, stays an error that says to switch model. Codex settles the turn on
+    // its error notification and states the refusal again in turn/completed, so a refusal while a
+    // retry waits, or after the last one, is that restatement: no turn is running to refuse.
+    if (data.type === 'error' && this.isOverloadRefusal(live, data)) {
+      if (live.overloadStop || live.overload?.timer || live.overloadSpent) return
+      live.overloadStop = data.message
+      const attempts = live.overload?.attempts ?? 0, model = concreteModel(live.spec.provider, (live.currentTurn?.settings ?? state.settings).model, state.capabilities)
+      data = attempts < OVERLOAD_RETRY_DELAYS_MS.length
+        ? { type: 'notice', message: overloadRetryNotice(live.spec.provider, model, OVERLOAD_RETRY_DELAYS_MS[attempts]!, attempts + 1) }
+        : { type: 'error', code: PROVIDER_OVERLOADED, message: overloadExhaustedMessage(live.spec.provider, model, data.message, attempts) }
+    }
     // Restated on every lifecycle event for the same reason: the renderer derives the tab's own
     // phase from the projection, so a conversation whose turn settled while a render runs on has
     // to carry that fact forward rather than depend on the one event that announced it.
@@ -1875,6 +1973,13 @@ export class StructuredSessions {
       if (data.code !== PROVIDER_AUTH_EXPIRED) this.noteUsageLimit(live, data.message)
       if (data.code === PROVIDER_SAFEGUARD_REFUSAL) this.noteSafeguardRefusal(live)
     }
+    if (data.type === 'session' && !active.has(data.phase)) {
+      if (live.overloadStop) {
+        const refusal = live.overloadStop
+        live.overloadStop = undefined
+        if (data.phase === 'failed') this.afterOverloadRefusal(live, refusal)
+      } else if (live.overload && !live.overload.timer && !live.overload.dispatching) live.overload = undefined
+    }
     // A turn that ended on a usage limit is announced once it settles, so whoever waits on this
     // conversation hears of it (2026-09-29: a limit-stopped Codex chain stalled its controller 7 h).
     if (data.type === 'session' && live.limitStop && !active.has(data.phase)) {
@@ -1910,6 +2015,8 @@ export class StructuredSessions {
       // A turn that ended only because the quota ran out is waiting, not broken: say so, so the
       // tab and its project roll up as limited instead of raising a failure nobody can act on.
       if (live.limitResumeAt && (phase === 'failed' || phase === 'complete' || phase === 'idle')) phase = 'limited'
+      // A refused turn with a retry on its timer is still Conductor's work, not a failure to raise.
+      else if (live.overload?.timer && phase === 'failed') phase = 'working'
       live.backgroundTasks = data.backgroundTasks ?? 0
       this.recordActivityPhase(live, this.owningActivityPhase(live, phase))
       live.budget?.setPhase(data.phase)

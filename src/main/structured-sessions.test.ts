@@ -11,7 +11,8 @@ import type { AgentSpec } from '../shared/models'
 import type { StructuredProvider } from '../shared/structured-agent'
 import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './providers/adapter'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, PromptOrigin, ProviderCapabilities, SessionSettings } from '../shared/structured-agent'
-import { ANSWERED_IN_CONVERSATION, MAX_PROMPT_CHARS, PROVIDER_AUTH_EXPIRED } from '../shared/structured-agent'
+import { ANSWERED_IN_CONVERSATION, MAX_PROMPT_CHARS, PROVIDER_AUTH_EXPIRED, PROVIDER_OVERLOADED } from '../shared/structured-agent'
+import { OVERLOAD_CONTINUE_PROMPT, OVERLOAD_RETRY_DELAYS_MS } from './provider-overload'
 import { LocalSetupError } from './providers/local'
 import { LOCAL_MODEL_SETUP_ERROR_CODE, LOCAL_MODEL_SETUP_URL } from '../shared/local-models'
 import { composeLocalPrompt, LOCAL_BACKGROUND_OPEN, splitLocalPrompt } from './local-models/briefing'
@@ -2176,5 +2177,116 @@ describe('a burst of synchronous events batches its durable write, its status wr
     const statusBroadcasts = f.broadcast.mock.calls.filter(call => call[0] === 'agent:status').slice(before)
     expect(statusBroadcasts).toHaveLength(1)
     expect(statusBroadcasts[0]![1]).toMatchObject({ id: f.spec.id })
+  })
+})
+
+describe('provider capacity refusals retry the turn (provider-capacity-retry)', () => {
+  const capacity = 'Selected model is at capacity. Please try a different model.'
+  const activityPhase = (f: ReturnType<typeof fixture>) => {
+    f.manager.flush()
+    return f.database.listProcesses().find(process => process.id === f.spec.id)?.activityPhase
+  }
+  /** How Codex reports it (seen live on 2026-10-19): the error notification settles the turn
+   *  failed, then turn/completed states the same refusal again and settles it a second time. */
+  const refusedBy = (adapter: { emit(event: AdapterEvent): void }): void => {
+    for (let statement = 0; statement < 2; statement++) {
+      adapter.emit({ data: { type: 'error', message: capacity, code: PROVIDER_OVERLOADED } })
+      adapter.emit({ data: { type: 'session', phase: 'failed' } })
+    }
+  }
+  const refused = (f: ReturnType<typeof fixture>): void => refusedBy(f.current)
+  const items = (f: ReturnType<typeof fixture>) => f.database.structured.snapshot(f.spec.id)!.items
+  const texts = (f: ReturnType<typeof fixture>) => f.current.submissions.map(submission => submission.text)
+
+  it('shows one notice instead of the raw errors and sends the untouched turn again after 20 s', async () => {
+    vi.useFakeTimers()
+    const f = fixture('codex')
+    await f.manager.submit(f.spec.id, 'Build the font picker', settings)
+    refused(f)
+    expect(items(f).filter(item => item.data.type === 'error')).toHaveLength(0)
+    const notices = items(f).filter(item => item.data.type === 'notice' && /at capacity/.test(item.data.message))
+    expect(notices.map(item => item.data.type === 'notice' && item.data.message)).toEqual([expect.stringMatching(/ says .* is at capacity; retrying in 20 s \(1\/3\)\.$/)])
+    // Still Conductor's work: nothing reports it failed while the retry waits.
+    expect(activityPhase(f)).toBe('working')
+    await vi.advanceTimersByTimeAsync(19_000)
+    expect(texts(f)).toEqual(['Build the font picker'])
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(texts(f)).toEqual(['Build the font picker', 'Build the font picker'])
+    f.current.finish()
+    expect(activityPhase(f)).toBe('complete')
+  })
+
+  it('asks a turn that already ran tools to continue rather than run them again', async () => {
+    vi.useFakeTimers()
+    const f = fixture('codex')
+    await f.manager.submit(f.spec.id, 'Deploy 0.2.13', settings)
+    f.current.emit({ itemId: 'tool-1', data: { type: 'tool', name: 'Bash', status: 'completed', input: { command: 'npm run deploy' }, output: 'deployed' } })
+    refused(f)
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(texts(f)).toEqual(['Deploy 0.2.13', OVERLOAD_CONTINUE_PROMPT])
+  })
+
+  it('backs off 20 s, 60 s, 180 s, then ends failed saying to switch model and tells the controller', async () => {
+    vi.useFakeTimers()
+    const f = fixture('codex')
+    f.manager.ensure({ ...f.spec, id: 'boss', title: 'Boss' })
+    f.manager.setControllerLookup(id => (id === f.spec.id ? 'boss' : undefined))
+    await f.manager.submit(f.spec.id, 'Build it', settings)
+    const adapter = f.current, worker = () => adapter
+    for (const [index, delay] of OVERLOAD_RETRY_DELAYS_MS.entries()) {
+      refusedBy(worker())
+      await vi.advanceTimersByTimeAsync(delay - 1)
+      expect(worker().submissions).toHaveLength(index + 1)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(worker().submissions).toHaveLength(index + 2)
+    }
+    const notices = items(f).filter(item => item.data.type === 'notice' && /at capacity/.test(item.data.message)).map(item => item.data.type === 'notice' ? item.data.message : '')
+    expect(notices.map(message => /retrying in (.+) \((\d)\/3\)/.exec(message)?.slice(1).join(' '))).toEqual(['20 s 1', '60 s 2', '3 min 3'])
+    // The fourth refusal: no more retries, one clear error, the tab failed.
+    refusedBy(worker())
+    const errors = items(f).filter(item => item.data.type === 'error')
+    expect(errors).toHaveLength(1)
+    expect(errors[0]!.data).toMatchObject({ code: PROVIDER_OVERLOADED, message: expect.stringContaining('Switch this conversation to another model or provider') })
+    expect(activityPhase(f)).toBe('failed')
+    await vi.advanceTimersByTimeAsync(10 * 60_000)
+    expect(worker().submissions).toHaveLength(4)
+    const told = f.database.structured.snapshot('boss')!.items.find(item => item.data.type === 'text' && item.data.role === 'user')
+    expect(told?.data.type === 'text' && told.data.text).toContain(`Your coworker "Build it" (${f.spec.id}, codex) stopped: its provider kept refusing the model as at capacity after 3 automatic retries`)
+  })
+
+  it('drops the waiting retry when the owner sends a message or stops the tab first', async () => {
+    vi.useFakeTimers()
+    const f = fixture('codex')
+    await f.manager.submit(f.spec.id, 'Build it', settings)
+    refused(f)
+    await f.manager.submit(f.spec.id, 'Use the other model instead', settings)
+    f.current.finish()
+    await vi.advanceTimersByTimeAsync(10 * 60_000)
+    expect(texts(f)).toEqual(['Build it', 'Use the other model instead'])
+    // Refused again later: a fresh budget, and Stop cancels it.
+    await f.manager.submit(f.spec.id, 'Try once more', settings)
+    refused(f)
+    expect(items(f).at(-1)!.data).toMatchObject({ type: 'notice', message: expect.stringContaining('(1/3)') })
+    await f.manager.interrupt(f.spec.id)
+    expect(items(f).at(-1)!.data).toMatchObject({ type: 'notice', message: expect.stringContaining('automatic retry after the capacity refusal was cancelled') })
+    expect(activityPhase(f)).toBe('failed')
+    await vi.advanceTimersByTimeAsync(10 * 60_000)
+    expect(texts(f)).toEqual(['Build it', 'Use the other model instead', 'Try once more'])
+  })
+
+  it('recognises a Claude 529 by its text, and never mistakes a usage limit for one', async () => {
+    vi.useFakeTimers()
+    const f = fixture('claude')
+    await f.manager.submit(f.spec.id, 'Review it', settings)
+    f.current.emit({ data: { type: 'error', message: 'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}' } })
+    f.current.emit({ data: { type: 'session', phase: 'failed' } })
+    expect(items(f).at(-1)!.data).toMatchObject({ type: 'notice', message: expect.stringMatching(/^Anthropic says .* retrying in 20 s \(1\/3\)\.$/) })
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(texts(f)).toEqual(['Review it', 'Review it'])
+    f.current.emit({ data: { type: 'error', message: "You've hit your session limit · resets in 2 hours" } })
+    f.current.emit({ data: { type: 'session', phase: 'failed' } })
+    expect(activityPhase(f)).toBe('limited')
+    await vi.advanceTimersByTimeAsync(10 * 60_000)
+    expect(texts(f)).toHaveLength(2)
   })
 })

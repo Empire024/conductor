@@ -7,7 +7,8 @@ import { SteeringUnavailableError, type AdapterOptions, type ProviderAdapter, ty
 import { captureAdapterState, restoreAdapterState, settled } from './adapter-state'
 import { currentRuntimeHost, JsonLineTransport, type HostedRuntimeHandle, type TransportOptions } from './transport'
 import { relayMcpConfigs, relaysMcp } from '../runtime-host/relay-config'
-import { PROVIDER_AUTH_EXPIRED, PROVIDER_SAFEGUARD_REFUSAL, PROVIDER_USAGE_LIMIT } from '../../shared/structured-agent'
+import { PROVIDER_AUTH_EXPIRED, PROVIDER_OVERLOADED, PROVIDER_SAFEGUARD_REFUSAL, PROVIDER_USAGE_LIMIT } from '../../shared/structured-agent'
+import { isOverloadedErrorInfo, isProviderOverloadedMessage } from '../provider-overload'
 import { authExpiredMessage } from '../provider-auth'
 import type { ActivityStatus, AdapterEvent, ContextAttachment, FileChange, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 import type { ClientRequest } from './generated/codex/ClientRequest'
@@ -1075,7 +1076,7 @@ export class CodexAdapter implements ProviderAdapter {
           // snapshots above reconcile any input already consumed before cancellation.
           for (const [id, turnId] of this.steeringInputs) if (turnId === params.turn.id) this.inputDelivery(id, params.turn.status === 'interrupted' ? 'cancelled' : 'uncertain', native)
           this.turnId = undefined
-          if (params.turn.error) { this.sandboxSetupNotice(params.turn.error.message, context); send(unauthorized(params.turn.error.codexErrorInfo) ? { type: 'error', message: authExpiredMessage('codex', params.turn.error.message), code: PROVIDER_AUTH_EXPIRED } : { type: 'error', message: params.turn.error.message, ...(safeguardRefusal(params.turn.error.message) ? { code: PROVIDER_SAFEGUARD_REFUSAL } : params.turn.error.codexErrorInfo === 'usageLimitExceeded' ? { code: PROVIDER_USAGE_LIMIT } : {}) }) }
+          if (params.turn.error) { this.sandboxSetupNotice(params.turn.error.message, context); send(unauthorized(params.turn.error.codexErrorInfo) ? { type: 'error', message: authExpiredMessage('codex', params.turn.error.message), code: PROVIDER_AUTH_EXPIRED } : { type: 'error', message: params.turn.error.message, ...(safeguardRefusal(params.turn.error.message) ? { code: PROVIDER_SAFEGUARD_REFUSAL } : params.turn.error.codexErrorInfo === 'usageLimitExceeded' ? { code: PROVIDER_USAGE_LIMIT } : isOverloadedErrorInfo(params.turn.error.codexErrorInfo) || isProviderOverloadedMessage(params.turn.error.message) ? { code: PROVIDER_OVERLOADED } : {}) }) }
           send({ type: 'session', phase: completedPhase }, { turnId: params.turn.id })
         }
         return
@@ -1151,7 +1152,7 @@ export class CodexAdapter implements ProviderAdapter {
       case 'error':
         this.sandboxSetupNotice(params.error.message, context)
         send(unauthorized(params.error.codexErrorInfo) && !params.willRetry ? { type: 'error', message: authExpiredMessage('codex', params.error.message), code: PROVIDER_AUTH_EXPIRED }
-          : { type: 'error', message: params.error.message, ...(safeguardRefusal(params.error.message) ? { code: PROVIDER_SAFEGUARD_REFUSAL } : params.error.codexErrorInfo === 'usageLimitExceeded' && !params.willRetry ? { code: PROVIDER_USAGE_LIMIT } : {}) })
+          : { type: 'error', message: params.error.message, ...(safeguardRefusal(params.error.message) ? { code: PROVIDER_SAFEGUARD_REFUSAL } : params.error.codexErrorInfo === 'usageLimitExceeded' && !params.willRetry ? { code: PROVIDER_USAGE_LIMIT } : !params.willRetry && (isOverloadedErrorInfo(params.error.codexErrorInfo) || isProviderOverloadedMessage(params.error.message)) ? { code: PROVIDER_OVERLOADED } : {}) })
         if (params.willRetry && (this.options.environment ?? process.env).CONDUCTOR_LIVE_TESTS === '1' && !this.liveRetryStopped) {
           this.liveRetryStopped = true
           this.interrupted = true

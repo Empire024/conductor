@@ -12,6 +12,10 @@ export const MAX_PROMPT_CHARS = 600_000
 export const PROVIDER_SAFEGUARD_REFUSAL = 'provider_safeguard_refusal'
 /** The provider says the account is out of quota (Codex usageLimitExceeded); the turn has stopped. */
 export const PROVIDER_USAGE_LIMIT = 'provider_usage_limit'
+/** The provider is out of capacity for this model right now (Codex "at capacity", OpenAI
+ *  server_overloaded or 503, Anthropic 529 overloaded_error): transient, so the host retries the
+ *  turn with backoff (src/main/provider-overload.ts) before it reports a failure. */
+export const PROVIDER_OVERLOADED = 'provider_overloaded'
 /** The provider CLI lost its login (expired OAuth session, 401, "Please run /login"): every turn
  *  fails until the owner logs in again, so the host alerts once per provider and resumes after. */
 export const PROVIDER_AUTH_EXPIRED = 'provider_auth_expired'

@@ -7,6 +7,7 @@ import { JsonLineTransport } from './transport'
 import { SteeringUnavailableError, type AdapterOptions } from './adapter'
 import type { AdapterEvent, AgentEvent, Json, SessionSettings } from '../../shared/structured-agent'
 import { replayAgentEvents } from '../../shared/structured-agent-reducer'
+import { PROVIDER_OVERLOADED } from '../../shared/structured-agent'
 import type { ConfigReadResponse } from './generated/codex/v2/ConfigReadResponse'
 import type { SkillsListResponse } from './generated/codex/v2/SkillsListResponse'
 
@@ -60,6 +61,17 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
     await patch.start()
     expect(patch.capabilities.limitations).toContain('Runtime 0.159.4 is not fixture-verified; baseline is 0.159.1. Experimental features are disabled.')
     await expect(create({ CONDUCTOR_FAKE_CODEX_VERSION: '0.156.0' }).adapter.start()).rejects.toThrow('outside the tested 0.155.x/0.159.x protocol baseline')
+  })
+
+  it('tags an at-capacity refusal, in both of its statements, as PROVIDER_OVERLOADED', async () => {
+    const { adapter, events } = create()
+    await adapter.submit('synthetic:at-capacity', settings)
+    await waitFor(() => events.some(event => event.data.type === 'session' && event.data.phase === 'failed'))
+    const errors = events.filter(event => event.data.type === 'error').map(event => event.data)
+    expect(errors).toEqual([
+      { type: 'error', message: 'Selected model is at capacity. Please try a different model.', code: PROVIDER_OVERLOADED },
+      { type: 'error', message: 'Selected model is at capacity. Please try a different model.', code: PROVIDER_OVERLOADED }
+    ])
   })
 
   it('keeps real tool results and child activity while excluding root self-status noise', async () => {
