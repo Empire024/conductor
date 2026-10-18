@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ExecutionNode, RemoteJob } from './types.ts'
 import { TERMINAL_REMOTE_JOB_STATUSES } from './types.ts'
@@ -106,8 +106,23 @@ export class RemoteJobStore {
     writeJson(join(this.jobDir(job.id), 'job.json'), job)
   }
 
-  appendLog(id: string, stream: LogStream, text: string): void {
-    if (text) appendFileSync(this.logPath(id, stream), text)
+  appendLog(id: string, stream: LogStream, text: string | Buffer): void {
+    if (text.length) appendFileSync(this.logPath(id, stream), text)
+  }
+
+  logSize(id: string, stream: LogStream): number {
+    try { return statSync(this.logPath(id, stream)).size } catch { return 0 }
+  }
+
+  /** Up to `bytes` of a log from a byte offset, for following it without re-reading the start. */
+  readLogRange(id: string, stream: LogStream, offset: number, bytes: number): { buffer: Buffer; size: number } {
+    const path = this.logPath(id, stream)
+    const size = this.logSize(id, stream)
+    const length = Math.max(0, Math.min(bytes, size - offset))
+    if (!length) return { buffer: Buffer.alloc(0), size }
+    const buffer = Buffer.alloc(length)
+    const fd = openSync(path, 'r')
+    try { return { buffer: buffer.subarray(0, readSync(fd, buffer, 0, length, offset)), size } } finally { closeSync(fd) }
   }
 
   /** The last `bytes` of a log, from the file, so it is right even after a restart. */

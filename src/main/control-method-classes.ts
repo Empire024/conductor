@@ -16,7 +16,7 @@ export const MUTATION_FAMILIES = {
     'schedules.create', 'schedules.update', 'schedules.pause', 'schedules.resume', 'schedules.runNow', 'schedules.delete', 'schedules.scripts.save', 'schedules.scripts.delete',
     'loops.run', 'loops.record', 'loops.propose', 'loops.apply', 'loops.reject'
   ],
-  nodes: ['nodes.probe', 'nodes.run', 'nodes.cancel', 'nodes.register', 'nodes.remove'],
+  nodes: ['nodes.probe', 'nodes.run', 'nodes.fetch', 'nodes.cancel', 'nodes.register', 'nodes.remove'],
   cloud: ['cloud.start', 'cloud.send', 'cloud.interrupt', 'cloud.stop', 'cloud.attach', 'cloud.fetch'],
   other: [
     'orchestration.tasks.create', 'orchestration.tasks.update', 'orchestration.routines.save',

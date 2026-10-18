@@ -103,6 +103,50 @@ grace and sends a stop-by-pid-file. A connection that ends without an exit repor
 marked offline, stop-by-pid sent); one that never started is `failed` with SSH's reason. After a
 restart, `recover()` records jobs the old process ran as lost and asks their node to stop them.
 
+### Detached jobs, log follow, artifacts (mac-node-test-runner, 2026-10-18)
+
+An attached job lives as long as its ssh session. A long test suite should not: `detached: true`
+starts it under a **supervisor on the node** (`DETACHED_LAUNCHER`/`DETACHED_SUPERVISOR` in
+`shell.ts`) launched with `nohup` in its own process group, all of its file descriptors away from
+ssh, so it survives a dropped connection, a Conductor restart, and MAIN sleeping. The launcher
+returns as soon as the command runs. Everything lives in `~/.conductor-node/jobs/<id>/`: `stdout`,
+`stderr`, `pid`, `supervisor`, `deadline`, `cwd`, and, at the end, `reason` (timeout | cancelled)
+and `exit`, written last via rename, so an exit file means the output is complete.
+
+- **Deadline and cancel are the node's.** The supervisor polls once a second: past `deadline` or once
+  a `cancel` file exists it sends `TERM` to the group, waits 10 s, sends `KILL`, then writes the exit
+  code. `nodes.cancel` creates that file. Any process may do that (the app, a script), and the
+  follower records how the job ended. A cancel asked for while the node is unreachable is kept in the
+  record (`cancelRequestedAt`) and delivered when the node is back, even after a restart.
+- **Following.** MAIN holds one ssh session per job (`DETACHED_FOLLOW`, renewed every 5 min) that
+  streams frames: a header line `frame out=N err=M pid=P alive=A exit=C reason=R`, then exactly N + M
+  bytes. Local `stdout.log`/`stderr.log` mirror the node byte for byte, so their sizes are the resume
+  offsets (`tail -c +N`). A broken session reconnects with backoff (2 s doubling to 60 s) for as long
+  as the node is away. The job is recorded `lost` only after 30 min without contact *past its
+  deadline*, or when the node answers that the supervisor is gone without an exit file (it rebooted)
+  or that the state folder is gone.
+- **Restart.** `shutdown()` leaves detached jobs running. `recover()` on the next start reattaches
+  every detached job whose runner process is dead, from the bytes it already has. Attached jobs keep
+  the old rule (lost, stop-by-pid).
+- **Log follow.** `nodes.log({jobId, offset, waitSeconds?, bytes?})` returns
+  `{text, offset, nextOffset, size, done}` from that byte offset, never splitting a UTF-8
+  character. With nothing new yet it waits up to `waitSeconds` (max 50, below the Claude MCP 60 s
+  limit). Pass `nextOffset` back until `done`. Without `offset` it still returns the tail.
+- **Artifacts.** `nodes.run({artifacts: [...]})` takes paths or bash globs (no `**`) relative to the
+  job's working directory, fetched when the job ends (any exit, including timeout and cancel)
+  into the **calling project's** `.conductor-scratch/remote-artifacts/<jobId>/`. `nodes.fetch({jobId,
+  path})` fetches more on demand, during or after the run, while the files are still on the node.
+  The node packs them with `tar -cz` over the same ssh transport (`FETCH_SCRIPT` in `artifacts.ts`);
+  MAIN unpacks them with its own reader (`TarExtractor`). Confinement: patterns may not be absolute,
+  start with `~`, name a drive or contain `..`. On the node each match is resolved with `pwd -P` and
+  must stay under the working directory, and a match that is a symbolic link is skipped. tar stores
+  links inside folders as links. MAIN writes only regular files and folders, and refuses unsafe entry
+  names. Cap: 512 MiB per fetch. The node refuses a larger total before sending anything, and MAIN
+  stops a stream that grows past it. The result `{dir, files, bytes, skipped, missing, error}` is on
+  the job as `artifactFetch`. A failed fetch never changes the job's status.
+- State of detached jobs nobody came back for is removed by the next launch after 14 days. A job
+  that ended normally has its state removed once its output and artifacts are on MAIN.
+
 ### Repository strategy (Phase 7)
 
 The node keeps **its own checkout**; tasks reference a **commit**. Per repository on the node:
@@ -123,15 +167,16 @@ fetches it into its checkout, `checkout --detach --force`, `git clean -fd` (keep
 the newest 300 finished jobs kept. Plain files beside (not inside) the multi-gigabyte journal.
 Every JSON write is temp-file + rename. The app and `scripts/mac-node.mjs` can use the folder at
 the same time: each job records its `runnerPid`, only that process follows, cancels or recovers
-it, and the other re-reads records and `nodes.json` from disk.
+it (a detached job can be cancelled from either, because the node owns it), and the other re-reads
+records and `nodes.json` from disk.
 
 ### App control
 
 `src/main/remote-jobs/control.ts`, wired into `agent-control.ts` with one dispatch line and
 plugged in from `index.ts` (`control.setRemoteJobs`):
 
-- reads: `nodes.list`, `nodes.jobs`, `nodes.job({jobId, waitSeconds})`, `nodes.log`;
-- `nodes.probe`, `nodes.run`, `nodes.cancel`: the owner, a wizard tab, or a non-local, writable
+- reads: `nodes.list`, `nodes.jobs`, `nodes.job({jobId, waitSeconds})`, `nodes.log({jobId, offset?, waitSeconds?})`;
+- `nodes.probe`, `nodes.run`, `nodes.fetch`, `nodes.cancel`: the owner, a wizard tab, or a non-local, writable
   conversation (the jobs.create rule); a job can be cancelled by the conversation that started it;
 - `nodes.register`, `nodes.remove`: owner or wizard only (they name a host to trust and a key file);
 - `machines.list` includes each node: as the `node` facet of its paired peer when
@@ -520,3 +565,76 @@ sudo shutdown -r now
 **BLOCKERS**
 - FileVault off + automatic login (owner decision, needs the Mac password): the command block in section 5. Until then an unplanned reboot leaves the Mac at its password screen, unreachable.
 - Signed macOS builds need the owner's Apple Developer ID (not requested yet).
+
+## 7. How-to: run another project's test suites on the Mac (haf-stuff)
+
+Any co-opened project can run its full suites on `mac-mini` instead of MAIN, so tests stop pausing
+renders here. The project needs no Conductor code. Its tab calls app control, and the job runs in
+the node's own checkout of that project's **committed** HEAD (`checkout: true` pushes it, so
+uncommitted edits are not included). The example is haf-stuff (PHP gates, JS gates, and a Playwright
+suite of about 25 min in `tests-e2e/`).
+
+### Once, by the owner (toolchain on the Mac)
+
+Over `ssh mac-mini` (or `nodes.run` from a wizard tab), with `~/.conductor-node/env.sh` putting
+Homebrew on PATH:
+
+```sh
+brew install php composer          # php 8.x; node@22 is already there
+# after the first checkout job has created ~/conductor-node/work/haf-stuff:
+cd ~/conductor-node/work/haf-stuff && composer install
+cd tests-e2e && npm init -y >/dev/null && npm i --no-save @playwright/test && npx playwright install chromium webkit
+```
+
+On MAIN, `tests-e2e/node_modules` is a junction to the haftheme install. On the Mac it is a real
+install, which `git clean -fd` keeps because it is gitignored. The **site under test** is the one
+real decision: Playwright drives `HAFOPS_BASE_URL` (default `http://hashandflowers.local`, which
+exists only on MAIN). Either:
+
+- point the Mac at MAIN's Local site over the tailnet (`HAFOPS_BASE_URL=http://<main-tailnet-name>`,
+  `HAFOPS_HOST_MAP=0`). The browsers and the test runner then move to the Mac and only PHP keeps
+  serving on MAIN. This needs the Local router reachable on the tailnet interface (owner's choice).
+- or run a WordPress copy on the Mac (Local for Mac, or `wp-env`) and point `HAFOPS_BASE_URL` at it.
+  Then nothing of the run touches MAIN.
+
+The PHP unit suite and `composer test:js` need no site. `phpunit --testsuite integration` needs the
+WordPress test library and a database on the Mac, or it stays on MAIN.
+
+### Each run, from the haf-stuff tab
+
+```js
+// gates first (minutes), attached is fine
+control({ method: 'nodes.run', args: { requires: ['macos'], checkout: true,
+  command: 'composer install -q && vendor/bin/phpunit --testsuite unit && composer test:js', timeoutSec: 1800 } })
+
+// the long Playwright suite: detached, with the report brought back
+control({ method: 'nodes.run', args: { requires: ['macos'], checkout: true, cwd: 'tests-e2e', detached: true,
+  timeoutSec: 4 * 3600, artifacts: ['playwright-report', 'test-results'],
+  command: 'HAFOPS_BASE_URL=http://<site> npx playwright test -c playwright.config.js' } })
+// -> { id: 'rj_…', status: 'queued' | 'preparing' | 'running' }
+
+// follow it live, 50 s at a time, without re-reading the log
+control({ method: 'nodes.log', args: { jobId: 'rj_…', offset: 0, waitSeconds: 50 } })
+// -> { text, nextOffset, done }; pass nextOffset back until done
+
+control({ method: 'nodes.job', args: { jobId: 'rj_…', waitSeconds: 100 } })
+// -> status, exitCode, artifactFetch: { dir, files, bytes, skipped, missing, error }
+```
+
+The report lands in haf-stuff's `.conductor-scratch/remote-artifacts/<jobId>/playwright-report/`.
+Add `.conductor-scratch/` to that project's `.gitignore`. `nodes.fetch({jobId,
+path: 'test-results/some-spec/trace.zip'})` brings back more afterwards, and `nodes.cancel({jobId})`
+stops the run on the Mac. A Conductor restart, an ssh drop or MAIN sleeping does not stop it. The
+next start reattaches, and the log continues from where it was. From a shell the same is
+`node scripts/mac-node.mjs run --checkout <haf-stuff path> --cwd tests-e2e --detached
+--artifacts playwright-report,test-results -- <command>` plus `log <id> --offset N --wait 30`,
+`fetch <id> <path>`, `follow <id>` and `cancel <id>`.
+
+Live check, 2026-10-18 (scripts/mac-node.mjs against mac-mini): a 3-minute detached job started
+with `--no-wait`, so its runner exited at once. A fresh process reattached and followed it by offset
+(`log --offset 0/16 --wait`). That follower was killed mid-run and a third one reattached. The final
+log held ticks 1–18 exactly once, and the job succeeded with its artifact fetched automatically.
+`nodes.fetch` brought back files on demand, refused `..`, reported a missing path and skipped both a
+top-level symlink to `/etc` and a symlink inside the fetched folder. A second detached job
+(`sleep 600 & sleep 601; wait`) was cancelled from another process: it ended `cancelled`, exit
+143, and `pgrep` found no leftovers.

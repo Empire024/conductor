@@ -9,6 +9,8 @@ export interface ExecOptions {
   /** Hard local limit: the connection is dropped after this, whatever the node is doing. */
   timeoutMs: number
   onStdout?(chunk: string): void
+  /** Raw stdout instead of onStdout: framed log chunks and archives, counted in bytes. */
+  onStdoutBytes?(chunk: Buffer): void
   onStderr?(chunk: string): void
 }
 
@@ -89,9 +91,12 @@ export function sshTransport(options: SshTransportOptions): TransportFactory {
       let timedOut = false
       let settled = false
       const child = run(sshBin, [...sshArgs(node, options.knownHostsFile), exec.command], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
-      child.stdout?.setEncoding('utf8')
+      if (exec.onStdoutBytes) child.stdout?.on('data', (chunk: Buffer) => exec.onStdoutBytes?.(chunk))
+      else {
+        child.stdout?.setEncoding('utf8')
+        child.stdout?.on('data', (chunk: string) => exec.onStdout?.(chunk))
+      }
       child.stderr?.setEncoding('utf8')
-      child.stdout?.on('data', (chunk: string) => exec.onStdout?.(chunk))
       child.stderr?.on('data', (chunk: string) => exec.onStderr?.(chunk))
       // An EPIPE on stdin after the node closed its side is expected, not a failure.
       child.stdin?.on('error', () => undefined)

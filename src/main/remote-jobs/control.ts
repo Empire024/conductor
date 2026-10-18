@@ -4,6 +4,9 @@ import type { RemoteJobService } from './service.ts'
 import type { LogStream } from './store.ts'
 import type { NodeSummary, RemoteJob, RemoteJobStatus } from './types.ts'
 
+/** Where a project's fetched artifacts land: one folder per job. */
+export const artifactsRoot = (projectPath: string): string => join(projectPath, '.conductor-scratch', 'remote-artifacts')
+
 /**
  * The nodes.* app-control methods. agent-control.ts decides who is calling; everything about
  * nodes and jobs is decided here, so the control surface stays one line there.
@@ -11,10 +14,11 @@ import type { NodeSummary, RemoteJob, RemoteJobStatus } from './types.ts'
 export const nodeSignatures = {
   'nodes.list': '() — execution nodes: other computers of the owner that run bounded commands over SSH inside the tailnet (docs/mac-node.md), each with platform, arch, hardware, capabilities (macos, arm64, apple-silicon, node@24, xcode-clt…), status, last seen, current jobs, and readiness (a Mac: never sleeps on AC, restarts after power loss, gets past boot unattended, Tailscale and Conductor start by themselves; missing lists the steps still needed)',
   'nodes.probe': '({nodeId?}) — ask one node (or every node) what it is now; marks it online or offline and refreshes its facts and capabilities',
-  'nodes.run': '({command,nodeId?|requires?:string[],cwd?,timeoutSec?,checkout?:boolean|{commit?},title?}) — run one bash command on a node: nodeId names it, or requires picks an online node with all those capabilities (["macos"] never runs anywhere else). Bounded: timeoutSec (default 1800) is enforced on the node, the whole process group is stopped on timeout, cancel or a lost connection, stdout/stderr are kept here. checkout brings the node\'s own checkout of this project to a commit first (HEAD by default; the commit is pushed to the node, nothing needs publishing) and cwd is then inside it. Returns the job; follow with nodes.job({jobId,waitSeconds})',
+  'nodes.run': '({command,nodeId?|requires?:string[],cwd?,timeoutSec?,checkout?:boolean|{commit?},title?,detached?,artifacts?:string[]}) — run one bash command on a node: nodeId names it, or requires picks an online node with all those capabilities (["macos"] never runs anywhere else). Bounded: timeoutSec (default 1800) is enforced on the node, the whole process group is stopped on timeout, cancel or a lost connection, stdout/stderr are kept here. checkout brings the node\'s own checkout of this project to a commit first (HEAD by default; the commit is pushed to the node, nothing needs publishing) and cwd is then inside it. detached:true runs it under a supervisor on the node that survives a dropped connection, a Conductor restart and this machine sleeping (use it for long test suites; nodes.cancel still stops it). artifacts: paths or globs under cwd (e.g. ["playwright-report","test-results"]) fetched when it ends into this project\'s .conductor-scratch/remote-artifacts/<jobId>/ (512 MiB cap). Returns the job; follow with nodes.log({jobId,offset:0,waitSeconds}) and nodes.job({jobId,waitSeconds})',
   'nodes.jobs': '({nodeId?,status?:string[],limit?}) — remote jobs of this project, newest first, without their output',
   'nodes.job': '({jobId,waitSeconds?}) — one job with the last 16 KB of stdout and stderr; waitSeconds (up to 100) waits for it to end',
-  'nodes.log': '({jobId,stream?:"stdout"|"stderr",bytes?}) — the end of a job\'s full log (default 64 KB, up to 1 MB) and the log file path',
+  'nodes.log': '({jobId,stream?:"stdout"|"stderr",bytes?,offset?,waitSeconds?}) — without offset: the end of a job\'s full log (default 64 KB, up to 1 MB) and the log file path. With offset: up to bytes from that byte offset as {text,nextOffset,done}; waitSeconds (up to 50) waits for new output when there is none yet. Follow a run by passing nextOffset back until done',
+  'nodes.fetch': '({jobId,path:string|string[]}) — bring files or globs under the job\'s working directory on its node back into this project\'s .conductor-scratch/remote-artifacts/<jobId>/ (tar over ssh, 512 MiB cap; nothing outside the working directory, no symbolic links); returns {dir,files,bytes,skipped,missing,error}',
   'nodes.cancel': '({jobId,reason?}) — stop a job: the node stops its whole process group; the owner, a wizard tab or the conversation that started it',
   'nodes.register': '({id,host,user,identityFile?,port?,name?,labels?:string[],root?,maxConcurrentJobs?,peerMachineId?}) — owner only: add or update a node; host is its Tailscale name, identityFile the private key here whose public half the node authorizes (default ~/.ssh/conductor_mac_ed25519)',
   'nodes.remove': '({nodeId}) — owner only: forget a node that has no jobs running'
@@ -22,15 +26,16 @@ export const nodeSignatures = {
 
 export const nodeMethods = new Set(Object.keys(nodeSignatures))
 export const NODE_READ_METHODS = ['nodes.list', 'nodes.jobs', 'nodes.job', 'nodes.log'] as const
-export const NODE_MUTATION_METHODS = ['nodes.probe', 'nodes.run', 'nodes.cancel', 'nodes.register', 'nodes.remove'] as const
+export const NODE_MUTATION_METHODS = ['nodes.probe', 'nodes.run', 'nodes.fetch', 'nodes.cancel', 'nodes.register', 'nodes.remove'] as const
 
 const allowedKeys: Record<string, string[]> = {
   'nodes.list': [],
   'nodes.probe': ['nodeId'],
-  'nodes.run': ['command', 'nodeId', 'requires', 'cwd', 'timeoutSec', 'checkout', 'title'],
+  'nodes.run': ['command', 'nodeId', 'requires', 'cwd', 'timeoutSec', 'checkout', 'title', 'detached', 'artifacts'],
   'nodes.jobs': ['nodeId', 'status', 'limit'],
   'nodes.job': ['jobId', 'waitSeconds'],
-  'nodes.log': ['jobId', 'stream', 'bytes'],
+  'nodes.log': ['jobId', 'stream', 'bytes', 'offset', 'waitSeconds'],
+  'nodes.fetch': ['jobId', 'path'],
   'nodes.cancel': ['jobId', 'reason'],
   'nodes.register': ['id', 'host', 'user', 'identityFile', 'port', 'name', 'labels', 'root', 'maxConcurrentJobs', 'peerMachineId'],
   'nodes.remove': ['nodeId']
@@ -103,7 +108,22 @@ export async function callNodeMethod(service: RemoteJobService, caller: NodeCall
     const job = ownJob()
     const stream = args.stream === undefined ? 'stdout' : args.stream
     if (stream !== 'stdout' && stream !== 'stderr') throw new Error('stream is "stdout" or "stderr"')
-    return service.readLog(job.id, stream as LogStream, int(args, 'bytes', 1, 1024 * 1024) ?? 64 * 1024)
+    const bytes = int(args, 'bytes', 1, 1024 * 1024) ?? 64 * 1024
+    const offset = int(args, 'offset', 0, Number.MAX_SAFE_INTEGER)
+    const wait = int(args, 'waitSeconds', 0, 50) ?? 0
+    if (offset === undefined) {
+      if (wait) throw new Error('waitSeconds needs an offset: pass 0, or the nextOffset the last call returned')
+      const log = service.readLog(job.id, stream as LogStream, bytes)
+      return { ...log, nextOffset: log.size, done: service.getJob(job.id).endedAt !== null }
+    }
+    return service.readLogFrom(job.id, stream as LogStream, offset, bytes, wait * 1000)
+  }
+  if (method === 'nodes.fetch') {
+    mayAct()
+    const job = ownJob()
+    if (!caller.projectPath) throw new Error('nodes.fetch needs a project whose folder is on this machine')
+    const path = args.path
+    return service.fetchArtifacts(job.id, Array.isArray(path) ? path : [path], join(artifactsRoot(caller.projectPath), job.id))
   }
   if (method === 'nodes.probe') {
     mayAct()
@@ -124,12 +144,17 @@ export async function callNodeMethod(service: RemoteJobService, caller: NodeCall
       if (commit !== undefined && (typeof commit !== 'string' || !/^[\w./@^~-]{1,200}$/.test(commit))) throw new Error('checkout.commit must be a commit id, branch or ref')
       checkout = { localRepoPath: caller.projectPath, ...(commit ? { commit } : {}) }
     }
+    const detached = args.detached
+    if (detached !== undefined && typeof detached !== 'boolean') throw new Error('detached is true or false')
+    if (args.artifacts !== undefined && !caller.projectPath) throw new Error('artifacts need a project whose folder is on this machine')
     return service.submit({
       command: str(args, 'command', 20_000)!,
       nodeId: str(args, 'nodeId', 40, false), requires: list(args, 'requires'),
       cwd: str(args, 'cwd', 500, false), timeoutSec: int(args, 'timeoutSec', 1, 24 * 60 * 60),
       title: str(args, 'title', 120, false), checkout,
-      projectId: caller.projectId, createdBy: caller.agentSessionId
+      projectId: caller.projectId, createdBy: caller.agentSessionId,
+      ...(detached ? { detached: true } : {}),
+      ...(args.artifacts !== undefined ? { artifacts: args.artifacts as string[], artifactsRoot: artifactsRoot(caller.projectPath!) } : {})
     })
   }
   if (method === 'nodes.cancel') {

@@ -1,11 +1,11 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { callNodeMethod, withNodes, type NodeCaller } from './control.ts'
 import { RemoteJobService } from './service.ts'
 import { RemoteJobStore } from './store.ts'
-import { FakeNodes } from './test-fakes.ts'
+import { FakeDetachedNode, FakeNodes, tarGz } from './test-fakes.ts'
 
 let root: string
 let fake: FakeNodes
@@ -69,6 +69,38 @@ describe('nodes.* control', () => {
     await expect(callNodeMethod(service, { ...agent, agentSessionId: 'agent_c' }, 'nodes.cancel', { jobId: job.id })).rejects.toThrow(/Only the owner/)
     await callNodeMethod(service, agent, 'nodes.cancel', { jobId: job.id, reason: 'done' })
     expect(await service.wait(job.id, 2000)).toMatchObject({ status: 'cancelled', cancelReason: 'done' })
+  })
+
+  it('a detached run with artifacts lands them in the caller\'s project; nodes.log follows it by offset', async () => {
+    const node = new FakeDetachedNode()
+    fake.handler = (command, run) => {
+      if (node.handle(command, run)) return
+      if (command.includes('kv hostname')) { run.stdout('os=Darwin\narch=arm64\n'); run.end(0); return }
+      run.end(0)
+    }
+    node.fetch = () => ({ marks: ['packing files=1 bytes=4'], archive: tarGz([{ name: './playwright-report/index.html', content: 'ok' }]) })
+    await callNodeMethod(service, owner, 'nodes.register', { id: 'mac-mini', host: 'jurajs-mac-mini', user: 'juraj' })
+    const project = { ...agent, projectPath: join(root, 'haf-stuff') }
+    await expect(callNodeMethod(service, project, 'nodes.run', { command: 'x', nodeId: 'mac-mini', detached: 'yes' })).rejects.toThrow(/detached is true or false/)
+    await expect(callNodeMethod(service, { ...project, projectPath: null }, 'nodes.run', { command: 'x', nodeId: 'mac-mini', artifacts: ['a'] })).rejects.toThrow(/on this machine/)
+    const job = await callNodeMethod(service, project, 'nodes.run', { command: 'npx playwright test', nodeId: 'mac-mini', detached: true, artifacts: ['playwright-report'] }) as { id: string; artifactsDir: string; detached: boolean }
+    expect(job).toMatchObject({ detached: true, artifactsDir: join(root, 'haf-stuff', '.conductor-scratch', 'remote-artifacts', job.id) })
+    await expect(callNodeMethod(service, project, 'nodes.log', { jobId: job.id, waitSeconds: 5 })).rejects.toThrow(/needs an offset/)
+    await expect(callNodeMethod(service, project, 'nodes.log', { jobId: job.id, offset: 0, waitSeconds: 51 })).rejects.toThrow(/waitSeconds must be/)
+    const waiting = callNodeMethod(service, project, 'nodes.log', { jobId: job.id, offset: 0, waitSeconds: 5 })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    node.output(job.id, 'stdout', 'Running 3 tests\n')
+    expect(await waiting).toMatchObject({ text: 'Running 3 tests\n', nextOffset: 16, done: false })
+    node.exit(job.id, 0)
+    expect(await callNodeMethod(service, project, 'nodes.job', { jobId: job.id, waitSeconds: 2 })).toMatchObject({ status: 'succeeded', artifactFetch: { files: 1, error: null } })
+    expect(await callNodeMethod(service, project, 'nodes.log', { jobId: job.id, offset: 16 })).toMatchObject({ text: '', done: true })
+    expect(readFileSync(join(job.artifactsDir, 'playwright-report', 'index.html'), 'utf8')).toBe('ok')
+    // On demand, by the same rules as nodes.run; another project's job reads as missing.
+    const fetched = await callNodeMethod(service, project, 'nodes.fetch', { jobId: job.id, path: 'playwright-report' }) as { dir: string; files: number }
+    expect(fetched).toMatchObject({ dir: job.artifactsDir, files: 1 })
+    await expect(callNodeMethod(service, { ...project, refusal: 'read-only' }, 'nodes.fetch', { jobId: job.id, path: 'x' })).rejects.toThrow(/read-only/)
+    await expect(callNodeMethod(service, { ...project, projectId: 'p2' }, 'nodes.fetch', { jobId: job.id, path: 'x' })).rejects.toThrow(/No remote job with that id/)
+    await expect(callNodeMethod(service, project, 'nodes.fetch', { jobId: job.id, path: '../../etc' })).rejects.toThrow(/may not contain/)
   })
 
   it('machines.list shows a node as its own machine, or as the node facet of its Conductor peer', async () => {

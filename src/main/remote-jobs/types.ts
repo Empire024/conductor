@@ -9,6 +9,8 @@
  * Everything here is plain data so it persists as JSON and crosses app control unchanged.
  */
 
+import type { ArtifactFetch } from './artifacts.ts'
+
 export type NodePlatform = 'darwin' | 'linux' | 'win32'
 
 export interface NodeSsh {
@@ -153,6 +155,15 @@ export interface RemoteJob {
   cancelReason: string | null
   /** The process that runs it (the app or a script); only that process follows or ends it. */
   runnerPid: number | null
+  /** Runs under a supervisor on the node that outlives the ssh session and this process (absent: false). */
+  detached?: boolean
+  /** When a cancel of a detached job was asked for; carried across a restart until the node has it. */
+  cancelRequestedAt?: string | null
+  /** Paths or globs under cwd brought back when the job ends, into artifactsDir on this machine. */
+  artifacts?: string[]
+  artifactsDir?: string | null
+  /** The last artifact fetch, automatic or nodes.fetch. */
+  artifactFetch?: ArtifactFetch | null
 }
 
 export interface SubmitRemoteJob {
@@ -168,6 +179,10 @@ export interface SubmitRemoteJob {
   checkout?: { localRepoPath: string; commit?: string; repo?: string }
   projectId?: string
   createdBy?: string
+  detached?: boolean
+  artifacts?: string[]
+  /** Folder that gets one subfolder per job for its artifacts; required with artifacts. */
+  artifactsRoot?: string
 }
 
 export interface RegisterNode {

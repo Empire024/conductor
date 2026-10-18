@@ -1951,6 +1951,8 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
   
   ![IMG_0385.jpg](.conductor/prompt-images/7e8f915d-1fde-4938-8894-1d4251a22372.jpg)
 
+- [ ] each chat needs t o have an easily visible section with agent links & questions that get stuck somewhere on the side or are easily visible upon clicking, currently links can get lost in conversation & agent questions (that are not created with askuserquestions but just basic questions in chat) can be forgotten - the latter is not necessary if it'd be hard to implement, but the links & files would be really nice to have in some view. <!-- conductor-task:e90b679f-a8db-4433-8cb6-43add3fd26c7 -->
+
 ## Phone WebApp: ultimate, snappy control suite (2026-10-03)
 
 - [x] 1. Repair phone dictation and explain iOS/Android browser, permission and PWA limitations with keyboard fallback. <!-- conductor-task:phone-redesign-dictation agent=agent_murrdn5k_umf5k4m -->
@@ -1981,3 +1983,5 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 - [x] tabs.focus (and clicking a tab in a list) does not scroll a tab that sits off the visible tab strip into view <!-- conductor-task:tabs-focus-scroll-into-view agent=agent_mvd7if7f_kxkulpb -->
 
 - [x] Coworkers of the same controller cannot send_message each other ("you control their tabs"), so every overlap coordination has to be relayed by the controller; let siblings under one controller message each other directly <!-- conductor-task:sibling-coworker-messaging agent=agent_mvd7if7f_kxkulpb -->
+
+- [x] Run any project's full test suites on the Mac mini instead of MAIN (owner via haf-stuff, 2026-10-18: "get conductor project to build out an integration where you'll just be able to call a tab on that device & let it run all tests you need it to run"; test runs on MAIN make other projects pause their renders). Execution node work: nodes.run detached jobs that survive MAIN restarts, ssh drops and sleep (nohup on the node, reattach in recover() instead of marking lost); live log follow (nodes.log offset/nextOffset, waitable); artifact fetch-back (nodes.run artifacts:[...] pulled automatically at job end + nodes.fetch({jobId,path}) into the calling project's .conductor-scratch/remote-artifacts/<jobId>/, paths confined to the job's work dir, size cap); docs/mac-node.md how-to for a non-Conductor project (haf-stuff Playwright). Done (phase 1, nodes.run detached + nodes.log offsets + artifacts/nodes.fetch, docs/mac-node.md §7). Phase 2, owner-gated, not started: Conductor tabs on the Mac itself (install the Mac build, pair, adopt a Mac clone) <!-- conductor-task:mac-node-test-runner agent=agent_mvdmpgfl_brb1ban -->

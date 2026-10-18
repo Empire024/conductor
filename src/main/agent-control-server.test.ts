@@ -188,7 +188,7 @@ describe('control method classes', () => {
       'projects.open', 'app.update.check', 'app.update.download', 'app.update.install', 'app.restart', 'app.restart.request', 'app.quit.confirm', 'supervisor.overview', 'supervisor.alert',
       'ideas.list', 'ideas.get', 'ideas.capture', 'ideas.link', 'ideas.note', 'ideas.explore', 'ideas.work',
       'ideas.run', 'ideas.runs', 'ideas.run.approve', 'ideas.run.decide', 'ideas.run.pause', 'ideas.run.resume', 'ideas.run.stop',
-      'nodes.list', 'nodes.jobs', 'nodes.job', 'nodes.log', 'nodes.probe', 'nodes.run', 'nodes.cancel', 'nodes.register', 'nodes.remove',
+      'nodes.list', 'nodes.jobs', 'nodes.job', 'nodes.log', 'nodes.probe', 'nodes.run', 'nodes.fetch', 'nodes.cancel', 'nodes.register', 'nodes.remove',
       'cloud.start', 'cloud.list', 'cloud.status', 'cloud.transcript', 'cloud.send', 'cloud.interrupt', 'cloud.stop', 'cloud.attach', 'cloud.fetch',
       'permissions.request', 'permissions.list', 'permissions.revoke', 'permissions.withdraw', 'permissions.decide', 'agents.approvals', 'agents.approve', 'approvals.policy.get', 'approvals.policy.set',
       'models.registry', 'models.route', 'decisions.list', 'decisions.get', 'models.refresh', 'models.outcome', 'models.evaluate', 'decisions.live',
