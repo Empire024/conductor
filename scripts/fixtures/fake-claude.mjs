@@ -498,6 +498,11 @@ for await (const line of input) {
       batch()
       continue
     }
+    if (prompt.startsWith('SYNTHETIC LINKS')) {
+      // A reply with links, a file mention and a closing plain-text question (the links rail).
+      text('Here is [the guide](https://example.com/guide) and the file `notes.md`. Status: https://example.org/status.\n\nShould I also update the changelog?')
+      finish(); continue
+    }
     if (prompt.startsWith('SYNTHETIC B')) {
       text('**Synthetic fixture continuation:** `wasOpen` and `wasPinned` were removed; the local Node test passed. This is offline fixture behavior, not live-provider context evidence.')
       finish(); continue

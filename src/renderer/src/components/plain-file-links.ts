@@ -129,6 +129,21 @@ export function useVerifiedPlainFileLinks(text: string, cwd: string, projectId: 
   return useMemo(() => new Set(verified), [signature])
 }
 
+/** The same check for a list gathered elsewhere (the conversation's links rail): through the shared,
+ *  bounded queue and cache, so a path already verified for its message costs nothing here. */
+export function useVerifiedFileLinkKeys(links: PlainFileLink[]): Set<string> {
+  const [, rerender] = useState(0)
+  useEffect(() => {
+    const listener = (): void => rerender(value => value + 1)
+    listeners.add(listener)
+    return () => { listeners.delete(listener) }
+  }, [])
+  useEffect(() => { requestChecks(links) }, [links])
+  const verified = links.filter(link => checked.get(link.key)?.exists).map(link => link.key)
+  const signature = verified.join('\n')
+  return useMemo(() => new Set(verified), [signature])
+}
+
 function splitText(value: string, links: Candidate[], verified: Set<string>): MarkdownNode[] {
   const matches = links.filter(link => verified.has(link.key))
   if (!matches.length) return [{ type: 'text', value }]

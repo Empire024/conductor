@@ -1951,7 +1951,7 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
   
   ![IMG_0385.jpg](.conductor/prompt-images/7e8f915d-1fde-4938-8894-1d4251a22372.jpg)
 
-- [ ] each chat needs t o have an easily visible section with agent links & questions that get stuck somewhere on the side or are easily visible upon clicking, currently links can get lost in conversation & agent questions (that are not created with askuserquestions but just basic questions in chat) can be forgotten - the latter is not necessary if it'd be hard to implement, but the links & files would be really nice to have in some view. <!-- conductor-task:e90b679f-a8db-4433-8cb6-43add3fd26c7 -->
+- [x] each chat needs t o have an easily visible section with agent links & questions that get stuck somewhere on the side or are easily visible upon clicking, currently links can get lost in conversation & agent questions (that are not created with askuserquestions but just basic questions in chat) can be forgotten - the latter is not necessary if it'd be hard to implement, but the links & files would be really nice to have in some view. <!-- conductor-task:e90b679f-a8db-4433-8cb6-43add3fd26c7 agent=agent_mvdlfzp1_qzvskgr -->
 
 ## Phone WebApp: ultimate, snappy control suite (2026-10-03)
 

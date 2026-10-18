@@ -2,7 +2,7 @@ import { conversationIdentity } from './conversation-tab'
 import { PromptImageUpload, PromptImageThumbnail } from '../components/PromptImageUpload'
 import { ProviderIcon } from '../components/ProviderIcon'
 import { startTransition, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type SetStateAction } from 'react'
-import { Archive, ArrowDown, ArrowLeft, ClipboardCopy, EyeOff, FileDiff, FilePlus2, GitBranch, Globe2, History, ListTree, Pin, Play, PlugZap, Settings2, Telescope, TerminalSquare, MessagesSquare, LoaderCircle, Undo2, WandSparkles, X } from 'lucide-react'
+import { Archive, ArrowDown, ArrowLeft, ClipboardCopy, EyeOff, FileDiff, FilePlus2, GitBranch, Globe2, History, Link2, ListTree, Pin, Play, PlugZap, Settings2, Telescope, TerminalSquare, MessagesSquare, LoaderCircle, Undo2, WandSparkles, X } from 'lucide-react'
 import type { AgentSpec, AgentActivityPhase, TurnMemoryRecall } from '../../../shared/models'
 import { isFrontierModel, MAX_PROMPT_CHARS, WIZARD_MODEL_HINT, wizardActive } from '../../../shared/structured-agent'
 import { singlePermissionCards } from './single-permission-card'
@@ -16,6 +16,8 @@ import { isRemoteFileMachine } from '../remote-files'
 import { openConversationFile } from '../conversation-file-open'
 import { MemoryRecallStrip, recallsByItem } from './MemoryRecallStrip'
 import { AgentChangeHistoryView } from './AgentChangeHistory'
+import { ConversationLinksRail } from './ConversationLinksRail'
+import { unansweredQuestion } from './conversation-links'
 import { StructuredComposerControls } from './StructuredComposerControls'
 import { StructuredSendButton, sendButtonIntent } from './StructuredSendButton'
 import { QueuedMessageList } from './QueuedMessageList'
@@ -107,6 +109,8 @@ function ComposerTextarea({ projectId, sessionId, textareaRef, ...props }: { pro
   return <textarea {...props} ref={textareaRef} />
 }
 
+const LINKS_RAIL_KEY = 'conductor.conversation-links-open'
+const ASKED_DISMISSED_KEY = 'conductor.conversation-asked-dismissed.'
 export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Element {
   const restoredView = useRef(suspendedViews.get(props.resourceId) ?? null)
   const [activeId, setActiveId] = useState(() => restoredView.current?.activeId ?? props.conversationId ?? props.resourceId)
@@ -221,6 +225,10 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const [filePath, setFilePath] = useState('')
   const [diff, setDiff] = useState<FileChange | null>(null)
   const [changesOpen, setChangesOpen] = useState(false)
+  // The links & files rail is a standing preference across conversations, like a panel left open.
+  const [linksOpen, setLinksOpen] = useState(() => localStorage.getItem(LINKS_RAIL_KEY) === '1')
+  const toggleLinks = (): void => setLinksOpen(current => { localStorage.setItem(LINKS_RAIL_KEY, current ? '0' : '1'); return !current })
+  const [askedVersion, setAskedVersion] = useState(0)
   const [eventsOpen, setEventsOpen] = useState(false)
   const [rawEvents, setRawEvents] = useState<AgentEvent[]>([])
   const [historyOpen, setHistoryOpen] = useState(false)
@@ -839,22 +847,24 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   }, [])
   // The scroll-to-pinned-prompt jump goes through the same reading-window pin as a deliberate
   // scroll up, rather than a raw scrollTop write, so it does not fight autoscroll afterwards.
-  const scrollToPinnedPrompt = (): void => {
-    if (!pinnedPrompt) return
+  // The links rail jumps to the message a link came from the same way.
+  const scrollToItem = (id: string): void => {
     userScrollUntil.current = Date.now() + 800
     nearBottom.current = false
     setReadingWindow((current) => {
-      if (current?.some((item) => item.id === pinnedPrompt.id)) return current
-      const index = conversationItems.findIndex((item) => item.id === pinnedPrompt.id)
+      if (current?.some((item) => item.id === id)) return current
+      const index = conversationItems.findIndex((item) => item.id === id)
       return index === -1 ? (current ?? lastVisibleItems.current) : conversationItems.slice(Math.max(0, index - 5))
     })
-    setPendingPromptScroll(pinnedPrompt.id)
+    setPendingPromptScroll(id)
   }
+  const scrollToPinnedPrompt = (): void => { if (pinnedPrompt) scrollToItem(pinnedPrompt.id) }
   useLayoutEffect(() => {
     if (!pendingPromptScroll) return
     const element = timeline.current
     const card = element?.querySelector<HTMLElement>('[data-item-id="' + CSS.escape(pendingPromptScroll) + '"]')
-    if (!element || !card) return
+    // Not rendered (folded into a group, say): nothing to scroll to, and nothing left waiting.
+    if (!element || !card) { setPendingPromptScroll(null); return }
     element.scrollTop += card.getBoundingClientRect().top - element.getBoundingClientRect().top - 12
     card.classList.add('sa-activity-flash')
     window.clearTimeout(promptFlashTimer.current)
@@ -890,6 +900,11 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     setReadingWindow(conversationItems.slice(-visibleCount))
     element.scrollTop += card.getBoundingClientRect().top - element.getBoundingClientRect().top - 12
   }, [conversationItems, ready, historical, projection.runtimeId, visibleCount])
+  // A plain-text question the agent ended its turn with and nobody has answered: a dot on the links
+  // toggle and the top of its rail. Dismissed per conversation, by the message it was asked in.
+  const asked = useMemo(() => historical ? null : unansweredQuestion(conversationItems, projection.phase), [historical, conversationItems, projection.phase])
+  const dismissedAsked = useMemo(() => localStorage.getItem(ASKED_DISMISSED_KEY + activeId), [activeId, askedVersion])
+  const openQuestion = asked && asked.itemId !== dismissedAsked ? asked : null
   const loadedMatches = useMemo(() => find.open ? conversationMatches(conversationItems, find.query) : [], [find.open, find.query, conversationItems])
   // History older than what is loaded is searched where it is stored; its hits count and step like
   // any other, and are paged in when the owner reaches one.
@@ -1223,6 +1238,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       {activePhases.has(projection.phase) && <span className="sa-session-phase" role="status"><span className={'sa-session-dot status-' + projection.phase} />{projection.phase === 'starting' ? 'Connecting…' : projection.phase === 'running' ? ['Thinking', 'Spelunking', 'Working', 'Considering'][workingWord] : projection.items.some(item => item.data.type === 'interaction' && item.data.interaction.status === 'pending' && item.data.interaction.review?.phase === 'reviewing') ? 'Waiting for stronger review' : displayPhase(projection.phase)}</span>}
       {pending > 0 && <span className="sa-attention-badge" aria-label={pending + ' pending requests'}>{pending}</span>}
       <span className="sa-spacer" />
+      <button className="sa-links-toggle" aria-label="Links and files" aria-pressed={linksOpen} title={openQuestion ? 'Links & files · the agent asked you something' : 'Links & files in this conversation'} onClick={toggleLinks}><Link2 size={15} />{openQuestion && <span className="sa-links-dot" aria-hidden="true" />}</button>
       <button aria-label="Copy transcript" title="Copy the whole conversation as Markdown" disabled={transcriptBusy} onClick={() => void copyTranscript()}>{transcriptBusy ? <LoaderCircle size={15} className="spin" /> : <ClipboardCopy size={15} />}</button>
       <button aria-label="Local change history" title="Files this conversation changed, with revert" onClick={() => setChangesOpen(true)}><FileDiff size={15} /></button>
       <button aria-label="Conversation history" title="History" onClick={() => setHistoryOpen(true)}><History size={15} /></button>
@@ -1250,7 +1266,8 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     {succession && <SuccessionBanner succession={succession} running={activePhases.has(projection.phase)} onOpen={() => followSuccession(succession)} />}
     {banner && <div className={'sa-runtime-banner sa-runtime-' + projection.phase} role="status"><PlugZap size={15} aria-hidden="true" /><span><strong>{banner.title}</strong><small>{banner.detail}</small></span>{banner.resume && <button className="sa-runtime-resume" disabled={banner.disabled} onClick={() => void resume()}>{resuming ? <LoaderCircle size={13} className="spin" /> : <Play size={13} />}{resuming ? 'Reconnecting...' : 'Resume conversation'}</button>}</div>}
     {find.open && <ConversationFindBar query={find.query} count={findMatches.length} index={find.index} results={findResults} searching={findSearching} focusToken={findFocus} onQuery={query => dispatchFind({ type: 'query', query })} onStep={direction => dispatchFind({ type: 'step', direction, count: findMatches.length })} onOpenHit={openFindHit} onClose={() => { dispatchFind({ type: 'close' }); if (composer.current && !composer.current.disabled) composer.current.focus(); else timeline.current?.focus() }} />}
-    {timelineView}
+    <div className="sa-body">{timelineView}{linksOpen && <ConversationLinksRail items={conversationItems} cwd={fileCwd} projectId={props.project.id} machineId={fileMachineId} asked={openQuestion}
+      onDismissAsked={itemId => { localStorage.setItem(ASKED_DISMISSED_KEY + activeId, itemId); setAskedVersion(value => value + 1) }} onJump={scrollToItem} onOpenFile={onOpenFile} onClose={toggleLinks} />}</div>
     <StructuredAgentTelemetry key={activeId} items={projection.items} runtimeId={projection.runtimeId} phase={projection.phase} truncated={projection.truncated} sessionId={activeId} cwd={fileCwd} projectId={props.project.id} interactive={!historical} onInspectAttachment={setInspectAttachment} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} />
     {!historical && !wizardActive(settings, provider) && <PendingGrantDock agentSessionId={activeId} rendered={renderedGrantCards} />}
     <form className="sa-composer agent-prompt-surface" onSubmit={event => { event.preventDefault(); void submit() }} onDragOver={event => { if (!isComposerFileDrag(event.dataTransfer.types)) return; event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'copy' }} onDrop={event => { if (!isComposerFileDrag(event.dataTransfer.types)) return; event.preventDefault(); event.stopPropagation(); void dropComposerFiles(event.dataTransfer) }}>
