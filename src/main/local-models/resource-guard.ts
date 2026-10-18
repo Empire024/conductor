@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { freemem } from 'node:os'
 import type { LocalModelConfig } from './config.ts'
@@ -29,9 +30,31 @@ export interface ResourceSnapshot { ramFreeBytes: number | null; vramFreeBytes: 
 export interface ServerProcess { pid: number; model: string; port?: number }
 const exec = (file: string, args: string[]): string => execFileSync(file, args, { encoding: 'utf8', windowsHide: true, timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim()
 
+/** Test hook for automation profiles only (CONDUCTOR_TEST_USER_DATA set): a JSON file holding the
+ *  inventory, [{pid, model, port?}], in place of the machine-wide process list. A parked smoke with
+ *  a stand-in server then never sees, matches or stops a llama-server the owner's projects run on
+ *  this machine (smoke-v3-s21, 2026-10-18: miron's real Qwen 9B was listed and the stand-in, a node
+ *  process, was dropped). An unreadable or malformed file fails closed like the real query. */
+export const TEST_INVENTORY_ENV = 'CONDUCTOR_TEST_LLAMA_INVENTORY'
+function testInventory(): ServerProcess[] | null {
+  const path = process.env[TEST_INVENTORY_ENV]
+  if (!path || !process.env.CONDUCTOR_TEST_USER_DATA) return null
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as unknown
+    if (!Array.isArray(parsed)) throw new Error('not an array')
+    return parsed.map(entry => {
+      const { pid, model, port } = entry as Partial<ServerProcess>
+      if (!Number.isInteger(pid) || (pid as number) <= 0 || typeof model !== 'string' || !model || (port !== undefined && !Number.isInteger(port))) throw new Error('bad entry')
+      return { pid: pid as number, model, ...(port === undefined ? {} : { port }) }
+    })
+  } catch { throw new Error(`Cannot read the test llama.cpp inventory ${path}; no second server was started.`) }
+}
+
 /** Read-only inventory also finds servers with missing records and servers under another root.
  * Command lines may contain keys: return only the model/port/pid, never the raw command. */
 export function runningLlamaProcesses(): ServerProcess[] {
+  const substitute = testInventory()
+  if (substitute) return substitute
   if (process.platform !== 'win32') throw new Error('Cannot verify the machine-wide llama.cpp process inventory on this platform; no server started')
   try {
     const raw = exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', "@(Get-CimInstance Win32_Process -Filter \"Name='llama-server.exe'\" -ErrorAction Stop | Select-Object ProcessId,CommandLine) | ConvertTo-Json -Compress"])

@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:net'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { defaultModelConfig, DOLPHIN_X1_8B, ORNITH_9B, QWEN_9B, QWEN_35B } from './config.ts'
-import { admissionRefusal, assertResourceHeadroom, resourceRequirements, withAdmissionLock } from './resource-guard.ts'
+import { admissionRefusal, assertResourceHeadroom, resourceRequirements, runningLlamaProcesses, TEST_INVENTORY_ENV, withAdmissionLock } from './resource-guard.ts'
 
 const GiB = 1024 ** 3
 describe('local model admission resources', () => {
@@ -48,6 +48,34 @@ describe('local model admission resources', () => {
   it('names the running model and never offers automatic eviction', () => {
     expect(admissionRefusal(QWEN_35B, QWEN_9B).message).toContain(`${QWEN_9B} is already running`)
     expect(admissionRefusal(QWEN_35B, QWEN_9B).message).toContain('Conductor has not stopped it')
+  })
+})
+
+describe('test llama.cpp inventory', () => {
+  // A parked smoke names its own inventory so it never sees or matches a server the owner's
+  // projects run on this machine (smoke-v3-s21, 2026-10-18).
+  it('replaces the machine-wide list only for an automation profile, and fails closed on a bad file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'conductor-inventory-')), file = join(dir, 'inventory.json')
+    const saved = { inventory: process.env[TEST_INVENTORY_ENV], profile: process.env.CONDUCTOR_TEST_USER_DATA }
+    try {
+      writeFileSync(file, JSON.stringify([{ pid: 999_999_001, model: 'local/qwen3.5-9b', port: 51999 }, { pid: 999_999_002, model: 'local/smoke-foreign' }]))
+      process.env[TEST_INVENTORY_ENV] = file
+      process.env.CONDUCTOR_TEST_USER_DATA = dir
+      expect(runningLlamaProcesses()).toEqual([{ pid: 999_999_001, model: 'local/qwen3.5-9b', port: 51999 }, { pid: 999_999_002, model: 'local/smoke-foreign' }])
+      writeFileSync(file, JSON.stringify([{ pid: -1, model: 'x' }]))
+      expect(() => runningLlamaProcesses()).toThrow(/Cannot read the test llama.cpp inventory/)
+      writeFileSync(file, '{')
+      expect(() => runningLlamaProcesses()).toThrow(/no second server was started/)
+      // Outside an automation profile the file is never read (the real, read-only query runs).
+      delete process.env.CONDUCTOR_TEST_USER_DATA
+      let real: Array<{ pid: number }> = []
+      try { real = runningLlamaProcesses() } catch { /* not Windows, or no process access: also not the file */ }
+      expect(real.map(entry => entry.pid)).not.toContain(999_999_001)
+    } finally {
+      if (saved.inventory === undefined) delete process.env[TEST_INVENTORY_ENV]; else process.env[TEST_INVENTORY_ENV] = saved.inventory
+      if (saved.profile === undefined) delete process.env.CONDUCTOR_TEST_USER_DATA; else process.env.CONDUCTOR_TEST_USER_DATA = saved.profile
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
 

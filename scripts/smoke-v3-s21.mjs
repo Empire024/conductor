@@ -9,13 +9,16 @@ import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
 import { expect } from '@playwright/test'
 
-// V3 verify S21: local.servers / local.stop against a stand-in llama.cpp server. The stand-in
-// answers /health, /slots (is_processing while a chat completion is in flight) and
-// /v1/chat/completions (slowly); a run record is written by hand so local.servers reports it
-// startedByConductor:true. Hard safety rule: local.stop is never called with force:true, and the
-// "not started by this Conductor" refusal case only uses a pid that this test instance's OWN
-// local.servers already reports startedByConductor:false (never the real machine-wide llama pid
-// found any other way).
+// V3 verify S21: local.servers / local.stop / local.protect against a stand-in llama.cpp server.
+// The stand-in answers /health, /slots (is_processing while a chat completion is in flight) and
+// /v1/chat/completions (slowly). A run record is written by hand, with the stand-in's own launch
+// identity, so local.servers reports it startedByConductor:true and local.stop can prove it is ours.
+// Isolation (2026-10-18: a real Qwen 9B another project ran on this machine was listed instead of
+// the stand-in): the instance reads its llama.cpp process inventory from a file this script writes
+// (CONDUCTOR_TEST_LLAMA_INVENTORY), naming only the stand-in and a decoy process this script owns,
+// so no server of the machine is ever listed, matched or stopped. Hard safety rules: local.stop is
+// never called with force:true, every stop and protect names a pid, and only the stand-in's or the
+// decoy's (callSafe refuses anything else before a request is sent).
 //   node scripts/smoke-lock.mjs -- node scripts/smoke-v3-s21.mjs [--keep]
 
 const keep = process.argv.includes('--keep')
@@ -76,6 +79,18 @@ const standInPid = standInChild.pid
 await expect.poll(() => existsSync(standInPortFile), { timeout: 15_000, intervals: [200] }).toBe(true)
 const standInPort = Number(await readFile(standInPortFile, 'utf8'))
 const standInFetch = (path, init) => fetch(`http://127.0.0.1:${standInPort}${path}`, init)
+// The decoy stands in for "a llama-server this Conductor did not start": a process of this
+// script's own, listed in the test inventory only, so the refusal case never names a real pid.
+const decoyChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true })
+const decoyPid = decoyChild.pid
+const DECOY_MODEL = 'local/smoke-foreign'
+const ownPids = new Set([standInPid, decoyPid])
+const inventoryPath = join(root, 'llama-inventory.json')
+await writeFile(inventoryPath, JSON.stringify([{ pid: standInPid, model: MODEL, port: standInPort }, { pid: decoyPid, model: DECOY_MODEL }]))
+// The identity a launch records (llama.ts processControl, read while the child handle pins the pid).
+const { processControl } = await import(new URL('../src/main/local-models/llama.ts', import.meta.url).href)
+const standInIdentity = await processControl.inspect(standInPid, 15_000)
+assert.equal(standInIdentity.state, 'running', `the stand-in's identity could not be read: ${JSON.stringify(standInIdentity)}`)
 
 await writeFile(join(localRoot, 'config', 'api-key'), KEY + '\n')
 await writeFile(join(localRoot, 'config', 'config.json'), JSON.stringify({
@@ -85,13 +100,13 @@ await writeFile(join(localRoot, 'config', 'config.json'), JSON.stringify({
 }, null, 2))
 // The run record local.servers reads (src/main/local-models/config.ts runFile): pid must be alive.
 const runRecordPath = join(localRoot, 'runtime', MODEL.replace(/[^a-z0-9.-]/gi, '_') + '.json')
-await writeFile(runRecordPath, JSON.stringify({ pid: standInPid, port: standInPort, model: MODEL, file: 'model.gguf', startedAt: new Date().toISOString() }, null, 2))
+await writeFile(runRecordPath, JSON.stringify({ pid: standInPid, port: standInPort, model: MODEL, file: 'model.gguf', startedAt: new Date().toISOString(), generation: 'smoke-v3-s21', identity: { creationTime: standInIdentity.creationTime, executable: standInIdentity.executable } }, null, 2))
 
 const git = (...args) => execFileSync('git', args, { cwd: projectPath, stdio: 'pipe' }).toString().trim()
 await writeFile(join(projectPath, 'README.md'), '# V3 S21 smoke\n')
 git('init', '-q', '-b', 'main'); git('-c', 'user.email=smoke@example.invalid', '-c', 'user.name=Smoke', 'add', '.'); git('-c', 'user.email=smoke@example.invalid', '-c', 'user.name=Smoke', 'commit', '-q', '-m', 'Initial')
 
-const env = { ...process.env, CONDUCTOR_TEST_USER_DATA: profile, CONDUCTOR_PROJECTS_ROOT: join(root, 'projects'), CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_LOCAL_ROOT: localRoot, CONDUCTOR_DURABLE_JOBS_MODEL_ENDPOINT: `http://127.0.0.1:${standInPort}` }
+const env = { ...process.env, CONDUCTOR_TEST_USER_DATA: profile, CONDUCTOR_PROJECTS_ROOT: join(root, 'projects'), CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_LOCAL_ROOT: localRoot, CONDUCTOR_DURABLE_JOBS_MODEL_ENDPOINT: `http://127.0.0.1:${standInPort}`, CONDUCTOR_TEST_LLAMA_INVENTORY: inventoryPath }
 delete env.ELECTRON_RUN_AS_NODE; delete env.CONDUCTOR_LIVE_TESTS; delete env.CONDUCTOR_BACKGROUND_WINDOWS
 
 let owner, projectId
@@ -99,6 +114,13 @@ const credential = async () => JSON.parse(await readFile(join(profile, 'control-
 const request = async (method, args = {}) => { const r = await fetch(owner.endpoint, { method: 'POST', headers: { Authorization: 'Bearer ' + owner.token, 'Content-Type': 'application/json' }, body: JSON.stringify({ method, args, ...(projectId ? { scope: { projectId } } : {}) }) }); return { status: r.status, body: await r.json() } }
 const call = async (method, args = {}) => { const r = await request(method, args); assert.equal(r.status, 200, `${method}: ${JSON.stringify(r.body)}`); return r.body.result }
 const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
+// Every call that can stop or claim a server goes through here: it must name a pid of this script's.
+const callSafe = async (method, args) => {
+  if (!ownPids.has(args.pid)) throw new Error(`refusing to send ${method} for pid ${args.pid}: not the stand-in's or the decoy's`)
+  return request(method, args)
+}
+// No server of the machine may ever be visible to this instance.
+const isolated = (servers, label) => { for (const server of servers) if (server.pid !== null && !ownPids.has(server.pid)) throw new Error(`${label}: local.servers listed pid ${server.pid} (${server.model}), which is not this script's; isolation failed`) }
 const tasklistLines = () => { try { return execFileSync('tasklist', { encoding: 'utf8' }).split('\n').filter(l => l.toLowerCase().includes('llama')) } catch { return [] } }
 
 const summary = { root, profile, build: resolve('out/main/index.js') }
@@ -118,12 +140,15 @@ try {
 
   const serversBefore = await call('local.servers')
   observe('local.servers (before any turn)', { serversBefore })
-  const ours = serversBefore.find(s => s.model === MODEL)
   summary.serversBefore = serversBefore
+  isolated(serversBefore, 'before any turn')
+  const ours = serversBefore.find(s => s.model === MODEL)
   assert.ok(ours, 'the stand-in server was not reported by local.servers')
   assert.equal(ours.startedByConductor, true, 'the stand-in should be reported startedByConductor:true')
   assert.equal(ours.pid, standInPid)
   assert.equal(ours.port, standInPort)
+  assert.equal(ours.ownerProject, null, 'a hand-written record names no owner')
+  assert.equal(ours.protected, false)
 
   // tabs.open needs the renderer's workspace pane mounted after projects.open (see S7's finding:
   // the shipped smoke-local-restart.mjs races this under load); this script has no CDP window
@@ -136,36 +161,50 @@ try {
   await expect.poll(standInProcessing, { timeout: 15_000, intervals: [200] }).toBe(true)
   observe('turn is mid-flight against the stand-in')
 
-  const stopWhileBusy = await request('local.stop', { model: MODEL })
-  observe('local.stop({model}) while busy', stopWhileBusy)
+  const stopWhileBusy = await callSafe('local.stop', { pid: standInPid })
+  observe('local.stop({pid}) while busy', stopWhileBusy)
   assert.notEqual(stopWhileBusy.status, 200, 'local.stop should refuse while the conversation is mid-turn')
   assert.match(JSON.stringify(stopWhileBusy.body), /mid-turn|busy|generating/i)
 
   const serversWhileBusy = await call('local.servers')
   summary.serversWhileBusy = serversWhileBusy
+  isolated(serversWhileBusy, 'while busy')
   observe('local.servers while busy', { serversWhileBusy })
 
-  // A pid this test instance's own local.servers reports startedByConductor:false (never the real
-  // owner pid found any other way) — only if one exists (a real llama-server may be visible via
-  // the machine-wide process inventory scan).
-  const notOurs = serversWhileBusy.find(s => s.startedByConductor === false)
-  if (notOurs) {
-    const refusedPid = await request('local.stop', { pid: notOurs.pid })
-    observe('local.stop({pid: not-started-by-conductor}) refusal', { pid: notOurs.pid, refusedPid })
-    summary.notStartedByConductorRefusal = { pid: notOurs.pid, status: refusedPid.status, body: refusedPid.body }
-    assert.notEqual(refusedPid.status, 200)
-    assert.match(JSON.stringify(refusedPid.body), /not started by this Conductor/i)
-  } else {
-    summary.notStartedByConductorRefusal = 'no startedByConductor:false server was visible in this test instance; case not exercised'
-    observe('no startedByConductor:false server visible; skipping that refusal case')
-  }
+  // The decoy is listed as a server this Conductor did not start; stopping it is refused, and it lives on.
+  const notOurs = serversWhileBusy.find(s => s.pid === decoyPid)
+  assert.ok(notOurs, 'the decoy from the test inventory was not listed')
+  assert.equal(notOurs.startedByConductor, false)
+  const refusedPid = await callSafe('local.stop', { pid: decoyPid })
+  observe('local.stop({pid: not-started-by-conductor}) refusal', { pid: decoyPid, refusedPid })
+  summary.notStartedByConductorRefusal = { pid: decoyPid, status: refusedPid.status, body: refusedPid.body }
+  assert.notEqual(refusedPid.status, 200)
+  assert.match(JSON.stringify(refusedPid.body), /not started by this Conductor/i)
+  assert.equal(alive(decoyPid), true, 'the refused stop must leave the decoy running')
 
   await expect.poll(async () => (await call('agents.status', { agentSessionId })).phase, { timeout: 30_000, intervals: [500] }).toBe('completed')
   await expect.poll(standInProcessing, { timeout: 5000 }).toBe(false)
   observe('turn completed; stand-in now idle')
 
-  const stopNowOk = await request('local.stop', { model: MODEL })
-  observe('local.stop({model}) after completion', stopNowOk)
+  // local.protect keeps its claim in the run record (cross-project-cleanup-guardrails): the file
+  // on disk carries it, local.servers reports it, and lifting it removes it again.
+  const protectedNow = await callSafe('local.protect', { pid: standInPid, reason: 'smoke: keep the stand-in up' })
+  observe('local.protect({pid})', protectedNow)
+  assert.equal(protectedNow.status, 200, JSON.stringify(protectedNow.body))
+  const recordProtection = JSON.parse(await readFile(runRecordPath, 'utf8')).protection
+  assert.equal(recordProtection?.reason, 'smoke: keep the stand-in up', 'the protection must be written into the run record')
+  assert.equal(recordProtection?.projectId, projectId)
+  const serversProtected = await call('local.servers')
+  isolated(serversProtected, 'while protected')
+  assert.equal(serversProtected.find(s => s.pid === standInPid)?.protected, true)
+  assert.equal(serversProtected.find(s => s.pid === standInPid)?.protection?.reason, 'smoke: keep the stand-in up')
+  const lifted = await callSafe('local.protect', { pid: standInPid, protect: false })
+  assert.equal(lifted.status, 200, JSON.stringify(lifted.body))
+  assert.equal(JSON.parse(await readFile(runRecordPath, 'utf8')).protection, undefined, 'lifting must remove the protection from the run record')
+  summary.protection = { protected: protectedNow.body, record: recordProtection, lifted: lifted.body }
+
+  const stopNowOk = await callSafe('local.stop', { pid: standInPid })
+  observe('local.stop({pid}) after completion', stopNowOk)
   assert.equal(stopNowOk.status, 200, JSON.stringify(stopNowOk.body))
   summary.stopNowOk = stopNowOk.body
   await expect.poll(() => alive(standInPid), { timeout: 10_000, intervals: [300] }).toBe(false)
@@ -190,6 +229,8 @@ try {
   try { summary.appLog = readFileSync(appLog, 'utf8').split('\n').filter(line => /local|llama|Error|error/i.test(line)).slice(-40) } catch { /* no log */ }
   summary.standInPidAliveAtEnd = alive(standInPid)
   if (alive(standInPid)) { try { execFileSync('taskkill.exe', ['/pid', String(standInPid), '/T', '/F'], { stdio: 'ignore' }) } catch { /* gone */ } }
+  // The decoy is this script's own child, killed through its handle (never a pid lookup).
+  try { decoyChild.kill() } catch { /* gone */ }
 }
 const result = { result: failed ? 'FAIL' : 'PASS', ...summary, root: keep || failed ? root : '(removed)', localRoot, observations }
 await writeFile(join(output, 'S21-summary.json'), JSON.stringify(result, null, 2))
