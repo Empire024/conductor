@@ -27,7 +27,6 @@ import { ProjectBacklogs } from './project-backlog'
 import type { ProjectTaskListQuery } from '../shared/project-backlog'
 import { ProjectTaskDispatcher } from './project-task-dispatch'
 import { SourceControl } from './source-control'
-import { pruneDiffSnapshots } from './agent-artifacts'
 import type { RevertScope } from '../shared/agent-change-history'
 import { AgentControl } from './agent-control'
 import { AgentControlServer } from './agent-control-server'
@@ -3374,7 +3373,7 @@ app.whenReady().then(async () => {
   installApplicationMenu()
   // Local snapshots are the only pre-git safety net, so they are kept generously but not
   // forever: age them out on launch and once a day, the way the event journal is compacted.
-  const pruneSnapshots = (): void => { try { pruneDiffSnapshots(database.structured.artifactDirectory) } catch (error) { console.error('Ignoring agent snapshot prune failure', error) } }
+  const pruneSnapshots = (): void => { try { database.structured.pruneArtifacts() } catch (error) { console.error('Ignoring agent snapshot prune failure', error) } }
   pruneSnapshots()
   snapshotPruneTimer = setInterval(pruneSnapshots, 24 * 60 * 60 * 1000)
   snapshotPruneTimer.unref?.()

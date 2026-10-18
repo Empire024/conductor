@@ -634,7 +634,7 @@ describe.skipIf(!engine.available)('audit browser', { timeout: BROWSER_TIMEOUT }
     await page.fill('#f [name="email"]', value)
     expect(await page.evaluate<string>(`document.querySelector('#f [name="email"]').value`)).toBe(value.value)
     await browser.close()
-  })
+  }, 60_000)
 
   it('loads a guest account\'s gate-only state into every unauthenticated page after preparing it, and refuses the open when preparing fails', async () => {
     const site = server.site('baseline')

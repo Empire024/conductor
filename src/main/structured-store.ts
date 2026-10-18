@@ -11,6 +11,7 @@ import { emptyProjection, projectAgentEvent } from '../shared/structured-agent-r
 import { emptyArchiveTail, growArchiveTail, settleArchiveTail, type ArchiveTail } from './conversation-history'
 import { liveCostLimits, liveReplacementAuthorization } from './live-test-policy'
 import { anonymousConversations } from './local-models/anonymous'
+import { pruneDiffSnapshots, pruneOutputArtifacts } from './agent-artifacts'
 
 /** Events beyond this many for a conversation live only in the durable transcript archive, never
  *  in the bounded journal `checkpoint` trims below it. */
@@ -162,6 +163,8 @@ function usageEvent(row: Record<string, unknown>, data: AgentEventData): WeeklyU
   return event
 }
 
+const ARTIFACT_ALLOWANCE_BYTES = 512 * 1024 * 1024
+
 export class StructuredAgentStore {
   private artifactBytes = 0
   private projections = new Map<string, SessionProjection>()
@@ -189,7 +192,7 @@ export class StructuredAgentStore {
     this.usageWeeks = new UsageWeeksStore(db)
     this.artifactDirectory = join(dataDirectory, 'agent-artifacts')
     mkdirSync(this.artifactDirectory, { recursive: true, mode: 0o700 })
-    this.artifactBytes = readdirSync(this.artifactDirectory).filter(name => /^[a-f0-9-]+\.(json|txt)$/.test(name)).reduce((sum, name) => sum + statSync(join(this.artifactDirectory, name)).size, 0)
+    this.artifactBytes = this.countArtifactBytes()
     db.exec(`
       CREATE TABLE IF NOT EXISTS structured_sessions (
         id TEXT PRIMARY KEY REFERENCES agent_sessions(id) ON DELETE CASCADE,
@@ -736,9 +739,23 @@ export class StructuredAgentStore {
     return id
   }
   artifact(sessionId: string, id: string): DiffArtifact { return JSON.parse(this.readArtifact(sessionId, id, 'diff')) as DiffArtifact }
+  private countArtifactBytes(): number {
+    return readdirSync(this.artifactDirectory).filter(name => /^[a-f0-9-]+\.(json|txt)$/.test(name)).reduce((sum, name) => sum + statSync(join(this.artifactDirectory, name)).size, 0)
+  }
+  /** Bound the artifact directory (old diff snapshots and old command output keep only their patch
+   *  or tail) and recount what is left, so the allowance below is measured against the pruned
+   *  directory rather than the launch-time total. Runs on launch, daily, and when a write would
+   *  otherwise hit the allowance. */
+  pruneArtifacts(now = Date.now()): { pruned: number; freedBytes: number } {
+    const diffs = pruneDiffSnapshots(this.artifactDirectory, now)
+    const outputs = pruneOutputArtifacts(this.artifactDirectory, now)
+    try { this.artifactBytes = this.countArtifactBytes() } catch { this.artifactBytes = Math.max(0, this.artifactBytes - diffs.freedBytes - outputs.freedBytes) }
+    return { pruned: diffs.pruned + outputs.pruned, freedBytes: diffs.freedBytes + outputs.freedBytes }
+  }
   private writeArtifact(filename: string, data: string): void {
     const bytes = Buffer.byteLength(data)
-    if (this.artifactBytes + bytes > 512 * 1024 * 1024) throw new Error('Private agent artifact storage reached its 512 MiB allowance; existing history was preserved')
+    if (this.artifactBytes + bytes > ARTIFACT_ALLOWANCE_BYTES) this.pruneArtifacts()
+    if (this.artifactBytes + bytes > ARTIFACT_ALLOWANCE_BYTES) throw new Error('Private agent artifact storage reached its 512 MiB allowance; existing history was preserved')
     writeFileSync(join(this.artifactDirectory, filename), data, { flag: 'wx', mode: 0o600 })
     this.artifactBytes += bytes
   }

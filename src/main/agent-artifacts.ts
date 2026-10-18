@@ -359,3 +359,36 @@ export function pruneDiffSnapshots(directory: string, now = Date.now(), maxAgeMs
   }
   return { pruned, freedBytes }
 }
+
+const PRUNED_OUTPUT_MARKER = '[Older command output was pruned to bound local artifact storage; its last lines are kept.]\n'
+
+/** The same bound for command-output artifacts (.txt), which nothing pruned before and which had
+ *  grown to most of the private allowance on the owner's machine. Past the window or over budget an
+ *  output keeps only its tail behind a marker, so its id still resolves and the timeline still shows
+ *  how the command ended. */
+export function pruneOutputArtifacts(directory: string, now = Date.now(), maxAgeMs = 30 * 24 * 60 * 60 * 1000, budgetBytes = 192 * 1024 * 1024, tailBytes = 4 * 1024): { pruned: number; freedBytes: number } {
+  let entries: Array<{ file: string; size: number; at: number }>
+  try {
+    entries = readdirSync(directory).filter(name => /^[a-f0-9-]+\.txt$/.test(name)).map(name => {
+      const stat = statSync(join(directory, name))
+      return { file: join(directory, name), size: stat.size, at: stat.mtimeMs }
+    }).sort((left, right) => right.at - left.at)
+  } catch { return { pruned: 0, freedBytes: 0 } }
+  let kept = 0, pruned = 0, freedBytes = 0
+  for (const entry of entries) {
+    kept += entry.size
+    if (now - entry.at <= maxAgeMs && kept <= budgetBytes) continue
+    if (entry.size <= tailBytes + PRUNED_OUTPUT_MARKER.length) continue
+    try {
+      const text = readFileSync(entry.file, 'utf8')
+      if (text.startsWith(PRUNED_OUTPUT_MARKER)) continue
+      const data = PRUNED_OUTPUT_MARKER + text.slice(-tailBytes)
+      writeFileSync(entry.file, data, { mode: 0o600 })
+      const freed = entry.size - Buffer.byteLength(data)
+      kept -= freed
+      freedBytes += freed
+      pruned++
+    } catch { /* An unreadable or concurrently written artifact is left exactly as it is. */ }
+  }
+  return { pruned, freedBytes }
+}

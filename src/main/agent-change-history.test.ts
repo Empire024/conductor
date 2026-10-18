@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, w
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { AgentArtifacts, pruneDiffSnapshots } from './agent-artifacts'
+import { AgentArtifacts, pruneDiffSnapshots, pruneOutputArtifacts } from './agent-artifacts'
 import { StructuredAgentStore } from './structured-store'
 import type { AgentEvent, AgentEventData, FileChange } from '../shared/structured-agent'
 import type { DiffArtifact } from '../shared/structured-agent'
@@ -230,5 +230,32 @@ describe('bounding local snapshot storage', () => {
     expect(pruneDiffSnapshots(f.store.artifactDirectory, Date.now(), 30 * 24 * 60 * 60 * 1000, budget).pruned).toBe(2)
     const survivors = ids.filter(id => (JSON.parse(readFileSync(join(f.store.artifactDirectory, id + '.json'), 'utf8')) as DiffArtifact).after !== null)
     expect(survivors).toEqual([ids.at(-1)])
+  })
+
+  it('cuts aged-out command output to its tail and keeps the id readable', () => {
+    const f = fixture()
+    const recent = f.store.putOutput('session', 'recent '.repeat(2000))
+    const old = f.store.putOutput('session', 'head '.repeat(4000) + 'THE END')
+    const stale = Date.now() / 1000 - 90 * 24 * 60 * 60
+    utimesSync(join(f.store.artifactDirectory, old + '.txt'), stale, stale)
+    expect(pruneOutputArtifacts(f.store.artifactDirectory).pruned).toBe(1)
+    const pruned = f.store.output('session', old)
+    expect(pruned).toMatch(/^\[Older command output was pruned/)
+    expect(pruned.endsWith('THE END')).toBe(true)
+    expect(pruned.length).toBeLessThan(5 * 1024)
+    expect(f.store.output('session', recent)).toBe('recent '.repeat(2000))
+    expect(pruneOutputArtifacts(f.store.artifactDirectory).pruned).toBe(0)
+  })
+
+  it('prunes instead of refusing when a write would reach the allowance', () => {
+    const f = fixture()
+    const old = f.store.putOutput('session', 'x'.repeat(64 * 1024))
+    const stale = Date.now() / 1000 - 90 * 24 * 60 * 60
+    utimesSync(join(f.store.artifactDirectory, old + '.txt'), stale, stale)
+    // Simulate a directory that a previous run filled to the allowance.
+    ;(f.store as unknown as { artifactBytes: number }).artifactBytes = 512 * 1024 * 1024
+    const fresh = f.store.putOutput('session', 'new output')
+    expect(f.store.output('session', fresh)).toBe('new output')
+    expect(f.store.output('session', old)).toMatch(/^\[Older command output was pruned/)
   })
 })
