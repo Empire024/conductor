@@ -608,6 +608,9 @@ textarea.input { resize: none; line-height: 1.45; }
 
 .attachments { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .attachment { font-size: 11px; color: var(--text-3); background: var(--surface-2); border-radius: 6px; padding: 2px 6px; }
+.delivered { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 6px; }
+.delivered-label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .4px; color: var(--accent); }
+.delivered-file { font-size: 11px; color: var(--text); background: color-mix(in srgb, var(--accent) 14%, transparent); border-radius: 6px; padding: 2px 6px; overflow-wrap: anywhere; }
 
 .status-line { align-self: center; font-size: 12px; color: var(--text-3); text-align: center; max-width: 92%; }
 

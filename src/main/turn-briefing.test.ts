@@ -9,7 +9,7 @@ import { MEMORY_PROTOCOL } from './memory'
 import type { CoworkerBriefingOptions } from './agent-collaboration-store'
 import { CoworkerRecovery } from './coworker-recovery'
 import { COWORKER_OPENED_PREFIX } from './coworker-autoclose'
-import { CONTEXT_RESET, OUTAGE_NUDGES, FINISH_HINT, MEMORY_HEADING, LOCAL_ASSIST_HINT, SHELL_HYGIENE_HINT, TurnBriefings, handoffNudge, SUCCESSION_HINT, SUCCESSION_NUDGE, SUCCESSION_PERCENT, SUCCESSION_TURNS, successionDue, successionNudge, successionProgress, coworkerHint } from './turn-briefing'
+import { CONTEXT_RESET, OUTAGE_NUDGES, FINISH_HINT, deliveryHint, MEMORY_HEADING, LOCAL_ASSIST_HINT, SHELL_HYGIENE_HINT, TurnBriefings, handoffNudge, SUCCESSION_HINT, SUCCESSION_NUDGE, SUCCESSION_PERCENT, SUCCESSION_TURNS, successionDue, successionNudge, successionProgress, coworkerHint } from './turn-briefing'
 
 const roots: string[] = [], databases: ConductorDatabase[] = []
 afterEach(() => {
@@ -159,6 +159,19 @@ describe('what a native runtime is told, and how often', () => {
     expect(f.briefings.compose(f.spec, 'Again', 'item-2', 'runtime-1')).not.toContain(LOCAL_ASSIST_HINT)
     const grok = fixture('grok')
     expect(grok.briefings.compose(grok.spec, 'Run the tests', 'item-1', '')).not.toContain(LOCAL_ASSIST_HINT)
+  })
+
+  it('tells Claude and Codex once per runtime how to deliver a file to the owner', () => {
+    const claude = fixture('claude')
+    expect(claude.briefings.compose(claude.spec, 'Make the logo', 'item-1', '')).toContain(deliveryHint('claude'))
+    expect(deliveryHint('claude')).toContain('files.open is for text files only')
+    expect(deliveryHint('claude').length).toBeLessThan(170)
+    claude.starting('runtime-1')
+    expect(claude.briefings.compose(claude.spec, 'Again', 'item-2', 'runtime-1')).not.toContain(deliveryHint('claude'))
+    const codex = fixture('codex')
+    expect(codex.briefings.compose(codex.spec, 'Make the logo', 'item-1', '')).toContain(':codex-file-citation{path="..." purpose="output"}')
+    const grok = fixture('grok')
+    expect(grok.briefings.compose(grok.spec, 'Make the logo', 'item-1', '')).not.toContain('To deliver a file')
   })
 
   it('tells a coworker a controller opened, once per runtime, to finish itself when done', () => {

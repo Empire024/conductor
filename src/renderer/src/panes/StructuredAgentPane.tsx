@@ -16,7 +16,7 @@ import { isRemoteFileMachine } from '../remote-files'
 import { openConversationFile } from '../conversation-file-open'
 import { MemoryRecallStrip, recallsByItem } from './MemoryRecallStrip'
 import { AgentChangeHistoryView } from './AgentChangeHistory'
-import { ConversationLinksRail } from './ConversationLinksRail'
+import { ConversationLinksRail, useDeliveredOutputs } from './ConversationLinksRail'
 import { unansweredQuestion } from './conversation-links'
 import { StructuredComposerControls } from './StructuredComposerControls'
 import { StructuredSendButton, sendButtonIntent } from './StructuredSendButton'
@@ -111,6 +111,7 @@ function ComposerTextarea({ projectId, sessionId, textareaRef, ...props }: { pro
 
 const LINKS_RAIL_KEY = 'conductor.conversation-links-open'
 const ASKED_DISMISSED_KEY = 'conductor.conversation-asked-dismissed.'
+const DELIVERED_SEEN_KEY = 'conductor.conversation-delivered-seen.'
 export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Element {
   const restoredView = useRef(suspendedViews.get(props.resourceId) ?? null)
   const [activeId, setActiveId] = useState(() => restoredView.current?.activeId ?? props.conversationId ?? props.resourceId)
@@ -905,6 +906,16 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const asked = useMemo(() => historical ? null : unansweredQuestion(conversationItems, projection.phase), [historical, conversationItems, projection.phase])
   const dismissedAsked = useMemo(() => localStorage.getItem(ASKED_DISMISSED_KEY + activeId), [activeId, askedVersion])
   const openQuestion = asked && asked.itemId !== dismissedAsked ? asked : null
+  // The files the latest turn delivered: the top of the rail, and a dot on its toggle until the
+  // rail has been open while they were there.
+  const delivered = useDeliveredOutputs(conversationItems, fileCwd, props.project.id, fileMachineId)
+  const deliveredSeen = useMemo(() => localStorage.getItem(DELIVERED_SEEN_KEY + activeId), [activeId, askedVersion])
+  const deliveredUnseen = !historical && Boolean(delivered.signature) && delivered.signature !== deliveredSeen
+  useEffect(() => {
+    if (!linksOpen || !deliveredUnseen) return
+    localStorage.setItem(DELIVERED_SEEN_KEY + activeId, delivered.signature)
+    setAskedVersion(value => value + 1)
+  }, [linksOpen, deliveredUnseen, delivered.signature, activeId])
   const loadedMatches = useMemo(() => find.open ? conversationMatches(conversationItems, find.query) : [], [find.open, find.query, conversationItems])
   // History older than what is loaded is searched where it is stored; its hits count and step like
   // any other, and are paged in when the owner reaches one.
@@ -1238,7 +1249,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       {activePhases.has(projection.phase) && <span className="sa-session-phase" role="status"><span className={'sa-session-dot status-' + projection.phase} />{projection.phase === 'starting' ? 'Connecting…' : projection.phase === 'running' ? ['Thinking', 'Spelunking', 'Working', 'Considering'][workingWord] : projection.items.some(item => item.data.type === 'interaction' && item.data.interaction.status === 'pending' && item.data.interaction.review?.phase === 'reviewing') ? 'Waiting for stronger review' : displayPhase(projection.phase)}</span>}
       {pending > 0 && <span className="sa-attention-badge" aria-label={pending + ' pending requests'}>{pending}</span>}
       <span className="sa-spacer" />
-      <button className="sa-links-toggle" aria-label="Links and files" aria-pressed={linksOpen} title={openQuestion ? 'Links & files · the agent asked you something' : 'Links & files in this conversation'} onClick={toggleLinks}><Link2 size={15} />{openQuestion && <span className="sa-links-dot" aria-hidden="true" />}</button>
+      <button className="sa-links-toggle" aria-label="Links and files" aria-pressed={linksOpen} title={openQuestion ? 'Links & files · the agent asked you something' : deliveredUnseen ? 'Links & files · the agent delivered files' : 'Links & files in this conversation'} onClick={toggleLinks}><Link2 size={15} />{(openQuestion || deliveredUnseen) && <span className="sa-links-dot" aria-hidden="true" />}</button>
       <button aria-label="Copy transcript" title="Copy the whole conversation as Markdown" disabled={transcriptBusy} onClick={() => void copyTranscript()}>{transcriptBusy ? <LoaderCircle size={15} className="spin" /> : <ClipboardCopy size={15} />}</button>
       <button aria-label="Local change history" title="Files this conversation changed, with revert" onClick={() => setChangesOpen(true)}><FileDiff size={15} /></button>
       <button aria-label="Conversation history" title="History" onClick={() => setHistoryOpen(true)}><History size={15} /></button>
@@ -1266,7 +1277,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     {succession && <SuccessionBanner succession={succession} running={activePhases.has(projection.phase)} onOpen={() => followSuccession(succession)} />}
     {banner && <div className={'sa-runtime-banner sa-runtime-' + projection.phase} role="status"><PlugZap size={15} aria-hidden="true" /><span><strong>{banner.title}</strong><small>{banner.detail}</small></span>{banner.resume && <button className="sa-runtime-resume" disabled={banner.disabled} onClick={() => void resume()}>{resuming ? <LoaderCircle size={13} className="spin" /> : <Play size={13} />}{resuming ? 'Reconnecting...' : 'Resume conversation'}</button>}</div>}
     {find.open && <ConversationFindBar query={find.query} count={findMatches.length} index={find.index} results={findResults} searching={findSearching} focusToken={findFocus} onQuery={query => dispatchFind({ type: 'query', query })} onStep={direction => dispatchFind({ type: 'step', direction, count: findMatches.length })} onOpenHit={openFindHit} onClose={() => { dispatchFind({ type: 'close' }); if (composer.current && !composer.current.disabled) composer.current.focus(); else timeline.current?.focus() }} />}
-    <div className="sa-body">{timelineView}{linksOpen && <ConversationLinksRail items={conversationItems} cwd={fileCwd} projectId={props.project.id} machineId={fileMachineId} asked={openQuestion}
+    <div className="sa-body">{timelineView}{linksOpen && <ConversationLinksRail items={conversationItems} cwd={fileCwd} projectId={props.project.id} machineId={fileMachineId} asked={openQuestion} delivered={delivered.links}
       onDismissAsked={itemId => { localStorage.setItem(ASKED_DISMISSED_KEY + activeId, itemId); setAskedVersion(value => value + 1) }} onJump={scrollToItem} onOpenFile={onOpenFile} onClose={toggleLinks} />}</div>
     <StructuredAgentTelemetry key={activeId} items={projection.items} runtimeId={projection.runtimeId} phase={projection.phase} truncated={projection.truncated} sessionId={activeId} cwd={fileCwd} projectId={props.project.id} interactive={!historical} onInspectAttachment={setInspectAttachment} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} />
     {!historical && !wizardActive(settings, provider) && <PendingGrantDock agentSessionId={activeId} rendered={renderedGrantCards} />}

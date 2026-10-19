@@ -410,5 +410,35 @@
     return host
   }
 
-  root.ConductorMarkdown = { parse: parse, parseInline: parseInline, render: render, safeUrl: safeUrl }
+  /* The files a reply hands over (feature-list delivered-outputs-highlight): Codex output citations,
+   * markdown links and plain mentions of an absolute local path with a file extension, in order,
+   * each once. The phone cannot stat or open them, so a relative path, which may be any word with
+   * a dot, is not counted. */
+  const ABSOLUTE = /^(?:file:\/\/\/?|\/)?[a-zA-Z]:[\\/]/
+  const deliveredFiles = source => {
+    const text = String(source === null || source === undefined ? '' : source)
+    const files = []
+    const seen = new Set()
+    const add = raw => {
+      let path = String(raw || '').trim()
+      try { path = decodeURIComponent(path) } catch (error) { /* keep it as written */ }
+      path = path.replace(/^file:\/\/\/?/i, '').replace(/^\/(?=[a-zA-Z]:)/, '').replace(/(?::\d+(?::\d+)?|#L\d+)$/, '')
+      if (!ABSOLUTE.test(path) || !/\.[a-zA-Z][a-zA-Z0-9]{0,11}$/.test(path)) return
+      const key = path.replace(/\\/g, '/').toLowerCase()
+      if (seen.has(key)) return
+      seen.add(key)
+      files.push({ name: path.replace(/\\/g, '/').split('/').filter(Boolean).pop(), path: path })
+    }
+    const prose = text
+      .replace(/:codex-file-citation(?:\[[^\]\n]*\])?\{([^}\n]*)\}/g, (whole, body) => {
+        const match = /path\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"']+))/.exec(body)
+        if (match) add(match[1] || match[2] || match[3])
+        return ' '
+      })
+      .replace(/\[[^\]\n]*\]\(\s*(?:<([^>\n]+)>|([^)\s>]+))[^)\n]*\)/g, (whole, bracketed, bare) => { add(bracketed || bare); return ' ' })
+    for (const match of prose.matchAll(/(?:^|[\s(`"'])([a-zA-Z]:[\\/][^<>"'`\n]*?\.[a-zA-Z][a-zA-Z0-9]{0,11}(?::\d+(?::\d+)?|#L\d+)?)(?=[\s),;!?`"'\]]|\.(?:\s|$)|$)/g)) add(match[1])
+    return files
+  }
+
+  root.ConductorMarkdown = { parse: parse, parseInline: parseInline, render: render, safeUrl: safeUrl, deliveredFiles: deliveredFiles }
 })(typeof window !== 'undefined' ? window : globalThis)

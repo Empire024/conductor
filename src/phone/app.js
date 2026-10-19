@@ -2550,6 +2550,20 @@
       for (const attachment of attachments) chips.appendChild(el('span', 'attachment', attachment.name || attachment.kind || 'attachment'))
       node.appendChild(chips)
     }
+    /* Files the agent handed over in this reply, named under it so they are easy to find; they
+       open on the computer (its Links & files rail lists them under Delivered). */
+    const markdown = window.ConductorMarkdown
+    const delivered = data.role === 'assistant' && !item.parentId && markdown && typeof markdown.deliveredFiles === 'function' ? markdown.deliveredFiles(text) : []
+    if (delivered.length) {
+      const box = el('div', 'delivered')
+      box.appendChild(el('span', 'delivered-label', 'Delivered'))
+      for (const file of delivered.slice(0, 12)) {
+        const chip = el('span', 'delivered-file', file.name)
+        chip.title = file.path
+        box.appendChild(chip)
+      }
+      node.appendChild(box)
+    }
     const stamp = el('time', 'bubble-time', dayTime(item.timestamp))
     node.appendChild(stamp)
     return node

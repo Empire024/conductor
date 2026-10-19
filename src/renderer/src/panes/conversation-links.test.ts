@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { AgentEventData, TimelineItem } from '../../../shared/structured-agent'
-import { conversationLinks, itemLinks, lastParagraph, unansweredQuestion, type LinkContext } from './conversation-links'
+import { conversationLinks, deliveredLinks, deliveredSignature, itemLinks, lastParagraph, unansweredQuestion, type LinkContext } from './conversation-links'
 
 const context: LinkContext = { cwd: 'C:\\work\\app', projectId: 'project-app', projects: [{ id: 'project-app', path: 'C:\\work\\app' }, { id: 'project-docs', path: 'C:\\work\\docs' }] }
 let sequence = 0
@@ -80,5 +80,43 @@ describe('the question the agent ended its turn with', () => {
     const reply = ended('Done. Should I push it?')
     expect(unansweredQuestion([reply, item(said('thinking', 'status')), item({ type: 'usage', source: 'provider', outputTokens: 3 })], 'completed')).toMatchObject({ itemId: reply.id })
     expect(lastParagraph('Here:\n\n```\nwhy?\n```')).toBe('Here:')
+  })
+})
+
+describe('the files the latest turn delivered (feature-list delivered-outputs-highlight)', () => {
+  const owner = (text: string): TimelineItem => item(said(text, 'user'))
+  const reply = (text: string, extra: Partial<TimelineItem> = {}): TimelineItem => item(said(text), extra)
+  it('takes every file link of the latest delivering turn, in posting order, with the exact path', () => {
+    const items = [
+      owner('Make the logos'),
+      reply('Working on it; first draft in `out/draft.png`.'),
+      item({ type: 'tool', name: 'Write', status: 'completed', input: { file_path: 'out/logo.pdf' } }),
+      reply('Done: [the logo](<C:/work/app/output/owner picks/HAF Logo.pdf>) and :codex-file-citation{path="C:\\work\\app\\output\\logos.zip" purpose="output"}. See https://example.com/brief.')
+    ]
+    const { links, candidates } = deliveredLinks(items, context)
+    expect(links.map(link => link.absolutePath)).toEqual(['C:/work/app/out/draft.png', 'C:/work/app/output/owner picks/HAF Logo.pdf', 'C:/work/app/output/logos.zip'])
+    expect(links[1]).toMatchObject({ path: 'output/owner picks/HAF Logo.pdf', projectId: 'project-app', itemId: items[3]!.id })
+    // The edit tool's file is not a delivery, and a URL is not a file.
+    expect(links.some(link => link.path === 'out/logo.pdf' || link.kind === 'url')).toBe(false)
+    expect(candidates.map(candidate => candidate.path)).toEqual(['out/draft.png'])
+    // A prose mention waits for its stat check.
+    expect(deliveredLinks(items, context, link => !link.candidate).links.map(link => link.label)).toEqual(['HAF Logo.pdf', 'logos.zip'])
+  })
+  it('keeps the last delivering turn after a reply that delivered nothing, and ends a turn at a coordinating agent\'s message', () => {
+    const delivered = reply('Here: C:\\work\\app\\output\\report.pdf')
+    expect(deliveredLinks([owner('report please'), delivered, owner('thanks'), reply('You are welcome.')], context).links.map(link => link.absolutePath)).toEqual(['C:/work/app/output/report.pdf'])
+    const fromController = item(said('[spec](docs/spec.md)', 'user', { origin: { agentSessionId: 'ctl', label: 'Wizard' } }))
+    const next = reply('[notes](docs/notes.md)')
+    expect(deliveredLinks([delivered, fromController, next], context).links.map(link => link.path)).toEqual(['docs/notes.md'])
+    expect(deliveredLinks([delivered, fromController], context).links.map(link => link.itemId)).toEqual([delivered.id])
+  })
+  it('ignores nested agents and files outside every open project; the signature names the newest message and its files', () => {
+    expect(deliveredLinks([owner('go'), reply('[x](C:/work/app/x.pdf)', { parentId: 'tool-1' })], context).links).toEqual([])
+    expect(deliveredLinks([owner('go'), reply('[x](C:/elsewhere/x.pdf)')], context).links).toEqual([])
+    const first = deliveredLinks([owner('go'), reply('[a](C:/work/app/a.pdf)')], context).links
+    const second = deliveredLinks([owner('go'), reply('[a](C:/work/app/a.pdf)'), reply('[b](C:/work/app/b.zip)')], context).links
+    expect(deliveredSignature(first)).not.toBe('')
+    expect(deliveredSignature(second)).not.toBe(deliveredSignature(first))
+    expect(deliveredSignature([])).toBe('')
   })
 })

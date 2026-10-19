@@ -8,7 +8,8 @@ import { launcherTile } from './lib/launcher-tile.mjs'
 // The links & files rail (feature-list e90b679f): an agent reply with links, a file mention and a
 // closing plain-text question shows in the rail beside the timeline. A row jumps to its message,
 // Open opens the file, and "Asked you" can be dismissed; the rail stays open across a tab switch
-// that unmounts the conversation view. Real Electron main/renderer; only the provider is the
+// that unmounts the conversation view. A later turn that links a local PDF shows it under Delivered
+// with a dot on the closed rail's toggle, and Open hands it to the default app. Real Electron main/renderer; only the provider is the
 // synthetic Claude fixture (no inference). Parked window; nothing opens an external browser.
 // Run after a build, one smoke at a time:
 //   node scripts/smoke-lock.mjs -- node scripts/smoke-conversation-links.mjs
@@ -47,7 +48,9 @@ try {
   await toggle.click()
   const rail = page.locator('.sa-links-rail')
   await expect(rail).toBeVisible()
-  await expect(rail.locator('.sa-links-item')).toHaveText([/the guide/, /example\.org\/status/, /notes\.md/])
+  // The file the reply posted is what that turn delivered: it leads, under Delivered.
+  await expect(rail.locator('.sa-links-delivered .sa-links-item')).toHaveText([/notes\.md/])
+  await expect(rail.locator('.sa-links-item')).toHaveText([/notes\.md/, /the guide/, /example\.org\/status/])
   await expect(rail.locator('.sa-links-asked')).toContainText('Should I also update the changelog?')
   await page.screenshot({ path: join(output, '1-rail.png') })
   check('The rail lists the reply\'s links and verified file, and the question it ended with')
@@ -71,6 +74,40 @@ try {
   await expect(page.locator('.sa-links-asked')).toHaveCount(0)
   await page.screenshot({ path: join(output, '2-after-switch.png') })
   check('Asked you is dismissible; the rail stays open and dismissed across a tab switch')
+
+  // Delivered outputs (feature-list delivered-outputs-highlight): a turn that links a local PDF puts
+  // it under Delivered with a dot on the closed rail's toggle until the rail is opened, and Open
+  // hands the exact path to the default app (stubbed: nothing opens on the owner's screen).
+  await mkdir(join(project.path, 'output', 'owner picks'), { recursive: true })
+  const pdf = join(project.path, 'output', 'owner picks', 'HAF logo.pdf')
+  await writeFile(pdf, '%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj 2 0 obj<</Type/Pages/Kids[]/Count 0>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n')
+  await app.evaluate(({ shell }) => { globalThis.__smokeOpened = []; shell.openPath = async path => { globalThis.__smokeOpened.push(path); return '' } })
+  await toggle.click()
+  await expect(page.locator('.sa-links-rail')).toHaveCount(0)
+  await composer.fill('SYNTHETIC DELIVERED ' + pdf.replaceAll('\\', '/'))
+  await page.getByRole('button', { name: 'Send message', exact: true }).click()
+  // The earlier delivery was seen with the rail open, so a dot now means this turn's file arrived.
+  await expect(toggle.locator('.sa-links-dot')).toHaveCount(1)
+  await expect.poll(async () => (await snapshot())?.phase, { timeout: 20000 }).toBe('completed')
+  await expect(toggle).toHaveAttribute('title', /delivered files/)
+  await page.screenshot({ path: join(output, '3-delivered-dot.png') })
+  await toggle.click()
+  const delivered = page.locator('.sa-links-rail .sa-links-delivered')
+  await expect(delivered.locator('.sa-links-item')).toHaveText([/HAF logo\.pdf/])
+  await expect(delivered.locator('.sa-links-item')).toHaveAttribute('title', /output\/owner picks\/HAF logo\.pdf$/)
+  await expect(toggle.locator('.sa-links-dot')).toHaveCount(0)
+  // The first turn's file is back in the general list, once.
+  await expect(page.locator('.sa-links-rail .sa-links-item').filter({ hasText: 'notes.md' })).toHaveCount(1)
+  await page.screenshot({ path: join(output, '4-delivered.png') })
+  check('A delivered PDF leads the rail under Delivered, with a dot on the toggle until the rail is opened')
+
+  await delivered.getByRole('button', { name: 'Open HAF logo.pdf', exact: true }).click()
+  await expect.poll(() => app.evaluate(() => globalThis.__smokeOpened.length)).toBe(1)
+  const opened = (await app.evaluate(() => globalThis.__smokeOpened))[0]
+  assert.equal(opened.replaceAll('\\', '/').toLowerCase(), pdf.replaceAll('\\', '/').toLowerCase())
+  assert.ok(opened.endsWith('HAF logo.pdf'), opened)
+  await expect(page.locator('.sa-links-error')).toHaveCount(0)
+  check('Open hands the delivered PDF to the default app at its exact path, not to files.open')
 
   assert.deepEqual(errors, [])
   await writeFile(join(output, 'report.json'), JSON.stringify({ checks, errors, inference: 'none', providerBoundary: 'synthetic raw process' }, null, 2))

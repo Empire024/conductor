@@ -54,6 +54,11 @@ export const SHELL_HYGIENE_HINT = 'Write scripts with the Write tool and run the
  *  ends its turn waiting for another tab's results says so, or it is filed under Done. */
 export const AWAIT_HINT = 'If you end a turn waiting for another tab’s results, declare it: send_message({agentSessionId,text,awaitReply:true}), or control agents.await({agents,reason}). Your tab then stays active as "waiting for …" and their message wakes you; never poll.'
 
+/** Once per runtime, for Claude and Codex conversations: how a file reaches the owner, so it lands
+ *  under Delivered in the conversation's Links & files rail (feature-list delivered-outputs-highlight). */
+export const deliveryHint = (provider: string): string =>
+  `To deliver a file (PDF, ZIP, image), link its absolute path in your final message${provider === 'codex' ? ' as :codex-file-citation{path="..." purpose="output"}' : ', e.g. [report.pdf](C:/abs/report.pdf)'}; files.open is for text files only.`
+
 /** Once per runtime, for a coworker a controller opened (coworker-autoclose.ts): a finished
  *  coworker left open keeps its CLI process alive for nothing. */
 export const FINISH_HINT = 'When your work is delivered and reported, end with agents.finish({}) so your tab and CLI are released.'
@@ -217,7 +222,7 @@ export class TurnBriefings {
     // (local-models/briefing.ts).
     if (local) return memory
     const coworkers = this.coworkers(spec, ledger)
-    const text = [memory, staticDue ? MEMORY_PROTOCOL : '', coworkers, staticDue ? projectTaskBriefing(spec) : '', staticDue ? [this.deps.machine?.() ?? '', LOCAL_ASSIST_PROVIDERS.has(spec.provider) ? LOCAL_ASSIST_HINT : '', LOCAL_ASSIST_PROVIDERS.has(spec.provider) ? AWAIT_HINT : '', spec.provider === 'claude' ? PERMISSION_GRANT_HINT : '', spec.provider === 'claude' ? SHELL_HYGIENE_HINT : ''].filter(Boolean).join(' ') : '', staticDue ? control : '', staticDue ? this.coworkerHint(spec) : '', this.successionHint(ledger, context), this.succession(spec.id, context) || this.nudge(ledger, context), this.outageNudges(spec.id, ledger)].filter(Boolean).join('\n\n')
+    const text = [memory, staticDue ? MEMORY_PROTOCOL : '', coworkers, staticDue ? projectTaskBriefing(spec) : '', staticDue ? [this.deps.machine?.() ?? '', LOCAL_ASSIST_PROVIDERS.has(spec.provider) ? LOCAL_ASSIST_HINT : '', LOCAL_ASSIST_PROVIDERS.has(spec.provider) ? AWAIT_HINT : '', LOCAL_ASSIST_PROVIDERS.has(spec.provider) ? deliveryHint(spec.provider) : '',spec.provider === 'claude' ? PERMISSION_GRANT_HINT : '', spec.provider === 'claude' ? SHELL_HYGIENE_HINT : ''].filter(Boolean).join(' ') : '', staticDue ? control : '', staticDue ? this.coworkerHint(spec) : '', this.successionHint(ledger, context), this.succession(spec.id, context) || this.nudge(ledger, context), this.outageNudges(spec.id, ledger)].filter(Boolean).join('\n\n')
     this.save(spec, ledger)
     return text
   }

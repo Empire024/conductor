@@ -127,3 +127,20 @@ describe('markdown.js inline', () => {
     expect(draw('Created :codex-file-citation{path="C:/a/b/report.pdf" purpose="output"} ok').html()).toBe('<div><p class="text-block md-p">Created <code class="md-code">report.pdf</code> ok</p></div>')
   })
 })
+
+describe('delivered files (feature-list delivered-outputs-highlight)', () => {
+  const { deliveredFiles } = window.ConductorMarkdown
+  it('names every absolute file the reply hands over, once, in order, with the exact path', () => {
+    const text = 'Done: :codex-file-citation{path="C:\\Out\\logos.zip" purpose="output"},[the logo](/C:/Out/owner%20picks/HAF%20Logo.pdf), [also](<C:/Out/owner picks/HAF Logo.pdf>) and `C:\\Out\\notes.md:12`.\nAgain C:/Out/logos.zip.'
+    expect(deliveredFiles(text)).toEqual([
+      { name: 'logos.zip', path: 'C:\\Out\\logos.zip' },
+      { name: 'HAF Logo.pdf', path: 'C:/Out/owner picks/HAF Logo.pdf' },
+      { name: 'notes.md', path: 'C:\\Out\\notes.md' }
+    ])
+  })
+  it('skips relative paths, web links and text without files', () => {
+    expect(deliveredFiles('Changed src/a.ts and [docs](docs/x.md); see https://example.com/C:/x.pdf')).toEqual([])
+    expect(deliveredFiles('')).toEqual([])
+    expect(deliveredFiles(null)).toEqual([])
+  })
+})

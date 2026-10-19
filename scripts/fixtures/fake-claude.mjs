@@ -503,6 +503,12 @@ for await (const line of input) {
       text('Here is [the guide](https://example.com/guide) and the file `notes.md`. Status: https://example.org/status.\n\nShould I also update the changelog?')
       finish(); continue
     }
+    if (prompt.startsWith('SYNTHETIC DELIVERED ')) {
+      // A reply that hands over the file named on the prompt's first line (the rail's Delivered group).
+      const path = prompt.slice('SYNTHETIC DELIVERED '.length).split('\n')[0].trim()
+      text('The logo is done: [' + path.split(/[\\/]/).pop() + '](<' + path + '>).')
+      finish(); continue
+    }
     if (prompt.startsWith('SYNTHETIC B')) {
       text('**Synthetic fixture continuation:** `wasOpen` and `wasPinned` were removed; the local Node test passed. This is offline fixture behavior, not live-provider context evidence.')
       finish(); continue
