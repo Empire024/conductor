@@ -459,11 +459,62 @@ export interface RemoteControlBridge {
    * why the other machine could not be told; the tab is closed here regardless.
    */
   closeTab(localSessionId: string): Promise<{ closed: boolean; message?: string }>
+  /**
+   * The conversations a project's host machine is running, workspace by workspace, so a project
+   * that lives there shows the tabs it actually has instead of an empty workspace. `localSessionId`
+   * names the tab here that already mirrors one.
+   */
+  workspaceTabs(projectId: string): Promise<RemoteWorkspaceTabs>
+  /**
+   * Mirrors a conversation already running on the host into a tab here. Closing that tab only stops
+   * watching it; the conversation and its tab on the host are left exactly as they were.
+   */
+  attachTab(request: RemoteAttachTabRequest): Promise<RemoteAttachedTab>
+  /** A host's tab list changed; names the host's own project and workspace ids. */
+  onTabsChanged(callback: (event: { machineId: string; projectId: string; sessionId: string }) => void): () => void
   /** Durable execution owner for a mirrored session, including released/offline tombstones. */
   sessionMachine(localSessionId: string): Promise<string>
   /** Machine and workspace root used to resolve file links for this conversation. */
   sessionFileContext(localSessionId: string): Promise<{ machineId: string; cwd: string | null }>
   onState(callback: (state: RemoteControlState) => void): () => void
+}
+
+export interface RemoteWorkspaceTab {
+  tabId: string
+  agentSessionId: string
+  title: string
+  provider: 'claude' | 'codex' | 'local'
+  phase?: string
+  /** The tab here that already mirrors this conversation, if there is one. */
+  localSessionId?: string
+}
+
+export interface RemoteWorkspaceTabs {
+  machineId: string
+  machineName: string
+  /** The host's own project id. */
+  remoteProjectId: string
+  workspaces: Array<{ id: string; name: string; tabs: RemoteWorkspaceTab[] }>
+}
+
+export interface RemoteAttachTabRequest {
+  /** The project here, by either id. */
+  projectId: string
+  /** The workspace here the tab is opened in. */
+  sessionId: string
+  /** The host's workspace and conversation, as `workspaceTabs` named them. */
+  remoteSessionId: string
+  remoteAgentSessionId: string
+}
+
+export interface RemoteAttachedTab {
+  localSessionId: string
+  machineId: string
+  machineName: string
+  title: string
+  provider: 'claude' | 'codex' | 'local'
+  /** The workspace here that already shows it, when it was mirrored before this request. */
+  existingWorkspaceId?: string
 }
 
 export interface RemoteTabRequest {

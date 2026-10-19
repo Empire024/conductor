@@ -1528,12 +1528,16 @@ const renameLocalProject = async (projectId: string, requestedName: string): Pro
   terminals.killProject(project.id)
   agents.killProject(project.id)
   await fs.rename(source, target)
+  let renamed: ProjectRecord
   try {
-    return database.updateProjectLocation(project.id, target, name)
+    renamed = database.updateProjectLocation(project.id, target, name)
   } catch (error) {
     await fs.rename(target, source).catch(() => undefined)
     throw error
   }
+  // A shared project's grants follow the folder; otherwise every paired machine is refused it.
+  try { remoteControl?.followProjectRename(project.id) } catch (error) { console.warn('Paired machines could not follow the renamed project', error) }
+  return renamed
 }
 
 const resolveProjectPath = (projectId: string, requested = '', feature = 'Files'): string => {
@@ -2946,6 +2950,16 @@ app.whenReady().then(async () => {
       }
       const result = await testDialogs.showSaveDialog(liveWindow(), options)
       return result.canceled || !result.filePath ? null : result.filePath
+    },
+    // A delivered PDF or archive from a paired machine, opened here as a read-only cached copy.
+    // An automation profile never launches the default app over the owner's desktop.
+    remoteOpen: {
+      root: join(app.getPath('userData'), 'remote-open'),
+      open: async path => {
+        if (process.env.CONDUCTOR_TEST_USER_DATA) { ((globalThis as { __conductorRemoteOpened?: string[] }).__conductorRemoteOpened ??= []).push(path); return }
+        const error = await shell.openPath(path)
+        if (error) throw new Error(error)
+      }
     },
     publish: (channel, payload) => publish(channel, payload)
   })

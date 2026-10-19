@@ -39,6 +39,11 @@ export interface RemoteSessionBinding {
   remoteTabId?: string
   /** The highest sequence already copied from that machine, so polling stays incremental. */
   remoteSequence: number
+  /**
+   * A conversation started on that machine and only watched from here. Closing the tab here stops
+   * watching it and never closes it there; a placed tab (absent) is closed where it runs.
+   */
+  attached?: boolean
 }
 
 const BINDINGS_SETTING = 'remote-control.sessionMirrors'
@@ -67,6 +72,7 @@ export function readBindings(raw: string | undefined): RemoteSessionBinding[] {
     if (strings.some(field => typeof field !== 'string' || !field)) return []
     if (typeof value.provider !== 'string') return []
     if (value.remoteTabId !== undefined && (typeof value.remoteTabId !== 'string' || !value.remoteTabId)) return []
+    if (value.attached !== undefined && value.attached !== true) return []
     return [{
       ...(value as RemoteSessionBinding),
       remoteSequence: Number.isSafeInteger(value.remoteSequence) && value.remoteSequence! >= 0 ? value.remoteSequence! : 0
@@ -97,6 +103,7 @@ export function rekeyRemoteEvents(
     sequence += 1
     return {
       ...event,
+      data: withoutWizard(event.data),
       sequence,
       sessionId: binding.localSessionId,
       projectId: binding.projectId,
@@ -105,6 +112,20 @@ export function rekeyRemoteEvents(
     }
   })
   return { events: rekeyed, remoteSequence }
+}
+
+/**
+ * The wand belongs to the machine that runs the conversation: a mirror of a wizard tab on MAIN is
+ * never a wizard here, so nothing on this computer treats it as carrying the owner's authority.
+ */
+export function withoutWizardSettings<T extends SessionSettings | undefined>(settings: T): T {
+  if (!settings || typeof settings !== 'object' || !('wizard' in settings)) return settings
+  const { wizard: _wizard, ...rest } = settings
+  return rest as T
+}
+
+function withoutWizard(data: AgentEvent['data']): AgentEvent['data'] {
+  return data?.type === 'session' && data.settings ? { ...data, settings: withoutWizardSettings(data.settings) } : data
 }
 
 function retainedRuntimeStatus(phase: SessionPhase): RuntimeEnsureResult['status'] {
@@ -385,6 +406,8 @@ export class RemoteSessionMirror {
   async closeRemote(localSessionId: string): Promise<{ closed: boolean; message?: string }> {
     const binding = this.bindings.get(localSessionId)
     if (!binding) return { closed: false, message: 'That machine is no longer paired, so it was never told to close this tab; if it is still running there, close it on that machine directly.' }
+    // Watching a conversation the owner started there ends here; the work there is not touched.
+    if (binding.attached) { this.release(localSessionId); return { closed: false } }
     try {
       const tabId = binding.remoteTabId ?? await this.remoteTabId(binding)
       await this.deps.call(binding.machineId, 'tabs.close', {
@@ -501,7 +524,7 @@ export class RemoteSessionMirror {
         phase: snapshot.phase as SessionPhase,
         ...(typeof snapshot.nativeSessionId === 'string' ? { nativeSessionId: snapshot.nativeSessionId } : {}),
         capabilities: snapshot.capabilities,
-        settings: snapshot.settings,
+        settings: withoutWizardSettings(snapshot.settings),
         ...(typeof snapshot.title === 'string' ? { title: snapshot.title } : {}),
         ...(typeof snapshot.archived === 'boolean' ? { archived: snapshot.archived } : {})
       }

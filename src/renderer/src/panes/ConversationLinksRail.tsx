@@ -2,6 +2,7 @@ import { useDeferredValue, useMemo, useState } from 'react'
 import { ExternalLink, FileText, Globe, MessageCircleQuestion, PackageCheck, Paperclip, PencilLine, X } from 'lucide-react'
 import type { TimelineItem } from '../../../shared/structured-agent'
 import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
+import { isRemoteOpenableDocument } from '../../../shared/remote-files'
 import { useFileLinkProjectRoots } from '../components/file-link-target'
 import { useVerifiedFileLinkKeys } from '../components/plain-file-links'
 import { openWorkspaceFile } from '../components/workspace-files-state'
@@ -56,9 +57,13 @@ export function ConversationLinksRail({ items, cwd, projectId, machineId, asked,
   // A PDF, an archive or anything else no Conductor view reads goes to the computer's default app;
   // files.open is for text files only.
   const external = (link: ConversationLink): boolean => Boolean(link.path) && (!link.machineId || link.machineId === LOCAL_MACHINE_ID) && ['pdf', 'external'].includes(classifyExplorerFile(link.path!))
+  // The same for a conversation running on another machine: the document is fetched to a
+  // read-only copy here and opened with this computer's default app (main: RemoteOpenCache).
+  const remoteDocument = (link: ConversationLink): boolean => Boolean(link.path) && Boolean(link.machineId) && link.machineId !== LOCAL_MACHINE_ID && isRemoteOpenableDocument(link.path!)
   const open = (link: ConversationLink): void => {
     setError('')
     if (link.url) void window.conductor.system.openExternal(link.url)
+    else if (link.path && remoteDocument(link)) void window.conductor.remote.files.openLocal({ machineId: link.machineId!, projectId: link.projectId ?? projectId, path: link.path }).catch((reason: unknown) => setError('Cannot open ' + link.label + ': ' + (reason instanceof Error ? reason.message : String(reason)).replace(/^Error invoking remote method '[^']+': (?:Error: )?/, '')))
     else if (link.path && external(link)) void window.conductor.files.openExternal(link.projectId ?? projectId, link.path).catch((reason: unknown) => setError('Cannot open ' + link.label + ': ' + (reason instanceof Error ? reason.message : String(reason)).replace(/^Error invoking remote method '[^']+': (?:Error: )?/, '')))
     else if (link.path && link.projectId && link.projectId !== projectId) openWorkspaceFile(link.projectId, link.path, 'auto', link.line, undefined, link.machineId)
     else if (link.path) onOpenFile(link.path, link.line)
@@ -70,7 +75,7 @@ export function ConversationLinksRail({ items, cwd, projectId, machineId, asked,
       <button type="button" className="sa-links-item" title={'Show where this came from: ' + detail} onClick={() => onJump(link.itemId)}>
         <Icon size={12} aria-hidden="true" /><span>{link.label}</span><small>{link.kind === 'url' ? detail.replace(/^https?:\/\//, '') : link.path!.includes('/') ? link.path!.slice(0, link.path!.lastIndexOf('/')) : link.source === 'edit' ? 'edited' : ''}</small>
       </button>
-      <button type="button" className="sa-links-open" aria-label={'Open ' + link.label} title={link.kind === 'url' ? 'Open in the browser' : external(link) ? 'Open with the default app' : 'Open the file'} onClick={() => open(link)}><ExternalLink size={12} /></button>
+      <button type="button" className="sa-links-open" aria-label={'Open ' + link.label} title={link.kind === 'url' ? 'Open in the browser' : external(link) ? 'Open with the default app' : remoteDocument(link) ? 'Open a copy with the default app' : 'Open the file'} onClick={() => open(link)}><ExternalLink size={12} /></button>
     </li>
   }
   return <aside className="sa-links-rail" aria-label="Links and files in this conversation">

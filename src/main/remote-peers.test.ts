@@ -549,6 +549,60 @@ describe('project scope', () => {
     expect(peers.requireProject(peers.listPeers()[0]!, 'project-a').path).toBe('/tmp/moved')
   })
 
+  describe('following a project renamed on this machine', () => {
+    const moved = { ...PROJECTS[0]!, name: 'haf-stuff', path: '/tmp/haf-stuff', identity: identityOf('a'.repeat(32), '/tmp/haf-stuff', 'haf-stuff') }
+    const reopen = (fix: ReturnType<typeof fixture>, projects: RemoteProjectSummary[], pathExists: (path: string) => boolean) => {
+      const activity = vi.fn()
+      const peers = new RemotePeers({
+        store: fix.store, accountId: () => 4242, accountLogin: () => 'Empire024',
+        accountKeys: async () => [fix.owner.publicKey], projects: () => projects, pathExists, activity
+      })
+      return { peers, activity }
+    }
+
+    it('follows the rename for every paired machine, once', async () => {
+      const fix = fixture()
+      await pairAndApprove(fix, fix.owner, ['project-a', 'project-b'])
+      const { peers, activity } = reopen(fix, [moved, PROJECTS[1]!], () => true)
+      expect(peers.followProjectMoves({ projectId: 'project-a', reason: 'renamed on this machine', requireOldPathGone: false })).toBe(1)
+      expect(peers.requireProject(peers.listPeers()[0]!, 'project-a').path).toBe('/tmp/haf-stuff')
+      expect(activity).toHaveBeenCalledTimes(1)
+      expect(activity.mock.calls[0]![0]).toMatchObject({ method: 'peer.reshare', projectId: 'project-a' })
+      // Idempotent: the healed grant names the current folder, so nothing is followed or logged again.
+      expect(peers.followProjectMoves({ projectId: 'project-a', reason: 'again', requireOldPathGone: false })).toBe(0)
+      expect(activity).toHaveBeenCalledTimes(1)
+    })
+
+    it('heals at startup only where the old folder is gone, and persists it', async () => {
+      const fix = fixture()
+      await pairAndApprove(fix, fix.owner, ['project-a'])
+      const copyLeftBehind = reopen(fix, [moved, PROJECTS[1]!], path => path === '/tmp/a')
+      expect(copyLeftBehind.peers.followProjectMoves({ reason: 'startup', requireOldPathGone: true })).toBe(0)
+      expect(() => copyLeftBehind.peers.requireProject(copyLeftBehind.peers.listPeers()[0]!, 'project-a')).toThrow(/moved from/)
+      const gone = reopen(fix, [moved, PROJECTS[1]!], () => false)
+      expect(gone.peers.followProjectMoves({ reason: 'startup', requireOldPathGone: true })).toBe(1)
+      expect(gone.peers.followProjectMoves({ reason: 'startup', requireOldPathGone: true })).toBe(0)
+      const restarted = reopen(fix, [moved, PROJECTS[1]!], () => false)
+      expect(restarted.peers.requireProject(restarted.peers.listPeers()[0]!, 'project-a').path).toBe('/tmp/haf-stuff')
+      expect(restarted.peers.followProjectMoves({ reason: 'startup', requireOldPathGone: true })).toBe(0)
+      expect(restarted.activity).not.toHaveBeenCalled()
+    })
+
+    it('never touches a different working copy, a project that is gone, or a revoked machine', async () => {
+      const fix = fixture()
+      const peer = await pairAndApprove(fix, fix.owner, ['project-a', 'project-b'])
+      const swapped = { ...moved, identity: identityOf('c'.repeat(32), '/tmp/haf-stuff', 'haf-stuff') }
+      const different = reopen(fix, [swapped], () => false)
+      expect(different.peers.followProjectMoves({ reason: 'startup', requireOldPathGone: true })).toBe(0)
+      const stored = () => JSON.parse(fix.store.getSetting('remote-control.peers')!)[0].grantedProjects as Array<{ projectId: string; identity: { path: string } }>
+      expect(stored().map(entry => entry.projectId)).toEqual(['project-a', 'project-b'])
+      expect(stored()[0]!.identity.path).toBe('/tmp/a')
+      fix.peers.revoke(peer.id)
+      const revoked = reopen(fix, [moved, PROJECTS[1]!], () => false)
+      expect(revoked.peers.followProjectMoves({ reason: 'startup', requireOldPathGone: true })).toBe(0)
+    })
+  })
+
   it('will not share a project whose identity cannot be read', async () => {
     const store = new MapStore()
     const owner = generateDeviceKey('owner')

@@ -143,6 +143,17 @@ joined, each project keeps the machine it lives on, and work opened in it runs o
   project made on MAIN is created in MAIN's own projects folder and appears here as MAIN's.
 - Removing one of MAIN's projects from this list removes it from the list only - MAIN keeps it, and
   **Account & machines** can show it here again.
+- The new-tab launcher of one of MAIN's projects lists **Tabs running on MAIN**, grouped by MAIN's
+  workspaces. **Open** shows one of those conversations here and **Open all** shows the rest of a
+  workspace (ones already shown here are skipped). They are mirrored exactly like a tab placed on
+  MAIN from here - read, prompted, steered and answered through MAIN's own `agents.*` calls under
+  the project grant - except that closing one here only stops watching it; MAIN keeps its tab. A
+  wizard tab's wand stays MAIN's: the laptop neither sees nor sets it.
+- A PDF, archive or office file such a conversation links opens here with this computer's default
+  app, as a read-only copy fetched through the grant into `userData/remote-open` (kept 7 days, at
+  most 500 MB). Text files open in the editor against MAIN's copy, as before.
+- Renaming a shared project on MAIN keeps it shared: the grant follows the folder, and a rename made
+  before this existed is healed when MAIN starts, provided the old folder is gone.
 
 To see whether a session is Direct or Relayed, open that machine's diagnostics: the value comes
 straight from `tailscale status --json` on this machine (`TailscalePeer.path` in

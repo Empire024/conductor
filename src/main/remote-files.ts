@@ -178,7 +178,7 @@ export class RemoteFiles {
     if (typeof result.size !== 'number' || !Number.isSafeInteger(result.size) || result.size <= 0 || result.size > REMOTE_FILE_MAX_ASSET_BYTES
       || typeof result.modifiedAt !== 'string' || !Number.isFinite(Date.parse(result.modifiedAt))
       || typeof result.version !== 'string' || !VERSION.test(result.version)
-      || result.kind !== 'image' && result.kind !== 'video'
+      || result.kind !== 'image' && result.kind !== 'video' && result.kind !== 'document'
       || typeof result.mimeType !== 'string' || result.mimeType.length > 100) {
       throw new RemoteAccessError('That machine returned invalid remote resource metadata.', 502)
     }

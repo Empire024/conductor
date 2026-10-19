@@ -19,10 +19,20 @@ import type { RemoteServiceRegistry } from './remote-services'
 import { RemoteTerminalHost, type RemoteTerminalStream, type TerminalRuntime } from './remote-terminals'
 import type { StructuredSessions } from './structured-sessions'
 import { readTextFile } from './text-files'
-import { REMOTE_FILE_CHUNK_BYTES, REMOTE_FILE_MAX_ASSET_BYTES } from '../shared/remote-files'
+import { REMOTE_FILE_CHUNK_BYTES, REMOTE_FILE_MAX_ASSET_BYTES, REMOTE_OPENABLE_DOCUMENTS } from '../shared/remote-files'
 import { MAX_PROMPT_CHARS, type ContextAttachment } from '../shared/structured-agent'
 import { isPastedText, PASTED_TEXT_MAX_CHARS } from '../shared/pasted-text'
 import { isAnonymousTab } from './local-models/anonymous'
+
+/**
+ * The wand is this machine's owner authority over this machine's Conductor - every tab, every card,
+ * updates and restarts - which is far beyond a project grant. A paired machine's settings change
+ * the conversation, never that: whatever it sends, the tab keeps the wizard state set here.
+ */
+export function keepHostWizard(requested: SessionSettings, current: SessionSettings): SessionSettings {
+  const { wizard: _ignored, ...rest } = requested && typeof requested === 'object' ? requested : current
+  return current.wizard === undefined ? rest as SessionSettings : { ...rest, wizard: current.wizard } as SessionSettings
+}
 
 type Args = Record<string, unknown>
 
@@ -448,8 +458,12 @@ export class RemoteControlHost {
       const relativePath = relative(await realpath(project.path), path).replaceAll('\\', '/')
       current()
       if (method === 'files.describe' || method === 'files.readChunk') {
-        const media = remoteMediaTypes[extname(relativePath).toLowerCase()]
-        if (!media) throw new RemoteAccessError('Only safe raster images and allowlisted video files can be previewed remotely.', 400)
+        const extension = extname(relativePath).toLowerCase()
+        // A document is fetched whole to be opened with the other computer's default app; it is
+        // never previewed there, and the allowlist holds nothing that could run.
+        const media = remoteMediaTypes[extension]
+          ?? (Object.hasOwn(REMOTE_OPENABLE_DOCUMENTS, extension) ? { kind: 'document' as const, mimeType: REMOTE_OPENABLE_DOCUMENTS[extension]! } : undefined)
+        if (!media) throw new RemoteAccessError('Only safe raster images, allowlisted video files and documents (PDF, archives, office files) can be fetched remotely.', 400)
         const handle = await open(path, 'r')
         current()
         try {
@@ -595,7 +609,7 @@ export class RemoteControlHost {
         const after = typeof args.afterSequence === 'number' && Number.isSafeInteger(args.afterSequence) && args.afterSequence >= 0 ? args.afterSequence : 0
         return database.structured.events(agentSessionId, after).slice(0, 100)
       }
-      const requestedSettings = args.settings === undefined ? state.settings : args.settings as SessionSettings
+      const requestedSettings = args.settings === undefined ? state.settings : keepHostWizard(args.settings as SessionSettings, state.settings)
       if (method === 'agents.interrupt') {
         await sessions.interrupt(agentSessionId, args.expediteSubmittedInput === true)
         return { interrupted: true }

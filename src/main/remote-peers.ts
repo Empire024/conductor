@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import type {
   PendingPairingRequest,
   RemoteActivityEntry,
@@ -37,6 +38,8 @@ export interface RemotePeersDependencies {
   /** SSH keys registered on this machine's own GitHub account. */
   accountKeys(force?: boolean): Promise<string[]>
   projects(): RemoteProjectSummary[]
+  /** Whether a folder still exists; the startup heal of moved grants never follows onto a copy. */
+  pathExists?(path: string): boolean
   now?(): number
   changed?(): void
   /** Remote work is surfaced in this machine's UI through here, like local agent activity. */
@@ -637,6 +640,45 @@ export class RemotePeers {
     this.persist()
     this.record(peer, 'peer.reshare', projectId, `Confirmed the new location of ${project.name} for ${peer.machineName}`, 'allowed')
     return { ...peer, grantedProjects: peer.grantedProjects.map(entry => ({ ...entry })) }
+  }
+
+  /**
+   * Grants that still name a shared project's old folder after this machine moved it. A project's
+   * recorded location changes in exactly one place - the owner renaming it in Conductor here - so a
+   * grant whose working copy (key and minted time) is unchanged but whose path is old is that
+   * rename, and the grant follows it instead of locking every paired machine out of the project.
+   *
+   * After a rename (`requireOldPathGone: false`) the owner's own act is the confirmation. The
+   * startup sweep heals what renames before this existed left behind, and only where the old folder
+   * is gone: a copy still sitting there is a second working copy with the same key, never a move,
+   * and stays refused. A different working copy, an unreadable identity, a project no longer
+   * registered and a revoked machine are all left exactly as they were. Healing is idempotent - a
+   * healed grant names the current path, so the next sweep passes it by - and each one is logged once.
+   */
+  followProjectMoves(input: { projectId?: string; reason: string; requireOldPathGone: boolean }): number {
+    const projects = this.deps.projects()
+    const exists = this.deps.pathExists ?? existsSync
+    let healed = 0
+    for (const peer of this.peers) {
+      if (peer.revokedAt) continue
+      for (const granted of peer.grantedProjects) {
+        if (input.projectId !== undefined && granted.projectId !== input.projectId) continue
+        const before = granted.identity
+        if (!before) continue
+        const project = projects.find(entry => entry.id === granted.projectId)
+        if (!project?.identity || !sameWorkingCopy(project.identity, before) || samePath(project.identity.path, before.path)) continue
+        if (input.requireOldPathGone && exists(before.path)) continue
+        granted.identity = project.identity
+        healed++
+        console.info(`Remote grant followed ${project.name} from ${before.path} to ${project.identity.path} for ${peer.machineName}`)
+        this.record(peer, 'peer.reshare', project.id, `Followed ${project.name} from ${before.path} to ${project.identity.path} for ${peer.machineName} — ${input.reason}`, 'allowed')
+      }
+    }
+    if (healed) {
+      this.authorityRevision++
+      this.persist()
+    }
+    return healed
   }
 
   record(peer: Pick<RemotePeerRecord, 'id' | 'machineName' | 'accountLogin'>, method: string, projectId: string | null, detail: string, outcome: 'allowed' | 'denied', message?: string): void {

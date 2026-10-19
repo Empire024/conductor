@@ -21,6 +21,8 @@ import { checkRemoteProjectPlacement } from '../../../shared/project-identity'
 import { checkProjectPlacement, requiredMachineId } from '../layout/machine-placement'
 import { DurableJobForm } from '../components/DurableJobsPane'
 import { CloudLaunchForm } from './CloudLaunchForm'
+import { RemoteConversationsList } from './RemoteConversationsList'
+import type { RemoteConversationChoice } from '../layout/remote-workspace-tabs'
 import { defaultTerminal, rendererPlatform } from '../../../shared/terminal-shell'
 
 interface LauncherPaneProps {
@@ -37,6 +39,8 @@ interface LauncherPaneProps {
   onOpenJob?(job: { id: string; title: string }): void
   /** Binds a tab to a shell already running on that machine instead of starting another. */
   onAttachTerminal?(machineId: string, remoteTerminalId: string, title: string): void
+  /** Shows conversations the project's host is already running as tabs here. */
+  onAttachConversations?(choices: RemoteConversationChoice[]): void
 }
 
 const choices: Array<{
@@ -97,7 +101,7 @@ export function machinePlacementOptions(
     })
 }
 
-export function LauncherPane({ projectId, project, machineId, error, onSelectMachine, onOpen, workspaceId, onOpenJob, onAttachTerminal }: LauncherPaneProps): React.JSX.Element {
+export function LauncherPane({ projectId, project, machineId, error, onSelectMachine, onOpen, workspaceId, onOpenJob, onAttachTerminal, onAttachConversations }: LauncherPaneProps): React.JSX.Element {
   const [machines, setMachines] = useState<MachineDescriptor[]>([])
   const [checking, setChecking] = useState(false)
   const [running, setRunning] = useState<RemoteTerminalSummary[] | null>(null)
@@ -316,6 +320,14 @@ export function LauncherPane({ projectId, project, machineId, error, onSelectMac
         running with the owner's build in it. Without this, the only way back to it is to start a
         second shell beside it and wonder why the first one still holds the port.
       */}
+      {/*
+        A project that lives on another machine has tabs there already - the ones the owner left
+        running on MAIN - and a workspace here that showed none of them read as "nothing is
+        happening" when everything was. They are listed straight away, by MAIN's workspaces.
+      */}
+      {host && selected === host && !current?.reason && onAttachConversations && (
+        <RemoteConversationsList projectId={projectId} machineId={host} hostName={hostName} onOpen={onAttachConversations} />
+      )}
       {selected !== LOCAL_MACHINE_ID && !current?.reason && onAttachTerminal && (
         <div className="launcher-attach">
           <button type="button" onClick={listRunning}>

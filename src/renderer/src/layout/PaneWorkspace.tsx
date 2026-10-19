@@ -95,6 +95,8 @@ import { SessionArchiveDormantPane } from '../components/SessionArchiveDormantPa
 import { debugLog } from '../debug-log'
 import { openWorkspaceFile } from '../components/workspace-files-state'
 import { fileMachineId, isRemoteFileMachine, statMachineFile } from '../remote-files'
+import { placeAttachedTabs, type RemoteConversationChoice } from './remote-workspace-tabs'
+import type { RemoteAttachedTab } from '../../../shared/remote-control'
 import { coworkerCloseTargets, coworkerTabGroups } from './coworker-tab-groups'
 import { ControlledByBadge } from '../components/ControlActivity'
 import { AwaitingMark } from '../components/AwaitingMark'
@@ -204,6 +206,7 @@ const PaneBody = ({
   placementError,
   onSelectMachine,
   onAttachTerminal,
+  onAttachConversations,
   onOpenJob
 }: {
   tab: PaneTab
@@ -214,6 +217,7 @@ const PaneBody = ({
   placementError: string
   onSelectMachine(machineId: string): void
   onAttachTerminal(machineId: string, remoteTerminalId: string, title: string): void
+  onAttachConversations(choices: RemoteConversationChoice[]): void
   onOpenJob?(job: { id: string; title: string }): void
   onOpen(kind: PaneKind, provider?: AgentProviderId, model?: string, options?: { anonymous?: boolean }): void
   onOpenFile(path: string, line?: number, mode?: 'editor' | 'preview', allowBinary?: boolean): void
@@ -227,7 +231,7 @@ const PaneBody = ({
   // keying a remote project by machine id exists to prevent.
   const host = requiredMachineId(project)
   if (host && !REMOTE_CAPABLE_PANES.has(tab.kind)) return <RemoteOnlyPane kind={tab.kind} machineName={projectHostName(project)} />
-  if (tab.kind === 'launcher') return <LauncherPane projectId={project.id} project={project} workspaceId={session.id} machineId={placement} error={placementError} onSelectMachine={onSelectMachine} onOpen={onOpen} onOpenJob={onOpenJob} onAttachTerminal={onAttachTerminal} />
+  if (tab.kind === 'launcher') return <LauncherPane projectId={project.id} project={project} workspaceId={session.id} machineId={placement} error={placementError} onSelectMachine={onSelectMachine} onOpen={onOpen} onOpenJob={onOpenJob} onAttachTerminal={onAttachTerminal} onAttachConversations={onAttachConversations} />
   if (tab.kind === 'terminal') {
     return (
       <TerminalPane
@@ -655,6 +659,38 @@ function PaneGroup({
     placeTab({ kind: 'terminal', machineId, projectId: placedProjectId, sessionId: workspace.session.id, remoteTerminalId })
   }
 
+  /**
+   * Shows conversations the host is already running as tabs in this workspace: one, or a whole host
+   * workspace. Each is mirrored like a placed tab (main: attachRemoteTab) and closing it here only
+   * stops watching. One already shown is selected, and one that fails is named with its reason
+   * rather than stopping the rest.
+   */
+  const attachConversations = async (choices: RemoteConversationChoice[]): Promise<void> => {
+    setPlacementError('')
+    const attached: RemoteAttachedTab[] = []
+    const failed: string[] = []
+    for (const choice of choices) {
+      try {
+        attached.push(await window.conductor.remote.attachTab({
+          projectId: workspace.project.id, sessionId: workspace.session.id,
+          remoteSessionId: choice.remoteSessionId, remoteAgentSessionId: choice.tab.agentSessionId
+        }))
+      } catch (reason) {
+        failed.push(`${choice.tab.title}: ${(reason instanceof Error ? reason.message : String(reason)).replace(/^Error invoking remote method '[^']+': (?:Error: )?/, '')}`)
+      }
+    }
+    const current = workspaceRef.current
+    if (current.session.id !== workspace.session.id) return
+    let elsewhere: string[] = []
+    flushSync(() => current.onLayout(layout => {
+      const placed = placeAttachedTabs(layout, group.id, activeTab.kind === 'launcher' ? activeTab.id : null, workspace.session.id, attached)
+      elsewhere = placed.elsewhere
+      return placed.layout
+    }))
+    if (failed.length) setPlacementError(`Not opened: ${failed.join('; ')}`)
+    if (elsewhere.length) window.dispatchEvent(new CustomEvent('conductor:toast', { detail: `Already open in another workspace here: ${elsewhere.join(', ')}` }))
+  }
+
   const openFile = (path: string, line?: number, mode?: 'editor' | 'preview', allowBinary?: boolean, machineId?: string): void => {
     const ownerMachine = fileMachineId(machineId)
     void statMachineFile(ownerMachine, workspace.project.id, path).then((info) => {
@@ -957,7 +993,7 @@ function PaneGroup({
         {group.tabs.filter((tab) => mountedIds.has(tab.id)).map((tab) => (
           <div key={tab.id} className="pane-tab-content" data-performance-tab-id={tab.id} style={{ display: tab.id === activeTab.id ? 'flex' : 'none' }}>
             <PaneBody tab={tab} groupId={group.id} project={workspace.project} session={workspace.session} onOpen={open} onOpenFile={(path, line, mode, allowBinary) => openFile(path, line, mode, allowBinary, tab.state?.machineId as string | undefined)} onUpdateTab={setTabState} onConversationChange={changeConversation}
-              placement={placement} placementError={placementError} onSelectMachine={choose} onOpenJob={workspace.onOpenJob} onAttachTerminal={attachTerminal} />
+              placement={placement} placementError={placementError} onSelectMachine={choose} onOpenJob={workspace.onOpenJob} onAttachTerminal={attachTerminal} onAttachConversations={choices => { void attachConversations(choices) }} />
           </div>
         ))}
       </div>

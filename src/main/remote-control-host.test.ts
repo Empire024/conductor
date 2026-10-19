@@ -7,7 +7,7 @@ import type { ConductorDatabase } from './database'
 import type { ProjectBacklogs } from './project-backlog'
 import type { TerminalSpec } from '../shared/models'
 import type { RemoteTerminalSummary } from '../shared/remote-terminals'
-import { RemoteControlHost, type RemoteControlHostDependencies } from './remote-control-host'
+import { keepHostWizard, RemoteControlHost, type RemoteControlHostDependencies } from './remote-control-host'
 import type { TerminalRuntime } from './remote-terminals'
 import { RemoteAccessError, type RemotePeers } from './remote-peers'
 import type { StructuredSessions } from './structured-sessions'
@@ -26,6 +26,8 @@ writeFileSync(join(shared, 'notes.md'), 'shared notes')
 writeFileSync(join(shared, 'unicode.txt'), '€'.repeat(40_000))
 writeFileSync(join(shared, 'frame.png'), Buffer.from('0123456789abcdef'))
 writeFileSync(join(shared, 'active.svg'), '<svg><script>alert(1)</script></svg>')
+writeFileSync(join(shared, 'report.pdf'), Buffer.from('%PDF-1.7 tiny'))
+writeFileSync(join(shared, 'payload.exe'), Buffer.from('MZ not really'))
 writeFileSync(join(private_, 'secrets.env'), 'GITHUB_TOKEN=ghp_realsecret')
 // A junction is the escape route a lexical check alone would miss.
 let junction = false
@@ -211,6 +213,14 @@ describe('what a paired machine may read and write', () => {
     expect(second).toMatchObject({ offset: 6, length: 10, totalSize: 16, eof: true })
   })
 
+  it('hands over an allowlisted document whole, for the other computer to open, and nothing that could run', async () => {
+    const described = await fix.call('files.describe', { projectId: 'shared-project', path: 'report.pdf' }) as Record<string, unknown>
+    expect(described).toMatchObject({ path: 'report.pdf', size: 13, kind: 'document', mimeType: 'application/pdf' })
+    const chunk = await fix.call('files.readChunk', { projectId: 'shared-project', path: 'report.pdf', offset: 0, length: 64, version: described.version }) as Record<string, unknown>
+    expect(Buffer.from(String(chunk.bytesBase64), 'base64').toString()).toBe('%PDF-1.7 tiny')
+    await expect(fix.call('files.describe', { projectId: 'shared-project', path: 'payload.exe' })).rejects.toThrow(/safe raster images/)
+  })
+
   it('refuses active media and invalid or stale ranges', async () => {
     await expect(fix.call('files.describe', { projectId: 'shared-project', path: 'active.svg' })).rejects.toThrow(/safe raster images/)
     const described = await fix.call('files.describe', { projectId: 'shared-project', path: 'frame.png' }) as Record<string, unknown>
@@ -393,6 +403,15 @@ describe('remote structured conversation operations', () => {
     expect(fix.sessions.respond).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'agent-remote', requestId: 'approval' }))
     expect(fix.sessions.rename).toHaveBeenCalledWith('agent-remote', 'New title')
     expect(fix.sessions.archive).toHaveBeenCalledWith('agent-remote', true)
+  })
+
+  it('never lets a paired machine hand a tab the wizard wand, or take it away', async () => {
+    await fix.call('agents.settings', { ...base, settings: { ...settings, wizard: true } })
+    expect(fix.sessions.saveSettings).toHaveBeenLastCalledWith('agent-remote', settings)
+    await fix.call('agents.submit', { ...base, prompt: 'now', settings: { ...settings, wizard: true } })
+    expect(fix.sessions.submit).toHaveBeenLastCalledWith('agent-remote', 'now', settings, [], expect.any(Object))
+    expect(keepHostWizard({ ...settings, wizard: false } as never, { ...settings, wizard: true } as never)).toEqual({ ...settings, wizard: true })
+    expect(keepHostWizard({ ...settings, wizard: true } as never, settings as never)).toEqual(settings)
   })
 
   it('rejects malformed lifecycle arguments at the host boundary', async () => {

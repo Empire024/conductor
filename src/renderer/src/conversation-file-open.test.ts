@@ -11,7 +11,7 @@ describe('durable conversation file routing', () => {
   it('fails closed before delayed session context resolves and never calls stale local layout routing', async () => {
     const pending = deferred<{ isFile: boolean }>()
     const stat = vi.fn(() => pending.promise), openRemote = vi.fn(), staleLocalCallback = vi.fn()
-    const opening = openConversationFile({ machineId: 'unresolved-remote-owner', projectId: 'p', path: 'same.txt' }, staleLocalCallback, { stat, openRemote })
+    const opening = openConversationFile({ machineId: 'unresolved-remote-owner', projectId: 'p', path: 'same.txt' }, staleLocalCallback, { stat, openRemote, openRemoteDocument: vi.fn() })
     expect(stat).toHaveBeenCalledWith('unresolved-remote-owner', 'p', 'same.txt')
     expect(staleLocalCallback).not.toHaveBeenCalled()
     // This models the delayed sessionFileContext reply. The in-flight click keeps its captured
@@ -24,16 +24,28 @@ describe('durable conversation file routing', () => {
 
   it('opens through the durable remote owner after context resolves even when tab state is missing', async () => {
     const stat = vi.fn().mockResolvedValue({ isFile: true }), openRemote = vi.fn(), staleLocalCallback = vi.fn()
-    await openConversationFile({ machineId: 'host-a', projectId: 'p', path: 'same.txt', line: 9 }, staleLocalCallback, { stat, openRemote })
+    await openConversationFile({ machineId: 'host-a', projectId: 'p', path: 'same.txt', line: 9 }, staleLocalCallback, { stat, openRemote, openRemoteDocument: vi.fn() })
     expect(openRemote).toHaveBeenCalledWith('host-a', 'p', 'same.txt', 9)
     expect(staleLocalCallback).not.toHaveBeenCalled()
   })
 
   it('uses legacy local routing only for a confirmed local owner', async () => {
     const stat = vi.fn(), openRemote = vi.fn(), openLocal = vi.fn()
-    await openConversationFile({ machineId: 'local', projectId: 'p', path: 'same.txt', line: 3 }, openLocal, { stat, openRemote })
+    await openConversationFile({ machineId: 'local', projectId: 'p', path: 'same.txt', line: 3 }, openLocal, { stat, openRemote, openRemoteDocument: vi.fn() })
     expect(openLocal).toHaveBeenCalledWith('same.txt', 3)
     expect(stat).not.toHaveBeenCalled()
     expect(openRemote).not.toHaveBeenCalled()
+  })
+
+  it('opens a remote PDF or archive as a local copy with the default app, never in the text editor', async () => {
+    const stat = vi.fn(), openRemote = vi.fn(), openRemoteDocument = vi.fn().mockResolvedValue({ path: 'C:/cache/report.pdf' }), openLocal = vi.fn()
+    await openConversationFile({ machineId: 'host-a', projectId: 'p', path: 'out/report.PDF' }, openLocal, { stat, openRemote, openRemoteDocument })
+    expect(openRemoteDocument).toHaveBeenCalledWith('host-a', 'p', 'out/report.PDF')
+    expect(openRemote).not.toHaveBeenCalled()
+    expect(openLocal).not.toHaveBeenCalled()
+    // A local conversation's PDF keeps the local route.
+    await openConversationFile({ machineId: 'local', projectId: 'p', path: 'out/report.pdf' }, openLocal, { stat, openRemote, openRemoteDocument })
+    expect(openRemoteDocument).toHaveBeenCalledTimes(1)
+    expect(openLocal).toHaveBeenCalledWith('out/report.pdf', undefined)
   })
 })

@@ -534,3 +534,32 @@ describe('the push channel driving the mirror', () => {
     expect(f.asked.map(entry => entry.machineId)).toEqual(['desktop', 'laptop', 'laptop'])
   })
 })
+
+describe('watching a conversation the host started', () => {
+  it('only stops watching when the owner closes an attached tab; the host keeps its tab', async () => {
+    const f = fixture(() => ({ closed: true }))
+    f.mirror.bind(binding({ remoteTabId: 'their-tab', attached: true }))
+    expect(await f.mirror.closeRemote('local-session')).toEqual({ closed: false })
+    expect(f.asked).toEqual([])
+    expect(f.mirror.list()).toEqual([])
+  })
+
+  it('keeps the attached mark across a restart and refuses a malformed one', () => {
+    const f = fixture(() => [])
+    f.mirror.bind(binding({ attached: true }))
+    expect(readBindings(f.settings.get('remote-control.sessionMirrors'))[0]).toMatchObject({ attached: true })
+    expect(readBindings(JSON.stringify([{ ...binding(), attached: 'yes' }]))).toEqual([])
+  })
+
+  it('never carries a host wizard wand into the mirror, from history or from the snapshot', async () => {
+    const wizardSettings: SessionProjection['settings'] = { model: 'claude-opus-5-5', effort: 'high', permission: 'default', plan: false, wizard: true }
+    const sessionEvent: AgentEvent = { ...remoteEvent(1, 'x'), data: { type: 'session', phase: 'idle', settings: wizardSettings } }
+    const { events } = rekeyRemoteEvents([sessionEvent], binding(), 0)
+    expect((events[0]!.data as { settings?: Record<string, unknown> }).settings).not.toHaveProperty('wizard')
+    expect((events[0]!.data as { settings?: Record<string, unknown> }).settings).toMatchObject({ model: 'claude-opus-5-5' })
+    const f = fixture(method => method === 'agents.snapshot' ? { ...remoteSnapshot(), settings: wizardSettings } : [])
+    f.mirror.bind(binding())
+    await f.mirror.connect('local-session')
+    expect(f.store.snapshot('local-session')?.settings).not.toHaveProperty('wizard')
+  })
+})

@@ -10,8 +10,12 @@ import type {
   MachineDescriptor,
   RemoteControlSettings,
   RemoteControlState,
+  RemoteAttachedTab,
+  RemoteAttachTabRequest,
   RemotePairingTicket,
-  RemoteProjectSummary
+  RemoteProjectSummary,
+  RemoteWorkspaceTab,
+  RemoteWorkspaceTabs
 } from '../shared/remote-control'
 import type { RemoteFileDescription, RemoteFileIdentity, RemoteFileWriteRequest } from '../shared/remote-files'
 import { decodeTicket, encodeTicket, LOCAL_MACHINE_ID, readRemoteProjectSummaries, type TailscaleState } from '../shared/remote-control'
@@ -28,6 +32,7 @@ import type { ProjectBacklogs } from './project-backlog'
 import { DIRECT_PROBE_TIMEOUT_MS, RemoteControlClient, type RemoteCallOptions } from './remote-control-client'
 import { RemoteControlHost } from './remote-control-host'
 import { RemoteFileResourceServer } from './remote-file-resources'
+import { RemoteOpenCache } from './remote-open-cache'
 import { RemoteFiles } from './remote-files'
 import { RemoteControlServer } from './remote-control-server'
 import { GitHubRelayMailbox } from './github-relay'
@@ -70,6 +75,8 @@ export interface RemoteControlServiceDependencies {
   clientId?: string
   /** Main-owned native save dialog; renderer input can never choose an arbitrary destination. */
   chooseRemoteDownloadPath?(description: RemoteFileDescription): Promise<string | null>
+  /** Where documents from a paired machine are copied to be opened here, and how they are opened. */
+  remoteOpen?: { root: string; open(path: string): Promise<void> }
   /**
    * Creates a project on this machine exactly as the owner's own "New project" does. It is what
    * serves `projects.create` for a paired machine, so a project made from the laptop is the same
@@ -245,6 +252,7 @@ export class RemoteControlService {
   /** Task list, rename and the rest of a "Remote: MAIN" project's own actions, done on its host. */
   readonly projectActions: RemoteProjectActions
   readonly resources: RemoteFileResourceServer
+  private readonly openCache: RemoteOpenCache | null
   readonly mirror: RemoteSessionMirror
   readonly tailscale: TailscaleService
   /** The tailnet route: the push channel this machine serves and the ones it holds to its hosts. */
@@ -445,6 +453,7 @@ export class RemoteControlService {
       changed: (_target, what) => { if (what === 'project') this.publishProjects() }
     })
     this.resources = new RemoteFileResourceServer({ files: this.files, chooseDownloadPath: deps.chooseRemoteDownloadPath })
+    this.openCache = deps.remoteOpen ? new RemoteOpenCache({ files: this.files, ...deps.remoteOpen }) : null
     this.mirror = new RemoteSessionMirror({
       database: store,
       call: (machineId, method, args) => this.client.call(machineId, method, args),
@@ -1171,6 +1180,90 @@ export class RemoteControlService {
     return { localSessionId, machineId: request.machineId, machineName: opened.machineName }
   }
 
+  /**
+   * The conversations a project's host is running, workspace by workspace. Everything here is read
+   * through the host's own `workspaces.list` and `agents.list`, which check the project grant and
+   * leave out anonymous tabs, so this lists nothing a paired machine could not already address.
+   */
+  async workspaceTabs(projectId: string): Promise<RemoteWorkspaceTabs> {
+    const target = this.remoteProjectTarget(String(projectId ?? ''))
+    const workspaces = await this.client.call(target.machineId, 'workspaces.list', { projectId: target.remoteProjectId }) as Array<{ id?: unknown; name?: unknown }>
+    const mirrored = new Map(this.mirror.list().filter(binding => binding.machineId === target.machineId)
+      .map(binding => [binding.remoteAgentSessionId, binding.localSessionId]))
+    const listed = (Array.isArray(workspaces) ? workspaces : []).filter(workspace => typeof workspace?.id === 'string' && workspace.id).slice(0, 50)
+    return {
+      machineId: target.machineId,
+      machineName: target.machineName,
+      remoteProjectId: target.remoteProjectId,
+      workspaces: await Promise.all(listed.map(async workspace => {
+        const id = workspace.id as string
+        const agents = await this.client.call(target.machineId, 'agents.list', { projectId: target.remoteProjectId, sessionId: id }) as Array<Record<string, unknown>>
+        const tabs = (Array.isArray(agents) ? agents : []).flatMap((agent): RemoteWorkspaceTab[] => {
+          const provider = agent?.provider
+          if (typeof agent?.tabId !== 'string' || typeof agent.agentSessionId !== 'string' || !agent.agentSessionId) return []
+          // Only a conversation this store can journal is mirrored; the rest stay on the host.
+          if (provider !== 'claude' && provider !== 'codex' && provider !== 'local') return []
+          const localSessionId = mirrored.get(agent.agentSessionId)
+          return [{
+            tabId: agent.tabId, agentSessionId: agent.agentSessionId, provider,
+            title: typeof agent.title === 'string' && agent.title ? agent.title.slice(0, 160) : 'Conversation',
+            ...(typeof agent.phase === 'string' ? { phase: agent.phase } : {}),
+            ...(localSessionId ? { localSessionId } : {})
+          }]
+        })
+        return { id, name: typeof workspace.name === 'string' && workspace.name ? workspace.name.slice(0, 160) : 'Workspace', tabs }
+      }))
+    }
+  }
+
+  /**
+   * Mirrors a conversation the host is already running into a tab here. Its authority is exactly a
+   * placed tab's: every later read, prompt, steer and answer is an ordinary host `agents.*` call,
+   * reauthorised there against the grant and stamped with remote prompt authority, and a wizard tab's
+   * wand stays the host's (keepHostWizard there, withoutWizardSettings here). Unlike a placed tab it
+   * is marked attached, so closing it here only stops watching: the owner started it on the host,
+   * and a view closing on the laptop must not end work on MAIN.
+   */
+  async attachRemoteTab(request: RemoteAttachTabRequest): Promise<RemoteAttachedTab> {
+    const target = this.remoteProjectTarget(String(request?.projectId ?? ''))
+    const sessionId = String(request?.sessionId ?? '')
+    const remoteSessionId = String(request?.remoteSessionId ?? '')
+    const remoteAgentSessionId = String(request?.remoteAgentSessionId ?? '')
+    if (!sessionId || !remoteSessionId || !remoteAgentSessionId) throw new RemoteAccessError('Name the workspace here and the conversation on the other machine.', 400)
+    const existing = this.mirror.list().find(binding => binding.machineId === target.machineId && binding.remoteAgentSessionId === remoteAgentSessionId)
+    const agents = await this.client.call(target.machineId, 'agents.list', { projectId: target.remoteProjectId, sessionId: remoteSessionId }) as Array<Record<string, unknown>>
+    const entry = (Array.isArray(agents) ? agents : []).find(agent => agent?.agentSessionId === remoteAgentSessionId)
+    if (!entry || typeof entry.tabId !== 'string') throw new RemoteAccessError(`That conversation is no longer open on ${target.machineName}.`, 404)
+    const provider = entry.provider
+    if (provider !== 'claude' && provider !== 'codex' && provider !== 'local') throw new RemoteAccessError(`${String(provider)} conversations cannot be shown on another machine yet.`, 400)
+    const title = typeof entry.title === 'string' && entry.title ? entry.title.slice(0, 160) : 'Conversation'
+    if (existing) {
+      return { localSessionId: existing.localSessionId, machineId: target.machineId, machineName: target.machineName, title, provider, existingWorkspaceId: existing.workspaceId }
+    }
+    const advertised = (await this.refreshRemoteProjects(target.machineId)).find(entry => entry.id === target.remoteProjectId)
+    const cwd = advertised?.identity?.path
+    if (!cwd) throw new RemoteAccessError(advertised?.identityError || `${target.machineName} is not sharing that project any more.`, 409)
+    const localSessionId = makeId('agent')
+    this.mirror.bind({
+      localSessionId,
+      machineId: target.machineId,
+      projectId: target.localProjectId,
+      workspaceId: sessionId,
+      provider,
+      cwd,
+      remoteProjectId: target.remoteProjectId,
+      remoteSessionId,
+      remoteAgentSessionId,
+      remoteTabId: entry.tabId,
+      remoteSequence: 0,
+      attached: true
+    })
+    this.mirror.start()
+    void this.mirror.pull(localSessionId).catch(error => console.warn('Remote session did not load', error))
+    void this.refreshSubscriptions(target.machineId)
+    return { localSessionId, machineId: target.machineId, machineName: target.machineName, title, provider }
+  }
+
   /** The tailnet as last read; `remote:tailscale` re-reads it on demand. */
   private tailscaleState(): TailscaleState { return this.tailscale.last() }
 
@@ -1209,7 +1302,19 @@ export class RemoteControlService {
     try { this.deps.publish('projects:changed', this.deps.database.listDeskProjects()) } catch { /* the window may be closing */ }
   }
 
+  /**
+   * The owner renamed a project here; every machine it is shared with follows it to the new
+   * folder rather than being refused with "moved since it was shared" (RemotePeers.followProjectMoves).
+   */
+  followProjectRename(projectId: string): void {
+    if (this.peers.followProjectMoves({ projectId, reason: 'renamed on this machine', requireOldPathGone: false })) this.publishState()
+  }
+
   async start(): Promise<void> {
+    // Renames made here before grants followed them left those projects refused to every paired
+    // machine; heal the ones whose old folder is gone before anyone calls.
+    try { this.peers.followProjectMoves({ reason: 'renamed on this machine earlier', requireOldPathGone: true }) }
+    catch (error) { console.warn('Moved project grants could not be checked', error) }
     await this.server.apply()
     // The relay this machine runs comes up before the client that uses it, so the first connection
     // finds something listening instead of failing and waiting out a backoff.
@@ -1334,6 +1439,12 @@ export class RemoteControlService {
     handle('remote:files-preview', (request: RemoteFileIdentity) => this.resources.issue(request))
     handle<boolean>('remote:files-revoke-preview', (url: string) => { this.resources.revoke(String(url)); return true })
     handle('remote:files-download', (request: RemoteFileIdentity) => this.resources.download(request))
+    handle('remote:files-open-local', (request: RemoteFileIdentity) => {
+      if (!this.openCache) throw new RemoteAccessError('This computer cannot open documents from another machine.', 501)
+      return this.openCache.open(request)
+    })
+    handle<RemoteWorkspaceTabs>('remote:workspace-tabs', (projectId: string) => this.workspaceTabs(projectId))
+    handle<RemoteAttachedTab>('remote:attach-tab', (request: RemoteAttachTabRequest) => this.attachRemoteTab(request))
     handle<TailscaleState>('remote:tailscale', () => this.transport.tailscaleState(true))
     handle<MachineDiagnostics>('remote:diagnostics', (machineId: string) => this.transport.diagnostics(String(machineId)))
     handle<RemoteControlState>('remote:detach', (machineId: string) => { this.attachment.detach(String(machineId)); return this.state() })
@@ -1397,7 +1508,8 @@ export class RemoteControlService {
         'remote:state', 'remote:set-settings', 'remote:set-relay-server', 'remote:set-relay-hosting', 'remote:ticket', 'remote:invite', 'remote:approve', 'remote:reshare-project', 'remote:deny', 'remote:revoke',
         'remote:connect', 'remote:forget', 'remote:remote-projects', 'remote:create-remote-project', 'remote:unshare-project',
         'remote:machines', 'remote:refresh-machines', 'remote:open-tab', 'remote:close-tab', 'remote:session-machine', 'remote:session-file-context', 'remote:files-list', 'remote:files-stat', 'remote:files-read',
-        'remote:files-write', 'remote:files-preview', 'remote:files-revoke-preview', 'remote:files-download',
+        'remote:files-write', 'remote:files-preview', 'remote:files-revoke-preview', 'remote:files-download', 'remote:files-open-local',
+        'remote:workspace-tabs', 'remote:attach-tab',
         'remote:tailscale', 'remote:diagnostics', 'remote:detach', 'remote:attach', 'remote:open-remote-project',
         'remote:terminals-list', 'remote:terminals-open', 'remote:terminals-attach', 'remote:terminals-release',
         'remote:services-registered', 'remote:services-register', 'remote:services-unregister', 'remote:services-list', 'remote:services-open', 'remote:services-close']) ipcMain.removeHandler(channel)

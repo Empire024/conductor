@@ -44,7 +44,39 @@ export interface RemoteFileWriteResponse {
 export const REMOTE_FILE_CHUNK_BYTES = 256 * 1024
 export const REMOTE_FILE_MAX_ASSET_BYTES = 256 * 1024 * 1024
 
-export type RemoteFilePreviewKind = 'image' | 'video'
+/**
+ * `document` is a file no Conductor view reads - a PDF, an archive, an office file - which is only
+ * ever fetched whole to the controlling computer and opened there with its default app. It is never
+ * served through a preview URL, and nothing that could run (scripts, executables, HTML) is one.
+ */
+export type RemoteFilePreviewKind = 'image' | 'video' | 'document'
+
+/** The files a paired machine may hand over to be opened with the controlling computer's default app. */
+export const REMOTE_OPENABLE_DOCUMENTS: Readonly<Record<string, string>> = {
+  '.pdf': 'application/pdf',
+  '.zip': 'application/zip',
+  '.7z': 'application/x-7z-compressed',
+  '.rar': 'application/vnd.rar',
+  '.tar': 'application/x-tar',
+  '.gz': 'application/gzip',
+  '.tgz': 'application/gzip',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.odt': 'application/vnd.oasis.opendocument.text',
+  '.ods': 'application/vnd.oasis.opendocument.spreadsheet',
+  '.odp': 'application/vnd.oasis.opendocument.presentation',
+  '.epub': 'application/epub+zip'
+}
+
+/** The lower-case extension of a host path, or '' when it has none. */
+export const remoteFileExtension = (path: string): string => {
+  const name = path.replaceAll('\\', '/').split('/').pop() ?? ''
+  const dot = name.lastIndexOf('.')
+  return dot > 0 ? name.slice(dot).toLowerCase() : ''
+}
+
+export const isRemoteOpenableDocument = (path: string): boolean => Object.hasOwn(REMOTE_OPENABLE_DOCUMENTS, remoteFileExtension(path))
 
 export interface RemoteFileDescription {
   file: RemoteFileIdentity
@@ -108,6 +140,11 @@ export interface RemoteFileResourceBridge {
   preview(file: RemoteFileIdentity): Promise<RemoteFilePreviewResource>
   revokePreview(url: string): Promise<void>
   download(file: RemoteFileIdentity): Promise<RemoteFileDownloadResult | null>
+  /**
+   * Fetches a host document (REMOTE_OPENABLE_DOCUMENTS) into a read-only copy on this computer and
+   * opens it with the default app. The copy is a cache, pruned by age and size; edits never go back.
+   */
+  openLocal(file: RemoteFileIdentity): Promise<{ path: string }>
 }
 
 /** Kept separate from the local files bridge so callers cannot accidentally fall back to disk. */

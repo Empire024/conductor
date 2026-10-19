@@ -1960,7 +1960,7 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 
 - [x] when multiple tabs open in file viewer scroll wheel opened instead of close tab when middle clicking <!-- conductor-task:c8d7d75f-b9f5-4f71-9644-37c79d6e6702 agent=agent_mvf107r0_mqjh9vu -->
 
-- [ ] i want all tabs from a workspace t o be able to be visible in conductor from my laptop if possible, also files etc get links to open up on the laptop etc <!-- conductor-task:21233d3f-69d3-418b-a91c-3ccf068946ad -->
+- [x] i want all tabs from a workspace t o be able to be visible in conductor from my laptop if possible, also files etc get links to open up on the laptop etc <!-- conductor-task:21233d3f-69d3-418b-a91c-3ccf068946ad agent=agent_mvf1qju3_batckbv -->
   
   ![image.png](.conductor/prompt-images/86e7a5dd-062e-432b-b111-10256519ea40.png)
 
