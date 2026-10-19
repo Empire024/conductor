@@ -371,7 +371,11 @@ models they want
 
 - [x] Encountered a bug where I thought all crashed + ctrl tab showed me Usage view was actually somehow open or something and after closing it I could use this app again - clicking anywhere did nothing till i did ctrl tab.. fix <!-- conductor-task:88138288-448e-4f07-827b-0e029b33d6fb agent=agent_muftf6uj_trclqks -->
 
+- [ ] close finished doesnt close them in view.. <!-- conductor-task:cf415374-684f-4747-a0be-a91a80e73ae9 -->
+
 Feature list:
+
+- [ ] Automatically discover and highlight delivered file links in the right-hand Links & files panel as soon as an agent sends them, so outputs (including PDFs and ZIPs) are immediately findable. Preserve the exact linked paths; support ordinary Markdown file links and `:codex-file-citation{path="..." purpose="output"}`. Document the delivery convention in agent briefings/docs. Follow-up to completed sidebar task e90b679f-a8db-4433-8cb6-43add3fd26c7: this adds automatic output discovery/highlighting, not another sidebar. Example: `C:/Users/stilj/Conductor/haf-stuff/output/owner-picks/HAF-owner-picks-round-and-serious.zip`. `files.open` rejects PDFs and is not the intended workaround. <!-- conductor-task:deliverable-links-auto-highlight agent=agent_mveu3kyg_3rvnuat -->
 
 0. [Implemented] Beautify the 'send' button.
 1. [Implemented] Right clicking night/day will open simple dropdown where you can choose the theme also.
@@ -1953,6 +1957,13 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 
 - [x] each chat needs t o have an easily visible section with agent links & questions that get stuck somewhere on the side or are easily visible upon clicking, currently links can get lost in conversation & agent questions (that are not created with askuserquestions but just basic questions in chat) can be forgotten - the latter is not necessary if it'd be hard to implement, but the links & files would be really nice to have in some view. <!-- conductor-task:e90b679f-a8db-4433-8cb6-43add3fd26c7 agent=agent_mvdlfzp1_qzvskgr -->
 
+
+- [ ] when multiple tabs open in file viewer scroll wheel opened instead of close tab when middle clicking <!-- conductor-task:c8d7d75f-b9f5-4f71-9644-37c79d6e6702 -->
+
+- [ ] i want all tabs from a workspace t o be able to be visible in conductor from my laptop if possible, also files etc get links to open up on the laptop etc <!-- conductor-task:21233d3f-69d3-418b-a91c-3ccf068946ad -->
+  
+  ![image.png](.conductor/prompt-images/86e7a5dd-062e-432b-b111-10256519ea40.png)
+
 ## Phone WebApp: ultimate, snappy control suite (2026-10-03)
 
 - [x] 1. Repair phone dictation and explain iOS/Android browser, permission and PWA limitations with keyboard fallback. <!-- conductor-task:phone-redesign-dictation agent=agent_murrdn5k_umf5k4m -->
@@ -1991,3 +2002,5 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 - [x] A Codex turn that OpenAI rejects with "Selected model is at capacity. Please try a different model." just dies with a raw red error (twice in a haf-stuff coworker, 2026-10-19; owner: "wtf is this bug"). Treat provider overload/capacity errors (Codex "at capacity", OpenAI 503/server_overloaded, Anthropic 529 overloaded_error) as transient: retry the turn automatically with backoff (bounded), show one readable notice instead of repeated raw errors, and if it keeps failing, report it to the controller/wizard and suggest switching model rather than leaving the tab silently stopped <!-- conductor-task:provider-capacity-retry agent=agent_mvdl9h9x_1o17dbn -->
 
 - [x] Codex file citations showed as raw markup in conversations (owner screenshot 2026-10-19: "Created :codex-file-citation{path="C:/Users/stilj/Conductor/haf-stuff/output/pdf/HAF-font-shortlist-US-Letter.pdf" purpose="output"}"). Desktop now renders each as a file link named after the file (line kept), the phone as the file name in code <!-- conductor-task:codex-file-citation-render agent=agent_mvdmpgfl_brb1ban -->
+
+- [ ] Delivered outputs must be easy to find (owner via haf-stuff, 2026-10-19: delivered logo PDFs were hard to find; "should be able to for example highlight your links that you send me ... just like the ones you just did"). The Links & files rail (dead458) should, when an agent finishes a turn that delivers files, automatically reveal/highlight those entries: every clickable file link the agent posted in that turn (ordinary markdown file links and plain verified paths, not only :codex-file-citation purpose="output"), marked as "Delivered" at the top of the rail, with a dot on the rail toggle while unseen; also surface them on the phone. Treat purpose="output" citations as delivered outputs. Inject a short agent instruction (turn briefing) on how to deliver outputs: post absolute file links (or :codex-file-citation purpose="output" for Codex) in the final message; files.open is for text files only, so do not use it for PDFs. Verify with a local PDF output in a parked smoke. Note: files.open refuses PDFs ("Only text files up to 1 MiB") by design; opening a PDF from the rail should use the OS default app / browser preview <!-- conductor-task:delivered-outputs-highlight -->
