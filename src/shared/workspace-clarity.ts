@@ -132,7 +132,10 @@ export function buildWorkspaceClarity(input: ClarityInput): WorkspaceClarity {
   // Live control links between tabs of this workspace: coworker tab -> controller tab.
   const controllerOf = new Map<string, string>()
   for (const link of input.links) if (byTab.has(link.controlledTabId) && byTab.has(link.controllerTabId) && link.controlledTabId !== link.controllerTabId) controllerOf.set(link.controlledTabId, link.controllerTabId)
-  const ended = (id: string): boolean => { const row = byTab.get(id)!; return isFinishedStatus(row.status) && !tabPinned(row.tab) }
+  // A live wizard that is not MAIN (a second one, idle) is still never finished work: the owner's
+  // "Close finished" keeps it open (finishedCloseRefusal), so Done must not offer it either.
+  const liveWizard = (id: string): boolean => { const row = byTab.get(id)!; return Boolean(row.facts?.wizard) && row.status !== 'handed-off' && row.status !== 'failed' && row.status !== 'stopped' }
+  const ended = (id: string): boolean => { const row = byTab.get(id)!; return isFinishedStatus(row.status) && !tabPinned(row.tab) && !liveWizard(id) }
   const liveCoworkers = new Map<string, number>()
   for (const [coworker, controller] of controllerOf) if (!ended(coworker)) liveCoworkers.set(controller, (liveCoworkers.get(controller) ?? 0) + 1)
   const mainTabId = pickMain(byTab, liveCoworkers)

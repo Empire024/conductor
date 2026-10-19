@@ -83,6 +83,28 @@ describe('buildWorkspaceClarity', () => {
     expect(statusLabel(clarity.done.find(row => row.tab.id === 'old')!)).toBe('handed off')
   })
 
+  it('keeps a second live wizard out of Done, since Close finished never closes a live wizard (feature-list cf415374)', () => {
+    // The owner's HAF ops workspace on 2026-10-19: two idle wizards; one is MAIN, the other sat in
+    // Done, was counted in "Close N", and main kept it open, so it stayed in view after every click.
+    const { input, tabs } = ownerWorkspace(2)
+    const withSecond = [...tabs, agent('wiz2', 'HAF ops app')]
+    const facts: Record<string, AgentTabFacts> = { ...input.facts, agent_wiz2: { wizard: true, handedOff: false, settledAt: at(3) } }
+    const phases = new Map<string, AgentActivityPhase>([...input.phases, ['agent_wiz2', 'complete']])
+    const clarity = buildWorkspaceClarity({ ...input, panes: [{ groupId: 'g', tabs: withSecond, activeTabId: 'wiz' }], facts, phases })
+    expect(clarity.mainTabId).toBe('wiz')
+    expect(clarity.done.map(row => row.tab.id)).not.toContain('wiz2')
+    expect(clarity.live.map(row => row.tab.id)).toContain('wiz2')
+    expect(clarity.hiddenFromStrip.has('wiz2')).toBe(false)
+    const closable = clarity.done.map(row => ({ finished: true, pinned: false, wizard: Boolean(facts[row.tab.resourceId!]?.wizard) && row.status !== 'failed', controlsLiveCoworkers: false, remote: false, busy: null }))
+    // Everything Done offers is something main's owner-button rule closes.
+    expect(closable.map(tab => finishedCloseRefusal(tab))).toEqual(closable.map(() => null))
+    // A failed, stopped or handed-off wizard is ended work and stays in Done.
+    for (const [phase, handedOff] of [['failed', false], ['stopped', false], ['complete', true]] as const) {
+      const ended = buildWorkspaceClarity({ ...input, panes: [{ groupId: 'g', tabs: withSecond, activeTabId: 'wiz' }], facts: { ...facts, agent_wiz2: { wizard: true, handedOff, settledAt: at(3) } }, phases: new Map([...phases, ['agent_wiz2', phase]]) })
+      expect(ended.done.map(row => row.tab.id)).toContain('wiz2')
+    }
+  })
+
   it('without a wizard, the controller with live coworkers is MAIN, even between its turns', () => {
     const { input } = ownerWorkspace(2)
     const facts = Object.fromEntries(Object.entries(input.facts).map(([id, value]) => [id, { ...value, wizard: false }]))

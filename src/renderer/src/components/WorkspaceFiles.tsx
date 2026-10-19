@@ -14,6 +14,7 @@ import { workspaceFileKey, workspaceFileMachine } from './workspace-files-state'
 import { recordRecentFile } from './recent-files-store'
 import { isRemoteFileMachine } from '../remote-files'
 import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
+import { middleClickClose } from './middle-click-close'
 import './WorkspaceFiles.css'
 
 const notify = (message: string): void => { window.dispatchEvent(new CustomEvent('conductor:toast', { detail: message })) }
@@ -177,12 +178,12 @@ export function WorkspaceFiles({ projects, projectId, workspaceId, showHiddenFil
     {active && <aside ref={host} className="workspace-document workspace-files" style={{ width }} aria-label="Open files">
       <button className="workspace-document-resizer" onPointerDown={resize} aria-label="Resize editor" />
       <div className="file-tabs" role="tablist" aria-label="File tabs">
-        {state.files.map((file) => <div className={'file-tab' + (file.id === active.id ? ' active' : '')} key={file.id}>
+        {state.files.map((file) => <div className={'file-tab' + (file.id === active.id ? ' active' : '')} key={file.id} data-autoscroll="off" {...middleClickClose(() => void close(file.id), naming?.file.id !== file.id)}>
           {naming?.file.id === file.id ? <div className="file-tab-naming">{(() => { const { icon: NamingIcon, colorClass } = fileTypeStyle(naming.value); return <NamingIcon size={13} className={colorClass} /> })()}<input ref={namingInput} className="file-tab-name" aria-label="New file name" value={naming.value} disabled={renaming} onChange={(event) => { const next = { ...naming, value: event.target.value }; namingRef.current = next; setNaming(next) }} onBlur={() => void finishNaming()} onKeyDown={(event) => {
             if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); stopNaming(); focusEditor() }
             if (event.key === 'Enter') { event.preventDefault(); event.stopPropagation(); void finishNaming().then(focusEditor) }
           }} /></div> : <button role="tab" aria-selected={file.id === active.id} title={(isRemoteFileMachine(file.machineId) ? 'Remote ' + workspaceFileMachine(file) + ' · ' : '') + projects.find((item) => item.id === file.projectId)?.name + ' / ' + file.path + (file.mode === 'browser' ? ' · Open in browser' : '')}
-            onClick={() => setState((current) => ({ ...current, activeId: file.id }))} onAuxClick={(event) => { if (event.button === 1) { event.preventDefault(); void close(file.id) } }} onContextMenu={(event) => showFileMenu(event, file)} data-autoscroll="off">
+            onClick={() => setState((current) => ({ ...current, activeId: file.id }))} onContextMenu={(event) => showFileMenu(event, file)} data-autoscroll="off">
             {file.mode === 'browser' ? <Globe2 size={13} /> : (() => { const { icon: TabIcon, colorClass } = fileTypeStyle(file.path); return <TabIcon size={13} className={colorClass} /> })()}<span>{file.path.split('/').pop()}</span>{dirtyIds.has(file.id) && <i className="file-dirty-dot" aria-label="Unsaved changes" />}
           </button>}<button className="file-tab-close" aria-label={'Close ' + file.path} onMouseDown={() => { if (namingRef.current?.file.id === file.id) stopNaming() }} onClick={() => void close(file.id)}><X size={12} /></button>
         </div>)}

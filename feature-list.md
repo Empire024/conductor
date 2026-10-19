@@ -371,7 +371,7 @@ models they want
 
 - [x] Encountered a bug where I thought all crashed + ctrl tab showed me Usage view was actually somehow open or something and after closing it I could use this app again - clicking anywhere did nothing till i did ctrl tab.. fix <!-- conductor-task:88138288-448e-4f07-827b-0e029b33d6fb agent=agent_muftf6uj_trclqks -->
 
-- [ ] close finished doesnt close them in view.. <!-- conductor-task:cf415374-684f-4747-a0be-a91a80e73ae9 -->
+- [x] close finished doesnt close them in view.. <!-- conductor-task:cf415374-684f-4747-a0be-a91a80e73ae9 agent=agent_mvf107r0_mqjh9vu -->
 
 Feature list:
 
@@ -1958,7 +1958,7 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 - [x] each chat needs t o have an easily visible section with agent links & questions that get stuck somewhere on the side or are easily visible upon clicking, currently links can get lost in conversation & agent questions (that are not created with askuserquestions but just basic questions in chat) can be forgotten - the latter is not necessary if it'd be hard to implement, but the links & files would be really nice to have in some view. <!-- conductor-task:e90b679f-a8db-4433-8cb6-43add3fd26c7 agent=agent_mvdlfzp1_qzvskgr -->
 
 
-- [ ] when multiple tabs open in file viewer scroll wheel opened instead of close tab when middle clicking <!-- conductor-task:c8d7d75f-b9f5-4f71-9644-37c79d6e6702 -->
+- [x] when multiple tabs open in file viewer scroll wheel opened instead of close tab when middle clicking <!-- conductor-task:c8d7d75f-b9f5-4f71-9644-37c79d6e6702 agent=agent_mvf107r0_mqjh9vu -->
 
 - [ ] i want all tabs from a workspace t o be able to be visible in conductor from my laptop if possible, also files etc get links to open up on the laptop etc <!-- conductor-task:21233d3f-69d3-418b-a91c-3ccf068946ad -->
   
