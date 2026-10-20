@@ -78,6 +78,12 @@ export const remoteFileExtension = (path: string): string => {
 
 export const isRemoteOpenableDocument = (path: string): boolean => Object.hasOwn(REMOTE_OPENABLE_DOCUMENTS, remoteFileExtension(path))
 
+/** The media a paired machine previews and hands over (the host's own list is the authority). */
+export const REMOTE_MEDIA_EXTENSIONS: readonly string[] = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.mp4', '.webm', '.mov']
+
+/** Whether a host file can be saved to this computer whole: safe media, or an allowlisted document. */
+export const isRemoteTransferable = (path: string): boolean => isRemoteOpenableDocument(path) || REMOTE_MEDIA_EXTENSIONS.includes(remoteFileExtension(path))
+
 export interface RemoteFileDescription {
   file: RemoteFileIdentity
   size: number

@@ -1264,6 +1264,24 @@ export class RemoteControlService {
     return { localSessionId, machineId: target.machineId, machineName: target.machineName, title, provider }
   }
 
+  /**
+   * A file a mirrored conversation linked, by the absolute path its reply used on the host: fetched
+   * through the project grant into the cached read-only copy (RemoteOpenCache.copy), whose path is
+   * answered. The path must lie in the conversation's own host folder; the grant and the host's own
+   * containment check decide the rest, exactly as for every other remote file read.
+   */
+  async copyConversationFile(localSessionId: string, absolutePath: string): Promise<string> {
+    if (!this.openCache) throw new RemoteAccessError('This computer cannot copy files from another machine.', 501)
+    const binding = this.mirror.get(String(localSessionId ?? ''))
+    if (!binding) throw new RemoteAccessError('This conversation is not mirrored from a paired machine any more.', 409)
+    const root = binding.cwd.replace(/\\/g, '/').replace(/\/+$/, '')
+    const path = String(absolutePath ?? '').replace(/\\/g, '/')
+    if (!path.toLowerCase().startsWith(root.toLowerCase() + '/')) throw new RemoteAccessError('That file is outside the conversation’s project on the other machine.', 403)
+    const relative = path.slice(root.length + 1)
+    const { path: copy } = await this.openCache.copy({ machineId: binding.machineId, projectId: binding.projectId, path: relative })
+    return copy
+  }
+
   /** The tailnet as last read; `remote:tailscale` re-reads it on demand. */
   private tailscaleState(): TailscaleState { return this.tailscale.last() }
 

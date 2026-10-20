@@ -19,7 +19,7 @@ function fixture(bytes = Buffer.from('remote-render-bytes')) {
   let now = Date.parse('2026-09-12T15:00:00.000Z')
   let version = 'a'.repeat(64)
   let mimeType = 'image/png'
-  let kind: 'image' | 'video' = 'image'
+  let kind: 'image' | 'video' | 'document' = 'image'
   const describeFile = vi.fn(async (file: RemoteFileIdentity): Promise<RemoteFileDescription> => ({
     file: { ...file }, size: bytes.length, modifiedAt: '2026-09-12T14:59:00.000Z', version, mimeType, kind
   }))
@@ -38,7 +38,8 @@ function fixture(bytes = Buffer.from('remote-render-bytes')) {
     now: () => now,
     advance: (ms: number) => { now += ms },
     change: () => { version = 'b'.repeat(64) },
-    active: () => { mimeType = 'image/svg+xml'; kind = 'image' as const }
+    active: () => { mimeType = 'image/svg+xml'; kind = 'image' as const },
+    document: () => { mimeType = 'application/pdf'; kind = 'document' as const }
   }
 }
 
@@ -136,6 +137,19 @@ describe('remote file loopback capabilities', () => {
     expect(fix.readChunk).toHaveBeenCalledTimes(2)
     expect(fix.readChunk.mock.calls.every(([request]) => request.length <= REMOTE_FILE_CHUNK_BYTES)).toBe(true)
     expect((await readdir(root)).filter(name => name.endsWith('.conductor-download'))).toEqual([])
+  })
+
+  it('saves a delivered document through the owner\'s save dialog but never previews one', async () => {
+    const fix = fixture(Buffer.from('%PDF-1.7 tiny'))
+    fix.document()
+    const root = await mkdtemp(join(tmpdir(), 'conductor-remote-download-')); roots.push(root)
+    const destination = join(root, 'HAF scale log.pdf')
+    const server = new RemoteFileResourceServer({ files: fix.files, chooseDownloadPath: async () => destination })
+    servers.push(server)
+    const pdf = { ...identity, path: 'out/HAF scale log.pdf' }
+    await expect(server.download(pdf)).resolves.toMatchObject({ path: destination, size: 13 })
+    expect((await readFile(destination)).toString()).toBe('%PDF-1.7 tiny')
+    await expect(server.issue(pdf)).rejects.toThrow(/metadata is invalid/)
   })
 
   it('removes only its owned temporary download when cancellation wins between chunks', async () => {

@@ -25,6 +25,9 @@ import type { SecretKeyValueStore, SecretVault } from './secret-store'
 import { generateVapidKeys, isValidVapidKeys, sendWebPush, type VapidKeys } from './web-push'
 import { PhoneLock } from './phone-lock'
 import { anonymousConversations } from './local-models/anonymous'
+import { conversationLinkedFiles, linkedPathKey } from './phone-delivered-files'
+import { confined } from './phone-files'
+import { realpath } from 'node:fs/promises'
 import type { WeeklyModelUsageReport } from '../shared/weekly-model-usage'
 import type { AccountLimitsReport } from '../shared/usage-accounting'
 import type { ProviderAllowanceRow } from '../shared/provider-allowance'
@@ -126,6 +129,12 @@ export interface PhoneRemoteSessions {
   respond(response: InteractionResponse): Promise<void>
   interrupt(localSessionId: string, expediteSubmittedInput?: boolean): Promise<void>
   resume(localSessionId: string, settings?: SessionSettings): Promise<void>
+  /**
+   * A file a mirrored conversation linked, fetched from the machine it runs on into a cached
+   * read-only copy here (src/main/remote-open-cache.ts); answers that copy's path. Only images,
+   * videos and documents travel this way.
+   */
+  copyFile?(localSessionId: string, absolutePath: string): Promise<string>
 }
 
 export interface PhoneProjectTasks {
@@ -960,6 +969,37 @@ export class PhoneAccessService {
     const cwd = this.deps.database.structured.spec<AgentSpec>(id)?.cwd
     if (!cwd) throw new PhoneAccessError('That conversation has no folder to keep the image in.', 409)
     return this.importImage(cwd, name, bytes)
+  }
+
+  /**
+   * The real path of a file a conversation delivered or linked, for the phone to preview or save.
+   *
+   * Three things must all hold. The path is one this conversation's own replies named (by the phone's
+   * own Delivered rule, phone-delivered-files.ts), so the phone cannot ask for an arbitrary path. It
+   * resolves - links followed - inside the conversation's project or working folder, and through no
+   * hidden segment, so .git, .env, node_modules and the rest stay refused exactly as the phone's file
+   * browser refuses them. And a conversation mirrored from another machine is read from that machine
+   * through its project grant into a cached copy here, never from this disk.
+   */
+  async deliveredFile(id: string, rawPath: unknown): Promise<string> {
+    const { project, projection } = this.located(id)
+    if (typeof rawPath !== 'string' || !rawPath || rawPath.length > 4096 || /[\u0000-\u001f]/.test(rawPath)) throw new PhoneAccessError('That file path is not valid.', 400)
+    const linked = conversationLinkedFiles(projection).get(linkedPathKey(rawPath))
+    if (!linked) throw new PhoneAccessError('That file is not one this conversation delivered or linked.', 403)
+    if (this.deps.remote?.isRemote(id)) {
+      if (!this.deps.remote.copyFile) throw new PhoneAccessError('Files from conversations on other machines are unavailable in this Conductor.', 503)
+      try { return await this.deps.remote.copyFile(id, linked) } catch (error) {
+        throw new PhoneAccessError(error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+': (?:Error: )?/, '') : 'That file could not be fetched from the other machine.', 409)
+      }
+    }
+    if (project.remote) throw new PhoneAccessError(`${project.name} lives on ${project.remote.machineName || 'another machine'}, and this conversation is not mirrored from it.`, 409)
+    const cwd = this.deps.database.structured.spec<AgentSpec>(id)?.cwd
+    const roots = (await Promise.all([project.path, cwd].filter((value): value is string => typeof value === 'string' && value.length > 0).map(path => realpath(path).catch(() => ''))))
+      .filter(Boolean)
+    let target: string
+    try { target = await realpath(linked) } catch { throw new PhoneAccessError('That file does not exist any more.', 404) }
+    if (!roots.some(root => confined(root, target))) throw new PhoneAccessError('That file is outside this conversation’s project, or in a folder the phone is never sent (hidden folders, node_modules).', 403)
+    return target
   }
 
   private async importImage(cwd: string, name: unknown, bytes: Uint8Array): Promise<PhoneImage> {

@@ -9,7 +9,7 @@ import type {
   RemoteFileIdentity,
   RemoteFilePreviewResource
 } from '../shared/remote-files'
-import { REMOTE_FILE_CHUNK_BYTES, REMOTE_FILE_MAX_ASSET_BYTES } from '../shared/remote-files'
+import { REMOTE_FILE_CHUNK_BYTES, REMOTE_FILE_MAX_ASSET_BYTES, REMOTE_OPENABLE_DOCUMENTS } from '../shared/remote-files'
 import type { RemoteFiles } from './remote-files'
 
 const DEFAULT_TTL_MS = 2 * 60 * 1000
@@ -52,6 +52,18 @@ const validDescription = (value: RemoteFileDescription): boolean =>
     && value.size > 0 && value.size <= REMOTE_FILE_MAX_ASSET_BYTES
     && /^[a-f0-9]{64}$/.test(value.version) && SAFE_MIME.has(value.mimeType)
     && (value.kind === 'image' ? value.mimeType.startsWith('image/') : value.kind === 'video' && value.mimeType.startsWith('video/')))
+
+/**
+ * What may be saved to a file of the owner's choosing: everything a preview may show, and the
+ * documents (PDFs, archives, office files) a conversation delivers. A document is never previewed
+ * through the loopback URL - only written to the path the owner picked in the save dialog.
+ */
+const DOCUMENT_MIME = new Set(Object.values(REMOTE_OPENABLE_DOCUMENTS))
+const downloadableDescription = (value: RemoteFileDescription): boolean =>
+  validDescription(value) || Boolean(value && value.file && typeof value.file.machineId === 'string' && typeof value.file.projectId === 'string'
+    && typeof value.file.path === 'string' && Number.isSafeInteger(value.size)
+    && value.size > 0 && value.size <= REMOTE_FILE_MAX_ASSET_BYTES
+    && /^[a-f0-9]{64}$/.test(value.version) && value.kind === 'document' && DOCUMENT_MIME.has(value.mimeType))
 
 /**
  * Streams an authenticated remote media file through one short-lived opaque loopback URL. The
@@ -252,7 +264,7 @@ export class RemoteFileResourceServer {
     if (!this.deps.chooseDownloadPath) throw new Error('Remote downloads require an owner-controlled save dialog.')
     const description = await this.deps.files.describe(file)
     current()
-    if (!validDescription(description) || !sameFile(description.file, file)) throw new Error('Remote download metadata is invalid.')
+    if (!downloadableDescription(description) || !sameFile(description.file, file)) throw new Error('Remote download metadata is invalid.')
     const destination = await this.deps.chooseDownloadPath(description)
     current()
     if (!destination) return null
@@ -260,7 +272,7 @@ export class RemoteFileResourceServer {
       const current = await this.deps.files.describe(file)
       this.assertOpen(lifecycle)
       if (signal?.aborted) throw new Error('Remote download was cancelled.')
-      if (!validDescription(current) || !sameFile(current.file, description.file)
+      if (!downloadableDescription(current) || !sameFile(current.file, description.file)
         || current.version !== description.version || current.size !== description.size
         || current.kind !== description.kind || current.mimeType !== description.mimeType) {
         throw new Error('Remote download resource changed.')

@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import { open, readdir, realpath, stat } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { extname, join, relative, sep } from 'node:path'
+import { basename, dirname, extname, join, relative, sep } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { PhoneAccessError } from './phone-access'
 
@@ -49,6 +49,16 @@ export function phoneFileType(name: string): string { return TYPES[extname(name)
 export interface PhoneFileEntry { name: string; kind: 'dir' | 'file'; size: number | null; modifiedAt: string | null; type: string | null; image: boolean }
 export interface PhoneFileListing { path: string; parent: string | null; entries: PhoneFileEntry[]; truncated: boolean }
 export interface PhoneFileCapability { url: string; path: string; expiresAt: string }
+/** One file, for a phone that tapped a file a conversation delivered: its URL and what it is. */
+export interface PhoneSingleFileCapability {
+  url: string
+  name: string
+  size: number
+  type: string
+  /** How the phone shows it: in its own image viewer, in a browser tab (PDF), or as a download. */
+  preview: 'image' | 'pdf' | 'none'
+  expiresAt: string
+}
 
 interface Capability {
   token: string
@@ -56,6 +66,8 @@ interface Capability {
   unlockId: string | null
   /** The folder's real path; every file it serves resolves inside it. */
   root: string
+  /** For a single-file capability, the one real path it serves; nothing else in `root` is reachable. */
+  file?: string
   createdAt: number
   usedAt: number
 }
@@ -170,6 +182,30 @@ export class PhoneFiles {
   }
 
   /**
+   * A capability for exactly one file, already resolved and checked by the caller (a conversation's
+   * delivered file, src/main/phone-access.ts deliveredFile). Its URL names that file, and the
+   * capability serves nothing else - not a sibling, not the folder.
+   */
+  async grantFile(realFile: string, owner: { deviceId: string; unlockId: string | null }): Promise<PhoneSingleFileCapability> {
+    const info = await stat(realFile).catch(() => null)
+    if (!info?.isFile()) throw new PhoneAccessError('That file does not exist any more.', 404)
+    if (info.size > MAX_PHONE_FILE_BYTES) throw new PhoneAccessError(`Files over ${MAX_PHONE_FILE_BYTES / 1024 / 1024} MiB are not sent to the phone.`, 413)
+    const name = basename(realFile)
+    this.prune()
+    const mine = [...this.capabilities.values()].filter(entry => entry.deviceId === owner.deviceId).sort((a, b) => a.usedAt - b.usedAt)
+    for (const stale of mine.slice(0, Math.max(0, mine.length - MAX_CAPABILITIES_PER_DEVICE + 1))) this.capabilities.delete(stale.token)
+    const token = randomBytes(32).toString('base64url')
+    const at = this.now()
+    this.capabilities.set(token, { token, deviceId: owner.deviceId, unlockId: owner.unlockId, root: dirname(realFile), file: realFile, createdAt: at, usedAt: at })
+    const type = phoneFileType(name)
+    return {
+      url: PHONE_FILES_PREFIX + token + '/' + encodeURIComponent(name), name, size: info.size, type,
+      preview: IMAGE.test(type) && !ACTIVE.test(type) ? 'image' : type === 'application/pdf' ? 'pdf' : 'none',
+      expiresAt: new Date(at + CAPABILITY_IDLE_MS).toISOString()
+    }
+  }
+
+  /**
    * Ends capabilities when a phone locks: with a null device every one (a code was set or
    * changed), with a null session every one of that phone (unpaired), otherwise that session's.
    */
@@ -211,9 +247,12 @@ export class PhoneFiles {
     let decoded: string[]
     try { decoded = (slash < 0 ? '' : rest.slice(slash + 1)).split('/').filter(Boolean).map(part => decodeURIComponent(part)) } catch { throw new PhoneAccessError('That path is not valid.', 400) }
     if (decoded.some(part => /[\\/]/.test(part))) throw new PhoneAccessError('That path is not valid.', 400)
-    const segments = pathSegments(decoded.join('/'))
+    // A single-file capability answers for its one file name and nothing else; it was resolved and
+    // checked when it was minted, so it is not re-confined to a folder the phone may not browse.
+    const segments = entry.file ? (decoded.length === 1 && same(decoded[0]!, basename(entry.file)) ? decoded : []) : pathSegments(decoded.join('/'))
     if (!segments.length) throw new PhoneAccessError('Not found', 404)
-    const target = await resolveInside(entry.root, segments)
+    const target = entry.file ? await realpath(entry.file).catch(() => '') : await resolveInside(entry.root, segments)
+    if (entry.file && !same(target, entry.file)) throw new PhoneAccessError('That file does not exist any more.', 404)
     entry.usedAt = at
     const handle = await open(target, 'r').catch(() => { throw new PhoneAccessError('That file does not exist.', 404) })
     try {
@@ -227,7 +266,9 @@ export class PhoneFiles {
         'Cache-Control': 'private, no-store', 'Accept-Ranges': 'bytes', 'Last-Modified': info.mtime.toUTCString()
       }
       if (ACTIVE.test(type) || type === 'application/octet-stream') headers['Content-Security-Policy'] = SANDBOX_CSP
-      if (query.get('download') === '1') headers['Content-Disposition'] = `attachment; filename="${name.replace(/[^\x20-\x7e]|["\\]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(name)}`
+      // Inline or attachment, the name travels with the bytes: a PDF opened in a tab and then saved
+      // from Safari's share sheet keeps its file name instead of becoming "document".
+      headers['Content-Disposition'] = `${query.get('download') === '1' ? 'attachment' : 'inline'}; filename="${name.replace(/[^\x20-\x7e]|["\\]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(name)}`
       let start = 0, end = info.size - 1, status = 200
       const range = typeof request.headers.range === 'string' ? request.headers.range.trim() : ''
       const parsed = /^bytes=(\d*)-(\d*)$/.exec(range)

@@ -3336,7 +3336,8 @@ app.whenReady().then(async () => {
       queue: (id, prompt, settings) => remoteControl!.mirror.queue(id, prompt, settings),
       respond: response => remoteControl!.mirror.respond(response),
       interrupt: (id, expedite) => remoteControl!.mirror.interrupt(id, expedite),
-      resume: (id, settings) => remoteControl!.mirror.resume(id, settings)
+      resume: (id, settings) => remoteControl!.mirror.resume(id, settings),
+      copyFile: (id, path) => remoteControl!.copyConversationFile(id, path)
     },
     providers: () => agents.listProviders(),
     machines: () => remoteControl!.machines(),

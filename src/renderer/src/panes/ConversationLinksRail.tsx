@@ -1,8 +1,8 @@
 import { useDeferredValue, useMemo, useState } from 'react'
-import { ExternalLink, FileText, Globe, MessageCircleQuestion, PackageCheck, Paperclip, PencilLine, X } from 'lucide-react'
+import { Download, ExternalLink, FileText, Globe, MessageCircleQuestion, PackageCheck, Paperclip, PencilLine, X } from 'lucide-react'
 import type { TimelineItem } from '../../../shared/structured-agent'
 import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
-import { isRemoteOpenableDocument } from '../../../shared/remote-files'
+import { isRemoteOpenableDocument, isRemoteTransferable } from '../../../shared/remote-files'
 import { useFileLinkProjectRoots } from '../components/file-link-target'
 import { useVerifiedFileLinkKeys } from '../components/plain-file-links'
 import { openWorkspaceFile } from '../components/workspace-files-state'
@@ -68,6 +68,14 @@ export function ConversationLinksRail({ items, cwd, projectId, machineId, asked,
     else if (link.path && link.projectId && link.projectId !== projectId) openWorkspaceFile(link.projectId, link.path, 'auto', link.line, undefined, link.machineId)
     else if (link.path) onOpenFile(link.path, link.line)
   }
+  // A file on the machine a mirrored conversation runs on can also be saved here whole, through the
+  // owner's own save dialog (main: RemoteFileResourceServer.download); a local one is already on disk.
+  const remoteDownload = (link: ConversationLink): boolean => Boolean(link.path) && Boolean(link.machineId) && link.machineId !== LOCAL_MACHINE_ID && isRemoteTransferable(link.path!)
+  const download = (link: ConversationLink): void => {
+    setError('')
+    void window.conductor.remote.files.download({ machineId: link.machineId!, projectId: link.projectId ?? projectId, path: link.path! })
+      .catch((reason: unknown) => setError('Cannot save ' + link.label + ': ' + (reason instanceof Error ? reason.message : String(reason)).replace(/^Error invoking remote method '[^']+': (?:Error: )?/, '')))
+  }
   const row = (link: ConversationLink): React.JSX.Element => {
     const Icon = link.kind === 'url' ? Globe : link.source === 'edit' ? PencilLine : link.source === 'attachment' ? Paperclip : FileText
     const detail = link.url ?? ((link.absolutePath ?? link.path!) + (link.line ? ':' + link.line : ''))
@@ -76,6 +84,7 @@ export function ConversationLinksRail({ items, cwd, projectId, machineId, asked,
         <Icon size={12} aria-hidden="true" /><span>{link.label}</span><small>{link.kind === 'url' ? detail.replace(/^https?:\/\//, '') : link.path!.includes('/') ? link.path!.slice(0, link.path!.lastIndexOf('/')) : link.source === 'edit' ? 'edited' : ''}</small>
       </button>
       <button type="button" className="sa-links-open" aria-label={'Open ' + link.label} title={link.kind === 'url' ? 'Open in the browser' : external(link) ? 'Open with the default app' : remoteDocument(link) ? 'Open a copy with the default app' : 'Open the file'} onClick={() => open(link)}><ExternalLink size={12} /></button>
+      {remoteDownload(link) && <button type="button" className="sa-links-open" aria-label={'Save ' + link.label} title="Save a copy to this computer" onClick={() => download(link)}><Download size={12} /></button>}
     </li>
   }
   return <aside className="sa-links-rail" aria-label="Links and files in this conversation">

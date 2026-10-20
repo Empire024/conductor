@@ -438,6 +438,7 @@ export class PhoneAccessServer {
     const sessionImages = /^\/api\/sessions\/([^/]+)\/images$/
     const projectFiles = /^\/api\/projects\/([^/]+)\/files$/
     const projectFileCapability = /^\/api\/projects\/([^/]+)\/files\/capability$/
+    const sessionFile = /^\/api\/sessions\/([^/]+)\/file$/
     const terminal = (action: string): RegExp => new RegExp(`^/api/terminal/([^/]+)/${action}$`)
     return [
       { method: 'GET', path: '/api/me', sample: '/api/me', run: ctx => service.self(ctx.device.id) },
@@ -460,6 +461,9 @@ export class PhoneAccessServer {
       // folder's files at /files/<capability>/ (src/main/phone-files.ts).
       { method: 'GET', path: projectFiles, sample: '/api/projects/project-a/files', run: ctx => this.files.list(service.fileRoot(ctx.params[0]).path, ctx.query.get('path') ?? '') },
       { method: 'POST', path: projectFileCapability, sample: '/api/projects/project-a/files/capability', run: ctx => this.files.grant(service.fileRoot(ctx.params[0]).path, ctx.body.path ?? '', { deviceId: ctx.device.id, unlockId: ctx.unlock?.id ?? null }) },
+      // One file a conversation delivered or linked (its Delivered chips and file links): checked
+      // against that conversation and served through a capability for that file alone.
+      { method: 'POST', path: sessionFile, sample: '/api/sessions/session-a/file', run: async ctx => this.files.grantFile(await service.deliveredFile(ctx.params[0]!, ctx.body.path), { deviceId: ctx.device.id, unlockId: ctx.unlock?.id ?? null }) },
       { method: 'POST', path: '/api/push/subscribe', sample: '/api/push/subscribe', run: ctx => { service.setSubscription(ctx.device.id, ctx.body.subscription); return { ok: true } } },
       { method: 'POST', path: '/api/push/unsubscribe', sample: '/api/push/unsubscribe', run: ctx => { service.setSubscription(ctx.device.id, null); return { ok: true } } },
       { method: 'POST', path: '/api/push/test', sample: '/api/push/test', run: async ctx => ({ ok: true, ...await service.testNotification(ctx.device.id) }) },

@@ -275,11 +275,16 @@
       if (char === '[') {
         const close = findBracket(text, index + 1)
         if (close > 0 && text[close + 1] === '(') {
-          const target = /^\(\s*<?([^\s()<>]*(?:\([^\s()]*\)[^\s()<>]*)*)>?(?:\s+"[^"]*")?\s*\)/.exec(text.slice(close + 1))
+          /* <...> may hold spaces (a file delivered as "owner picks/HAF Logo.pdf"); a bare target may not. */
+          const target = /^\(\s*<([^<>\n]+)>(?:\s+"[^"]*")?\s*\)/.exec(text.slice(close + 1)) ||
+            /^\(\s*<?([^\s()<>]*(?:\([^\s()]*\)[^\s()<>]*)*)>?(?:\s+"[^"]*")?\s*\)/.exec(text.slice(close + 1))
           if (target) {
             const label = parseInline(text.slice(index + 1, close))
             const href = safeUrl(target[1])
+            /* A link to a file on the computer is a file to preview or save, not a web page. */
+            const file = href ? null : localFilePath(target[1])
             if (href) push({ type: 'link', href: href, children: label })
+            else if (file) push({ type: 'file', path: file, children: label })
             else { flush(); for (const node of label) nodes.push(node) }
             index = close + 1 + target[0].length
             continue
@@ -337,7 +342,14 @@
         if (node.type === 'text') parent.appendChild(text(node.text))
         else if (node.type === 'break') parent.appendChild(make('br'))
         else if (node.type === 'code') { const code = make('code', 'md-code'); code.textContent = node.text; parent.appendChild(code) }
-        else if (node.type === 'link') {
+        else if (node.type === 'file') {
+          /* A button, not a link: nothing navigates. The app opens the file sheet for it. */
+          const file = make('button', 'md-link md-file')
+          file.setAttribute('type', 'button')
+          file.setAttribute('data-file-path', node.path)
+          inline(file, node.children)
+          parent.appendChild(file)
+        } else if (node.type === 'link') {
           const link = make('a', 'md-link')
           link.setAttribute('href', node.href)
           link.setAttribute('target', '_blank')
@@ -415,15 +427,21 @@
    * each once. The phone cannot stat or open them, so a relative path, which may be any word with
    * a dot, is not counted. */
   const ABSOLUTE = /^(?:file:\/\/\/?|\/)?[a-zA-Z]:[\\/]/
+  /* An absolute local file path as a reply wrote it (file URL, %-encoded, with a :line suffix), or
+     null. One rule for Delivered chips, file links and the computer's own check of both. */
+  const localFilePath = raw => {
+    let path = String(raw || '').trim()
+    try { path = decodeURIComponent(path) } catch (error) { /* keep it as written */ }
+    path = path.replace(/^file:\/\/\/?/i, '').replace(/^\/(?=[a-zA-Z]:)/, '').replace(/(?::\d+(?::\d+)?|#L\d+)$/, '')
+    return ABSOLUTE.test(path) && /\.[a-zA-Z][a-zA-Z0-9]{0,11}$/.test(path) ? path : null
+  }
   const deliveredFiles = source => {
     const text = String(source === null || source === undefined ? '' : source)
     const files = []
     const seen = new Set()
     const add = raw => {
-      let path = String(raw || '').trim()
-      try { path = decodeURIComponent(path) } catch (error) { /* keep it as written */ }
-      path = path.replace(/^file:\/\/\/?/i, '').replace(/^\/(?=[a-zA-Z]:)/, '').replace(/(?::\d+(?::\d+)?|#L\d+)$/, '')
-      if (!ABSOLUTE.test(path) || !/\.[a-zA-Z][a-zA-Z0-9]{0,11}$/.test(path)) return
+      const path = localFilePath(raw)
+      if (!path) return
       const key = path.replace(/\\/g, '/').toLowerCase()
       if (seen.has(key)) return
       seen.add(key)

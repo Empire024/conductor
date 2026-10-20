@@ -90,6 +90,15 @@ describe('opening a document from another machine with this computer\'s default 
     expect(existsSync(newer)).toBe(false)
   })
 
+  it('copies an image for the phone without opening anything, and honours a narrower kind list', async () => {
+    const f = fixture(Buffer.from('PNGBYTES'), { kind: 'image' })
+    const { path, description } = await f.cache.copy({ ...file, path: 'out/logo.png' })
+    expect(readFileSync(path, 'utf8')).toBe('PNGBYTES')
+    expect(description.kind).toBe('image')
+    expect(f.opened).toEqual([])
+    await expect(f.cache.copy({ ...file, path: 'out/logo.png' }, ['document'])).rejects.toThrow(/document/)
+  })
+
   it('keeps a usable, safe file name', () => {
     expect(safeCopyName('out/q3 report.pdf')).toBe('q3 report.pdf')
     expect(safeCopyName('a:b*c?.zip')).toBe('a_b_c_.zip')

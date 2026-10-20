@@ -144,3 +144,24 @@ describe('delivered files (feature-list delivered-outputs-highlight)', () => {
     expect(deliveredFiles(null)).toEqual([])
   })
 })
+
+describe('links to files on the computer (delivered files on the phone)', () => {
+  it('renders a link to an absolute local file as a file button the app opens, never as a link that navigates', () => {
+    const root = draw('See [the logo](<C:/Out/owner picks/HAF Logo.pdf>) and [notes](/C:/Out/notes.md:12), [web](https://example.com/a.pdf), [rel](docs/x.md).')
+    const files = root.all().filter(node => node.className === 'md-link md-file')
+    expect(files.map(node => [node.tag, node.attributes.type, node.attributes['data-file-path'], node.textContent])).toEqual([
+      ['button', 'button', 'C:/Out/owner picks/HAF Logo.pdf', 'the logo'],
+      ['button', 'button', 'C:/Out/notes.md', 'notes']
+    ])
+    expect(files.some(node => 'href' in node.attributes)).toBe(false)
+    expect(root.all().filter(node => node.tag === 'a').map(node => node.attributes.href)).toEqual(['https://example.com/a.pdf'])
+    // A relative link stays plain text, as before.
+    expect(root.textContent).toContain('rel')
+  })
+  it('names the same path for a file link as its Delivered chip, which is what the computer checks', () => {
+    const { deliveredFiles } = window.ConductorMarkdown
+    const text = '[the logo](/C:/Out/owner%20picks/HAF%20Logo.pdf)'
+    const button = draw(text).all().find(node => node.className === 'md-link md-file')!
+    expect(button.attributes['data-file-path']).toBe(deliveredFiles(text)[0].path)
+  })
+})

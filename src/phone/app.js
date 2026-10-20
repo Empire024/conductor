@@ -2550,16 +2550,18 @@
       for (const attachment of attachments) chips.appendChild(el('span', 'attachment', attachment.name || attachment.kind || 'attachment'))
       node.appendChild(chips)
     }
-    /* Files the agent handed over in this reply, named under it so they are easy to find; they
-       open on the computer (its Links & files rail lists them under Delivered). */
+    /* Files the agent handed over in this reply, named under it so they are easy to find. A tap
+       previews or saves the file on the phone (openDeliveredFile; the conversation screen listens
+       for every [data-file-path] in its timeline). */
     const markdown = window.ConductorMarkdown
     const delivered = data.role === 'assistant' && !item.parentId && markdown && typeof markdown.deliveredFiles === 'function' ? markdown.deliveredFiles(text) : []
     if (delivered.length) {
       const box = el('div', 'delivered')
       box.appendChild(el('span', 'delivered-label', 'Delivered'))
       for (const file of delivered.slice(0, 12)) {
-        const chip = el('span', 'delivered-file', file.name)
-        chip.title = file.path
+        const chip = button('delivered-file', file.name)
+        chip.setAttribute('data-file-path', file.path)
+        chip.title = 'Preview or download ' + file.path
         box.appendChild(chip)
       }
       node.appendChild(box)
@@ -3008,6 +3010,13 @@
     header.classList.add('conversation-bar')
     const scroll = scroller()
     scroll.classList.add('timeline')
+    /* A Delivered chip or a link to a file on the computer, anywhere in the timeline. */
+    scroll.addEventListener('click', event => {
+      const target = event.target && typeof event.target.closest === 'function' ? event.target.closest('[data-file-path]') : null
+      if (!target) return
+      event.preventDefault()
+      openDeliveredFile(id, target.getAttribute('data-file-path'), target.textContent)
+    })
     const footer = el('div', 'footer')
     root.appendChild(header)
     root.appendChild(scroll)
@@ -4036,6 +4045,93 @@
         if (mintedAt && Date.now() - mintedAt > FILE_CAPABILITY_REFRESH_MS) void load()
       }
     }
+  }
+
+  // ------------------------------------------------------------------ delivered files
+
+  /* A file a conversation delivered or linked, previewed or saved on the phone. The computer checks
+     the path against that conversation's own replies and its project (src/main/phone-access.ts
+     deliveredFile) and answers a capability URL for that one file (src/main/phone-files.ts
+     grantFile), so an <img>, a PDF tab and a download all work without the bearer header.
+     Images are shown here; a PDF opens in a browser tab, which renders it; anything else is saved.
+     Share hands the phone's share sheet the file itself (Save to Files on iPhone), which is the way
+     a Home Screen app saves reliably; the bytes are fetched first so the tap still counts as the
+     user's when the sheet opens. */
+  const SHARE_PREFETCH_BYTES = 32 * 1024 * 1024
+  const openDeliveredFile = (sessionId, path, label) => {
+    if (!sessionId || !path) return
+    const view = el('div', 'file-sheet')
+    view.setAttribute('role', 'dialog')
+    view.setAttribute('aria-modal', 'true')
+    const panel = el('div', 'file-sheet-panel')
+    const name = el('strong', 'file-sheet-name', (label || '').trim() || String(path).replace(/\\/g, '/').split('/').pop())
+    view.setAttribute('aria-label', name.textContent)
+    const note = el('p', 'card-note file-sheet-note', 'Asking the computer for this file…')
+    const preview = el('div', 'file-sheet-preview')
+    const actions = el('div', 'files-actions file-sheet-actions')
+    let closed = false
+    const close = () => {
+      if (closed) return
+      closed = true
+      document.removeEventListener('keydown', onKey)
+      if (view.parentNode) view.parentNode.removeChild(view)
+    }
+    const onKey = event => { if (event.key === 'Escape') close() }
+    document.addEventListener('keydown', onKey)
+    view.addEventListener('click', event => { if (event.target === view) close() })
+    panel.appendChild(name)
+    panel.appendChild(note)
+    panel.appendChild(preview)
+    panel.appendChild(actions)
+    panel.appendChild(button('ghost wide file-sheet-close', 'Close', close))
+    view.appendChild(panel)
+    document.body.appendChild(view)
+
+    void api('/api/sessions/' + encodeURIComponent(sessionId) + '/file', { method: 'POST', body: { path: path } }).then(file => {
+      if (closed) return
+      name.textContent = file.name
+      note.textContent = dotRow([fileSize(file.size), file.preview === 'pdf' ? 'PDF' : file.preview === 'image' ? 'Image' : (file.type || '').split(';')[0]])
+      if (file.preview === 'image') {
+        const image = el('img', 'file-sheet-image')
+        image.src = file.url
+        image.alt = file.name
+        preview.appendChild(image)
+      }
+      if (file.preview !== 'none') {
+        const open = linkButton('primary files-action file-sheet-open', file.preview === 'pdf' ? 'Open PDF' : 'Open full size', file.url)
+        open.target = '_blank'
+        open.rel = 'noopener noreferrer'
+        actions.appendChild(open)
+      }
+      const download = linkButton('ghost files-action file-sheet-download', 'Download', file.url + '?download=1')
+      download.setAttribute('download', file.name)
+      actions.appendChild(download)
+      if (typeof navigator.share === 'function' && typeof navigator.canShare === 'function' && typeof File === 'function' && file.size <= SHARE_PREFETCH_BYTES) {
+        let shared = null
+        const share = button('ghost files-action file-sheet-share', 'Share…', () => {
+          if (!shared) { note.textContent = 'Still fetching the file; try again in a moment.'; return }
+          navigator.share({ files: [shared], title: file.name }).catch(error => {
+            if (error && error.name === 'AbortError') return
+            note.textContent = 'Sharing did not work here; use Download instead.'
+          })
+        })
+        share.disabled = true
+        actions.appendChild(share)
+        fetch(file.url, { cache: 'no-store' }).then(response => {
+          if (!response.ok) throw new Error('HTTP ' + response.status)
+          return response.blob()
+        }).then(blob => {
+          const candidate = new File([blob], file.name, { type: (file.type || '').split(';')[0] || 'application/octet-stream' })
+          if (closed || !navigator.canShare({ files: [candidate] })) { if (share.parentNode) share.parentNode.removeChild(share); return }
+          shared = candidate
+          share.disabled = false
+        }).catch(() => { if (share.parentNode) share.parentNode.removeChild(share) })
+      }
+    }).catch(error => {
+      if (closed) return
+      note.textContent = errorMessage(error) || 'The computer could not hand this file over.'
+      note.className = 'pending-error file-sheet-note'
+    })
   }
 
   // ------------------------------------------------------------------ new task screen

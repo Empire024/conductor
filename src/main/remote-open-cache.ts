@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { chmod, lstat, mkdir, open, readdir, rename, rm, rmdir, utimes, type FileHandle } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { RemoteFileDescription, RemoteFileIdentity } from '../shared/remote-files'
+import type { RemoteFileDescription, RemoteFileIdentity, RemoteFilePreviewKind } from '../shared/remote-files'
 import { isRemoteOpenableDocument, REMOTE_FILE_CHUNK_BYTES, REMOTE_FILE_MAX_ASSET_BYTES } from '../shared/remote-files'
 import type { RemoteFiles } from './remote-files'
 
@@ -44,9 +44,23 @@ export class RemoteOpenCache {
   async open(file: RemoteFileIdentity): Promise<{ path: string }> {
     // Checked here as well as on the host: this is the computer whose default app would run it.
     if (!isRemoteOpenableDocument(file.path)) throw new Error('Only PDFs, archives and office documents from another machine open with this computer\'s default app.')
+    const { path } = await this.copy(file, ['document'])
+    await this.deps.open(path)
+    return { path }
+  }
+
+  /**
+   * The cached read-only copy of a host file, fetched if this version is not here yet, without
+   * opening it: what the phone is served for a file a mirrored conversation delivered. Only the
+   * kinds the host will describe travel - safe images, allowlisted video, documents - and `kinds`
+   * narrows that further for a caller that only wants some of them.
+   */
+  async copy(file: RemoteFileIdentity, kinds: readonly RemoteFilePreviewKind[] = ['image', 'video', 'document']): Promise<{ path: string; description: RemoteFileDescription }> {
     const description = await this.deps.files.describe(file)
-    if (description.kind !== 'document' || description.size <= 0 || description.size > REMOTE_FILE_MAX_ASSET_BYTES) {
-      throw new Error('That machine did not describe the file as a document this computer can open.')
+    if (!kinds.includes(description.kind) || description.size <= 0 || description.size > REMOTE_FILE_MAX_ASSET_BYTES) {
+      throw new Error(kinds.length === 1 && kinds[0] === 'document'
+        ? 'That machine did not describe the file as a document this computer can open.'
+        : 'That machine does not hand this kind of file over.')
     }
     const folder = join(this.deps.root,
       createHash('sha256').update([file.machineId, file.projectId, file.path].join('\0')).digest('hex').slice(0, 24),
@@ -61,8 +75,7 @@ export class RemoteOpenCache {
       await this.fetch(description, folder, destination)
     }
     await this.prune(destination).catch(error => console.warn('Remote open cache was not pruned', error))
-    await this.deps.open(destination)
-    return { path: destination }
+    return { path: destination, description }
   }
 
   private async fetch(description: RemoteFileDescription, folder: string, destination: string): Promise<void> {

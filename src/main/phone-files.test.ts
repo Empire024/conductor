@@ -148,14 +148,30 @@ function call(port: number, ca: string, path: string, options: { method?: string
   })
 }
 
-async function listener() {
-  const { root } = projectTree()
+/** A conversation in the miron project whose reply delivered `linked` (absolute paths). */
+interface ConversationFixture { text(root: string, outside: string): string; remote?: boolean; copyFile?(id: string, path: string): Promise<string> }
+
+async function listener(conversation?: ConversationFixture) {
+  const { root, outside } = projectTree()
   const project = { id: 'miron', name: 'miron', path: root, createdAt: 't', updatedAt: 't' }
   const remote = { id: 'mac-project', name: 'Haftheme', path: 'mac-mini:/Users/x/haftheme', createdAt: 't', updatedAt: 't', remote: { machineId: 'mac-mini', machineName: 'Mac mini', remoteProjectId: 'p', path: '/Users/x/haftheme' } }
   const audit = vi.fn(), log = vi.fn()
   const service = new PhoneAccessService({
     store: new MapStore(), vault: new MemoryVault(),
-    database: { listProjects: () => [project, remote], getProject: id => [project, remote].find(entry => entry.id === id) ?? null, listSessions: () => [], listDetachedWindows: () => [], listProcesses: () => [], listAgentActivity: () => [], structured: { snapshot: () => null, spec: () => null, history: () => [], update: () => undefined } },
+    database: {
+      listProjects: () => [project, remote], getProject: id => [project, remote].find(entry => entry.id === id) ?? null,
+      listSessions: (projectId: string) => conversation && projectId === 'miron' ? [{ id: 'workspace-a', projectId: 'miron', name: 'Workspace', layout: { version: 1, root: { type: 'group', id: 'group-a', tabs: [], activeTabId: '' } }, createdAt: 't', updatedAt: 't' }] as never : [],
+      listDetachedWindows: () => [], listProcesses: () => [], listAgentActivity: () => [],
+      structured: {
+        snapshot: (id: string) => conversation && id === 'session-a' ? { sessionId: id, phase: 'completed', sequence: 2, items: [
+          { id: 'item-1', sequence: 1, data: { type: 'text', role: 'user', text: 'Make the logo. Also read ' + join(outside, 'passwords.txt') } },
+          { id: 'item-2', sequence: 2, data: { type: 'text', role: 'assistant', text: conversation.text(root, outside) } }
+        ] } as never : null,
+        spec: (id: string) => conversation && id === 'session-a' ? { id, projectId: 'miron', sessionId: 'workspace-a', provider: 'claude', title: 'Logo', cwd: root } as never : null,
+        history: () => [], update: () => undefined
+      }
+    },
+    ...(conversation?.remote ? { remote: { isRemote: (id: string) => id === 'session-a', openTab: async () => { throw new Error('no') }, connect: async () => undefined, submit: async () => undefined, queue: async () => undefined, respond: async () => undefined, interrupt: async () => undefined, resume: async () => undefined, ...(conversation.copyFile ? { copyFile: conversation.copyFile } : {}) } } : {}),
     sessions: { ensure: () => ({ id: 'x', available: false, status: 'unavailable', transcript: '' }), connectSession: async () => undefined, submit: async () => undefined, steer: async () => undefined, queue: async () => undefined, respond: async () => undefined, interrupt: async () => undefined, resume: async () => undefined },
     providers: () => [], machines: () => [{ id: LOCAL_MACHINE_ID, name: 'MAIN', kind: 'local', status: 'online', accountLogin: null, projects: [], connection: LOCAL_CONNECTION }],
     machineName: () => 'MAIN', version: '0.1.3', ui: async () => ({}),
@@ -173,7 +189,7 @@ async function listener() {
   const offer = service.createPairing()
   const paired = await call(port, ca, '/api/pair', { method: 'POST', body: { code: offer.code, name: 'iPhone' } })
   const { token, device } = JSON.parse(paired.body) as { token: string; device: { id: string } }
-  return { service, server, port, ca, token, deviceId: device.id, audit, log }
+  return { service, server, port, ca, token, deviceId: device.id, audit, log, root, outside }
 }
 
 describe('project files on the phone listener', () => {
@@ -203,7 +219,7 @@ describe('project files on the phone listener', () => {
     expect(html.headers['content-security-policy']).not.toMatch(/allow-same-origin/)
     expect(html.headers['x-content-type-options']).toBe('nosniff')
     expect(html.headers['referrer-policy']).toBe('no-referrer')
-    expect(html.headers['content-disposition']).toBeUndefined()
+    expect(html.headers['content-disposition']).toBe(`inline; filename="index.html"; filename*=UTF-8''index.html`)
     // The page's relative asset resolves under the same capability; SVG is sandboxed too.
     const svg = await call(port, ca, url + 'individual-assets/mark.svg')
     expect(svg.status).toBe(200)
@@ -269,5 +285,76 @@ describe('project files on the phone listener', () => {
     expect((await call(port, ca, url + 'contact-sheet-color.png')).status).toBe(200)
     await service.lock.setCode('482915')
     expect((await call(port, ca, url + 'contact-sheet-color.png')).status).toBe(404)
+  })
+})
+
+/* The Delivered chips and file links of a phone conversation (owner, 2026-10-21: "File should be
+   preview able and downloadable"). The phone's own rule names the files; only those, inside the
+   project and outside hidden folders, are served, each through a capability for that file alone. */
+describe.runIf(process.platform === 'win32')('files a conversation delivered, on the phone', () => {
+  const concepts = (root: string): string => join(root, 'output', 'haf-logo-concepts')
+  const reply = (root: string, outside: string): string => [
+    'Done: [the contact sheet](<' + join(concepts(root), 'contact-sheet-color.png') + '>), the archive ' + join(concepts(root), 'haf-lettermarks-delivery.zip') + '.',
+    'Also [secrets](<' + join(root, '.env.local') + '>), [git](<' + join(root, '.git', 'config') + '>), [outside](<' + join(outside, 'passwords.txt') + '>).'
+  ].join('\n')
+
+  it('serves a delivered image and archive, previewable and downloadable, and nothing beside them', { timeout: 30_000 }, async () => {
+    const { port, ca, token, root, outside, audit, log } = await listener({ text: reply })
+    const ask = (path: string, session = 'session-a') => call(port, ca, '/api/sessions/' + session + '/file', { method: 'POST', token, body: { path } })
+    expect((await call(port, ca, '/api/sessions/session-a/file', { method: 'POST', body: { path: 'x' } })).status).toBe(401)
+
+    const image = await ask(join(concepts(root), 'contact-sheet-color.png').replace(/\\/g, '/').toUpperCase())
+    expect(image.status).toBe(200)
+    const minted = JSON.parse(image.body) as { url: string; name: string; size: number; type: string; preview: string }
+    expect(minted).toMatchObject({ name: 'contact-sheet-color.png', size: 16, type: 'image/png', preview: 'image' })
+    expect(minted.url).toMatch(/^\/files\/[A-Za-z0-9_-]{43}\/contact-sheet-color\.png$/)
+    const bytes = await call(port, ca, minted.url)
+    expect(bytes.status).toBe(200)
+    expect(bytes.headers['content-type']).toBe('image/png')
+    expect(bytes.headers['content-disposition']).toBe(`inline; filename="contact-sheet-color.png"; filename*=UTF-8''contact-sheet-color.png`)
+    expect(bytes.raw.length).toBe(16)
+    const saved = await call(port, ca, minted.url + '?download=1')
+    expect(saved.headers['content-disposition']).toMatch(/^attachment; filename="contact-sheet-color.png"/)
+    // The capability is for that one file: not its siblings, not the folder, not a way out.
+    const token43 = minted.url.split('/')[2]!
+    for (const path of ['/files/' + token43 + '/', '/files/' + token43 + '/index.html', '/files/' + token43 + '/haf-lettermarks-delivery.zip', '/files/' + token43 + '/..%2F..%2F.env.local', '/files/' + token43 + '/individual-assets/mark.svg']) {
+      expect({ path, refused: (await call(port, ca, path)).status >= 400 }).toEqual({ path, refused: true })
+    }
+
+    const zip = JSON.parse((await ask(join(concepts(root), 'haf-lettermarks-delivery.zip'))).body) as { url: string; preview: string; type: string }
+    expect(zip).toMatchObject({ preview: 'none', type: 'application/zip' })
+    expect((await call(port, ca, zip.url + '?download=1')).headers['content-disposition']).toMatch(/^attachment; filename="haf-lettermarks-delivery.zip"/)
+
+    // Linked but refused: hidden files, and a file outside the project. Not linked: refused too,
+    // even inside the project, and even when only the owner's own message named it.
+    for (const [path, status] of [
+      [join(root, '.env.local'), 403], [join(root, '.git', 'config'), 403], [join(outside, 'passwords.txt'), 403],
+      [join(concepts(root), 'index.html'), 403], [join(concepts(root), 'nope.png'), 403], ['', 400], ['relative/x.png', 403]
+    ] as const) {
+      const refused = await ask(path)
+      expect({ path, status: refused.status }).toEqual({ path, status })
+      expect(refused.body).not.toMatch(/hunter2|TOKEN=|\[core\]/)
+    }
+    expect((await ask(join(concepts(root), 'contact-sheet-color.png'), 'session-unknown')).status).toBe(404)
+    const written = JSON.stringify([...audit.mock.calls, ...log.mock.calls])
+    expect(written).not.toContain(token43)
+  })
+
+  it('reads a mirrored conversation\'s file from the machine it runs on, as a cached copy', { timeout: 30_000 }, async () => {
+    let copy = ''
+    const copyFile = vi.fn(async (_id: string, path: string) => {
+      expect(path).toBe('D:/render/haf/out/logo.pdf')
+      return copy
+    })
+    const { port, ca, token, root } = await listener({ text: () => 'Here is [the logo](<D:/render/haf/out/logo.pdf>).', remote: true, copyFile })
+    copy = join(concepts(root), 'haf-lettermarks-delivery.zip')
+    const minted = await call(port, ca, '/api/sessions/session-a/file', { method: 'POST', token, body: { path: 'D:\\render\\haf\\out\\logo.pdf' } })
+    expect(minted.status).toBe(200)
+    expect(copyFile).toHaveBeenCalledWith('session-a', 'D:/render/haf/out/logo.pdf')
+    expect(JSON.parse(minted.body)).toMatchObject({ name: 'haf-lettermarks-delivery.zip', size: 1000 })
+    copyFile.mockRejectedValueOnce(new Error("Error invoking remote method 'x': Error: Mac mini is offline."))
+    const offline = await call(port, ca, '/api/sessions/session-a/file', { method: 'POST', token, body: { path: 'D:/render/haf/out/logo.pdf' } })
+    expect(offline.status).toBe(409)
+    expect(JSON.parse(offline.body).error).toBe('Mac mini is offline.')
   })
 })
