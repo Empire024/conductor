@@ -41,7 +41,11 @@ app.whenReady().then(async () => {
     response.end('<body style="margin:0;background:#fff"><h1>Unprimed capture</h1><video id="clip" src="/tiny.webm" preload="auto" style="width:480px;height:270px"></video></body>')
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
-  const views = new BrowserViews({ tabs: () => [], openBrowserTab: async () => {}, rendererPath: '', projectRoot: () => project })
+  // The detached host is created hidden at -32000; present('detached') shows it inactive there, off
+  // every display, so this probe never puts a window on the owner's screen.
+  const { BrowserWindow } = require('electron')
+  const createDetachedWindow = (_projectId, onClosed) => { const window = new BrowserWindow({ show: false, focusable: false, skipTaskbar: true, frame: false, x: -32000, y: -32000, width: 1200, height: 800, webPreferences: { backgroundThrottling: false } }); window.once('closed', onClosed); window.on('show', () => window.setPosition(-32000, -32000)); return window }
+  const views = new BrowserViews({ tabs: () => [], openBrowserTab: async () => {}, rendererPath: '', projectRoot: () => project, createDetachedWindow })
   const scope = { projectId: 'probe-project', sessionId: 'probe-workspace', agentSessionId: 'probe-agent' }
   try {
     const view = await views.view(scope)
@@ -61,6 +65,12 @@ app.whenReady().then(async () => {
       return { time: frame.time, width: size.width, height: size.height, r: bitmap[at + 2], g: bitmap[at + 1], b: bitmap[at] }
     })
     result.mode = frames.mode
+    // The videos wizard's case: detached, then background, then a capture straight away.
+    await view.present('detached')
+    await new Promise(resolve => setTimeout(resolve, 400))
+    await view.present('background')
+    const switched = await view.screenshot()
+    result.afterSwitch = { width: switched.width, height: switched.height, base64: switched.data.length }
     result.windows = require('electron').BrowserWindow.getAllWindows().map(window => ({ shown: window.isVisible(), focusable: window.isFocusable(), bounds: window.getBounds() }))
     views.dispose(); server.close(); done(0)
   } catch (error) { result.error = error.stack || String(error); done(1) }
@@ -80,5 +90,6 @@ const fixed = !result.error && result.screenshot?.base64 > 1000 && result.screen
   && result.frames?.map(colour).join(',') === 'red,green,blue'
   && result.windows?.every(window => !window.shown && !window.focusable && window.bounds.x < -10_000)
   && result.debuggerAttachedAfter === false
-console.log(`reproduced (plain capturePage fails): ${reproduced}; fixed (screenshot + red/green/blue frames, nothing shown): ${fixed}`)
+  && result.afterSwitch?.base64 > 1000
+console.log(`reproduced (plain capturePage fails): ${reproduced}; fixed (screenshot + red/green/blue frames + capture right after detached → background, nothing shown): ${fixed}`)
 process.exit(reproduced && fixed ? 0 : 1)

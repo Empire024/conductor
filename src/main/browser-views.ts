@@ -30,7 +30,7 @@ const failure = (error: unknown): string => error instanceof Error ? error.messa
 /** An image with pixels. capturePage resolves an empty 0x0 image, not an error, for a view that has
  *  no compositor surface, which is what a guest hidden in its workspace window is. */
 const usable = (image: NativeImage | undefined): image is NativeImage => Boolean(image && !image.isEmpty() && image.getSize().width > 0 && image.getSize().height > 0)
-const CAPTURE_ADVICE = 'The page is still loaded: read it with browser_snapshot, or call browser_present({mode:"detached"}) to show it in its own window (it does not take focus) and capture again.'
+const CAPTURE_ADVICE = 'The page is still loaded: read it with browser_snapshot, re-open it with browser_navigate to the same URL (that reloads it and gives it a fresh surface), or call browser_present({mode:"detached"}) to show it in its own window (it does not take focus) and capture again.'
 /** A download still running this long is answered "continuing in the background": the MCP client
  *  gives a tool call 60 s and would otherwise drop a call whose file is still arriving. */
 const DOWNLOAD_ANSWER_MS = 45_000
@@ -71,6 +71,9 @@ interface OwnedBrowser {
   captures?: number
   /** The emulated page viewport the surface last asked for (Phone, Desktop, …). */
   viewport?: { width: number; height: number }
+  /** The guest moved to another host window since its last capture; its next capture asks for a
+   *  fresh frame first. */
+  rehosted?: boolean
 }
 
 export function browserViewCandidates(scope: BrowserMcpScope, tabs: AgentControlTab[]): Set<string> {
@@ -417,6 +420,7 @@ export class BrowserViews implements BrowserMcpHost {
       this.unparent(owned)
       window.contentView.addChildView(owned.view)
       owned.parent = window
+      owned.rehosted = true
       this.hosts.set(owned.view.webContents.id, window.webContents.id)
     }
     owned.view.setVisible(visible)
@@ -504,35 +508,76 @@ export class BrowserViews implements BrowserMcpHost {
 
   /** Runs work with a grab() that always returns pixels or throws saying why. A visible guest is
    *  captured where it is; any other is captured from its parking host for the whole of the work. */
+  /** Resolves after the guest has had the chance to paint twice, or after 500 ms (a page that paints
+   *  no frames must not hang a capture). */
+  private async painted(contents: WebContents): Promise<void> {
+    await Promise.race([contents.executeJavaScript('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))').catch(() => undefined), settle(500)])
+  }
+
+  /** Asks the compositor for a new frame of the guest without touching the page's state: a 1px
+   *  resize round trip allocates a new surface, as a navigation does, and invalidate repaints it. */
+  private async freshFrame(owned: OwnedBrowser): Promise<void> {
+    const contents = owned.view.webContents
+    if (contents.isDestroyed()) return
+    const bounds = owned.view.getBounds()
+    if (bounds.width > 1) {
+      owned.view.setBounds({ ...bounds, width: bounds.width - 1 })
+      await this.painted(contents)
+      owned.view.setBounds(bounds)
+    }
+    contents.invalidate()
+    await this.painted(contents)
+  }
+
+  /** Runs work with a grab() that always returns pixels or throws saying why. A visible guest is
+   *  captured where it is; any other is captured from its parking host for the whole of the work.
+   *
+   *  Two states give a hidden guest no capturable surface (docs/browser-mcp.md): a guest never
+   *  painted in a shown window, where capturePage refuses until a DevTools screenshot makes the
+   *  renderer produce one, and the first capture after it left a shown window (detached, then
+   *  background), where even the DevTools screenshot answered "Internal error" until the page was
+   *  navigated. So the first capture after any move asks for a fresh frame, and a failed capture
+   *  escalates: DevTools screenshot, fresh frame, a brand-new capture host, each retried, and the
+   *  error names what every step returned. */
   private async withCapture<T>(owned: OwnedBrowser, work: (grab: () => Promise<NativeImage>) => Promise<T>): Promise<T> {
     const contents = owned.view.webContents
-    const painted = async (): Promise<void> => {
-      await Promise.race([contents.executeJavaScript('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))').catch(() => undefined), settle(500)])
-    }
     owned.captures = (owned.captures ?? 0) + 1
     let borrowed = false
-    const borrow = async (): Promise<void> => { this.borrowParking(owned); borrowed = true; await painted() }
+    const borrow = async (): Promise<void> => { this.borrowParking(owned); borrowed = true; await this.painted(contents) }
+    const refreshIfMoved = async (): Promise<void> => { if (owned.rehosted) { owned.rehosted = false; await this.freshFrame(owned) } }
     const grab = async (): Promise<NativeImage> => {
       if (contents.isDestroyed()) throw new Error('The browser view was closed')
-      let reason = ''
+      const attempts: string[] = []
+      const capture = async (): Promise<NativeImage | string> => {
+        try { const image = await contents.capturePage(); return usable(image) ? image : 'empty image' }
+        catch (error) { return failure(error) }
+      }
       if (this.shownInPlace(owned)) {
-        try { const image = await contents.capturePage(); if (usable(image)) return image; reason = 'the visible view returned an empty image' }
-        catch (error) { reason = failure(error) }
+        await refreshIfMoved()
+        const image = await capture()
+        if (typeof image !== 'string') return image
+        attempts.push(`visible view: ${image}`)
       }
       if (owned.parent !== owned.parking || !owned.parking || owned.parking.isDestroyed()) await borrow()
-      try { const image = await contents.capturePage(); if (usable(image)) return image; reason = 'the off-screen capture host returned an empty image' }
-      catch (error) { reason = failure(error) }
-      // A guest that has never been painted in a shown window has no compositor surface at all, so
-      // capturePage refuses ("Current display surface not available for capture") or comes back
-      // empty however long it waits, which is the installed app's background browser. A DevTools
-      // screenshot makes the renderer produce one; from then on capturePage works, and the DevTools
-      // PNG itself is the fallback (probed on Electron 37, docs/browser-mcp.md).
-      const primed = await devtoolsScreenshot(contents)
-      try { const image = await contents.capturePage(); if (usable(image)) return image }
-      catch (error) { reason = `${reason}; after a DevTools screenshot: ${failure(error)}` }
-      if (primed.image && usable(primed.image)) return primed.image
-      if (primed.error) reason = `${reason}; DevTools screenshot: ${primed.error}`
-      throw new Error(`Conductor could not capture the browser view (${reason}). ${CAPTURE_ADVICE}`)
+      await refreshIfMoved()
+      const first = await capture()
+      if (typeof first !== 'string') return first
+      attempts.push(`off-screen capture host: ${first}`)
+      const steps: Array<[string, () => Promise<void>]> = [
+        ['with a DevTools screenshot', async () => {}],
+        ['after a fresh frame', () => this.freshFrame(owned)],
+        ['in a new capture host', async () => { this.unparent(owned); this.closeParking(owned); await borrow(); await this.freshFrame(owned) }]
+      ]
+      for (const [label, prepare] of steps) {
+        await prepare()
+        if (contents.isDestroyed()) throw new Error('The browser view was closed')
+        const primed = await devtoolsScreenshot(contents)
+        const image = await capture()
+        if (typeof image !== 'string') return image
+        if (primed.image && usable(primed.image)) return primed.image
+        attempts.push(`${label}: capturePage ${image}, DevTools ${primed.error ?? 'empty image'}`)
+      }
+      throw new Error(`Conductor could not capture the browser view (${attempts.join('; ')}). ${CAPTURE_ADVICE}`)
     }
     try {
       if (!this.shownInPlace(owned) && owned.parent !== owned.parking) await borrow()

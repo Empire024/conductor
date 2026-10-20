@@ -27,6 +27,8 @@ const electronFake = vi.hoisted(() => {
     openDevTools(): void {}
     enableDeviceEmulation(parameters: { viewSize: { width: number; height: number }; scale: number }): void { this.emulation = parameters }
     async executeJavaScript(): Promise<string> { return 'null' }
+    invalidations = 0
+    invalidate(): void { this.invalidations++ }
     async capturePage(): Promise<unknown> {
       const size = capture(this)
       if (size === 'no-surface') throw new Error('Current display surface not available for capture')
@@ -210,6 +212,45 @@ describe('main-owned project browser surfaces', () => {
     expect(guest.webContents.debugger.attached).toBe(true)
   })
 
+  it('asks for a fresh frame before the first capture after a detached → background switch', async () => {
+    const detached: Array<InstanceType<typeof FakeWindow>> = []
+    const manager = new BrowserViews({ tabs: () => [], openBrowserTab: async () => {}, rendererPath: 'C:/out/index.html', createDetachedWindow: () => { const window = new FakeWindow(); detached.push(window); return window as never } })
+    const view = await manager.view({ projectId: 'project-a', sessionId: 'workspace-a', agentSessionId: 'agent-a' })
+    const guest = created[0]!
+    electronFake.setCapture(() => ({ width: 1440, height: 900 }))
+    await view.screenshot()
+    manager.present('project-a', 'detached')
+    manager.present('project-a', 'background')
+    // Like the installed app right after the switch: nothing until the guest paints a new frame, and
+    // DevTools answers "Internal error" meanwhile.
+    const before = guest.webContents.invalidations
+    electronFake.setCapture(() => guest.webContents.invalidations > before ? { width: 1440, height: 900 } : 'no-surface')
+    electronFake.setDevtools(() => { throw new Error('Internal error') })
+    expect(await view.screenshot()).toMatchObject({ width: 1440, height: 900 })
+    expect(guest.webContents.debugger.commands).toEqual([])
+    expect(guest.bounds).toEqual({ x: 0, y: 0, width: 1440, height: 900 })
+    // The fresh frame is asked for once per move, not on every capture.
+    const after = guest.webContents.invalidations
+    await view.screenshot()
+    expect(guest.webContents.invalidations).toBe(after)
+  })
+
+  it('escalates to a brand-new capture host and names every step when nothing else works', async () => {
+    const manager = new BrowserViews({ tabs: () => [], openBrowserTab: async () => {}, rendererPath: 'C:/out/index.html' })
+    const view = await manager.view({ projectId: 'project-a', sessionId: 'workspace-a', agentSessionId: 'agent-a' })
+    const guest = created[0]!
+    const original = windows.find(window => window.children.includes(guest))!
+    // Only a host window created after the failure has a surface.
+    electronFake.setCapture(() => { const host = windows.find(window => !window.destroyed && window.children.includes(guest)); return host && host !== original ? { width: 1440, height: 900 } : 'no-surface' })
+    electronFake.setDevtools(() => { throw new Error('Internal error') })
+    expect(await view.screenshot()).toMatchObject({ width: 1440, height: 900 })
+    expect(original.destroyed).toBe(true)
+    expect(guest.webContents.debugger.commands).toEqual(['Page.captureScreenshot', 'Page.captureScreenshot', 'Page.captureScreenshot'])
+    expect(windows.filter(window => !window.destroyed && window.children.includes(guest))).toHaveLength(1)
+    electronFake.setCapture(() => 'no-surface')
+    await expect(view.screenshot()).rejects.toThrow(/off-screen capture host: Current display surface not available for capture; with a DevTools screenshot: capturePage Current display surface not available for capture, DevTools Internal error; after a fresh frame: capturePage .*, DevTools Internal error; in a new capture host: capturePage .*, DevTools Internal error\)/)
+  })
+
   it('captures a visible pane where it is, and refuses rather than returning an empty image', async () => {
     const manager = new BrowserViews({ tabs: () => [], openBrowserTab: async () => {}, rendererPath: 'C:/out/index.html' })
     const owner = new FakeWindow(); owner.visible = true
@@ -219,7 +260,7 @@ describe('main-owned project browser surfaces', () => {
     expect((await view.screenshot()).width).toBe(640)
     expect(windows).toEqual([owner])
     electronFake.setCapture(() => ({ width: 0, height: 0 }))
-    await expect(view.screenshot()).rejects.toThrow(/could not capture the browser view \(the off-screen capture host returned an empty image; DevTools screenshot: no image within 3 s\).*browser_present/)
+    await expect(view.screenshot()).rejects.toThrow(/could not capture the browser view \(visible view: empty image; off-screen capture host: empty image; with a DevTools screenshot: capturePage empty image, DevTools no image within 3 s; after a fresh frame: capturePage empty image, DevTools no image within 3 s; in a new capture host: capturePage empty image, DevTools no image within 3 s\).*browser_navigate.*browser_present/)
     expect(owner.children).toEqual([created[0]])
     expect(created[0]?.visible).toBe(true)
   })

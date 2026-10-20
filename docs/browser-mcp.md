@@ -57,6 +57,19 @@ debugger client is attached, and detaching only what it attached), retries `capt
 falls back to the DevTools PNG itself. Video frames go through the same `grab()`, so a primed guest
 captures every later frame directly.
 
+A second state showed up on the installed e5f2a81 (videos wizard): right after
+`browser_present({mode:"detached"})` and then `{mode:"background"}`, the first capture came back
+empty and the DevTools screenshot answered "Internal error"; `browser_navigate` to the same page
+healed it. (In Chromium, "Internal error" from `Page.captureScreenshot` means the widget had no
+view to copy from.) It needs a detached window really painted on a display, so neither the
+off-screen probes nor the parked smoke reproduce it. Two defences followed: a guest that moved to
+another host window since its last capture (`OwnedBrowser.rehosted`, set by `attachTo`) first gets
+a fresh frame (a 1px resize round trip, which allocates a new surface as a navigation does, plus
+`invalidate()`, waiting for two animation frames); and a failed capture escalates through a
+DevTools screenshot, a fresh frame and a brand-new capture host, each followed by `capturePage`
+and DevTools again. The error, if every step fails, lists what each step returned, and suggests
+`browser_navigate` to the same URL.
+
 ### Watching a video: `browser_video_frames`
 
 `{selector?, start?, end?, fps?, maxFrames?, scale?, format?, mode?, audio?}`. The target is the
