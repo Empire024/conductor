@@ -70,6 +70,20 @@ DevTools screenshot, a fresh frame and a brand-new capture host, each followed b
 and DevTools again. The error, if every step fails, lists what each step returned, and suggests
 `browser_navigate` to the same URL.
 
+On the installed 1e4ace2 every one of those steps still failed for that state (empty image and
+DevTools "Internal error" each time), while `browser_navigate` to the same URL healed it. So the
+chain now ends in a **reload of last resort**: the same `loadURL` of the page's own URL that
+`browser_navigate` makes, a wait for the load and a fresh frame, and the capture again. The result
+says so plainly (`reloaded` in the screenshot and `browser_video_frames` results, appended to the
+tool text): the page's scroll position, video position and form input are lost.
+`browser_video_frames` takes one capture before it locates the video, so a reload can never leave
+the frames pointing at an element that is gone. A page is never reloaded when that could submit a
+form again: the session's `webRequest.onSendHeaders` (non-blocking, `types: ['mainFrame']`, so a
+page's own traffic never passes through it) records the method of the guest's last main-frame
+request, each redirect hop included. Only a page whose last main-frame request was a GET is
+reloaded, so a POST answered with a 303 is fine. A POST, an unknown method or a non-http(s) page
+keeps the full error, with the reason as its last entry (`no reload: …`).
+
 ### Watching a video: `browser_video_frames`
 
 `{selector?, start?, end?, fps?, maxFrames?, scale?, format?, mode?, audio?}`. The target is the

@@ -11,7 +11,8 @@ export interface BrowserView {
   readonly tabId: string
   navigate(url: string): Promise<{ url: string; title: string }>
   snapshot(options: { selector?: string; maxChars: number }): Promise<Record<string, unknown>>
-  screenshot(): Promise<{ data: string; mimeType: string; width: number; height: number }>
+  /** reloaded: the page had to be reloaded to get a capturable surface (its state was lost). */
+  screenshot(): Promise<{ data: string; mimeType: string; width: number; height: number; reloaded?: string }>
   messages(limit: number): Array<{ level: string; message: string; source?: string; line?: number; at: string }>
   evaluate(code: string): Promise<unknown>
   click(selector: string): Promise<Record<string, unknown>>
@@ -56,6 +57,8 @@ export interface VideoFramesResult {
   audio?: { path: string; seconds: number; sampleRate: number } | { unavailable: string }
   /** Why fewer frames were written than the window asked for. */
   truncated?: string
+  /** The page had to be reloaded to get a capturable surface before the frames were taken. */
+  reloaded?: string
 }
 export interface DownloadRequest { url?: string; fromVideo: boolean; selector?: string; path?: string; maxBytes: number }
 export interface DownloadResult {
@@ -236,7 +239,7 @@ export const BROWSER_TOOLS: BrowserTool[] = [
       const view = await host.view(scope)
       const shot = await view.screenshot()
       assertCapturedImage(shot)
-      return { text: `Captured the browser view (${shot.width}×${shot.height}).`, image: { data: shot.data, mimeType: shot.mimeType } }
+      return { text: `Captured the browser view (${shot.width}×${shot.height}).${shot.reloaded ? ` ${shot.reloaded}` : ''}`, image: { data: shot.data, mimeType: shot.mimeType } }
     }
   },
   {
@@ -260,7 +263,7 @@ export const BROWSER_TOOLS: BrowserTool[] = [
       const first = result.frames[0]?.path, last = result.frames.at(-1)?.path
       const audio = result.audio && 'path' in result.audio ? ` Audio: ${result.audio.path} (${result.audio.seconds.toFixed(1)} s).` : result.audio ? ` Audio not recorded: ${result.audio.unavailable}` : ''
       return {
-        text: `Wrote ${result.frames.length} ${result.width}×${result.height} frame${result.frames.length === 1 ? '' : 's'} (${result.mode}) to ${result.directory}${first ? `: ${first}${last && last !== first ? ` … ${last}` : ''}` : ''}.${audio}${result.truncated ? ` Stopped early: ${result.truncated}` : ''}`,
+        text: `Wrote ${result.frames.length} ${result.width}×${result.height} frame${result.frames.length === 1 ? '' : 's'} (${result.mode}) to ${result.directory}${first ? `: ${first}${last && last !== first ? ` … ${last}` : ''}` : ''}.${audio}${result.truncated ? ` Stopped early: ${result.truncated}` : ''}${result.reloaded ? ` ${result.reloaded}` : ''}`,
         structured: result as unknown as Record<string, unknown>
       }
     }

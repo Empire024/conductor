@@ -74,6 +74,9 @@ interface OwnedBrowser {
   /** The guest moved to another host window since its last capture; its next capture asks for a
    *  fresh frame first. */
   rehosted?: boolean
+  /** The HTTP method of the guest's last main-frame request (each redirect hop counts), so the
+   *  reload of last resort never submits a form again. */
+  mainFrameMethod?: string
 }
 
 export function browserViewCandidates(scope: BrowserMcpScope, tabs: AgentControlTab[]): Set<string> {
@@ -283,6 +286,11 @@ export class BrowserViews implements BrowserMcpHost {
     view.setVisible(false)
     const owned: OwnedBrowser = { projectId, view, presentation: 'background' }
     this.owned.set(projectId, owned)
+    // Non-blocking and main-frame requests only, so a page's own traffic never waits on it. The
+    // session belongs to this project's browser alone; a newer guest replaces the listener.
+    view.webContents.session?.webRequest?.onSendHeaders?.({ urls: ['<all_urls>'], types: ['mainFrame'] }, details => {
+      if (details.webContentsId === view.webContents.id) owned.mainFrameMethod = details.method
+    })
     this.observe(view.webContents)
     const changed = (): void => this.publish(owned)
     view.webContents.on('did-start-loading', changed)
@@ -539,7 +547,7 @@ export class BrowserViews implements BrowserMcpHost {
    *  navigated. So the first capture after any move asks for a fresh frame, and a failed capture
    *  escalates: DevTools screenshot, fresh frame, a brand-new capture host, each retried, and the
    *  error names what every step returned. */
-  private async withCapture<T>(owned: OwnedBrowser, work: (grab: () => Promise<NativeImage>) => Promise<T>): Promise<T> {
+  private async withCapture<T>(owned: OwnedBrowser, work: (grab: () => Promise<NativeImage>) => Promise<T>, options: { reload?: (note: string) => void } = {}): Promise<T> {
     const contents = owned.view.webContents
     owned.captures = (owned.captures ?? 0) + 1
     let borrowed = false
@@ -577,6 +585,29 @@ export class BrowserViews implements BrowserMcpHost {
         if (primed.image && usable(primed.image)) return primed.image
         attempts.push(`${label}: capturePage ${image}, DevTools ${primed.error ?? 'empty image'}`)
       }
+      // The guaranteed last resort, measured on the installed app (2026-10-21): a guest painted in a
+      // detached window on a display and then hidden keeps no usable view, and only a navigation
+      // gives it one. It is the same load browser_navigate makes, and the caller is told that the
+      // page's state (scroll, video position, form input) was lost.
+      if (options.reload) {
+        const reloaded = await this.reloadForSurface(owned)
+        if (reloaded.refused) attempts.push(`no reload: ${reloaded.refused}`)
+        else {
+          if (owned.parent !== owned.parking || !owned.parking || owned.parking.isDestroyed()) await borrow()
+          await this.freshFrame(owned)
+          let image = await capture()
+          if (typeof image === 'string') {
+            const primed = await devtoolsScreenshot(contents)
+            const retried = await capture()
+            image = typeof retried !== 'string' ? retried : primed.image && usable(primed.image) ? primed.image : retried
+            if (typeof image === 'string') attempts.push(`after reloading the page: capturePage ${image}, DevTools ${primed.error ?? 'empty image'}`)
+          }
+          if (typeof image !== 'string') {
+            options.reload(`The page (${reloaded.url}) was reloaded to get a capturable surface: after it had been detached and then hidden it had none, and nothing short of a reload restores one. Its scroll position, video position and form input were lost.`)
+            return image
+          }
+        }
+      }
       throw new Error(`Conductor could not capture the browser view (${attempts.join('; ')}). ${CAPTURE_ADVICE}`)
     }
     try {
@@ -586,6 +617,19 @@ export class BrowserViews implements BrowserMcpHost {
       owned.captures = Math.max(0, (owned.captures ?? 1) - 1)
       if (borrowed && !owned.captures) this.returnFromParking(owned)
     }
+  }
+
+  /** Reloads the guest's page in place, with the same load browser_navigate makes, unless that
+   *  would submit a form again or the page is not an http(s) page. */
+  private async reloadForSurface(owned: OwnedBrowser): Promise<{ url?: string; refused?: string }> {
+    const contents = owned.view.webContents
+    const url = contents.getURL()
+    if (!/^https?:/i.test(url)) return { refused: `the page (${url || 'blank'}) is not an http(s) page that can be reloaded` }
+    if (owned.mainFrameMethod !== 'GET') return { refused: owned.mainFrameMethod ? `its last navigation was a ${owned.mainFrameMethod} (a form submission), and reloading would submit it again` : 'the method of its last navigation is unknown, so it may have been a form submission' }
+    try { await contents.loadURL(url) }
+    catch (error) { if (!/ERR_ABORTED/.test(failure(error))) return { refused: `reloading ${url} failed: ${failure(error)}` } }
+    await this.loaded(contents)
+    return { url }
   }
 
   private projectRootOf(projectId: string): string {
@@ -732,6 +776,10 @@ export class BrowserViews implements BrowserMcpHost {
     const guest = owned.view.webContents
     const root = this.projectRootOf(owned.projectId)
     const deadline = Date.now() + VIDEO_FRAMES.budgetMs
+    // A capture first, which may have to reload the page to get a surface; reloading after the
+    // video was located would leave the frames pointing at an element that is gone.
+    let reloaded: string | undefined
+    await this.withCapture(owned, grab => grab(), { reload: note => { reloaded = note } })
     const target = await runInPage(guest, locateMedia(request.selector)) as MediaTarget
     const video = target.kind === 'video'
     if (video && !target.readyState) throw new Error('The video has not loaded anything yet (readyState 0). Start it with browser_click on its play control, or browser_evaluate("document.querySelector(\'video\').play()"), then call browser_video_frames again.')
@@ -819,7 +867,8 @@ export class BrowserViews implements BrowserMcpHost {
       directory, frames, width, height, mode, bytes,
       ...(video ? { video: { source: target.source ?? '', duration: typeof target.duration === 'number' ? target.duration : null } } : {}),
       ...(audio ? { audio } : {}),
-      ...(truncated ? { truncated } : {})
+      ...(truncated ? { truncated } : {}),
+      ...(reloaded ? { reloaded } : {})
     }
   }
 
@@ -974,12 +1023,13 @@ export class BrowserViews implements BrowserMcpHost {
       },
       screenshot: async () => {
         alive()
-        const image = await this.withCapture(owned, grab => grab())
+        let reloaded: string | undefined
+        const image = await this.withCapture(owned, grab => grab(), { reload: note => { reloaded = note } })
         const size = image.getSize()
         // A full-resolution PNG of a desktop viewport is megabytes of base64 in the agent's
         // context for no extra legibility; 900px wide is still readable text.
         const scaled = size.width > 900 ? image.resize({ width: 900 }) : image
-        return { data: scaled.toPNG().toString('base64'), mimeType: 'image/png', width: size.width, height: size.height }
+        return { data: scaled.toPNG().toString('base64'), mimeType: 'image/png', width: size.width, height: size.height, ...(reloaded ? { reloaded } : {}) }
       },
       messages: (limit) => (this.consoles.get(guest.id) ?? []).slice(-limit),
       evaluate: (code) => run(code),

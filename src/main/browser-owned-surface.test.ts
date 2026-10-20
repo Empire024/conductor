@@ -16,7 +16,7 @@ const electronFake = vi.hoisted(() => {
     emulation?: { viewSize: { width: number; height: number }; scale: number }
     popup?: (details: { url: string }) => unknown
     navigationHistory = { canGoBack: () => false, canGoForward: () => false, goBack: () => {}, goForward: () => {} }
-    async loadURL(url: string): Promise<void> { this.url = url; this.emit('did-navigate'); this.emit('did-stop-loading') }
+    async loadURL(url: string): Promise<void> { this.loads?.push(url); this.url = url; this.emit('did-navigate'); this.emit('did-stop-loading') }
     getURL(): string { return this.url }
     getTitle(): string { return this.title }
     isLoading(): boolean { return this.loading }
@@ -29,6 +29,11 @@ const electronFake = vi.hoisted(() => {
     async executeJavaScript(): Promise<string> { return 'null' }
     invalidations = 0
     invalidate(): void { this.invalidations++ }
+    loads: string[] = []
+    sendHeaders?: { filter: { urls: string[]; types?: string[] }; listener: (details: { webContentsId?: number; method: string }) => void }
+    session = { webRequest: { onSendHeaders: (filter: { urls: string[]; types?: string[] }, listener: (details: { webContentsId?: number; method: string }) => void): void => { this.sendHeaders = { filter, listener } } } }
+    /** A main-frame request of this guest, as the session's webRequest reports it. */
+    request(method: string): void { this.sendHeaders?.listener({ webContentsId: this.id, method }) }
     async capturePage(): Promise<unknown> {
       const size = capture(this)
       if (size === 'no-surface') throw new Error('Current display surface not available for capture')
@@ -248,7 +253,36 @@ describe('main-owned project browser surfaces', () => {
     expect(guest.webContents.debugger.commands).toEqual(['Page.captureScreenshot', 'Page.captureScreenshot', 'Page.captureScreenshot'])
     expect(windows.filter(window => !window.destroyed && window.children.includes(guest))).toHaveLength(1)
     electronFake.setCapture(() => 'no-surface')
-    await expect(view.screenshot()).rejects.toThrow(/off-screen capture host: Current display surface not available for capture; with a DevTools screenshot: capturePage Current display surface not available for capture, DevTools Internal error; after a fresh frame: capturePage .*, DevTools Internal error; in a new capture host: capturePage .*, DevTools Internal error\)/)
+    await expect(view.screenshot()).rejects.toThrow(/off-screen capture host: Current display surface not available for capture; with a DevTools screenshot: capturePage Current display surface not available for capture, DevTools Internal error; after a fresh frame: capturePage .*, DevTools Internal error; in a new capture host: capturePage .*, DevTools Internal error; no reload: the page \(blank\) is not an http\(s\) page that can be reloaded\)/)
+  })
+
+  it('reloads a GET page as the last resort, says that its state was lost, and never reloads a POST', async () => {
+    const manager = new BrowserViews({ tabs: () => [], openBrowserTab: async () => {}, rendererPath: 'C:/out/index.html' })
+    const view = await manager.view({ projectId: 'project-a', sessionId: 'workspace-a', agentSessionId: 'agent-a' })
+    const guest = created[0]!
+    expect(guest.webContents.sendHeaders?.filter).toEqual({ urls: ['<all_urls>'], types: ['mainFrame'] })
+    await view.navigate('https://reels.example/watch?v=1')
+    guest.webContents.request('GET')
+    // Another guest's request on the same session is not this guest's navigation.
+    guest.webContents.sendHeaders!.listener({ webContentsId: 999, method: 'POST' })
+    // Like the installed app after detached → background: nothing but a navigation brings a surface back.
+    const loadsBefore = guest.webContents.loads.length
+    electronFake.setCapture(() => guest.webContents.loads.length > loadsBefore ? { width: 1440, height: 900 } : { width: 0, height: 0 })
+    electronFake.setDevtools(() => { throw new Error('Internal error') })
+    const shot = await view.screenshot()
+    expect(shot).toMatchObject({ width: 1440, height: 900 })
+    expect(shot.reloaded).toMatch(/^The page \(https:\/\/reels\.example\/watch\?v=1\) was reloaded to get a capturable surface.*scroll position, video position and form input were lost\.$/)
+    expect(guest.webContents.loads.slice(loadsBefore)).toEqual(['https://reels.example/watch?v=1'])
+    // A page reached by a form POST is never reloaded: the error stays, naming why.
+    guest.webContents.request('POST')
+    const loadsAtPost = guest.webContents.loads.length
+    electronFake.setCapture(() => ({ width: 0, height: 0 }))
+    await expect(view.screenshot()).rejects.toThrow(/no reload: its last navigation was a POST \(a form submission\), and reloading would submit it again\)/)
+    expect(guest.webContents.loads).toHaveLength(loadsAtPost)
+    // A 303 after the POST is a GET again, and that page may be reloaded.
+    guest.webContents.request('GET')
+    electronFake.setCapture(() => guest.webContents.loads.length > loadsAtPost ? { width: 1440, height: 900 } : { width: 0, height: 0 })
+    expect((await view.screenshot()).reloaded).toMatch(/was reloaded/)
   })
 
   it('captures a visible pane where it is, and refuses rather than returning an empty image', async () => {
@@ -260,7 +294,7 @@ describe('main-owned project browser surfaces', () => {
     expect((await view.screenshot()).width).toBe(640)
     expect(windows).toEqual([owner])
     electronFake.setCapture(() => ({ width: 0, height: 0 }))
-    await expect(view.screenshot()).rejects.toThrow(/could not capture the browser view \(visible view: empty image; off-screen capture host: empty image; with a DevTools screenshot: capturePage empty image, DevTools no image within 3 s; after a fresh frame: capturePage empty image, DevTools no image within 3 s; in a new capture host: capturePage empty image, DevTools no image within 3 s\).*browser_navigate.*browser_present/)
+    await expect(view.screenshot()).rejects.toThrow(/could not capture the browser view \(visible view: empty image; off-screen capture host: empty image; with a DevTools screenshot: capturePage empty image, DevTools no image within 3 s; after a fresh frame: capturePage empty image, DevTools no image within 3 s; in a new capture host: capturePage empty image, DevTools no image within 3 s; no reload: the method of its last navigation is unknown, so it may have been a form submission\).*browser_navigate.*browser_present/)
     expect(owner.children).toEqual([created[0]])
     expect(created[0]?.visible).toBe(true)
   })
