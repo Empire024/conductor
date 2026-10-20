@@ -66,7 +66,11 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
   it('tags an at-capacity refusal, in both of its statements, as PROVIDER_OVERLOADED', async () => {
     const { adapter, events } = create()
     await adapter.submit('synthetic:at-capacity', settings)
-    await waitFor(() => events.some(event => event.data.type === 'session' && event.data.phase === 'failed'))
+    // Codex settles the turn on the error notification already, before turn/completed restates the
+    // refusal, so the first 'failed' says nothing about the second error. Wait for what ends the
+    // scenario instead: the second error and a settle after it, however slowly the frames arrive.
+    const lastError = () => events.map(event => event.data.type).lastIndexOf('error')
+    await waitFor(() => events.filter(event => event.data.type === 'error').length >= 2 && events.slice(lastError() + 1).some(event => event.data.type === 'session' && event.data.phase === 'failed'))
     const errors = events.filter(event => event.data.type === 'error').map(event => event.data)
     expect(errors).toEqual([
       { type: 'error', message: 'Selected model is at capacity. Please try a different model.', code: PROVIDER_OVERLOADED },
