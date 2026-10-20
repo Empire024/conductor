@@ -84,6 +84,8 @@ request, each redirect hop included. Only a page whose last main-frame request w
 reloaded, so a POST answered with a 303 is fine. A POST, an unknown method or a non-http(s) page
 keeps the full error, with the reason as its last entry (`no reload: …`).
 
+The installed 2a9ce5c narrowed the failing state down (videos wizard). A page loaded and painted before `detached` → `background` captures on the first try. The state that loses its surface is a browser that was **blank** (about:blank, or no URL) when it was detached, and a blank page can never be reloaded. So `browser_screenshot` and `browser_video_frames` now refuse a blank browser up front: "The project browser has no page loaded (it is blank). Call browser_navigate with the page you want first." The navigation that follows gives it a surface, or the chain above does. When the plain capture had nothing, the screenshot text names the step that produced the image (`Captured the browser view (1440×900), with a DevTools screenshot.`), so a live run shows which step served it. In the plain-Electron probe, a blank guest detached, hidden and then navigated is captured by the DevTools step.
+
 ### Watching a video: `browser_video_frames`
 
 `{selector?, start?, end?, fps?, maxFrames?, scale?, format?, mode?, audio?}`. The target is the

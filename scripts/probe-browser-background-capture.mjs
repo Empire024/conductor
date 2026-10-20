@@ -70,7 +70,17 @@ app.whenReady().then(async () => {
     await new Promise(resolve => setTimeout(resolve, 400))
     await view.present('background')
     const switched = await view.screenshot()
-    result.afterSwitch = { width: switched.width, height: switched.height, base64: switched.data.length }
+    result.afterSwitch = { width: switched.width, height: switched.height, base64: switched.data.length, via: switched.via ?? 'first try', reloaded: Boolean(switched.reloaded) }
+    // A browser that was blank when it was detached (videos wizard on 2a9ce5c): refused with the
+    // step that helps, and captured once it has been navigated.
+    const blank = await views.view({ projectId: 'probe-blank', sessionId: 'probe-workspace', agentSessionId: 'probe-agent' })
+    await blank.present('detached')
+    await new Promise(resolve => setTimeout(resolve, 400))
+    await blank.present('background')
+    try { await blank.screenshot(); result.blankRefusal = 'captured' } catch (error) { result.blankRefusal = error.message }
+    await blank.navigate('http://127.0.0.1:' + server.address().port + '/')
+    const navigated = await blank.screenshot()
+    result.blankThenNavigated = { width: navigated.width, height: navigated.height, base64: navigated.data.length, via: navigated.via ?? 'first try', reloaded: Boolean(navigated.reloaded) }
     result.windows = require('electron').BrowserWindow.getAllWindows().map(window => ({ shown: window.isVisible(), focusable: window.isFocusable(), bounds: window.getBounds() }))
     views.dispose(); server.close(); done(0)
   } catch (error) { result.error = error.stack || String(error); done(1) }
@@ -91,5 +101,7 @@ const fixed = !result.error && result.screenshot?.base64 > 1000 && result.screen
   && result.windows?.every(window => !window.shown && !window.focusable && window.bounds.x < -10_000)
   && result.debuggerAttachedAfter === false
   && result.afterSwitch?.base64 > 1000
-console.log(`reproduced (plain capturePage fails): ${reproduced}; fixed (screenshot + red/green/blue frames + capture right after detached → background, nothing shown): ${fixed}`)
+  && /no page loaded .*browser_navigate/.test(result.blankRefusal ?? '')
+  && result.blankThenNavigated?.base64 > 1000
+console.log(`reproduced (plain capturePage fails): ${reproduced}; fixed (screenshot + red/green/blue frames + capture right after detached → background + blank refused then captured once navigated, nothing shown): ${fixed}`)
 process.exit(reproduced && fixed ? 0 : 1)

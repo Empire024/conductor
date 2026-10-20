@@ -74,6 +74,8 @@ interface OwnedBrowser {
   /** The guest moved to another host window since its last capture; its next capture asks for a
    *  fresh frame first. */
   rehosted?: boolean
+  /** Which step of the capture chain produced the last image (see withCapture). */
+  captureVia?: string
   /** The HTTP method of the guest's last main-frame request (each redirect hop counts), so the
    *  reload of last resort never submits a form again. */
   mainFrameMethod?: string
@@ -112,6 +114,14 @@ const evaluation = (code: string): string => {
     }
     catch (error) { return JSON.stringify({ __conductorError: String((error && error.message) || error) }) }
   })()`
+}
+
+/** A browser with no page has nothing to capture, and a blank guest is also one that can have no
+ *  surface at all after detached → background (videos wizard on 2a9ce5c), so captures refuse it up
+ *  front with the one step that helps. */
+const requirePage = (contents: WebContents): void => {
+  const url = contents.getURL()
+  if (!url || url === 'about:blank') throw new Error('The project browser has no page loaded (it is blank). Call browser_navigate with the page you want first.')
 }
 
 /** A DevTools Page.captureScreenshot of the guest, bounded. It attaches the debugger only when no
@@ -563,13 +573,13 @@ export class BrowserViews implements BrowserMcpHost {
       if (this.shownInPlace(owned)) {
         await refreshIfMoved()
         const image = await capture()
-        if (typeof image !== 'string') return image
+        if (typeof image !== 'string') { owned.captureVia = 'visible view'; return image }
         attempts.push(`visible view: ${image}`)
       }
       if (owned.parent !== owned.parking || !owned.parking || owned.parking.isDestroyed()) await borrow()
       await refreshIfMoved()
       const first = await capture()
-      if (typeof first !== 'string') return first
+      if (typeof first !== 'string') { owned.captureVia = 'off-screen capture host'; return first }
       attempts.push(`off-screen capture host: ${first}`)
       const steps: Array<[string, () => Promise<void>]> = [
         ['with a DevTools screenshot', async () => {}],
@@ -581,8 +591,9 @@ export class BrowserViews implements BrowserMcpHost {
         if (contents.isDestroyed()) throw new Error('The browser view was closed')
         const primed = await devtoolsScreenshot(contents)
         const image = await capture()
+        owned.captureVia = label
         if (typeof image !== 'string') return image
-        if (primed.image && usable(primed.image)) return primed.image
+        if (primed.image && usable(primed.image)) { owned.captureVia = `${label} (the DevTools image)`; return primed.image }
         attempts.push(`${label}: capturePage ${image}, DevTools ${primed.error ?? 'empty image'}`)
       }
       // The guaranteed last resort, measured on the installed app (2026-10-21): a guest painted in a
@@ -603,6 +614,7 @@ export class BrowserViews implements BrowserMcpHost {
             if (typeof image === 'string') attempts.push(`after reloading the page: capturePage ${image}, DevTools ${primed.error ?? 'empty image'}`)
           }
           if (typeof image !== 'string') {
+            owned.captureVia = 'after reloading the page'
             options.reload(`The page (${reloaded.url}) was reloaded to get a capturable surface: after it had been detached and then hidden it had none, and nothing short of a reload restores one. Its scroll position, video position and form input were lost.`)
             return image
           }
@@ -774,6 +786,7 @@ export class BrowserViews implements BrowserMcpHost {
    *  budget; the page's audio output stays muted throughout, and the video is put back as found. */
   private async videoFrames(owned: OwnedBrowser, request: VideoFramesRequest): Promise<VideoFramesResult> {
     const guest = owned.view.webContents
+    requirePage(guest)
     const root = this.projectRootOf(owned.projectId)
     const deadline = Date.now() + VIDEO_FRAMES.budgetMs
     // A capture first, which may have to reload the page to get a surface; reloading after the
@@ -1022,14 +1035,15 @@ export class BrowserViews implements BrowserMcpHost {
         return value as Record<string, unknown>
       },
       screenshot: async () => {
-        alive()
+        requirePage(alive())
         let reloaded: string | undefined
         const image = await this.withCapture(owned, grab => grab(), { reload: note => { reloaded = note } })
         const size = image.getSize()
         // A full-resolution PNG of a desktop viewport is megabytes of base64 in the agent's
         // context for no extra legibility; 900px wide is still readable text.
         const scaled = size.width > 900 ? image.resize({ width: 900 }) : image
-        return { data: scaled.toPNG().toString('base64'), mimeType: 'image/png', width: size.width, height: size.height, ...(reloaded ? { reloaded } : {}) }
+        const via = owned.captureVia && !['visible view', 'off-screen capture host'].includes(owned.captureVia) ? owned.captureVia : undefined
+        return { data: scaled.toPNG().toString('base64'), mimeType: 'image/png', width: size.width, height: size.height, ...(reloaded ? { reloaded } : {}), ...(via && !reloaded ? { via } : {}) }
       },
       messages: (limit) => (this.consoles.get(guest.id) ?? []).slice(-limit),
       evaluate: (code) => run(code),

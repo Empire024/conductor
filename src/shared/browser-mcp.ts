@@ -12,7 +12,8 @@ export interface BrowserView {
   navigate(url: string): Promise<{ url: string; title: string }>
   snapshot(options: { selector?: string; maxChars: number }): Promise<Record<string, unknown>>
   /** reloaded: the page had to be reloaded to get a capturable surface (its state was lost). */
-  screenshot(): Promise<{ data: string; mimeType: string; width: number; height: number; reloaded?: string }>
+  /** via: the recovery step that produced the image when the plain capture had none. */
+  screenshot(): Promise<{ data: string; mimeType: string; width: number; height: number; reloaded?: string; via?: string }>
   messages(limit: number): Array<{ level: string; message: string; source?: string; line?: number; at: string }>
   evaluate(code: string): Promise<unknown>
   click(selector: string): Promise<Record<string, unknown>>
@@ -239,7 +240,7 @@ export const BROWSER_TOOLS: BrowserTool[] = [
       const view = await host.view(scope)
       const shot = await view.screenshot()
       assertCapturedImage(shot)
-      return { text: `Captured the browser view (${shot.width}×${shot.height}).${shot.reloaded ? ` ${shot.reloaded}` : ''}`, image: { data: shot.data, mimeType: shot.mimeType } }
+      return { text: `Captured the browser view (${shot.width}×${shot.height})${shot.via ? `, ${shot.via}` : ''}.${shot.reloaded ? ` ${shot.reloaded}` : ''}`, image: { data: shot.data, mimeType: shot.mimeType } }
     }
   },
   {

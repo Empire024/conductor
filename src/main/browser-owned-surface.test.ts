@@ -198,6 +198,7 @@ describe('main-owned project browser surfaces', () => {
     const manager = new BrowserViews({ tabs: () => [], openBrowserTab: async () => {}, rendererPath: 'C:/out/index.html' })
     const view = await manager.view({ projectId: 'project-a', sessionId: 'workspace-a', agentSessionId: 'agent-a' })
     const guest = created[0]!
+    guest.webContents.url = 'https://example.test/'
     // Like Electron 37 for a guest only ever hosted in a hidden window: no surface until DevTools asks for a frame.
     let primed = false
     electronFake.setCapture(() => primed ? { width: 1440, height: 900 } : 'no-surface')
@@ -222,6 +223,7 @@ describe('main-owned project browser surfaces', () => {
     const manager = new BrowserViews({ tabs: () => [], openBrowserTab: async () => {}, rendererPath: 'C:/out/index.html', createDetachedWindow: () => { const window = new FakeWindow(); detached.push(window); return window as never } })
     const view = await manager.view({ projectId: 'project-a', sessionId: 'workspace-a', agentSessionId: 'agent-a' })
     const guest = created[0]!
+    guest.webContents.url = 'https://example.test/'
     electronFake.setCapture(() => ({ width: 1440, height: 900 }))
     await view.screenshot()
     manager.present('project-a', 'detached')
@@ -244,16 +246,17 @@ describe('main-owned project browser surfaces', () => {
     const manager = new BrowserViews({ tabs: () => [], openBrowserTab: async () => {}, rendererPath: 'C:/out/index.html' })
     const view = await manager.view({ projectId: 'project-a', sessionId: 'workspace-a', agentSessionId: 'agent-a' })
     const guest = created[0]!
+    guest.webContents.url = 'https://example.test/'
     const original = windows.find(window => window.children.includes(guest))!
     // Only a host window created after the failure has a surface.
     electronFake.setCapture(() => { const host = windows.find(window => !window.destroyed && window.children.includes(guest)); return host && host !== original ? { width: 1440, height: 900 } : 'no-surface' })
     electronFake.setDevtools(() => { throw new Error('Internal error') })
-    expect(await view.screenshot()).toMatchObject({ width: 1440, height: 900 })
+    expect(await view.screenshot()).toMatchObject({ width: 1440, height: 900, via: 'in a new capture host' })
     expect(original.destroyed).toBe(true)
     expect(guest.webContents.debugger.commands).toEqual(['Page.captureScreenshot', 'Page.captureScreenshot', 'Page.captureScreenshot'])
     expect(windows.filter(window => !window.destroyed && window.children.includes(guest))).toHaveLength(1)
     electronFake.setCapture(() => 'no-surface')
-    await expect(view.screenshot()).rejects.toThrow(/off-screen capture host: Current display surface not available for capture; with a DevTools screenshot: capturePage Current display surface not available for capture, DevTools Internal error; after a fresh frame: capturePage .*, DevTools Internal error; in a new capture host: capturePage .*, DevTools Internal error; no reload: the page \(blank\) is not an http\(s\) page that can be reloaded\)/)
+    await expect(view.screenshot()).rejects.toThrow(/off-screen capture host: Current display surface not available for capture; with a DevTools screenshot: capturePage Current display surface not available for capture, DevTools Internal error; after a fresh frame: capturePage .*, DevTools Internal error; in a new capture host: capturePage .*, DevTools Internal error; no reload: the method of its last navigation is unknown, so it may have been a form submission\)/)
   })
 
   it('reloads a GET page as the last resort, says that its state was lost, and never reloads a POST', async () => {
@@ -283,6 +286,20 @@ describe('main-owned project browser surfaces', () => {
     guest.webContents.request('GET')
     electronFake.setCapture(() => guest.webContents.loads.length > loadsAtPost ? { width: 1440, height: 900 } : { width: 0, height: 0 })
     expect((await view.screenshot()).reloaded).toMatch(/was reloaded/)
+  })
+
+  it('refuses to capture a browser with no page, saying to navigate first', async () => {
+    const manager = new BrowserViews({ tabs: () => [], openBrowserTab: async () => {}, rendererPath: 'C:/out/index.html', projectRoot: () => 'C:/project' })
+    const view = await manager.view({ projectId: 'project-a', sessionId: 'workspace-a', agentSessionId: 'agent-a' })
+    let captured = 0
+    electronFake.setCapture(() => { captured++; return { width: 1440, height: 900 } })
+    for (const url of ['', 'about:blank']) {
+      created[0]!.webContents.url = url
+      await expect(view.screenshot()).rejects.toThrow('The project browser has no page loaded (it is blank). Call browser_navigate with the page you want first.')
+      await expect(view.videoFrames({ fps: 1, maxFrames: 1, scale: 1, format: 'png', mode: 'auto', audio: false })).rejects.toThrow(/no page loaded/)
+    }
+    expect(captured).toBe(0)
+    expect(created[0]!.webContents.loads).toEqual([])
   })
 
   it('captures a visible pane where it is, and refuses rather than returning an empty image', async () => {
