@@ -61,7 +61,7 @@ describe('runtime host', () => {
     for (const client of clients.splice(0)) client.dispose()
     await host.close()
     await new Promise(resolve => setTimeout(resolve, 200))
-    rmSync(directory, { recursive: true, force: true })
+    rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
   })
 
   it('refuses a client without the secret', async () => {
