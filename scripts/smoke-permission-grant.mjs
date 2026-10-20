@@ -41,7 +41,10 @@ const flags = async () => (await readFile(flagLog, 'utf8').catch(() => '')).spli
 // Every Claude tab with the conductor server holds these in its flag layer (CONDUCTOR_MCP_ALLOWED_TOOLS),
 // beside the owner's grants: filing a request is never the classifier's to refuse.
 const EXEMPT = ['mcp__conductor__request_permission', 'mcp__conductor__list_permissions']
-const granted = rules => rules?.filter(rule => !EXEMPT.includes(rule))
+// A tab with browser tools on (the default) also holds an exact rule per conductor-browser tool
+// (BROWSER_MCP_ALLOWED_TOOLS, docs/browser-mcp.md). Like EXEMPT they are Conductor's, not a grant.
+const BROWSER_TOOL_RULE = /^mcp__conductor-browser__browser_[a-z_]+$/
+const granted = rules => rules?.filter(rule => !EXEMPT.includes(rule) && !BROWSER_TOOL_RULE.test(rule))
 const denials = async id => (await snapshot(id)).items.filter(item => item.data.type === 'notice' && item.data.payload?.autoModeDenial)
 const settled = async id => expect.poll(async () => (await snapshot(id))?.phase, { timeout: 20000 }).toMatch(/^(completed|idle)$/)
 const submit = (id, text) => page.evaluate(async ([value, prompt]) => {
