@@ -39,8 +39,23 @@ duration of the capture, at the size the page is laid out at, and puts the view 
 presentation keeps it (`BrowserViews.withCapture`). A visible view is captured where it is. An image
 with no pixels is never returned: the tool fails with the reason and the next step (read the page
 with `browser_snapshot`, or `browser_present({mode:"detached"})` and capture again).
-(Probed 2026-10-20 on Electron 37: CDP `Page.captureScreenshot` times out for such a view, and
-`capturePage` on a window shown off-screen fails with "Current display surface not available".)
+(Probed 2026-10-20 on Electron 37: `capturePage` on a window shown off-screen fails with "Current
+display surface not available".)
+
+A guest that has **never been painted in a shown window** has no compositor surface at all: a
+project whose browser only MCP ever drove lives in the hidden parking window from its first load.
+There `capturePage` refuses ("Current display surface not available for capture") or comes back
+empty however long it waits, and neither `invalidate()`, reparenting, toggling visibility, showing
+the host off-screen, a frame subscription nor `stayHidden`/`stayAwake` changes that. That was the
+installed app's failure after 9aa6dba; the parked smoke had passed because its guest had first been
+painted in the (shown, off-screen) workspace window, and because Playwright drives Electron over
+DevTools, which by itself gives a guest a surface. A DevTools `Page.captureScreenshot` makes the
+renderer produce a surface: it answers with the PNG in about 0.1 s, `capturePage` works from about
+70 ms after the request, and it keeps working after the debugger detaches. So when the parked
+capture fails, `grab()` takes one DevTools screenshot (attaching the debugger only if no Electron
+debugger client is attached, and detaching only what it attached), retries `capturePage`, and
+falls back to the DevTools PNG itself. Video frames go through the same `grab()`, so a primed guest
+captures every later frame directly.
 
 ### Watching a video: `browser_video_frames`
 
@@ -120,6 +135,12 @@ first-party, allowed by rule, and use the browser's own sign-in. The server's MC
   `src/main/browser-owned-surface.test.ts` (background capture through the parking host and back),
   provider tests for the allow rules and Codex answers.
 - Parked smoke: `node scripts/smoke-lock.mjs -- node scripts/smoke-browser-watch-media.mjs` after a
-  build. It screenshots in background presentation, extracts red/green/blue frames and a WAV from
+  build. It screenshots in background presentation (a pane-mounted guest, and a never-painted guest
+  of a second project that only MCP drove), extracts red/green/blue frames and a WAV from
   `scripts/fixtures/browser-media/tiny.webm` (3 s, 160x90, VP8 + 440 Hz Opus) served from loopback,
   and downloads with a cookie and referer check. No network.
+- Unprimed capture: `node scripts/smoke-lock.mjs -- node scripts/probe-browser-background-capture.mjs`
+  bundles the real `BrowserViews` and runs it in plain Electron with no DevTools client, the
+  installed app's condition. It checks that a plain `capturePage` of an MCP-only guest is refused
+  (the reproduction), then that the screenshot and red/green/blue seeked frames succeed with nothing
+  shown. Exit 0 means reproduced and fixed.

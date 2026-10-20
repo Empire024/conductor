@@ -1,4 +1,4 @@
-import { BrowserWindow, net, WebContentsView, type NativeImage, type WebContents } from 'electron'
+import { BrowserWindow, nativeImage, net, WebContentsView, type NativeImage, type WebContents } from 'electron'
 import { randomBytes } from 'node:crypto'
 import { createWriteStream, existsSync, mkdirSync } from 'node:fs'
 import { mkdir, rename, rm, writeFile } from 'node:fs/promises'
@@ -106,6 +106,19 @@ const evaluation = (code: string): string => {
     }
     catch (error) { return JSON.stringify({ __conductorError: String((error && error.message) || error) }) }
   })()`
+}
+
+/** A DevTools Page.captureScreenshot of the guest, bounded. It attaches the debugger only when no
+ *  Electron debugger client is attached already, and detaches only what it attached. */
+const devtoolsScreenshot = async (contents: WebContents): Promise<{ image?: NativeImage; error?: string }> => {
+  let attached = false
+  try {
+    if (!contents.debugger.isAttached()) { contents.debugger.attach('1.3'); attached = true }
+    const reply = await Promise.race([contents.debugger.sendCommand('Page.captureScreenshot', { format: 'png' }) as Promise<{ data?: string }>, settle(3000).then(() => undefined)])
+    if (!reply?.data) return { error: 'no image within 3 s' }
+    return { image: nativeImage.createFromBuffer(Buffer.from(reply.data, 'base64')) }
+  } catch (error) { return { error: failure(error) } }
+  finally { if (attached) { try { contents.debugger.detach() } catch { /* already detached */ } } }
 }
 
 /** Runs code in the guest page and returns its JSON value; an in-page throw becomes a readable error. */
@@ -509,6 +522,16 @@ export class BrowserViews implements BrowserMcpHost {
       if (owned.parent !== owned.parking || !owned.parking || owned.parking.isDestroyed()) await borrow()
       try { const image = await contents.capturePage(); if (usable(image)) return image; reason = 'the off-screen capture host returned an empty image' }
       catch (error) { reason = failure(error) }
+      // A guest that has never been painted in a shown window has no compositor surface at all, so
+      // capturePage refuses ("Current display surface not available for capture") or comes back
+      // empty however long it waits, which is the installed app's background browser. A DevTools
+      // screenshot makes the renderer produce one; from then on capturePage works, and the DevTools
+      // PNG itself is the fallback (probed on Electron 37, docs/browser-mcp.md).
+      const primed = await devtoolsScreenshot(contents)
+      try { const image = await contents.capturePage(); if (usable(image)) return image }
+      catch (error) { reason = `${reason}; after a DevTools screenshot: ${failure(error)}` }
+      if (primed.image && usable(primed.image)) return primed.image
+      if (primed.error) reason = `${reason}; DevTools screenshot: ${primed.error}`
       throw new Error(`Conductor could not capture the browser view (${reason}). ${CAPTURE_ADVICE}`)
     }
     try {

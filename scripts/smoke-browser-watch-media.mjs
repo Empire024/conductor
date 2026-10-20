@@ -109,9 +109,11 @@ let originalFailure, cleanupFailure
 try {
   await page.waitForFunction(() => Boolean(window.conductor?.structured && window.conductor?.browser))
   const project = await page.evaluate(async () => window.conductor.projects.create('Media project'))
+  // Created now so it is listed after the reload; its browser is first touched near the end.
+  const lazy = await page.evaluate(async () => window.conductor.projects.create('Lazy media project'))
   assert.ok(project.path && existsSync(project.path), JSON.stringify(project))
   await page.reload()
-  await page.locator('.project-row').filter({ hasText: project.name }).click()
+  await page.locator('.project-row').filter({ has: page.getByText(project.name, { exact: true }) }).click()
   await launcherTile(page, 'Claude').click()
   const pane = page.locator('.structured-agent-pane:visible')
   await expect(pane.getByRole('textbox', { name: 'Message Claude Code', exact: true })).toBeEnabled()
@@ -213,7 +215,44 @@ try {
   await refused(mcp, 'browser_download', { fromVideo: true }, /blob: source .*browser_video_frames/)
   check('fromVideo saves the <video> source file, and a blob: source is refused with a pointer to browser_video_frames')
 
-  await expect.poll(windowCount, { message: 'no window was left behind' }).toBe(windowsBefore)
+  // The installed app's case (videos wizard, 2026-10-20, on c597c04): a project whose browser only
+  // MCP ever drove. Its guest has lived in the hidden parking host from the start and was never
+  // painted in a shown window, so Electron has no surface for it: capturePage refuses with "Current
+  // display surface not available for capture" (or comes back empty) until DevTools asks for a frame.
+  // Playwright itself drives Electron over DevTools, which gives the guest a surface, so under this
+  // smoke the plain capture usually works (report.lazyPlainCapture); the faithful reproduction is
+  // scripts/probe-browser-background-capture.mjs, which runs BrowserViews with no DevTools client.
+  await page.locator('.project-row').filter({ has: page.getByText(lazy.name, { exact: true }) }).click()
+  await launcherTile(page, 'Claude').click()
+  const lazyPane = page.locator('.structured-agent-pane:visible')
+  await expect(lazyPane.getByRole('textbox', { name: 'Message Claude Code', exact: true })).toBeEnabled()
+  const lazySession = await lazyPane.getAttribute('data-structured-session')
+  await page.evaluate(async id => { const snapshot = await window.conductor.structured.snapshot(id); await window.conductor.structured.saveSettings(id, { ...snapshot.settings, browserMcp: true }); await window.conductor.structured.connect(id) }, lazySession)
+  await expect.poll(async () => JSON.parse(await readFile(capture, 'utf8')).mcpServers['conductor-browser'].headers.Authorization).not.toBe(server.headers.Authorization)
+  const lazyServer = JSON.parse(await readFile(capture, 'utf8')).mcpServers['conductor-browser']
+  const lazyMcp = { url: lazyServer.url, headers: lazyServer.headers }
+  await rpc(lazyMcp, 'initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'media-smoke-lazy', version: '1' } })
+  const known = new Set((await ownedContents()).map(item => item.id))
+  await call(lazyMcp, 'browser_navigate', { url: origin + '/' })
+  const lazyGuest = (await ownedContents()).find(item => !known.has(item.id))
+  assert.ok(lazyGuest, 'project B got its own guest')
+  assert.equal((await surface(lazyGuest.id)).parking, true, 'the lazy guest lives in the parking host')
+  // Whether this run reproduces the bug: a plain capturePage of the never-painted guest.
+  report.lazyPlainCapture = await app.evaluate(async ({ webContents }, id) => {
+    try { const image = await webContents.fromId(id).capturePage(); return image.isEmpty() ? 'empty' : `${image.getSize().width}x${image.getSize().height}` }
+    catch (error) { return 'refused: ' + error.message }
+  }, lazyGuest.id)
+  const lazyShot = await call(lazyMcp, 'browser_screenshot')
+  const lazyImage = lazyShot.content.find(block => block.type === 'image')
+  assert.ok(lazyImage && lazyImage.data.length > 1000, lazyShot.content[0].text)
+  await writeFile(join(output, `lazy-screenshot-${stamp}.png`), Buffer.from(lazyImage.data, 'base64'))
+  const lazyFrames = (await call(lazyMcp, 'browser_video_frames', { selector: '#clip', fps: 1, maxFrames: 2, start: 0.5, end: 1.5 })).structuredContent
+  assert.deepEqual(await Promise.all(lazyFrames.frames.map(async frame => dominant(await centre(frame.path)))), ['red', 'green'])
+  assert.ok(lazyFrames.directory.startsWith(join(lazy.path, '.conductor', 'browser-captures')), lazyFrames.directory)
+  check(`A never-painted background guest (plain capturePage: ${report.lazyPlainCapture}) still screenshots and yields red/green video frames`)
+
+  // Only the lazy project's own hidden parking host is added.
+  await expect.poll(windowCount, { message: 'no window was left behind' }).toBe(windowsBefore + 1)
   await page.screenshot({ path: join(output, `workspace-${stamp}.png`) })
   assert.deepEqual(rendererErrors, [])
 } catch (error) {

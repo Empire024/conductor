@@ -29,12 +29,15 @@ const electronFake = vi.hoisted(() => {
     async executeJavaScript(): Promise<string> { return 'null' }
     async capturePage(): Promise<unknown> {
       const size = capture(this)
-      const image = (current: { width: number; height: number }): unknown => ({ isEmpty: () => !current.width, getSize: () => current, resize: ({ width }: { width: number }) => image({ width, height: Math.round(current.height * width / current.width) }), toPNG: () => Buffer.from(current.width ? 'png' : '') })
-      return image(size)
+      if (size === 'no-surface') throw new Error('Current display surface not available for capture')
+      return fakeImage(size)
     }
+    debugger = { attached: false, commands: [] as string[], isAttached: (): boolean => this.debugger.attached, attach: (): void => { this.debugger.attached = true }, detach: (): void => { this.debugger.attached = false }, sendCommand: async (method: string): Promise<unknown> => { this.debugger.commands.push(method); return devtools(this) } }
     close(): void { this.destroyed = true; this.emit('destroyed') }
   }
-  let capture = (_contents: FakeContents): { width: number; height: number } => ({ width: 0, height: 0 })
+  const fakeImage = (current: { width: number; height: number }): unknown => ({ isEmpty: () => !current.width, getSize: () => current, resize: ({ width }: { width: number }) => fakeImage({ width, height: Math.round(current.height * width / current.width) }), toPNG: () => Buffer.from(current.width ? 'png' : '') })
+  let capture = (_contents: FakeContents): { width: number; height: number } | 'no-surface' => ({ width: 0, height: 0 })
+  let devtools = (_contents: FakeContents): unknown => ({})
   const created: FakeView[] = []
   class FakeView {
     webContents = new FakeContents(); bounds = { x: 0, y: 0, width: 0, height: 0 }; visible = false
@@ -57,12 +60,13 @@ const electronFake = vi.hoisted(() => {
     close(): void { this.destroyed = true; this.emit('closed') }
   }
   const windows: FakeWindow[] = []
-  return { created, windows, FakeWindow, FakeView, setCapture: (fn: typeof capture): void => { capture = fn }, reset: (): void => { created.splice(0); windows.splice(0); nextContentsId = 20; capture = () => ({ width: 0, height: 0 }) } }
+  return { created, windows, FakeWindow, FakeView, setCapture: (fn: typeof capture): void => { capture = fn }, setDevtools: (fn: typeof devtools): void => { devtools = fn }, fakeImage, reset: (): void => { created.splice(0); windows.splice(0); nextContentsId = 20; capture = () => ({ width: 0, height: 0 }); devtools = () => ({}) } }
 })
 
 vi.mock('electron', () => ({
   BrowserWindow: Object.assign(electronFake.FakeWindow, { getAllWindows: () => [] }),
   WebContentsView: electronFake.FakeView,
+  nativeImage: { createFromBuffer: (buffer: Buffer) => electronFake.fakeImage(buffer.length ? { width: 777, height: 555 } : { width: 0, height: 0 }) },
   webContents: { fromId: () => undefined }
 }))
 
@@ -183,6 +187,29 @@ describe('main-owned project browser surfaces', () => {
     expect(owner.children).toEqual([guest])
   })
 
+  it('gives a never-painted background guest a surface through a DevTools screenshot, as the installed app needs', async () => {
+    const manager = new BrowserViews({ tabs: () => [], openBrowserTab: async () => {}, rendererPath: 'C:/out/index.html' })
+    const view = await manager.view({ projectId: 'project-a', sessionId: 'workspace-a', agentSessionId: 'agent-a' })
+    const guest = created[0]!
+    // Like Electron 37 for a guest only ever hosted in a hidden window: no surface until DevTools asks for a frame.
+    let primed = false
+    electronFake.setCapture(() => primed ? { width: 1440, height: 900 } : 'no-surface')
+    electronFake.setDevtools(() => { primed = true; return { data: Buffer.from('png').toString('base64') } })
+    expect(await view.screenshot()).toMatchObject({ width: 1440, height: 900 })
+    expect(guest.webContents.debugger.commands).toEqual(['Page.captureScreenshot'])
+    expect(guest.webContents.debugger.attached).toBe(false)
+    // Primed once, later captures (every video frame) go straight through capturePage.
+    await view.screenshot()
+    expect(guest.webContents.debugger.commands).toHaveLength(1)
+    // When capturePage still has nothing, the DevTools PNG itself is the screenshot.
+    electronFake.setCapture(() => 'no-surface')
+    expect(await view.screenshot()).toMatchObject({ width: 777, height: 555 })
+    // A debugger someone else attached is used and left attached.
+    guest.webContents.debugger.attached = true
+    await view.screenshot()
+    expect(guest.webContents.debugger.attached).toBe(true)
+  })
+
   it('captures a visible pane where it is, and refuses rather than returning an empty image', async () => {
     const manager = new BrowserViews({ tabs: () => [], openBrowserTab: async () => {}, rendererPath: 'C:/out/index.html' })
     const owner = new FakeWindow(); owner.visible = true
@@ -192,7 +219,7 @@ describe('main-owned project browser surfaces', () => {
     expect((await view.screenshot()).width).toBe(640)
     expect(windows).toEqual([owner])
     electronFake.setCapture(() => ({ width: 0, height: 0 }))
-    await expect(view.screenshot()).rejects.toThrow(/could not capture the browser view \(the off-screen capture host returned an empty image\).*browser_present/)
+    await expect(view.screenshot()).rejects.toThrow(/could not capture the browser view \(the off-screen capture host returned an empty image; DevTools screenshot: no image within 3 s\).*browser_present/)
     expect(owner.children).toEqual([created[0]])
     expect(created[0]?.visible).toBe(true)
   })
