@@ -8,7 +8,7 @@ export const SETTINGS_SECTIONS = [
   { id: 'notifications', title: 'Notifications', description: 'See which "needs you" moments were sent and which were held back.', keywords: 'needs you attention log grace period push alerts approvals questions refusals denials routed around reviewer wizard' },
   { id: 'permissions', title: 'Permissions', description: 'See the commands and files you always allow, and revoke them.', keywords: 'permissions always allow approve grants standing revoke commands files claude auto mode classifier' },
   { id: 'updates', title: 'Updates', description: 'Check for updates and choose which builds you receive.', keywords: 'installed app updates local test builds folder github releases version check now' },
-  { id: 'runtimes', title: 'Runtimes', description: 'Check the coding tools, their login and Claude Full Auto authorization on this PC.', keywords: 'frontier runtimes provider cli path claude codex grok xai gemini deepseek docs install full auto permissions guarded authorization bypass login logged out sign in long-lived token setup-token oauth' },
+  { id: 'runtimes', title: 'Runtimes', description: 'Check the coding tools, their login and Claude Full Auto authorization on this PC.', keywords: 'frontier runtimes provider cli path claude codex grok xai gemini deepseek docs install full auto permissions guarded authorization bypass login logged out sign in long-lived token setup-token oauth claude in chrome extension browser' },
   { id: 'debug', title: 'Debug', description: 'Capture local events to help troubleshoot a problem.', keywords: 'debug tools logging console warnings errors issue reports' }
 ] as const
 

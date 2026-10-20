@@ -350,6 +350,9 @@ export class ClaudeAdapter implements ProviderAdapter {
     // One variadic flag carries both servers; a repeated flag is not something the CLI promises to merge.
     const mcpConfigs = await this.relayMcp(this.options.approvalReviewer || this.options.profile === 'evaluation' ? [] : [this.options.mcpConfig, this.options.localAssistMcpConfig, this.options.conductorMcpConfig].filter((config): config is string => Boolean(config)))
     if (mcpConfigs.length) args.push('--mcp-config', ...mcpConfigs)
+    // Claude in Chrome: in --print mode the CLI attaches the extension's MCP server only with
+    // --chrome (its interactive default does not apply here). Never in an isolated launch.
+    if (this.options.claudeInChrome && !this.options.approvalReviewer && this.options.profile !== 'evaluation') args.push('--chrome')
     if (this.nativeSessionId) args.push(this.options.newNativeSession ? '--session-id' : '--resume', this.nativeSessionId)
     // Rules the owner granted this conversation (src/main/permission-grants), and the exemption of
     // Conductor's request tools, ride in the flag settings layer, the same layer

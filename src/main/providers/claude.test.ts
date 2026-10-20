@@ -154,6 +154,22 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     expect(reviewer.transport.options.args).not.toContain('local.json')
   })
 
+  // haf-claude-in-chrome-missing-20261021: --print mode attaches the extension only with --chrome.
+  it('launches with --chrome when Claude in Chrome is on, and never for a reviewer or an evaluation turn', async () => {
+    const on = fixture({ claudeInChrome: true })
+    await on.adapter.start()
+    expect(on.transport.options.args).toContain('--chrome')
+    const off = fixture()
+    await off.adapter.start()
+    expect(off.transport.options.args).not.toContain('--chrome')
+    const reviewer = fixture({ claudeInChrome: true, approvalReviewer: true })
+    await reviewer.adapter.start()
+    expect(reviewer.transport.options.args).not.toContain('--chrome')
+    const evaluation = fixture({ claudeInChrome: true, profile: 'evaluation' })
+    await evaluation.adapter.start()
+    expect(evaluation.transport.options.args).not.toContain('--chrome')
+  })
+
   it('keeps a managed Auto worker on native auto even when its controller reviews coworkers', async () => {
     const f = fixture({ reviewApprovals: true, settings: { permission: 'auto', plan: false } })
     await f.adapter.start()

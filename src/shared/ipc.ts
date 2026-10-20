@@ -70,6 +70,7 @@ export interface FileSearchOptions { showHidden?: boolean; activeProjectId?: str
 
 export interface ConductorBridge {
   claudeFullAuto: import('./claude-full-auto').ClaudeFullAutoBridge
+  claudeInChrome: import('./claude-in-chrome').ClaudeInChromeBridge
   providerLogin: import('./claude-login').ProviderLoginBridge
   sessionArchive: import('./session-archive').SessionArchiveBridge
   agentControl: import('./agent-control').AgentControlBridge

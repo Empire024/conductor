@@ -39,6 +39,7 @@ import { latestModelsFromSchedules, latestModelsWatcher, startModelIntelligence,
 import { registerPermissionGrantsIpc, startPermissionGrants } from './permission-grants/wiring'
 import { ClaudeFullAutoPolicy } from './claude-full-auto'
 import { registerClaudeFullAutoIpc } from './claude-full-auto-ipc'
+import { registerClaudeInChromeIpc } from './claude-in-chrome'
 import { BrowserViews } from './browser-views'
 import { RemoteControlService } from './remote-control-ipc'
 import { safeStorageCipher } from './safe-storage-vault'
@@ -2788,6 +2789,7 @@ const registerIpc = (): void => {
   registerPermissionGrantsIpc(() => permissionGrants?.grants, event => trustedStructured(event))
   // Provider login and the long-lived Claude token (src/main/claude-login.ts): trusted UI only, never app control.
   disposeProviderLoginIpc = registerProviderLoginIpc(ipcMain, () => providerLogin, event => trustedStructured(event))
+  registerClaudeInChromeIpc(ipcMain, database, event => trustedStructured(event))
   registerClaudeFullAutoIpc(ipcMain, claudeFullAuto, event => trustedStructured(event), () => {
     const cli = agents.nativeCli.claudeFullAutoTabs().map(tab => ({ ...tab, runtime: 'cli' as const }))
     const cliIds = new Set(cli.map(tab => tab.agentSessionId))

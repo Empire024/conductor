@@ -15,6 +15,7 @@ import { agentCollaborationBridge } from './agent-collaboration'
 import { deliveryBridge } from './delivery'
 import { permissionGrantsBridge } from './permission-grants'
 import { claudeFullAutoBridge } from './claude-full-auto'
+import { claudeInChromeBridge } from './claude-in-chrome'
 import { providerLoginBridge } from './provider-login'
 import { durableJobsBridge } from './durable-jobs'
 import { tokenBurnBridge } from './token-burn'
@@ -208,6 +209,7 @@ const bridge: ConductorBridge = {
   delivery: deliveryBridge,
   permissionGrants: permissionGrantsBridge,
   claudeFullAuto: claudeFullAutoBridge,
+  claudeInChrome: claudeInChromeBridge,
   providerLogin: providerLoginBridge,
   durableJobs: durableJobsBridge,
   tokenBurn: tokenBurnBridge,

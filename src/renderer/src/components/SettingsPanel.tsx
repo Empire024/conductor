@@ -12,6 +12,7 @@ import { PhoneAccessSettings } from './PhoneAccessSettings'
 import { AttentionLogSettings } from './AttentionLogSettings'
 import { PermissionsSettings } from './PermissionsSettings'
 import { ClaudeFullAutoControl } from './ClaudeFullAutoControl'
+import { ClaudeInChromeSetting } from './ClaudeInChromeSetting'
 import { ProviderLoginControl } from './ProviderLoginControl'
 import { matchingSettingsSections, resolveSettingsSection, SETTINGS_SECTIONS, type SettingsSectionId } from './settings-navigation'
 import './SettingsPanel.css'
@@ -282,6 +283,7 @@ export function SettingsPanel({
             </>}
             {activeSection === 'runtimes' && <>
               <ClaudeFullAutoControl />
+              <ClaudeInChromeSetting />
               <ProviderLoginControl />
               <section>
                 <div className="settings-section-title"><Bot size={14} /><div><strong>Frontier runtimes</strong><span>Conductor uses each provider's real local CLI.</span></div></div>

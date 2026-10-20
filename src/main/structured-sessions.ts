@@ -35,6 +35,7 @@ import { ApprovalReviewGate, type ApprovalReviewRouting } from './approval-revie
 import { evaluateApprovalPolicy, policyAnswerLog, type PolicyDecision, type PolicyRequest } from './approval-policy'
 import { SUCCESSION_NUDGE, successionProgress, type BriefingContext } from './turn-briefing'
 import type { PermissionGrants } from './permission-grants/service'
+import { claudeInChromeState } from './claude-in-chrome'
 import type { NativeSlashCommand } from '../shared/slash-commands'
 
 interface LiveSession {
@@ -538,6 +539,7 @@ export class StructuredSessions {
       ...(live.spec.provider === 'claude' && !isolated ? {
         conductorMcpConfig: this.conductorMcp?.configure(live.spec) ?? '',
         claudeFullAutoAuthorized: () => this.claudeFullAutoPolicy(),
+        claudeInChrome: claudeInChromeState(key => this.database.getSetting(key)).enabled,
         ...(this.permissionGrants ? { permissionGrants: this.permissionGrants.adapterPort(id) } : {})
       } : {}),
       ...(lean ? { profile: 'evaluation' as const } : {}),

@@ -44,6 +44,9 @@ export interface AdapterOptions {
     executionFinished?(call: NativeGrantCall, outcome: 'succeeded' | 'failed' | 'blocked' | 'cancelled' | 'unknown'): void }
   /** Host-only reviewer isolation; never accepted from worker settings or app-control input. */
   approvalReviewer?: boolean
+  /** Claude only: launch with --chrome so the Claude in Chrome extension's tools are attached
+   *  (src/main/claude-in-chrome.ts). Never for a reviewer or an evaluation turn. */
+  claudeInChrome?: boolean
   /** Trusted host policy, read at the moment a Claude permission transition is requested. */
   claudeFullAutoAuthorized?: () => boolean
   /** Host-only lean launch of a cloud evaluation turn (AgentSpec.profile): the adapter drops what the
