@@ -1032,3 +1032,121 @@ describe('an approval reaches a conversation whose turn is still running (H06)',
     expect(h.retried.filter(entry => entry.id === successor)).toEqual([])
   })
 })
+
+// conductor-task:refused-request-no-card
+describe('a call Conductor refuses itself never reaches the owner (haftheme 2026-10-20)', () => {
+  const settings = 'C:\\Users\\owner\\site\\theme\\.claude\\settings.local.json'
+  const project = (id: string): string | undefined => id === tab || id === 'agent_other' ? 'project_theme' : id === 'agent_elsewhere' ? 'project_shop' : undefined
+  function saving(overrides: Partial<PermissionGrantPorts> = {}) {
+    let saved: SavedPermissionGrants | undefined
+    const h = harness({ project, provider: id => ['agent_tab', 'agent_other', 'agent_elsewhere'].includes(id) ? 'claude' : undefined, persist: value => { saved = JSON.parse(JSON.stringify(value)) as SavedPermissionGrants }, ...overrides })
+    return { ...h, saved: () => saved }
+  }
+
+  it('answers the agent with the refusal and files no card, no phone push and no pending request', async () => {
+    const h = saving()
+    const answer = await callPermissions(h.grants, { agentSessionId: tab }, 'permissions.request', { tool: 'Edit', path: settings, reason: 'add one allow rule' }) as Record<string, unknown>
+    expect(answer).toMatchObject({ refused: true, class: 'shared', refusal: expect.stringMatching(/agent permissions, hooks or instructions/), next: expect.stringMatching(/did not ask the owner; do not retry/) })
+    expect(answer.requestId).toBeUndefined()
+    expect(h.notices).toEqual([])
+    expect(h.ports.phone).not.toHaveBeenCalled()
+    expect(h.grants.state().requests).toEqual([])
+    expect(h.grants.list(tab).requests).toEqual([])
+    // A wildcard command is refused the same way.
+    expect(h.grants.request(tab, { command: 'rm -rf build/*', reason: 'clean' })).toMatchObject({ status: 'denied', refusal: expect.stringMatching(/wildcard/) })
+    expect(h.grants.state().requests).toEqual([])
+  })
+
+  it('keeps a refused classifier denial informational: no pending request, and nothing to decide', async () => {
+    const h = saving()
+    const item = h.deny('toolu_cfg', 'Edit', { file_path: settings }, 'Self-Modification', true)
+    expect(h.grants.state().requests).toEqual([])
+    await expect(h.grants.decide(tab, item, 'deny', 'owner')).rejects.toThrow(/refuses this call itself, so there is nothing to answer/)
+    await expect(h.grants.decide(tab, item, 'approve-once', 'wizard')).rejects.toThrow(/nothing to answer/)
+    expect(h.told).toEqual([])
+  })
+
+  it('drops a refused card an older build left pending when the app starts', () => {
+    const before = saving()
+    const kept = before.grants.request(tab, { command: 'bash app/prod/fix-pool.sh', reason: 'pool fix' })
+    const saved = before.saved()!
+    // What the older build saved for the haftheme request: pending, no rule, a refusal.
+    saved.requests.push({ ...describeGrantRequest({ tool: 'Edit', input: { file_path: settings }, cwd }), id: 'grant:cd1695fb-df2c-47fb-aef1-f747ab10d276', source: 'agent', status: 'pending', requestedAt: '2026-10-20T03:45:00.000Z', agentSessionId: tab })
+    const after = saving()
+    expect(after.grants.restore(saved, id => id === tab)).toEqual({ requests: 1, grants: 0, dropped: 1 })
+    expect(after.grants.state().requests.map(request => request.id)).toEqual([kept.id])
+    // The old card reads as no longer waiting, never as a question.
+    expect(after.grants.state().settled).toEqual([{ agentSessionId: tab, id: 'grant:cd1695fb-df2c-47fb-aef1-f747ab10d276', status: 'expired' }])
+    expect(after.saved()!.requests.map(request => request.id)).toEqual([kept.id])
+  })
+
+  it('Always allow: the owner\'s answer covers exactly that command for every conversation of the project, survives a restart, and is revocable', async () => {
+    const h = saving()
+    const command = 'bash app/prod/fix-pool.sh'
+    const asked = h.grants.request(tab, { command, reason: 'pool fix' })
+    const result = await h.grants.decide(tab, asked.id, 'approve-always', 'owner')
+    expect(result).toMatchObject({ status: 'approved-session', message: expect.stringMatching(/always, in this project/) })
+    expect(h.told.at(-1)!.text).toMatch(/^\[Conductor\] approved: Bash\(bash app\/prod\/fix-pool\.sh\) \(always, in this project\); retry it now/)
+    expect(h.grants.state().standing).toEqual([expect.objectContaining({ projectId: 'project_theme', rule: `Bash(${command})`, decidedBy: 'owner', askedIn: tab })])
+    // Exact match only, in the same project; another project and another command still ask.
+    expect(h.grants.adapterPort('agent_other').standing('Bash', { command })).toBe(`Bash(${command})`)
+    expect(h.grants.adapterPort('agent_other').standing('Bash', { command: command + ' --force' })).toBeUndefined()
+    expect(h.grants.adapterPort('agent_other').standing('Bash', { command: 'bash app/prod/fix-pool.sh; rm -rf /' })).toBeUndefined()
+    expect(h.grants.adapterPort('agent_other').standing('PowerShell', { command })).toBeUndefined()
+    expect(h.grants.adapterPort('agent_elsewhere').standing('Bash', { command })).toBeUndefined()
+    // Asking again for it is answered at once, with no card.
+    const notices = h.notices.length
+    expect(await callPermissions(h.grants, { agentSessionId: 'agent_other' }, 'permissions.request', { command, reason: 'again' })).toMatchObject({ alwaysAllowed: true, next: expect.stringMatching(/run it now/) })
+    expect(h.notices).toHaveLength(notices)
+    expect(h.grants.state().requests.filter(request => request.status === 'pending')).toEqual([])
+    // A restart keeps it.
+    const after = saving()
+    after.grants.restore(h.saved(), () => true)
+    expect(after.grants.adapterPort(tab).standing('Bash', { command })).toBe(`Bash(${command})`)
+    expect(after.grants.list(tab).alwaysAllowed).toEqual([expect.objectContaining({ rule: `Bash(${command})`, uses: 2 })])
+    // Settings > Permissions revokes it: the next such call asks again.
+    const id = after.grants.state().standing![0]!.id
+    expect(after.grants.revokeStanding(id)).toBe(true)
+    expect(after.grants.adapterPort(tab).standing('Bash', { command })).toBeUndefined()
+    expect(after.saved()!.standing).toBeUndefined()
+    expect(after.grants.request(tab, { command, reason: 'after revoke' }).status).toBe('pending')
+  })
+
+  it('Always allow never covers a protected file, a domain or an agent\'s own answer, and a saved file cannot widen it', async () => {
+    const h = saving()
+    const fetch = h.grants.request(tab, { url: 'https://example.com/a', reason: 'docs' })
+    await expect(h.grants.decide(tab, fetch.id, 'approve-always', 'owner')).rejects.toThrow(/one exact command/)
+    expect(h.grants.list(tab).requests.find(request => request.id === fetch.id)!.status).toBe('pending')
+    // An agent cannot answer at all: permissions.decide is the owner's or a wizard's.
+    const write = h.grants.request(tab, { path: 'C:\\Users\\owner\\site\\theme\\dist\\out.txt', reason: 'build' })
+    await expect(callPermissions(h.grants, { agentSessionId: tab }, 'permissions.decide', { agentSessionId: tab, requestId: write.id, decision: 'approve-always' })).rejects.toThrow(/owner's own control credential or a wizard tab/)
+    // A tampered save naming a protected file, a wildcard or a domain is dropped on load.
+    const saved = h.saved()!
+    saved.standing = [
+      { id: 's1', projectId: 'project_theme', rule: 'Edit(//c/Users/owner/site/theme/.claude/settings.local.json)', tool: 'Edit', resource: settings, class: 'shared', grantedAt: 'now', decidedBy: 'owner' },
+      { id: 's2', projectId: 'project_theme', rule: 'Bash(rm -rf *)', tool: 'Bash', resource: 'rm -rf *', class: 'destructive', grantedAt: 'now', decidedBy: 'owner' },
+      { id: 's3', projectId: 'project_theme', rule: 'WebFetch(domain:example.com)', tool: 'WebFetch', resource: 'https://example.com', class: 'external', grantedAt: 'now', decidedBy: 'owner' },
+      { id: 's4', projectId: 'project_theme', rule: 'Edit(//c/Users/owner/site/theme/dist/out.txt)', tool: 'Write', resource: 'out.txt', class: 'local', grantedAt: 'now', decidedBy: 'wizard' }
+    ]
+    const after = saving()
+    after.grants.restore(saved, () => true)
+    expect(after.grants.state().standing!.map(entry => entry.id)).toEqual(['s4'])
+    expect(after.grants.adapterPort(tab).standing('Edit', { file_path: settings })).toBeUndefined()
+    expect(after.grants.adapterPort(tab).standing('Write', { file_path: 'C:\\Users\\owner\\site\\theme\\dist\\out.txt' })).toBe('Edit(//c/Users/owner/site/theme/dist/out.txt)')
+  })
+
+  it('approves a classifier denial of an always-allowed call without a card, once per conversation', async () => {
+    const h = saving()
+    const command = 'bash app/prod/fix-pool.sh'
+    const asked = h.grants.request(tab, { command, reason: 'pool fix' })
+    await h.grants.decide(tab, asked.id, 'approve-always', 'owner')
+    const item = h.deny('toolu_again', 'Bash', { command }, 'Production Deploy')
+    h.grants.adapterPort('agent_other').denied(item, describeGrantRequest({ tool: 'Bash', input: { command }, cwd, category: 'Production Deploy', toolUseId: 'toolu_again' }))
+    await vi.waitFor(() => expect(h.grants.list('agent_other').requests).toEqual([expect.objectContaining({ id: item, status: 'approved-session', always: true })]))
+    await vi.waitFor(() => expect(h.told.at(-1)).toMatchObject({ id: 'agent_other', text: expect.stringMatching(/approved: Bash\(bash app\/prod\/fix-pool\.sh\) \(always, in this project\)/) }))
+    // Refused again in the same conversation: the owner's card asks rather than a loop.
+    const second = 'auto-denial:toolu_third'
+    h.grants.adapterPort('agent_other').denied(second, describeGrantRequest({ tool: 'Bash', input: { command }, cwd, category: 'Production Deploy', toolUseId: 'toolu_third' }))
+    expect(h.grants.list('agent_other').requests.find(request => request.id === second)).toMatchObject({ status: 'pending' })
+  })
+})

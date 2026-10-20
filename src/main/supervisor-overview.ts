@@ -1,5 +1,7 @@
 import type { AwaitingRecord } from '../shared/awaiting-results'
-import type { SessionProjection } from '../shared/structured-agent'
+import type { PermissionGrantRequest } from '../shared/permission-grants'
+import { isAsyncQuestion, type SessionProjection } from '../shared/structured-agent'
+import { approvalDecisions, grantDecisions, offersAllow } from './approval-wakes'
 
 /**
  * supervisor.overview: everything the meta-wizard (docs/meta-wizard.md) needs to judge every tab
@@ -32,7 +34,9 @@ export interface SupervisorTab {
   lastError: string | null
   lastActivityAt: string | null
   limitResumeAt: string | null
-  /** Approval or question cards waiting, by who answers them. */
+  /** Approval or question cards waiting, by who answers them: only those the runtime attached now
+   *  can still take, approvals only when they offer an allow, and permission requests that can be
+   *  approved (a narrow rule, or a native request while it is live). */
   pending: { owner: number; reviewer: number }
 }
 
@@ -52,13 +56,29 @@ const flat = (value: string, limit: number, tail = false): string => {
   return line.length <= limit ? line : tail ? '…' + line.slice(-limit) : line.slice(0, limit) + '…'
 }
 
-export function supervisorTab(base: Omit<SupervisorTab, 'awaiting' | 'lastTool' | 'lastAnswer' | 'lastError' | 'limitResumeAt' | 'pending'>, state: SessionProjection | null, awaiting: AwaitingRecord | null): SupervisorTab {
+/**
+ * `grants` are this conversation's permission-grant requests (PermissionGrants.state().requests);
+ * when given, a native card that has a permission card (permissionGrantId) is counted as that
+ * request instead, as the approval sweep answers it there.
+ */
+export function supervisorTab(base: Omit<SupervisorTab, 'awaiting' | 'lastTool' | 'lastAnswer' | 'lastError' | 'limitResumeAt' | 'pending'>, state: SessionProjection | null, awaiting: AwaitingRecord | null, grants?: ReadonlyArray<Pick<PermissionGrantRequest, 'source' | 'rule' | 'nativeAvailable' | 'call' | 'status'>>): SupervisorTab {
   const items = state ? [...state.items].sort((a, b) => (b.updatedSequence ?? b.sequence) - (a.updatedSequence ?? a.sequence)) : []
   const tool = items.find(item => item.data.type === 'tool' && item.data.name !== 'acceptance')
   const text = items.find(item => !item.parentId && item.data.type === 'text' && item.data.role === 'assistant')
   const error = items.find(item => item.data.type === 'error')
   const pending = { owner: 0, reviewer: 0 }
-  for (const item of items) if (item.data.type === 'interaction' && item.data.interaction.status === 'pending') pending[item.data.interaction.review?.phase === 'reviewing' ? 'reviewer' : 'owner']++
+  for (const item of items) {
+    if (!state || item.data.type !== 'interaction' || item.data.interaction.status !== 'pending') continue
+    const interaction = item.data.interaction
+    // Only a card the runtime attached now can take (a Codex async question: its current thread),
+    // as answerableInteractions and pendingOf decide; one left by an earlier runtime is dead.
+    const open = isAsyncQuestion(interaction) ? (interaction.input as { threadId?: string } | null)?.threadId === state.nativeSessionId : item.runtimeId === state.runtimeId
+    if (!open || (grants && interaction.permissionGrantId)) continue
+    // A Deny-only (or choiceless) approval is not something to answer (owner rule 2026-10-20).
+    if (interaction.kind === 'approval' && !offersAllow(approvalDecisions(interaction))) continue
+    pending[interaction.review?.phase === 'reviewing' ? 'reviewer' : 'owner']++
+  }
+  for (const request of grants ?? []) if (offersAllow(grantDecisions(request))) pending.owner++
   let lastTool: SupervisorTab['lastTool'] = null
   if (tool?.data.type === 'tool') {
     const data = tool.data as { name: string; status: string; input?: unknown; output?: string }

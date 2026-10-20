@@ -4,7 +4,7 @@ import type { PermissionGrants } from './service'
 
 // conductor-task:cross-project-cleanup-guardrails
 describe('permissions.revoke and permissions.withdraw across projects', () => {
-  const grants = () => ({ revoke: vi.fn(async () => true), withdrawRequest: vi.fn(() => ({ withdrawn: true })) })
+  const grants = () => ({ revoke: vi.fn(async () => true), withdrawRequest: vi.fn(() => ({ withdrawn: true })), state: () => ({ requests: [], grants: [] }) })
   const answers = (id: string): boolean => id === 'coworker'
 
   it('lets a wizard name the conversations it answers for, and no other project\'s', async () => {

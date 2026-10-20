@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { BellRing, Bot, Bug, Check, ExternalLink, EyeOff, FolderCog, MessageCircleQuestion, Minus, MoonStar, Palette, Plus, RefreshCw, RotateCcw, Search, Settings2, Gauge, Monitor, Smartphone, Sun, Volume2, X, ZoomIn } from 'lucide-react'
+import { BellRing, Bot, Bug, Check, ExternalLink, EyeOff, FolderCog, MessageCircleQuestion, Minus, MoonStar, Palette, Plus, RefreshCw, RotateCcw, Search, Settings2, ShieldCheck, Gauge, Monitor, Smartphone, Sun, Volume2, X, ZoomIn } from 'lucide-react'
 import type { AgentProviderInfo, AgentSoundCue, AgentSoundProfile, AppSettings, AppUpdateState, ThemeId, ThemeVariant } from '../../../shared/models'
 import { THEME_OPTIONS } from '../../../shared/models'
 import { playAgentSound } from '../agent-sounds'
@@ -10,13 +10,14 @@ import { RemoteControlSettings } from './RemoteControlSettings'
 import { AlwaysOnSettings } from './AlwaysOnSettings'
 import { PhoneAccessSettings } from './PhoneAccessSettings'
 import { AttentionLogSettings } from './AttentionLogSettings'
+import { PermissionsSettings } from './PermissionsSettings'
 import { ClaudeFullAutoControl } from './ClaudeFullAutoControl'
 import { ProviderLoginControl } from './ProviderLoginControl'
 import { matchingSettingsSections, resolveSettingsSection, SETTINGS_SECTIONS, type SettingsSectionId } from './settings-navigation'
 import './SettingsPanel.css'
 
 let rememberedSection: SettingsSectionId = 'general'
-const sectionIcons = { general: Settings2, appearance: Palette, sounds: Volume2, usage: Gauge, machines: Monitor, phone: Smartphone, notifications: BellRing, updates: RefreshCw, runtimes: Bot, debug: Bug }
+const sectionIcons = { general: Settings2, appearance: Palette, sounds: Volume2, usage: Gauge, machines: Monitor, phone: Smartphone, notifications: BellRing, permissions: ShieldCheck, updates: RefreshCw, runtimes: Bot, debug: Bug }
 
 export function SettingsPanel({
   settings,
@@ -248,6 +249,9 @@ export function SettingsPanel({
             </>}
             {activeSection === 'notifications' && <>
               <AttentionLogSettings />
+            </>}
+            {activeSection === 'permissions' && <>
+              <PermissionsSettings />
             </>}
             {activeSection === 'updates' && <>
               <section>

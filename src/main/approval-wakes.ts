@@ -19,6 +19,9 @@
  * catches a card raised before the policy changed or by a runtime that does not ask it.
  */
 
+import type { GrantDecision, PermissionGrantRequest } from '../shared/permission-grants'
+import type { PendingInteraction } from '../shared/structured-agent'
+
 /** How long a card waits for an automatic answer before its controller is woken. */
 export const WAKE_GRACE_MS = 5_000
 /** Cards remembered as woken, so a re-shown card never wakes twice (bounded). */
@@ -46,7 +49,33 @@ export interface PendingCard {
   reviewPhase?: string
   /** Whom it wakes: the coworker's controller (or its successor). */
   controller?: string
+  /** The decisions the card really offers (approvalDecisions, grantDecisions); the wake names only these. */
+  decisions?: readonly string[]
 }
+
+/** The runtime choice ids agents.approve answers "allow" and "deny" with (wizard-approvals.ts
+ *  ALLOW_ONCE, ALLOW_SESSION and DENY). */
+const ALLOW_CHOICES = ['allow', 'accept', 'allow-session', 'acceptForSession'], DENY_CHOICES = ['deny', 'decline']
+
+/** What agents.approve can answer on a native approval card: only the choices its runtime enables
+ *  (agents.approvals mayAllow). Owner rule 2026-10-20: a card with no allow is never presented as
+ *  something to answer. */
+export function approvalDecisions(interaction: Pick<PendingInteraction, 'choices'>): Array<'allow' | 'deny'> {
+  const offers = (ids: string[]) => (interaction.choices ?? []).some(choice => ids.includes(choice.id) && !choice.disabled)
+  return [...(offers(ALLOW_CHOICES) ? ['allow' as const] : []), ...(offers(DENY_CHOICES) ? ['deny' as const] : [])]
+}
+
+/** What permissions.decide can answer on a grant request (permission-grants/service.ts decide()):
+ *  a native provider request only once and only while its exact request is live; any other only
+ *  with its narrow rule (without one Conductor refuses the call itself and nothing is answerable). */
+export function grantDecisions(request: Pick<PermissionGrantRequest, 'source' | 'rule' | 'nativeAvailable' | 'call' | 'status'>): GrantDecision[] {
+  if (request.status !== 'pending') return []
+  if (request.source === 'native') return request.nativeAvailable === true && request.call?.requestId ? ['approve-once', 'deny'] : []
+  return request.rule ? ['approve-once', 'approve-session', 'deny'] : []
+}
+
+/** Whether a card's decisions include an allow; one that does not is not woken or counted. */
+export const offersAllow = (decisions: readonly string[]): boolean => decisions.some(decision => decision !== 'deny')
 
 export const cardKey = (card: Pick<PendingCard, 'agentSessionId' | 'kind' | 'runtimeId' | 'requestId'>): string =>
   [card.agentSessionId, card.kind, card.runtimeId ?? '', card.requestId].join('\n')
@@ -104,10 +133,11 @@ const quote = (value: string): string => JSON.stringify(value)
 export function cardLine(card: PendingCard, options: { canAnswer: boolean; sealed?: boolean }): string {
   const what = options.sealed ? `${card.tool} (an anonymous conversation's action; read it in its tab)` : `${card.tool} ${quote(line(card.action, 300))}`
   const facts = [card.class ? `class ${card.class}` : '', card.attention ? `needs a careful look: ${card.attention}` : '', card.reason && !options.sealed ? `reason: ${line(card.reason, 200)}` : '', card.reviewPhase ? `stronger review: ${card.reviewPhase}` : ''].filter(Boolean).join('; ')
+  const decisions = (card.decisions?.length ? card.decisions : card.kind === 'approval' ? ['allow', 'deny'] : ['approve-once', 'approve-session', 'deny']).map(quote).join('|')
   const answer = !options.canAnswer ? 'the owner answers it in that tab'
     : card.kind === 'approval'
-      ? `agents.approve({agentSessionId:${quote(card.agentSessionId)}, requestId:${quote(card.requestId)}, decision:"allow"|"deny", reason:"…"})`
-      : `permissions.decide({agentSessionId:${quote(card.agentSessionId)}, requestId:${quote(card.requestId)}, decision:"approve-once"|"approve-session"|"deny"})`
+      ? `agents.approve({agentSessionId:${quote(card.agentSessionId)}, requestId:${quote(card.requestId)}, decision:${decisions}, reason:"…"})`
+      : `permissions.decide({agentSessionId:${quote(card.agentSessionId)}, requestId:${quote(card.requestId)}, decision:${decisions}})`
   return `- "${card.title || 'Coworker'}" (${card.agentSessionId}) ${card.kind === 'approval' ? 'approval' : 'permission request'} ${card.requestId}: ${what}${facts ? ` (${facts})` : ''}. Answer: ${answer}`
 }
 

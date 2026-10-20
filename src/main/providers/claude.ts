@@ -476,7 +476,9 @@ export class ClaudeAdapter implements ProviderAdapter {
         const tool = this.tools.get(request.toolId)
         const call = tool ? this.grantCall(request.toolId, tool.name, request.input, id) : undefined
         const grant = call ? this.options.permissionGrants?.nativePending?.(call) : undefined
-        if (grant) Object.assign(request.interaction, { permissionGrantId: grant.id })
+        // Only a grant card that can still answer replaces this interaction (single-permission-card):
+        // a settled one would hide the only Allow the owner has.
+        if (grant?.status === 'pending' && grant.nativeAvailable) Object.assign(request.interaction, { permissionGrantId: grant.id })
       }
       this.emit({ requestId: id, itemId: request.toolId, data: { type: 'interaction', interaction: request.interaction } })
     }
@@ -1449,7 +1451,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     const nativeGrant = !question && nativeCall ? this.options.permissionGrants?.nativePending?.(nativeCall) : undefined
     const interaction: PendingInteraction = {
       id, kind: question ? 'question' : 'approval', status: 'pending', title: string(request.title) ?? (question ? 'Claude needs your input' : `Allow ${name}?`),
-      ...(nativeGrant ? { permissionGrantId: nativeGrant.id } : {}),
+      ...(nativeGrant?.status === 'pending' && nativeGrant.nativeAvailable ? { permissionGrantId: nativeGrant.id } : {}),
       ...(requiredApproval && !question ? { required: true } : {}),
       input, choices: [{ id: 'allow', label: question ? 'Submit answers' : 'Allow once' }, ...(!question ? [
         { id: 'allow-session', label: 'Allow for this session', description: sessionDescription, disabled: !permissionUpdates.length },
@@ -1549,7 +1551,11 @@ export class ClaudeAdapter implements ProviderAdapter {
   /** The owner's auto-approve policy for one tool call (approval-policy.ts; the host journals an
    *  allow). Never asked for an isolated reviewer or in plan or read-only mode. */
   private policyDecision(name: string, input: ObjectValue, requestId: string): PolicyDecision {
-    if (!this.options.approvalPolicy || this.options.approvalReviewer || this.settings.plan || this.settings.permission === 'read-only') return null
+    if (this.options.approvalReviewer || this.settings.plan || this.settings.permission === 'read-only') return null
+    // The owner's "Always allow" of exactly this command or file in this project (permission-grants).
+    const standing = this.options.permissionGrants?.standing?.(name, input)
+    if (standing) return { decision: 'allow', rule: `always allowed by the owner: ${standing}` }
+    if (!this.options.approvalPolicy) return null
     const request = policyRequestFor({ provider: 'claude', tool: name, nativeMethod: 'can_use_tool', input, cwd: this.options.cwd, projectRoot: this.options.cwd })
     if (!request) return null
     try { return this.options.approvalPolicy(request, { requestId, tool: name, input }) } catch { return null }
@@ -1562,7 +1568,10 @@ export class ClaudeAdapter implements ProviderAdapter {
     const pending = this.requests.get(id)
     if (!pending) return
     this.requests.delete(id)
-    if (reason === 'Provider cancelled request' && pending.toolId) {
+    // An unanswered request that ends for any reason (cancelled, interrupted, turn ended,
+    // disconnected) ends its grant card too, so no card keeps offering an Allow that answers
+    // nothing. A reply already on its way is uncertain and left to its result.
+    if (pending.toolId && !pending.submitting && !this.replies.has(id)) {
       const call = this.grantCalls.get(pending.toolId)
       if (call?.requestId === id) this.options.permissionGrants?.executionFinished?.(call, 'cancelled')
     }

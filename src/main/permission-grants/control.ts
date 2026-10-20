@@ -3,9 +3,9 @@ import type { AgentGrantRequest, PermissionGrants } from './service'
 
 /** The app-control methods (agent-control.ts delegates every `permissions.*` call here). */
 export const PERMISSION_METHOD_SIGNATURES: Record<string, string> = {
-  'permissions.request': '({command}|{path}|{url}, tool?, reason, rollback?) — ask the owner for exactly one call the classifier refused or would refuse: command for Bash (tool:"PowerShell" for PowerShell), path for Write (tool:"Edit" for Edit), url for WebFetch. The owner gets one card with Approve once / Approve for this session / Deny; you are then told "[Conductor] approved: <rule>; retry it now" (run exactly that call, unchanged) or that it was denied. Write a script and ask for running that script rather than one long command; never ask for edits to permission settings',
+  'permissions.request': '({command}|{path}|{url}, tool?, reason, rollback?) — ask the owner for exactly one call the classifier refused or would refuse: command for Bash (tool:"PowerShell" for PowerShell), path for Write (tool:"Edit" for Edit), url for WebFetch. The owner gets one card with Approve once / Approve for this session / Always allow / Deny; you are then told "[Conductor] approved: <rule>; retry it now" (run exactly that call, unchanged) or that it was denied. Write a script and ask for running that script rather than one long command; never ask for edits to permission settings: a call Conductor refuses itself (permission settings, hooks, instructions, a wildcard) comes straight back as refused and never reaches the owner',
   'permissions.list': '({agentSessionId?}) — your own open requests and live grants; the owner or a wizard tab may name a conversation',
-  'permissions.revoke': '({grantId, agentSessionId?}) — withdraw a live grant at once; your own, or any for the owner or a wizard tab',
+  'permissions.revoke': '({grantId, agentSessionId?}) — withdraw a live grant at once; your own, or any for the owner or a wizard tab, who may also name an "Always allow" grant (permissions.list alwaysAllowed) to end it',
   'permissions.withdraw': '({requestId, reason, agentSessionId?}) — take back your own PENDING request (one you asked, or one a handoff moved to you) that is no longer needed: its card stops asking the owner and reads expired with your reason; returns {withdrawn:false,status} when it was already answered. The owner or a wizard tab may name a conversation. permissions.revoke is for live grants'
 }
 /** Only the owner's credential or a wizard tab sees and may call this. The same authority as
@@ -13,7 +13,7 @@ export const PERMISSION_METHOD_SIGNATURES: Record<string, string> = {
  *  wizard holds that authority, its own requests included, plus the coworkers it controls anywhere
  *  and a co-open project's wizard and its coworkers. */
 export const PERMISSION_OWNER_SIGNATURES: Record<string, string> = {
-  'permissions.decide': '({agentSessionId, requestId, decision: "approve-once"|"approve-session"|"deny"}) — owner credential or wizard tab only: answer a permission request for the owner, the same authority as agents.approve: the owner answers any conversation of this project, a wizard the same plus its own requests (and those a handoff moved to it), the coworkers it controls in other projects, and the wizard of a project co-opened in this window and its coworkers; any class, local, shared, destructive or external (production included), so review the exact call, reason and rollback first. An approval of a conversation whose turn is still running interrupts that turn at once, so the retry runs as a message of its own'
+  'permissions.decide': '({agentSessionId, requestId, decision: "approve-once"|"approve-session"|"approve-always"|"deny"}) — owner credential or wizard tab only: answer a permission request for the owner (approve-always: exactly this command or file, for every Claude conversation of the project, until revoked in Settings > Permissions; never protected files), the same authority as agents.approve: the owner answers any conversation of this project, a wizard the same plus its own requests (and those a handoff moved to it), the coworkers it controls in other projects, and the wizard of a project co-opened in this window and its coworkers; any class, local, shared, destructive or external (production included), so review the exact call, reason and rollback first. An approval of a conversation whose turn is still running interrupts that turn at once, so the retry runs as a message of its own'
 }
 export const PERMISSION_METHODS = [...Object.keys(PERMISSION_METHOD_SIGNATURES), ...Object.keys(PERMISSION_OWNER_SIGNATURES)]
 
@@ -47,10 +47,17 @@ export async function callPermissions(grants: PermissionGrants, scope: Permissio
     if (unknown.length) throw new Error(`permissions.request does not take ${unknown.join(', ')}`)
     const request: AgentGrantRequest = { tool: text(args.tool, 'tool'), command: text(args.command, 'command'), path: text(args.path, 'path'), url: text(args.url, 'url'), reason: text(args.reason, 'reason', true), rollback: text(args.rollback, 'rollback') }
     const created = grants.request(scope.agentSessionId, request)
+    if (!created.rule) return { refused: true, class: created.class, refusal: created.refusal, next: 'Conductor refuses this call itself and did not ask the owner; do not retry it or ask again. Report it as blocked or find another way the owner would expect.' }
+    if (created.always) return { status: created.status, class: created.class, rule: created.rule, alwaysAllowed: true, next: 'The owner always allows exactly this call in this project: run it now, unchanged. Nothing was asked.' }
     return { requestId: created.id, status: created.status, class: created.class, ...(created.rule ? { rule: created.rule } : { refusal: created.refusal }), next: created.rule ? (scope.wizard ? `You hold the owner's authority: answer it yourself with permissions.decide({agentSessionId:"${scope.agentSessionId}", requestId:"${created.id}", decision}), then run exactly that call once when "[Conductor] approved: …; retry it now" arrives.` : 'Wait for "[Conductor] approved: …; retry it now", then run exactly that call once. Carry on with other work meanwhile.') : 'No narrow rule can cover this; do not retry it. Report it as blocked or find another way the owner would expect.' }
   }
   if (method === 'permissions.list') return grants.list(target())
-  if (method === 'permissions.revoke') return { revoked: await grants.revoke(target(), text(args.grantId, 'grantId', true)!) }
+  if (method === 'permissions.revoke') {
+    const grantId = text(args.grantId, 'grantId', true)!
+    // An "Always allow" is the owner's: only the owner or a wizard tab ends one.
+    if (sovereign && grants.state().standing?.some(entry => entry.id === grantId)) return { revoked: grants.revokeStanding(grantId), alwaysAllowed: true }
+    return { revoked: await grants.revoke(target(), grantId) }
+  }
   if (method === 'permissions.withdraw') {
     const unknown = Object.keys(args).filter(key => !['requestId', 'reason', 'agentSessionId'].includes(key))
     if (unknown.length) throw new Error(`permissions.withdraw does not take ${unknown.join(', ')}; it takes {requestId, reason}`)

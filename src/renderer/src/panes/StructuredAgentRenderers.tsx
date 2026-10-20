@@ -378,6 +378,9 @@ interface ActivityProps {
   onDockQuestion?(id: string, docked: boolean): void
   /** Applies a composer mode change from inside the timeline (the auto-mode denial card's "Switch to Edit mode"). Absent for a historical conversation. */
   onSwitchPermission?(permission: 'accept-edits'): void
+  /** The conversation runs on another machine (a mirrored tab): its permission cards are answered
+   *  there, by that machine's grant service, so here they only show what was asked. */
+  grantsElsewhere?: boolean
 }
 /** A short, truncated head-of-output hint so a collapsed row shows a bit of what actually happened,
  *  not just the tool name. The full stream stays behind the expand toggle. */
@@ -660,8 +663,8 @@ export const StructuredActivity = memo(function StructuredActivity(props: Activi
     case 'error': body = <p className="sa-error" role="alert">{data.message}{data.code && data.code !== LOCAL_MODEL_SETUP_ERROR_CODE && <small> ({data.code})</small>}{data.code === LOCAL_MODEL_SETUP_ERROR_CODE && <button type="button" onClick={() => void window.conductor.system.openExternal(LOCAL_MODEL_SETUP_URL)}>Download / set up local model</button>}</p>; break
     case 'notice': {
       const denial = autoModeDenialOf(data)
-      if (denial?.request) { body = <LivePermissionGrantCard agentSessionId={props.sessionId} requestId={props.item.nativeItemId ?? props.item.id} request={{ ...denial.request, status: grantStatusOf(data) }} interactive={props.interactive} onSwitchToEdit={props.onSwitchPermission ? () => props.onSwitchPermission?.('accept-edits') : undefined} />; break }
-      const asked = permissionGrantOf(data); if (asked) { body = <LivePermissionGrantCard agentSessionId={props.sessionId} requestId={asked.id} request={asked} interactive={props.interactive} />; break }
+      if (denial?.request) { body = <LivePermissionGrantCard agentSessionId={props.sessionId} requestId={props.item.nativeItemId ?? props.item.id} request={{ ...denial.request, status: grantStatusOf(data) }} interactive={props.interactive} elsewhere={props.grantsElsewhere} onSwitchToEdit={props.onSwitchPermission ? () => props.onSwitchPermission?.('accept-edits') : undefined} />; break }
+      const asked = permissionGrantOf(data); if (asked) { body = <LivePermissionGrantCard agentSessionId={props.sessionId} requestId={asked.id} request={asked} interactive={props.interactive} elsewhere={props.grantsElsewhere} />; break }
       if (denial) { body = <AutoModeDenialCard denial={denial} onSwitchToEdit={props.onSwitchPermission ? () => props.onSwitchPermission?.('accept-edits') : undefined} />; break }
       const stop = localStopOf(data); if (stop) { body = <LocalStopCard report={stop} />; break }
       const energy = localEnergyOf(data); if (energy) { body = <LocalEnergyNotice reading={energy} />; break }

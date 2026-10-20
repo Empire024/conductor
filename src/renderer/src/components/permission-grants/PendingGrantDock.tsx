@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { PermissionGrantRequest, PermissionGrantsState } from '../../../../shared/permission-grants'
+import { grantAsksOwner, type PermissionGrantRequest, type PermissionGrantsState } from '../../../../shared/permission-grants'
 import { LivePermissionGrantCard, usePermissionGrants } from './PermissionGrantCard'
 
 /** Asks the conversation pane showing `agentSessionId` to bring its waiting permission cards into
@@ -25,7 +25,7 @@ export function revealConversation(agentSessionId: string | undefined): void {
  */
 export function dockedGrantRequests(state: PermissionGrantsState, agentSessionId: string, rendered: ReadonlySet<string> = new Set()): PermissionGrantRequest[] {
   return state.requests
-    .filter(request => request.agentSessionId === agentSessionId && request.status === 'pending' && !rendered.has(request.id))
+    .filter(request => request.agentSessionId === agentSessionId && grantAsksOwner(request) && !rendered.has(request.id))
     .sort((a, b) => (Date.parse(a.requestedAt) || 0) - (Date.parse(b.requestedAt) || 0))
 }
 

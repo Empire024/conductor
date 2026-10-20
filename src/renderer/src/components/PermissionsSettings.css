@@ -1,0 +1,26 @@
+/* Settings > Permissions: the owner's "Always allow" grants (PermissionsSettings.tsx). */
+.permissions-settings-empty { margin: 8px 0 0; color: var(--text-3); font-size: 8px; }
+.permissions-settings-error { color: var(--danger); }
+.permissions-settings-list {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.permissions-settings-entry {
+  padding: 7px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: var(--surface-0);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.permissions-settings-head { display: flex; align-items: baseline; gap: 7px; min-width: 0; }
+.permissions-settings-head strong { color: var(--text); font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.permissions-settings-head small { color: var(--text-3); font-size: 7.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.permissions-settings-head button { margin-left: auto; flex: none; }
+.permissions-settings-rule { font-size: 8px; color: var(--text-2); white-space: pre-wrap; word-break: break-all; }

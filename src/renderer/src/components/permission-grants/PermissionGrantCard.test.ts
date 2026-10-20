@@ -69,14 +69,44 @@ describe('permission grant card', () => {
     expect(html).toContain('>Deny</button>')
   })
 
-  it('sends the chosen answer, offers only Deny when no rule can cover the call, and shows no answers in history', () => {
+  it('sends the chosen answer, and shows no answers in history', () => {
     const onDecide = vi.fn()
-    const [once, session, deny] = buttons(PermissionGrantCard({ request, status: 'pending', onDecide }))
-    ;(once!.props.onClick as () => void)(); (session!.props.onClick as () => void)(); (deny!.props.onClick as () => void)()
-    expect(onDecide.mock.calls).toEqual([['approve-once'], ['approve-session'], ['deny']])
-    const refused = buttons(PermissionGrantCard({ request: { ...request, rule: undefined, refusal: 'This file holds agent permissions.' }, status: 'pending', onDecide, onSwitchToEdit: () => {} }))
-    expect(refused.map(button => button.props.className)).toEqual(['sa-grant-deny', 'sa-auto-denial-switch'])
+    const [once, session, always, deny] = buttons(PermissionGrantCard({ request, status: 'pending', onDecide }))
+    ;(once!.props.onClick as () => void)(); (session!.props.onClick as () => void)(); (always!.props.onClick as () => void)(); (deny!.props.onClick as () => void)()
+    expect(onDecide.mock.calls).toEqual([['approve-once'], ['approve-session'], ['approve-always'], ['deny']])
+    expect(always!.props.children).toBe('Always allow')
     expect(buttons(PermissionGrantCard({ request, status: 'pending' }))).toEqual([])
+  })
+
+  // conductor-task:refused-request-no-card
+  it('never asks the owner about a call Conductor refuses itself: no Deny, no attention (owner 2026-10-20)', () => {
+    const onDecide = vi.fn()
+    const settings: GrantCardRequest = { tool: 'Edit', action: 'Edit a file', resource: 'C:\\haftheme\\.claude\\settings.local.json', class: 'shared', source: 'agent', refusal: 'This file holds agent permissions, hooks or instructions.' }
+    const card = PermissionGrantCard({ request: settings, status: 'pending', onDecide, onSwitchToEdit: () => {} })
+    const html = renderToStaticMarkup(card)
+    expect(html).not.toContain('needs-attention')
+    expect(html).not.toContain('role="alert"')
+    expect(html).toContain('Refused: Edit a file')
+    expect(html).toContain('there is nothing for you to answer')
+    // A classifier denial's card keeps "Switch to Edit mode", a real owner choice, and nothing else.
+    expect(buttons(card).map(button => button.props.className)).toEqual(['sa-auto-denial-switch'])
+    expect(buttons(PermissionGrantCard({ request: settings, status: 'pending', onDecide }))).toEqual([])
+  })
+
+  it('claims attention only when it can answer, and offers Always allow only for one exact command or file', () => {
+    // An old runtime's card nothing here holds: no buttons, so no alert either.
+    expect(renderToStaticMarkup(PermissionGrantCard({ request, status: 'pending' }))).not.toContain('needs-attention')
+    const fetch: GrantCardRequest = { tool: 'WebFetch', action: 'Fetch a web page', resource: 'https://example.com/a', class: 'external', rule: 'WebFetch(domain:example.com)' }
+    expect(buttons(PermissionGrantCard({ request: fetch, status: 'pending', onDecide: () => {} })).map(button => button.props.className)).toEqual(['sa-grant-once', 'sa-grant-session', 'sa-grant-deny'])
+    const always = renderToStaticMarkup(PermissionGrantCard({ request: { ...request, always: true }, status: 'approved-session' }))
+    expect(always).toContain('Always allowed in this project (Settings &gt; Permissions revokes it)')
+  })
+
+  it('shows a mirrored conversation\'s request without answers: it is answered on its own machine', () => {
+    const html = renderToStaticMarkup(PermissionGrantCard({ request, status: 'pending', elsewhere: true }))
+    expect(html).not.toContain('<button')
+    expect(html).not.toContain('needs-attention')
+    expect(html).toContain('answered there')
   })
 
   it('offers request-specific Allow once only for a live native request and shows uncertain execution', () => {

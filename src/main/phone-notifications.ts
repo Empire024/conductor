@@ -1,6 +1,6 @@
 import type { AgentActivityPhase } from '../shared/models'
 import type { PhoneAutoModeDenial, PhoneNotification, PhoneSessionState, PhoneSessionSummary } from '../shared/phone-access'
-import { autoModeDenialOf, autoModeDenialSummary } from '../shared/auto-mode-denial'
+import { autoModeDenialOf, denialAsksOwner, autoModeDenialSummary } from '../shared/auto-mode-denial'
 import { isViewing } from '../shared/project-activity'
 import type { PendingInteraction, SessionPhase, TimelineItem } from '../shared/structured-agent'
 
@@ -48,7 +48,7 @@ export function autoModeDenials(items: readonly TimelineItem[]): PhoneAutoModeDe
   const denials: PhoneAutoModeDenial[] = []
   for (const item of items) {
     const denial = autoModeDenialOf(item.data)
-    if (denial && !denials.some(entry => entry.id === item.id)) denials.push({ id: item.id, tool: denial.tool, reason: denial.reason })
+    if (denial && denialAsksOwner(denial) && !denials.some(entry => entry.id === item.id)) denials.push({ id: item.id, tool: denial.tool, reason: denial.reason })
   }
   return denials.slice(-20)
 }

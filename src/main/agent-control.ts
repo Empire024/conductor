@@ -71,7 +71,7 @@ import type { LocalMachineReadiness } from '../shared/always-on'
 import { ControlActivityRecorder, type PreparedCall } from './control-activity'
 import { callPermissions, PERMISSION_METHOD_SIGNATURES, PERMISSION_METHODS, PERMISSION_OWNER_SIGNATURES } from './permission-grants/control'
 import { callWizardApprovals, classify, pendingOf, toolOf, WIZARD_APPROVAL_METHODS, WIZARD_APPROVAL_SIGNATURES, type AnswerableConversation, type WizardApprovalScope } from './wizard-approvals'
-import { ApprovalWakes, awaitWakeText, cardKey, controllerWakeText, type PendingCard } from './approval-wakes'
+import { ApprovalWakes, approvalDecisions, awaitWakeText, cardKey, controllerWakeText, grantDecisions, offersAllow, type PendingCard } from './approval-wakes'
 import { APPROVAL_POLICY_SETTING, currentApprovalPolicy, describeApprovalPolicy, evaluateApprovalPolicy, policyAnswerLog, policyNotice, policyRequestFor, setCurrentApprovalPolicy } from './approval-policy'
 import { reachOf } from './approval-review-gate'
 import { ownerOnlyEscalation } from './providers/codex'
@@ -1638,8 +1638,11 @@ export class AgentControl {
   private async approvalSweep(graceMs?: number): Promise<number> {
     const { database, sessions } = this.deps
     const ledger = this.approvalLedger ??= new ApprovalWakes({ graceMs })
-    const requests = (this.deps.permissionGrants?.state().requests ?? []).filter(request => request.status === 'pending' && !(request.source === 'native' && request.nativeAvailable === false))
-    const ids = new Set([...this.approvalCandidates, ...requests.map(request => request.agentSessionId)])
+    // Only requests permissions.decide can allow: a native one while its exact provider request is
+    // live (once), any other with its narrow rule. A request Conductor refuses itself, or a native
+    // one no longer answerable, is never offered as something to answer (owner rule 2026-10-20).
+    const requests = (this.deps.permissionGrants?.state().requests ?? []).flatMap(request => { const decisions = grantDecisions(request); return offersAllow(decisions) ? [{ request, decisions }] : [] })
+    const ids = new Set([...this.approvalCandidates, ...requests.map(({ request }) => request.agentSessionId)])
     if (!ids.size) return 0
     const titleOf = (id: string) => this.describeTarget({ agentSessionId: id })?.title ?? database.structured.snapshot(id)?.title ?? database.structured.spec<AgentSpec>(id)?.title
     const cards: PendingCard[] = []
@@ -1652,18 +1655,21 @@ export class AgentControl {
         pending++
         // A native request with a permission card is answered there (permissions.decide).
         if (interaction.permissionGrantId) continue
+        // A card whose runtime offers no allow (Deny only, or no choice) is not offered as something to answer.
+        const decisions = approvalDecisions(interaction)
+        if (!offersAllow(decisions)) continue
         const tool = toolOf(state, item, interaction)
         // Why it asks: the review's escalation, or the runtime's own reason (Codex titles its card with it).
         const reason = interaction.review?.rationale || (GENERIC_APPROVAL_TITLE.test(interaction.title) ? undefined : interaction.title.replace(/^Owner decision: /, ''))
-        const card: PendingCard = { agentSessionId: id, title: titleOf(id), kind: 'approval', requestId: interaction.id, runtimeId: state.runtimeId, tool, action: commandText(interaction.input) ?? canonicalAction(interaction.input), requestedAt: Date.parse(item.timestamp) || undefined, ...(reason ? { reason } : {}), ...(interaction.review ? { reviewPhase: interaction.review.phase } : {}), ...(controller ? { controller } : {}) }
+        const card: PendingCard = { agentSessionId: id, title: titleOf(id), kind: 'approval', requestId: interaction.id, runtimeId: state.runtimeId, tool, action: commandText(interaction.input) ?? canonicalAction(interaction.input), decisions, requestedAt: Date.parse(item.timestamp) || undefined, ...(reason ? { reason } : {}), ...(interaction.review ? { reviewPhase: interaction.review.phase } : {}), ...(controller ? { controller } : {}) }
         if (ledger.wasWoken(card)) continue
         if (await this.answerByPolicy(card, spec, state, interaction)) { ledger.mark(card); continue }
         const verdict = classify(tool, interaction.input, spec.cwd)
         cards.push({ ...card, class: verdict.class, ...(verdict.attention ? { attention: verdict.attention } : {}) })
       }
-      for (const request of requests) if (request.agentSessionId === id) {
+      for (const { request, decisions } of requests) if (request.agentSessionId === id) {
         pending++
-        cards.push({ agentSessionId: id, title: titleOf(id), kind: 'permission', requestId: request.id, tool: request.tool, action: request.resource, class: request.class, ...(request.reason ?? request.category ? { reason: request.reason ?? request.category } : {}), requestedAt: Date.parse(request.requestedAt) || undefined, ...(controller ? { controller } : {}) })
+        cards.push({ agentSessionId: id, title: titleOf(id), kind: 'permission', requestId: request.id, tool: request.tool, action: request.resource, class: request.class, decisions, ...(request.reason ?? request.category ? { reason: request.reason ?? request.category } : {}), requestedAt: Date.parse(request.requestedAt) || undefined, ...(controller ? { controller } : {}) })
       }
       if (!pending && !this.awaitedForApprovals(id)) this.approvalCandidates.delete(id)
     }
@@ -3151,6 +3157,8 @@ export class AgentControl {
     }
     validateArgs(method, args, [])
     const tabs: SupervisorOverview['tabs'] = []
+    // Permission cards that wait for the owner count as pending (supervisorTab keeps those with an allow).
+    const grantRequests = this.deps.permissionGrants?.state().requests ?? []
     let ledger: AwaitingResults | undefined
     try { ledger = this.awaiting() } catch { /* no waits known */ }
     for (const project of database.listProjects()) for (const workspace of database.listSessions(project.id)) {
@@ -3174,7 +3182,7 @@ export class AgentControl {
           wizard: wizardActive(state?.settings, provider ?? undefined), controller: this.linkFor(id)?.controllerAgentSessionId ?? null,
           successor: successor !== id ? successor : null,
           lastActivityAt: lastEvent?.timestamp ?? null
-        }, state, awaiting))
+        }, state, awaiting, grantRequests.filter(request => request.agentSessionId === id)))
       }
     }
     const build = localUpdates?.status()

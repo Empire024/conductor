@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, classifierOutageMessage, classifierOutagePayload, isClassifierOutage, type AutoModeDenial, type DenialGrantRequest } from '../../shared/auto-mode-denial'
 import {
-  describeGrantRequest, grantApprovedMessage, grantDeniedMessage, grantHolderLabel, grantNeedsPhone, grantRequestSummary, nativeGrantRules,
-  type GrantCallIdentity, type GrantDecision, type GrantExecution, type GrantExecutionStatus, type GrantRule, type GrantStatus, type PermissionGrant, type PermissionGrantDecisionResult, type PermissionGrantRequest, type PermissionGrantsState
+  alwaysAllowable, describeGrantRequest, grantApprovedMessage, grantDeniedMessage, grantHolderLabel, grantNeedsPhone, grantRequestSummary, nativeGrantRules, standingRuleProblem,
+  type GrantCallIdentity, type GrantDecision, type GrantExecution, type GrantExecutionStatus, type GrantRule, type GrantStatus, type PermissionGrant, type PermissionGrantDecisionResult, type PermissionGrantRequest, type PermissionGrantsState, type StandingGrant
 } from '../../shared/permission-grants'
 import type { Json } from '../../shared/structured-agent'
 import { grantCallIdentity, grantWorkKey, sameNativeCall, sameToolAttempt, type NativeGrantCall } from './identity'
@@ -40,6 +40,8 @@ export interface PermissionGrantPorts {
   title?(agentSessionId: string): string | undefined
   /** The conversation's working folder, where a relative path in a request is resolved. */
   cwd(agentSessionId: string): string | undefined
+  /** The project the conversation belongs to: the scope of an "Always allow" (StandingGrant). */
+  project?(agentSessionId: string): string | undefined
   /** Hands the live runtime its current rules; 'offline' when there is none (its next start reads them). */
   apply(agentSessionId: string): Promise<'applied' | 'unsupported' | 'offline'>
   /** Answer only a still-pending provider request with this exact identity. A stale response must
@@ -99,12 +101,16 @@ export interface SavedPermissionGrants {
   settled: Array<[string, string, GrantStatus]>
   /** Terminal work keys prevent a repeated unchanged denial from asking the owner again. */
   terminal?: Array<[string, string, GrantExecution]>
+  /** The owner's "Always allow" grants; they end only when the owner revokes them. */
+  standing?: StandingGrant[]
 }
 export interface AgentGrantRequest { tool?: string; command?: string; path?: string; url?: string; reason?: string; rollback?: string }
 
 const ACTIVE_PHASES = new Set(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
 const AGENT_PREFIX = 'grant:'
-const DECIDED: Record<Exclude<GrantDecision, 'deny'>, GrantStatus> = { 'approve-once': 'approved-once', 'approve-session': 'approved-session' }
+const DECIDED: Record<Exclude<GrantDecision, 'deny'>, GrantStatus> = { 'approve-once': 'approved-once', 'approve-session': 'approved-session', 'approve-always': 'approved-session' }
+/** Bound on the owner's standing grants, so a saved file stays small. */
+const MAX_STANDING = 500
 /** Bounds on what a restart keeps of history that is neither waiting nor unspent. */
 const SAVED_SETTLED = 200
 const SAVED_MOVED = 200
@@ -170,6 +176,11 @@ export class PermissionGrants {
   private readonly retries = new Map<string, string>()
   /** Approval turns being delivered, by conversation and text (deliver, followDeliveries). */
   private readonly deliveries = new Map<string, Delivery>()
+  /** The owner's "Always allow" grants by id, every project. */
+  private readonly standing = new Map<string, StandingGrant>()
+  /** Conversation + rule a classifier denial was approved for from a standing grant: once only, so
+   *  a provider that keeps refusing falls back to the owner's card instead of a loop. */
+  private readonly standingApproved = new Set<string>()
   /** The app is quitting (freeze): runtimes stopping now are not conversations ending. */
   private stopping = false
   constructor(private readonly ports: PermissionGrantPorts) {}
@@ -209,7 +220,8 @@ export class PermissionGrants {
       movedOut: [...movedOut],
       aliases: [...this.aliases].map(([agentSessionId, views]) => [agentSessionId, [...views]]),
       settled: settled.slice(-SAVED_SETTLED),
-      terminal: [...this.terminal].slice(-SAVED_SETTLED).map(([key, value]) => [key, value.agentSessionId, value.execution])
+      terminal: [...this.terminal].slice(-SAVED_SETTLED).map(([key, value]) => [key, value.agentSessionId, value.execution]),
+      ...(this.standing.size ? { standing: [...this.standing.values()].map(entry => ({ ...entry })) } : {})
     }
   }
 
@@ -232,6 +244,9 @@ export class PermissionGrants {
       if (!exists(agentSessionId)) { dropped++; continue }
       // A classifier outage an older build saved as a card was never a question: withdrawn, not asked again.
       if (request.status === 'pending' && outageCard(request)) { this.settledAs(agentSessionId, request.id, 'expired'); dropped++; continue }
+      // A call Conductor refuses itself (no rule) that an older build still filed as a card offered
+      // the owner nothing but Deny (haftheme 2026-10-20): withdrawn, never asked again.
+      if (request.status === 'pending' && request.source !== 'native' && !request.rule) { this.settledAs(agentSessionId, request.id, 'expired'); dropped++; continue }
       if (request.source === 'native') {
         // A kept native runtime can preserve the pending request through an app restart. The
         // card remains visible but cannot answer until that *same* can_use_tool is observed live
@@ -287,6 +302,11 @@ export class PermissionGrants {
       if (text(key) && text(agentSessionId) && exists(agentSessionId) && execution && TERMINAL_EXECUTIONS.has(execution.status))
         this.terminal.set(key, { agentSessionId, execution })
     }
+    for (const entry of list(data.standing).slice(-MAX_STANDING)) {
+      if (!entry || !text(entry.id) || !text(entry.projectId) || !text(entry.rule) || !text(entry.tool) || standingRuleProblem(entry.rule) ||
+          (entry.decidedBy !== 'owner' && entry.decidedBy !== 'wizard')) continue
+      this.standing.set(entry.id, { ...entry })
+    }
     this.changed()
     return { requests: restoredRequests, grants: restoredGrants, dropped }
   }
@@ -306,9 +326,11 @@ export class PermissionGrants {
 
   /** What the Claude adapter is given (AdapterOptions.permissionGrants). */
   adapterPort(agentSessionId: string): { rules(): GrantRule[]; used(rule: string): void; refused(rule: string): void; denied(itemId: string, request: DenialGrantRequest): void;
+    standing(tool: string, input: unknown): string | undefined;
     nativePending(call: NativeGrantCall): PermissionGrantRequest | undefined; executionStarted(call: NativeGrantCall, evidence: 'tool-progress'): void;
     executionFinished(call: NativeGrantCall, outcome: 'succeeded' | 'failed' | 'blocked' | 'cancelled' | 'unknown'): void } {
     return { rules: () => this.rules(agentSessionId), used: rule => this.used(agentSessionId, rule), refused: rule => this.refused(agentSessionId, rule),
+      standing: (tool, input) => this.standingFor(agentSessionId, tool, input),
       denied: (itemId, request) => this.denied(agentSessionId, itemId, request), nativePending: call => this.nativePending(agentSessionId, call),
       executionStarted: (call, evidence) => this.executionStarted(agentSessionId, call, evidence), executionFinished: (call, outcome) => this.executionFinished(agentSessionId, call, outcome) }
   }
@@ -419,6 +441,10 @@ export class PermissionGrants {
    */
   denied(agentSessionId: string, itemId: string, described: DenialGrantRequest): void {
     if (isClassifierOutage(described.category)) return
+    // No rule: Conductor refuses the call itself (permission settings, hooks, instructions, a
+    // wildcard), so there is nothing for the owner to answer. The card stays informational and
+    // never becomes a pending request (owner 2026-10-20: "why was deny my only option").
+    if (!described.rule) return
     const known = this.requests.get(agentSessionId)?.get(itemId)
     if (known) {
       if (known.status !== 'pending') this.card(agentSessionId, known)
@@ -464,7 +490,55 @@ export class PermissionGrants {
     const open = this.requests.get(agentSessionId) ?? new Map<string, PermissionGrantRequest>()
     open.set(itemId, request)
     this.requests.set(agentSessionId, open)
+    // The owner always allows exactly this call here: approved from the standing grant, no card.
+    // Once per conversation and rule, so a provider that refuses it anyway reaches the owner.
+    const standing = this.standingMatch(agentSessionId, request)
+    const key = `${agentSessionId}\n${request.rule}`
+    if (standing && !this.standingApproved.has(key)) {
+      this.standingApproved.add(key)
+      request.always = true
+      void this.decide(agentSessionId, itemId, 'approve-session', standing.decidedBy).catch(error => console.warn('An always-allowed call could not be approved; its card asks the owner', error))
+      return
+    }
     this.changed()
+  }
+
+  /** The owner's standing grant covering exactly this request in its conversation's project. */
+  private standingMatch(agentSessionId: string, request: Pick<PermissionGrantRequest, 'tool' | 'rule' | 'refusal'> & Partial<Pick<PermissionGrantRequest, 'source'>>): StandingGrant | undefined {
+    if (!this.standing.size || !request.rule || !alwaysAllowable(request) || this.ports.provider(agentSessionId) !== 'claude') return undefined
+    const projectId = this.ports.project?.(agentSessionId)
+    if (!projectId) return undefined
+    for (const entry of this.standing.values()) if (entry.projectId === projectId && entry.rule === request.rule && !standingRuleProblem(entry.rule)) return entry
+    return undefined
+  }
+
+  /** The adapter's PreToolUse check (permissionGrants.standing): the rule of the owner's standing
+   *  grant that covers exactly this call, so the hook allows it before Claude's own permission
+   *  check, with no card and no classifier refusal. */
+  standingFor(agentSessionId: string, tool: string, input: unknown): string | undefined {
+    if (!this.standing.size) return undefined
+    const cwd = this.ports.cwd(agentSessionId)
+    if (!cwd) return undefined
+    const found = this.standingMatch(agentSessionId, describeGrantRequest({ tool, input, cwd }))
+    if (!found) return undefined
+    found.uses = (found.uses ?? 0) + 1
+    found.lastUsedAt = this.now()
+    this.changed()
+    return found.rule
+  }
+
+  /** The owner ends a standing grant (Settings > Permissions, or permissions.revoke for the owner
+   *  or a wizard). Conversations keep what was already granted to them for this session. */
+  revokeStanding(standingId: string): boolean {
+    if (!this.standing.delete(standingId)) return false
+    this.changed()
+    return true
+  }
+
+  /** The standing grants of the conversation's project (permissions.list). */
+  private standingOf(agentSessionId: string): StandingGrant[] {
+    const projectId = this.ports.project?.(agentSessionId)
+    return projectId ? [...this.standing.values()].filter(entry => entry.projectId === projectId) : []
   }
 
   state(): PermissionGrantsState {
@@ -475,7 +549,8 @@ export class PermissionGrants {
       requests: [...this.requests].flatMap(([agentSessionId, requests]) => [...requests.values()].map(request => ({ ...request, agentSessionId }))),
       grants: [...this.grants.values()].flat(),
       ...(settled.length ? { settled } : {}),
-      ...(waiting.length ? { waiting } : {})
+      ...(waiting.length ? { waiting } : {}),
+      ...(this.standing.size ? { standing: [...this.standing.values()].map(entry => ({ ...entry })) } : {})
     }
   }
 
@@ -509,12 +584,13 @@ export class PermissionGrants {
     if (delivery.offered) { delivery.offered = false; this.changed() }
   }
 
-  list(agentSessionId: string): { requests: PermissionGrantRequest[]; grants: PermissionGrant[] } {
+  list(agentSessionId: string): { requests: PermissionGrantRequest[]; grants: PermissionGrant[]; alwaysAllowed?: StandingGrant[] } {
     // Where each grant lives natively: this conversation's session permissions (the claude CLI's
     // flag-settings layer, apply_flag_settings live or --settings at launch), never a settings
     // file that every Claude tab of the project would also read.
     const installed = (grant: PermissionGrant): PermissionGrant => ({ ...grant, nativeRules: nativeGrantRules(grant.rule), installedIn: grant.delivery === 'live' ? 'this conversation\'s Claude Code session permissions (live)' : 'this conversation\'s Claude Code session permissions (--settings when its runtime next starts)' })
-    return { requests: [...(this.requests.get(agentSessionId)?.values() ?? [])], grants: (this.grants.get(agentSessionId) ?? []).map(installed) }
+    const alwaysAllowed = this.standingOf(agentSessionId)
+    return { requests: [...(this.requests.get(agentSessionId)?.values() ?? [])], grants: (this.grants.get(agentSessionId) ?? []).map(installed), ...(alwaysAllowed.length ? { alwaysAllowed } : {}) }
   }
 
   /**
@@ -532,6 +608,13 @@ export class PermissionGrants {
     if (args.tool && args.tool !== tool) throw new Error(`tool ${args.tool} does not go with the field given; use command for Bash or PowerShell, path for Write or Edit, url for WebFetch`)
     const input = args.command ? { command: args.command } : args.path ? { file_path: args.path } : { url: args.url }
     const described = describeGrantRequest({ tool, input, cwd, reason: args.reason, rollback: args.rollback })
+    // Refused by Conductor itself (no rule): the agent is told, and nothing reaches the owner: no
+    // card, no phone push, nothing to click (haftheme 2026-10-20, a Deny-only card for an edit to
+    // .claude/settings.local.json). The returned request is not kept.
+    if (!described.rule) return { ...described, id: AGENT_PREFIX + randomUUID(), source: 'agent', status: 'denied', requestedAt: this.now() }
+    // Already always allowed by the owner in this project: nothing to ask either.
+    const standing = this.standingMatch(agentSessionId, described)
+    if (standing) return { ...described, id: AGENT_PREFIX + randomUUID(), source: 'agent', status: 'approved-session', always: true, requestedAt: this.now(), decidedAt: standing.grantedAt, decidedBy: standing.decidedBy }
     const open = this.requests.get(agentSessionId) ?? new Map<string, PermissionGrantRequest>()
     const existing = [...open.values()].find(request => request.status === 'pending' && request.tool === described.tool && request.resource === described.resource)
     if (existing) return existing
@@ -539,7 +622,7 @@ export class PermissionGrants {
     open.set(request.id, request)
     this.requests.set(agentSessionId, open)
     this.card(agentSessionId, request)
-    if (grantNeedsPhone(request)) this.ports.phone?.(agentSessionId, 'Needs your approval', grantRequestSummary(request))
+    if (grantNeedsPhone(request)) this.ports.phone?.(agentSessionId, 'Needs your approval', `${grantRequestSummary(request)} (answer on the computer)`)
     this.changed()
     return request
   }
@@ -548,7 +631,7 @@ export class PermissionGrants {
    *  answers one request. Once the grant is applied this never throws: an approval turn the
    *  conversation cannot take yet is handed over again from sweep(). */
   async decide(agentSessionId: string, requestId: string, decision: GrantDecision, actor: GrantActor): Promise<PermissionGrantDecisionResult> {
-    if (!['approve-once', 'approve-session', 'deny'].includes(decision)) throw new Error('decision must be approve-once, approve-session or deny')
+    if (!['approve-once', 'approve-session', 'approve-always', 'deny'].includes(decision)) throw new Error('decision must be approve-once, approve-session, approve-always or deny')
     requestId = this.aliases.get(agentSessionId)?.get(requestId) ?? requestId
     agentSessionId = this.holderOf(agentSessionId, requestId)
     const request = this.pendingRequest(agentSessionId, requestId)
@@ -589,6 +672,18 @@ export class PermissionGrants {
     }
     if (!request.rule) throw new Error(request.refusal ?? 'No narrow rule can cover this request')
     if (this.ports.provider(agentSessionId) !== 'claude') throw new Error('Permission grants apply to Claude conversations only')
+    // "Always allow": the owner's (or a wizard's, the owner's authority) standing grant of exactly
+    // this command or file for the project. Checked before anything changes, so a refusal leaves
+    // the request waiting for another answer.
+    let standing: StandingGrant | undefined
+    if (decision === 'approve-always') {
+      if (!alwaysAllowable(request)) throw new Error('Always allow takes one exact command (Bash, PowerShell) or one exact file (Write, Edit); approve once or for this session instead')
+      const problem = standingRuleProblem(request.rule)
+      if (problem) throw new Error(problem)
+      const projectId = this.ports.project?.(agentSessionId)
+      if (!projectId) throw new Error('This conversation belongs to no project, so nothing can be always allowed for it; approve once or for this session instead')
+      standing = { id: randomUUID(), projectId, rule: request.rule, tool: request.tool, resource: request.resource, class: request.class, grantedAt: this.now(), decidedBy: actor, askedIn: this.askedIn(agentSessionId, request.id) }
+    }
     const scope = decision === 'approve-once' ? 'once' : 'session'
     const grant: PermissionGrant = {
       id: randomUUID(), agentSessionId, requestId: request.id, rule: request.rule, scope, class: request.class, tool: request.tool,
@@ -596,6 +691,12 @@ export class PermissionGrants {
       ...(request.call ? { execution: { status: 'owner-authorized' as const, call: request.call, scope, updatedAt: decidedAt } } : {})
     }
     if (grant.execution) request.execution = grant.execution
+    if (standing) {
+      for (const [id, entry] of this.standing) if (entry.projectId === standing.projectId && entry.rule === standing.rule) this.standing.delete(id)
+      this.standing.set(standing.id, standing)
+      while (this.standing.size > MAX_STANDING) this.standing.delete(this.standing.keys().next().value!)
+      request.always = true
+    }
     this.grants.set(agentSessionId, [...(this.grants.get(agentSessionId) ?? []).filter(entry => entry.rule !== grant.rule), grant])
     this.settle(agentSessionId, request, { status: DECIDED[decision], decidedAt, decidedBy: actor })
     if (grant.execution) { grant.execution = { ...grant.execution, status: 'applying', updatedAt: this.now() }; request.execution = grant.execution; this.changed() }
@@ -614,7 +715,7 @@ export class PermissionGrants {
     const handed = await this.deliver(agentSessionId, text, [grant], actor)
     const next = !handed ? 'The conversation is still stopping its last turn; Conductor hands it the retry as soon as it has stopped.'
       : busy ? (this.ports.interrupt ? 'Conductor interrupts its running turn, and the retry runs at once as a message of its own.' : 'The conversation retries it in a message of its own once its current turn ends; Esc in its tab interrupts that turn so the retry runs at once.') : 'The conversation was told to retry it.'
-    return { status: DECIDED[decision], grant, message: `Approved: ${grant.rule}. ${next}` }
+    return { status: DECIDED[decision], grant, message: `Approved: ${grant.rule}${standing ? ' (always, in this project; Settings > Permissions revokes it)' : ''}. ${next}` }
   }
 
   /** "[Conductor] approved: …; retry it now", saying which conversation made the call and when it
@@ -626,7 +727,7 @@ export class PermissionGrants {
       const asker = this.askedIn(holder, grant.requestId)
       const title = this.ports.title?.(asker)
       const where = asker === holder ? 'this conversation' : `${grantHolderLabel({ agentSessionId: asker, ...(title ? { title } : {}) })} (which handed itself on to this one)`
-      return `${grantApprovedMessage(grant.rule, grant.scope)} (Asked in ${where} at ${at(request?.requestedAt)}; approved by ${grant.decidedBy === 'wizard' ? 'a wizard tab' : 'the owner'} at ${at(grant.grantedAt)}.)`
+      return `${grantApprovedMessage(grant.rule, grant.scope, request?.always === true)} (Asked in ${where} at ${at(request?.requestedAt)}; approved by ${grant.decidedBy === 'wizard' ? 'a wizard tab' : 'the owner'} at ${at(grant.grantedAt)}.)`
     }).join('\n')
   }
 
@@ -1048,6 +1149,7 @@ export class PermissionGrants {
     const denial = this.ports.denial(agentSessionId, requestId)
     if (!denial?.request || autoModeDenialItemId(denial.toolUseId) !== requestId) throw new Error('No such permission request in this conversation')
     if (isClassifierOutage(denial.reason)) throw new Error('This request was already answered (expired): the classifier was unavailable, which is not a permission question')
+    if (!denial.request.rule) throw new Error(`Conductor refuses this call itself, so there is nothing to answer: ${denial.request.refusal ?? 'no narrow rule can cover it'}`)
     const request: PermissionGrantRequest = { ...denial.request, id: requestId, source: 'denial', status: 'pending', requestedAt: this.now() }
     const open = this.requests.get(agentSessionId) ?? new Map<string, PermissionGrantRequest>()
     open.set(requestId, request)

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { callMatchesRule, changesDirectoryBeforeInput, commandHost, describeGrantRequest, escapeRuleContent, grantStatusOf, nativeGrantRules, permissionGrantOf, posixPath } from './permission-grants'
+import { denialAsksOwner } from './auto-mode-denial'
+import { alwaysAllowable, callMatchesRule, changesDirectoryBeforeInput, commandHost, describeGrantRequest, escapeRuleContent, grantAsksOwner, grantStatusOf, nativeGrantRules, permissionGrantOf, posixPath, standingRuleProblem } from './permission-grants'
 
 const cwd = 'C:\\Users\\owner\\site\\theme'
 
@@ -101,5 +102,36 @@ describe('the native rules one grant installs (permission-approval-delivery-clas
     expect(changesDirectoryBeforeInput('pushd app && sort < in.txt | head')).toBe(true)
     for (const command of ['cd app && node run.js | tail -5', 'node run.js < app/in.txt', 'cd app && cat <<EOF', 'cd app && diff <(a) <(b)', 'cd app && echo "a < b"', 'cd app && node x.js 2>&1', 'node x.js < in.txt && cd app'])
       expect(changesDirectoryBeforeInput(command)).toBe(false)
+  })
+})
+
+// conductor-task:refused-request-no-card
+describe('what asks the owner, and what Always allow may cover', () => {
+  it('asks only with an allow to offer', () => {
+    expect(grantAsksOwner({ status: 'pending', rule: 'Bash(npm test)', source: 'agent' })).toBe(true)
+    expect(grantAsksOwner({ status: 'pending', source: 'agent' })).toBe(false)
+    expect(grantAsksOwner({ status: 'pending', source: 'native', nativeAvailable: true })).toBe(true)
+    expect(grantAsksOwner({ status: 'pending', source: 'native', nativeAvailable: false })).toBe(false)
+    expect(grantAsksOwner({ status: 'approved-once', rule: 'Bash(npm test)' })).toBe(false)
+    const refused = describeGrantRequest({ tool: 'Edit', input: { file_path: '.claude/settings.local.json' }, cwd })
+    expect(denialAsksOwner({ request: refused })).toBe(false)
+    expect(denialAsksOwner({ request: describeGrantRequest({ tool: 'Bash', input: { command: 'npm test' }, cwd }) })).toBe(true)
+    expect(denialAsksOwner({})).toBe(true)
+  })
+
+  it('takes one exact command or file, never a protected file, a wildcard, a domain or a whole tool', () => {
+    expect(alwaysAllowable(describeGrantRequest({ tool: 'Bash', input: { command: 'npm test' }, cwd }))).toBe(true)
+    expect(alwaysAllowable(describeGrantRequest({ tool: 'Write', input: { file_path: 'dist/a.txt' }, cwd }))).toBe(true)
+    expect(alwaysAllowable(describeGrantRequest({ tool: 'WebFetch', input: { url: 'https://example.com' }, cwd }))).toBe(false)
+    expect(alwaysAllowable(describeGrantRequest({ tool: 'mcp__github__create_issue', input: {}, cwd }))).toBe(false)
+    expect(alwaysAllowable(describeGrantRequest({ tool: 'Edit', input: { file_path: '.claude/settings.local.json' }, cwd }))).toBe(false)
+    expect(standingRuleProblem('Bash(npm test)')).toBeUndefined()
+    expect(standingRuleProblem('Edit(//c/Users/owner/site/theme/dist/a.txt)')).toBeUndefined()
+    expect(standingRuleProblem('Edit(//c/Users/owner/site/theme/.claude/settings.local.json)')).toMatch(/permissions, hooks or instructions/)
+    expect(standingRuleProblem('Edit(//c/x/.git/hooks/pre-commit)')).toMatch(/permissions, hooks or instructions/)
+    expect(standingRuleProblem('Edit(//c/x/AGENTS.md*)')).toMatch(/pattern/)
+    expect(standingRuleProblem('Bash(rm -rf *)')).toMatch(/wildcard/)
+    expect(standingRuleProblem('Bash')).toMatch(/one exact/)
+    expect(standingRuleProblem('WebFetch(domain:example.com)')).toMatch(/one exact/)
   })
 })

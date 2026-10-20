@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react'
-import { grantHolderLabel, type GrantDecision, type GrantStatus, type PermissionGrant, type PermissionGrantRequest, type PermissionGrantsState } from '../../../../shared/permission-grants'
+import { alwaysAllowable, grantHolderLabel, type GrantDecision, type GrantStatus, type PermissionGrant, type PermissionGrantRequest, type PermissionGrantsState } from '../../../../shared/permission-grants'
 import './permission-grants.css'
 
 /** The fields a card needs: a denial's request (auto-mode-denial.ts) or an agent's own request. */
-export type GrantCardRequest = Pick<PermissionGrantRequest, 'tool' | 'action' | 'resource' | 'class'> & Partial<Pick<PermissionGrantRequest, 'host' | 'category' | 'rule' | 'refusal' | 'reason' | 'rollback' | 'status' | 'holder' | 'source' | 'call' | 'nativeAvailable' | 'execution'>>
+export type GrantCardRequest = Pick<PermissionGrantRequest, 'tool' | 'action' | 'resource' | 'class'> & Partial<Pick<PermissionGrantRequest, 'host' | 'category' | 'rule' | 'refusal' | 'reason' | 'rollback' | 'status' | 'holder' | 'source' | 'call' | 'nativeAvailable' | 'execution' | 'always'>>
 
 const CLASS_WORDS: Record<PermissionGrantRequest['class'], string> = {
   local: 'Local: this machine, reversible',
@@ -23,7 +23,8 @@ const STATUS_WORDS: Record<GrantStatus, string> = {
   moved: 'Moved to the tab that continued this conversation'
 }
 
-function statusWords(status: GrantStatus, execution?: PermissionGrantRequest['execution']): string {
+function statusWords(status: GrantStatus, execution?: PermissionGrantRequest['execution'], always?: boolean): string {
+  if (always && status === 'approved-session' && !execution) return 'Always allowed in this project (Settings > Permissions revokes it)'
   switch (execution?.status) {
     case 'succeeded': return 'Action succeeded'
     case 'failed': return 'Action failed'
@@ -62,8 +63,10 @@ export function usePermissionGrants(): PermissionGrantsState {
  * what kind of resource, and the single rule approving hands this conversation. Kept free of
  * pane imports; the actions are props so it renders in a plain unit test.
  */
-export function PermissionGrantCard({ request, status, grant, busy, error, onDecide, onRevoke, onSwitchToEdit, onInterrupt }: {
+export function PermissionGrantCard({ request, status, grant, busy, error, onDecide, onRevoke, onSwitchToEdit, onInterrupt, elsewhere }: {
   request: GrantCardRequest
+  /** Answered on the machine the conversation runs on (LivePermissionGrantCard elsewhere). */
+  elsewhere?: boolean
   status: GrantStatus
   grant?: PermissionGrant
   busy?: boolean
@@ -76,10 +79,14 @@ export function PermissionGrantCard({ request, status, grant, busy, error, onDec
 }): React.JSX.Element {
   const pending = status === 'pending'
   const nativeOnce = pending && request.source === 'native' && request.nativeAvailable === true && Boolean(request.call?.requestId)
-  const needsOwner = pending && !(request.source === 'native' && !request.nativeAvailable)
+  // A card asks the owner only when it offers an allow: a call Conductor refuses itself (no rule,
+  // no live native request) is information, never a Deny-only question (owner 2026-10-20), and a
+  // card nothing here can answer (an old runtime's) does not claim attention either.
+  const refused = pending && !request.rule && request.source !== 'native'
+  const needsOwner = pending && Boolean(onDecide) && (Boolean(request.rule) || nativeOnce)
   return <section className={'sa-interaction sa-grant-card' + (needsOwner ? ' needs-attention' : '')} role={needsOwner ? 'alert' : undefined} aria-label={'Permission: ' + request.action} data-grant-status={status} data-grant-class={request.class}>
     <header className="sa-grant-header">
-      <strong>{request.category ? `Auto mode refused ${request.tool}` : `Permission requested: ${request.action}`}</strong>
+      <strong>{refused ? `Refused: ${request.action}` : request.category ? `Auto mode refused ${request.tool}` : `Permission requested: ${request.action}`}</strong>
       {request.category && <span className="sa-auto-denial-reason">{request.category}</span>}
       <span className={'sa-grant-class sa-grant-class-' + request.class}>{CLASS_WORDS[request.class]}</span>
     </header>
@@ -95,14 +102,19 @@ export function PermissionGrantCard({ request, status, grant, busy, error, onDec
     </dl>
     {pending && request.rule && <p className="sa-muted">Approving hands this one conversation exactly this rule and tells it to retry the call. Nothing else is allowed, and the grant ends with this tab.</p>}
     {pending && request.source === 'native' && !request.nativeAvailable && <p className="sa-muted">Waiting for this exact provider request to be confirmed again. It cannot be answered from an old card.</p>}
-    {pending && onDecide && <div className="sa-interaction-actions">
+    {refused && <p className="sa-muted">Conductor refused this call itself and told the conversation; there is nothing for you to answer.</p>}
+    {elsewhere && pending && !refused && <p className="sa-muted">This conversation runs on another machine; its permission requests are answered there.</p>}
+    {needsOwner && onDecide && <div className="sa-interaction-actions">
       {request.rule && <button type="button" className="sa-grant-once" disabled={busy} onClick={() => onDecide('approve-once')}>Approve once</button>}
       {nativeOnce && <button type="button" className="sa-grant-once" disabled={busy} onClick={() => onDecide('approve-once')}>Allow this provider request once</button>}
       {request.rule && <button type="button" className="sa-grant-session" disabled={busy} onClick={() => onDecide('approve-session')}>Approve for this session</button>}
+      {alwaysAllowable(request) && <button type="button" className="sa-grant-always" disabled={busy} onClick={() => onDecide('approve-always')} title={`Allow exactly this ${request.tool === 'Bash' || request.tool === 'PowerShell' ? 'command' : 'file'} for every conversation of this project, without asking again. Settings > Permissions revokes it.`}>Always allow</button>}
       <button type="button" className="sa-grant-deny" disabled={busy} onClick={() => onDecide('deny')}>Deny</button>
-      {!request.rule && !nativeOnce && onSwitchToEdit && <button type="button" className="sa-auto-denial-switch" disabled={busy} onClick={onSwitchToEdit}>Switch to Edit mode</button>}
     </div>}
-    {!pending && <p className="sa-grant-status">{statusWords(status, request.execution)}{grant ? ` · ${grant.delivery === 'live' ? 'in force now' : grant.delivery === 'restart' ? 'applies when the conversation restarts' : 'applies when the conversation starts'}` : ''}
+    {refused && onSwitchToEdit && <div className="sa-interaction-actions">
+      <button type="button" className="sa-auto-denial-switch" disabled={busy} onClick={onSwitchToEdit}>Switch to Edit mode</button>
+    </div>}
+    {!pending && <p className="sa-grant-status">{statusWords(status, request.execution, request.always)}{grant ? ` · ${grant.delivery === 'live' ? 'in force now' : grant.delivery === 'restart' ? 'applies when the conversation restarts' : 'applies when the conversation starts'}` : ''}
       {grant && onRevoke && <button type="button" className="sa-grant-revoke" disabled={busy} onClick={onRevoke}>Revoke</button>}</p>}
     {!pending && onInterrupt && <div className="sa-interaction-actions sa-grant-waiting">
       <span className="sa-muted">The retry is queued behind a turn that is still running.</span>
@@ -131,12 +143,15 @@ export function grantAnswerable(state: PermissionGrantsState, agentSessionId: st
 }
 
 /** The card wired to the main process for one conversation's request. */
-export function LivePermissionGrantCard({ agentSessionId, requestId, request, interactive, onSwitchToEdit }: {
+export function LivePermissionGrantCard({ agentSessionId, requestId, request, interactive, onSwitchToEdit, elsewhere }: {
   agentSessionId: string
   requestId: string
   request: GrantCardRequest
   interactive: boolean
   onSwitchToEdit?(): void
+  /** A mirrored tab of a conversation on another machine: this machine holds none of its
+   *  requests, so the card shows what was asked, with no answers and no attention. */
+  elsewhere?: boolean
 }): React.JSX.Element {
   const state = usePermissionGrants()
   const [busy, setBusy] = useState(false)
@@ -145,6 +160,8 @@ export function LivePermissionGrantCard({ agentSessionId, requestId, request, in
   const answerable = grantAnswerable(state, agentSessionId, requestId, interactive)
   const grant = state.grants.find(entry => entry.agentSessionId === agentSessionId && entry.requestId === requestId)
   const currentRequest = state.requests.find(entry => entry.agentSessionId === agentSessionId && entry.id === requestId)
+  // After every hook: a tab's machine resolves after its first render.
+  if (elsewhere) return <PermissionGrantCard request={request} status={request.status ?? 'pending'} elsewhere />
   const act = (work: () => Promise<unknown>): void => {
     setBusy(true); setError(undefined)
     void work().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))).finally(() => setBusy(false))

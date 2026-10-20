@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { ApprovalWakes, awaitWakeText, controllerWakeText, type PendingCard } from './approval-wakes'
+import { ApprovalWakes, approvalDecisions, awaitWakeText, controllerWakeText, grantDecisions, offersAllow, type PendingCard } from './approval-wakes'
 
 const card = (requestId: string, extra: Partial<PendingCard> = {}): PendingCard => ({ agentSessionId: 'worker', title: 'Worker', kind: 'approval', requestId, runtimeId: 'r1', tool: 'Bash', action: 'npm install left-pad', controller: 'wizard', ...extra })
 
@@ -59,6 +59,29 @@ describe('approval wakes: grace, dedupe and coalescing', () => {
   })
 })
 
+describe('the decisions a card really offers (owner rule 2026-10-20: never a Deny-only card to answer)', () => {
+  const choice = (id: string, disabled?: boolean) => ({ id, label: id, ...(disabled ? { disabled } : {}) })
+  it('maps a native approval\'s enabled runtime choices to allow and deny', () => {
+    expect(approvalDecisions({ choices: [choice('allow'), choice('deny')] })).toEqual(['allow', 'deny'])
+    expect(approvalDecisions({ choices: [choice('accept'), choice('acceptForSession'), choice('decline')] })).toEqual(['allow', 'deny'])
+    expect(approvalDecisions({ choices: [choice('allow-session')] })).toEqual(['allow'])
+    expect(approvalDecisions({ choices: [choice('allow', true), choice('deny')] })).toEqual(['deny'])
+    expect(approvalDecisions({ choices: [] })).toEqual([])
+    expect(offersAllow(approvalDecisions({ choices: [choice('deny')] }))).toBe(false)
+    expect(offersAllow(approvalDecisions({ choices: [] }))).toBe(false)
+  })
+
+  it('offers a native grant request only once, and only while its exact request is live; any other only with a rule', () => {
+    const call = { runtimeId: 'r1', nativeSessionId: 'n', toolUseId: 't', tool: 'Bash', argsDigest: 'd', requestId: '7' }
+    expect(grantDecisions({ source: 'native', status: 'pending', nativeAvailable: true, call })).toEqual(['approve-once', 'deny'])
+    expect(grantDecisions({ source: 'native', status: 'pending', nativeAvailable: false, call })).toEqual([])
+    expect(grantDecisions({ source: 'native', status: 'pending', nativeAvailable: true, call: { ...call, requestId: undefined } })).toEqual([])
+    expect(grantDecisions({ source: 'agent', status: 'pending', rule: 'Bash(npm test)' })).toEqual(['approve-once', 'approve-session', 'deny'])
+    expect(grantDecisions({ source: 'denial', status: 'pending' })).toEqual([])
+    expect(grantDecisions({ source: 'agent', status: 'denied', rule: 'Bash(npm test)' })).toEqual([])
+  })
+})
+
 describe('approval wake texts', () => {
   it('names each card with the exact call that answers it', () => {
     const text = controllerWakeText([card('req-1', { class: 'shared', attention: 'a shared action (install)', reason: undefined }), card('grant:9', { kind: 'permission', tool: 'Write', action: 'C:/x/y.ts', reason: 'fix the build' })], { canAnswer: true })
@@ -68,6 +91,13 @@ describe('approval wake texts', () => {
     expect(text).toContain('permissions.decide({agentSessionId:"worker", requestId:"grant:9", decision:"approve-once"|"approve-session"|"deny"})')
     expect(text).toContain('reason: fix the build')
     expect(text).toMatch(/do not poll agents\.approvals/)
+  })
+
+  it('names only the decisions the card really offers', () => {
+    const text = controllerWakeText([card('req-1', { decisions: ['allow'] }), card('native-grant:r1:7', { kind: 'permission', tool: 'Bash', action: 'curl https://x', decisions: ['approve-once', 'deny'] })], { canAnswer: true })
+    expect(text).toContain('requestId:"req-1", decision:"allow", reason:"…"})')
+    expect(text).toContain('permissions.decide({agentSessionId:"worker", requestId:"native-grant:r1:7", decision:"approve-once"|"deny"})')
+    expect(text).not.toContain('approve-session')
   })
 
   it('keeps an anonymous coworker\'s action out, and says who answers when the recipient cannot', () => {

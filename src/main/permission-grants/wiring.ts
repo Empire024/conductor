@@ -34,7 +34,7 @@ export interface GrantStore {
   snapshot(id: string): Pick<SessionProjection, 'items' | 'phase' | 'settings' | 'queuedPrompts' | 'pendingSteering' | 'runtimeId' | 'nativeSessionId'> | null | undefined
 }
 
-export const permissionGrantsIpcChannels = ['permission-grants:state', 'permission-grants:decide', 'permission-grants:revoke', 'permission-grants:interrupt'] as const
+export const permissionGrantsIpcChannels = ['permission-grants:state', 'permission-grants:decide', 'permission-grants:revoke', 'permission-grants:revoke-standing', 'permission-grants:interrupt'] as const
 /** Verify the provider still has the exact native request and tool arguments the owner saw. */
 export function nativeResponseTarget(state: Pick<SessionProjection, 'items' | 'runtimeId' | 'nativeSessionId'> | null | undefined, call: GrantCallIdentity): boolean {
   if (!state || state.runtimeId !== call.runtimeId || state.nativeSessionId !== call.nativeSessionId || !call.requestId) return false
@@ -144,6 +144,7 @@ export async function startPermissionGrants(deps: {
     provider: id => spec(id)?.provider,
     title: id => spec(id)?.title,
     cwd: id => spec(id)?.cwd,
+    project: id => spec(id)?.projectId,
     apply: id => deps.sessions.applyPermissionRules(id),
     respondNative: async (id: string, call: GrantCallIdentity, decision: 'allow' | 'deny') => {
       const state = deps.store.snapshot(id)
@@ -247,6 +248,11 @@ export function registerPermissionGrantsIpc(service: () => PermissionGrants | un
     authorize(event)
     if (typeof agentSessionId !== 'string' || typeof grantId !== 'string') throw new Error('Invalid grant')
     return grants().revoke(agentSessionId, grantId)
+  })
+  ipcMain.handle('permission-grants:revoke-standing', (event, standingId: unknown) => {
+    authorize(event)
+    if (typeof standingId !== 'string') throw new Error('Invalid grant')
+    return grants().revokeStanding(standingId)
   })
   ipcMain.handle('permission-grants:interrupt', (event, agentSessionId: unknown, grantId: unknown) => {
     authorize(event)

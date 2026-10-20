@@ -93,7 +93,7 @@ import {
   type IssueReportContext
 } from './debug-log'
 import { getAttentionSessionIds, getProjectActivityStatuses, getSessionActivityStatuses, hasActiveSubagent, mergeProjectActivity, resolveActivityPhases, retainVisibleAttentionResources } from './attention'
-import { autoModeDenialOf } from '../../shared/auto-mode-denial'
+import { autoModeDenialOf, denialAsksOwner } from '../../shared/auto-mode-denial'
 import type { ProjectActivitySnapshot } from '../../shared/project-activity'
 import { migrateLegacyCodexModels, migrateLegacyCodexTab } from './agent-models'
 import { useAppUpdates } from './use-app-updates'
@@ -494,7 +494,7 @@ export function App(): React.JSX.Element {
       for (const event of events) {
         const denial = autoModeDenialOf(event.data)
         const key = denial ? event.sessionId + ':' + denial.toolUseId : ''
-        if (!denial || announcedDenials.has(key)) continue
+        if (!denial || !denialAsksOwner(denial) || announcedDenials.has(key)) continue
         announcedDenials.add(key)
         if (announcedDenials.size > 512) announcedDenials.delete(announcedDenials.values().next().value!)
         recentAttentionSounds.set(event.sessionId, Date.now())
@@ -592,7 +592,7 @@ export function App(): React.JSX.Element {
   viewedResourceIdsRef.current = viewedResourceIds
   useEffect(() => window.conductor.structured.onEvents((events) => {
     // A denial the owner is already looking at needs no bell; one in a tab they are not keeps it lit.
-    const denied = events.filter((event) => autoModeDenialOf(event.data) && !viewedResourceIdsRef.current.has(event.sessionId)).map((event) => event.sessionId)
+    const denied = events.filter((event) => { const denial = autoModeDenialOf(event.data); return denial && denialAsksOwner(denial) && !viewedResourceIdsRef.current.has(event.sessionId) }).map((event) => event.sessionId)
     if (!denied.length) return
     setDenialAttentionResourceIds((current) => {
       if (denied.every((id) => current.has(id))) return current

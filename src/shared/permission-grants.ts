@@ -14,7 +14,9 @@
 /** local: this machine, reversible. shared: something other people or programs also depend on.
  *  destructive: deletes or overwrites. external: reaches another machine or service. */
 export type GrantClass = 'local' | 'shared' | 'destructive' | 'external'
-export type GrantDecision = 'approve-once' | 'approve-session' | 'deny'
+/** approve-always: the owner's standing approval of exactly this command or path for the
+ *  project (StandingGrant), on top of a session grant for the conversation that asked. */
+export type GrantDecision = 'approve-once' | 'approve-session' | 'approve-always' | 'deny'
 export type GrantStatus = 'pending' | 'approved-once' | 'approved-session' | 'denied' | 'used' | 'revoked' | 'expired' | 'ineffective' | 'moved'
 /** Provider execution is separate from the owner's decision. In particular, an approval is not
  * evidence that a tool ran, and an unknown result must never be retried automatically. */
@@ -72,6 +74,30 @@ export interface PermissionGrantRequest {
   /** The conversation that holds the request now, set when a handoff moved it there from the tab
    *  that asked (agents.handoff successor). On the old tab's card the status is 'moved'. */
   holder?: { agentSessionId: string; title?: string }
+  /** Approved with "Always allow": a standing grant for its project covers the same call from now on. */
+  always?: boolean
+}
+
+/**
+ * The owner's "Always allow" (owner 2026-10-20: approved standing permissions stick without more
+ * cards). Exactly one command or one file path, for every Claude conversation of one project, until
+ * the owner revokes it in Settings > Permissions. Only the owner's card or a wizard tab (the owner's
+ * authority) creates one; an agent never can, and a call Conductor refuses (permission settings,
+ * hooks, instructions, wildcards) has no rule, so it can never become one.
+ */
+export interface StandingGrant {
+  id: string
+  projectId: string
+  rule: string
+  tool: string
+  resource: string
+  class: GrantClass
+  grantedAt: string
+  decidedBy: 'owner' | 'wizard'
+  /** The conversation whose card it was approved on. */
+  askedIn?: string
+  lastUsedAt?: string
+  uses?: number
 }
 
 export interface PermissionGrant {
@@ -106,6 +132,8 @@ export interface PermissionGrantsState {
   /** Approved retries still queued behind a running turn past the waiting notice (H06): the card
    *  offers "Interrupt and retry" for these grants. Absent when none. */
   waiting?: Array<{ agentSessionId: string; grantIds: string[]; rules: string[]; since: string }>
+  /** The owner's standing "Always allow" grants, every project. Absent when none. */
+  standing?: StandingGrant[]
 }
 
 export interface PermissionGrantDecisionResult {
@@ -118,6 +146,8 @@ export interface PermissionGrantsBridge {
   state(): Promise<PermissionGrantsState>
   decide(agentSessionId: string, requestId: string, decision: GrantDecision): Promise<PermissionGrantDecisionResult>
   revoke(agentSessionId: string, grantId: string): Promise<boolean>
+  /** Ends one of the owner's standing "Always allow" grants (Settings > Permissions). */
+  revokeStanding(standingId: string): Promise<boolean>
   /** Interrupts the turn an approved retry waits behind, so the retry runs at once. */
   interrupt(agentSessionId: string, grantId: string): Promise<void>
   onChanged(callback: (state: PermissionGrantsState) => void): () => void
@@ -152,6 +182,12 @@ export function grantStatusOf(data: { type: string; payload?: unknown }): GrantS
 
 /** A native rule entry as `rules()` hands it to the adapter. */
 export interface GrantRule { rule: string; once: boolean }
+
+/** Whether a request waits for the owner with an allow to offer: a rule to approve, or a native
+ *  provider request still live. Anything else (refused by Conductor, an old runtime's native
+ *  request) is never counted, docked or pushed as something to answer (owner 2026-10-20). */
+export const grantAsksOwner = (request: { status: string; rule?: string; source?: string; nativeAvailable?: boolean }): boolean =>
+  request.status === 'pending' && (request.source === 'native' ? request.nativeAvailable === true : Boolean(request.rule))
 
 /** Production and external actions reach the owner's phone even while the turn goes on. */
 export const grantNeedsPhone = (request: Pick<PermissionGrantRequest, 'class'>): boolean => request.class === 'external' || request.class === 'shared' || request.class === 'destructive'
@@ -244,6 +280,32 @@ export function describeGrantRequest(request: GrantRequestInput): Omit<Permissio
   return { ...base, action: `Use ${tool}`, resource: JSON.stringify(input).slice(0, 400), class: 'shared', refusal: `Conductor has no narrow rule for ${tool}; switch the conversation to Edit mode to approve it as a one-off.` }
 }
 
+/** Tools whose rule names one exact command or one exact file, the only ones "Always allow" takes:
+ *  a WebFetch rule covers a whole domain and an MCP rule every call of the tool. */
+const ALWAYS_TOOLS = new Set([...EDIT_TOOLS, ...SHELL_TOOLS])
+
+/** Whether the owner's card offers "Always allow" for this request. */
+export const alwaysAllowable = (request: Pick<PermissionGrantRequest, 'tool' | 'rule'> & Partial<Pick<PermissionGrantRequest, 'source' | 'refusal'>>): boolean =>
+  Boolean(request.rule) && !request.refusal && request.source !== 'native' && ALWAYS_TOOLS.has(request.tool)
+
+/** Why a rule cannot be a standing grant, or undefined when it can: re-checked whenever one is made
+ *  or read back, so a saved file can never smuggle in a wider rule or a protected file. */
+export function standingRuleProblem(rule: string): string | undefined {
+  const parsed = parsedRule(rule)
+  if (parsed.content === undefined || !parsed.content.trim()) return 'Always allow takes one exact command or one exact file'
+  if (parsed.tool === 'Edit') {
+    if (permissionConfig(parsed.content)) return 'This file holds agent permissions, hooks or instructions; Conductor never grants an agent the right to change those'
+    if (/[*?[\]{}]/.test(parsed.content)) return 'The path holds pattern characters, so the rule would also match other files'
+    return undefined
+  }
+  if (parsed.tool === 'Bash' || parsed.tool === 'PowerShell') {
+    if (parsed.content.includes('*') || /:\s*$/.test(parsed.content)) return 'The command holds a wildcard, so the rule would allow other commands too'
+    if (parsed.content.length > 4000) return 'The command is too long for one exact rule'
+    return undefined
+  }
+  return 'Always allow takes one exact command (Bash, PowerShell) or one exact file (Write, Edit)'
+}
+
 /** The request as the owner reads it in one line (card title, phone body). */
 export const grantRequestSummary = (request: Pick<PermissionGrantRequest, 'action' | 'resource' | 'class'>): string =>
   `${request.action} (${request.class}): ${request.resource.length > 140 ? request.resource.slice(0, 139) + '…' : request.resource}`
@@ -256,8 +318,8 @@ export const grantHolderLabel = (holder: NonNullable<PermissionGrantRequest['hol
 }
 
 /** What the tab is told once the owner approved. */
-export const grantApprovedMessage = (rule: string, scope: 'once' | 'session'): string =>
-  `[Conductor] approved: ${rule}${scope === 'once' ? ' (once)' : ' (for this session)'}; retry it now. Run exactly the approved call, unchanged: the rule matches only that.`
+export const grantApprovedMessage = (rule: string, scope: 'once' | 'session', always = false): string =>
+  `[Conductor] approved: ${rule}${scope === 'once' ? ' (once)' : always ? ' (always, in this project)' : ' (for this session)'}; retry it now. Run exactly the approved call, unchanged: the rule matches only that.`
 
 /** What the tab is told when the owner, or a wizard tab answering for the owner, denied. */
 export const grantDeniedMessage = (request: Pick<PermissionGrantRequest, 'action' | 'resource'>, by: 'owner' | 'wizard' = 'owner'): string =>

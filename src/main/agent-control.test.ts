@@ -3973,6 +3973,34 @@ describe('a coworker\'s approval card wakes whoever can answer it', () => {
     expect(wakes(f, f.spec.id).at(-1)!.prompt).not.toContain('req-2')
   })
 
+  // Owner rule 2026-10-20: never present a Deny-only approval, or one with no choice, as something to answer.
+  it('offers only the decisions a card really has, and wakes nobody for a card with no allow', async () => {
+    const f = fixture()
+    asWizard(f)
+    const tab = await f.control.call(f.scope, 'tabs.open', { title: 'Shell' }) as AgentControlTab
+    const worker = tab.resourceId!
+    raise(f, worker, 'deny-only', { command: 'rm -rf build' }, { choices: [{ id: 'deny', label: 'Deny' }] })
+    raise(f, worker, 'no-choice', { command: 'rm -rf dist' }, { choices: [] })
+    raise(f, worker, 'allow-disabled', { command: 'rm -rf out' }, { choices: [{ id: 'allow', label: 'Allow', disabled: true }, { id: 'deny', label: 'Deny' }] })
+    expect(await f.control.sweepApprovalWakes(0)).toBe(0)
+    const call = { runtimeId: 'r1', nativeSessionId: 'n', toolUseId: 't', tool: 'Bash', argsDigest: 'd', requestId: '7' }
+    const request = (id: string, extra: Record<string, unknown>) => ({ id, agentSessionId: worker, tool: 'Bash', action: 'Run a command', resource: `echo ${id}`, class: 'local', status: 'pending', requestedAt: new Date(0).toISOString(), ...extra })
+    f.control.setPermissionGrants({ state: () => ({ grants: [], requests: [
+      request('native-grant:r1:7', { source: 'native', nativeAvailable: true, call }),
+      request('native-grant:r1:8', { source: 'native', nativeAvailable: false, call: { ...call, requestId: '8' } }),
+      request('grant:refused', { source: 'agent', refusal: 'Conductor refuses it itself' }),
+      request('grant:ruled', { source: 'agent', rule: 'Bash(echo grant:ruled)' })
+    ] }) } as never)
+    raise(f, worker, 'allow-only', { command: 'git push origin main' },{ choices: [{ id: 'accept', label: 'Allow once' }] })
+    expect(await f.control.sweepApprovalWakes(0)).toBe(1)
+    const sent = wakes(f, f.spec.id).at(-1)!.prompt
+    expect(sent).toMatch(/waiting on 3 approvals/)
+    expect(sent).toContain('requestId:"allow-only", decision:"allow", reason:"…"})')
+    expect(sent).toContain('requestId:"native-grant:r1:7", decision:"approve-once"|"deny"})')
+    expect(sent).toContain('requestId:"grant:ruled", decision:"approve-once"|"approve-session"|"deny"})')
+    for (const absent of ['deny-only', 'no-choice', 'allow-disabled', 'native-grant:r1:8', 'grant:refused']) expect(sent).not.toContain(`"${absent}"`)
+  })
+
   it('agents.await({approvals:true}) ends when an awaited conversation raises a card', async () => {
     const f = fixture()
     const fixer = agentIn(f, f.project.id, f.workspace.id, 'fixer')

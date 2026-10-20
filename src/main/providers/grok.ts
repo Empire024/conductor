@@ -629,12 +629,23 @@ export class GrokAdapter implements ProviderAdapter {
       this.transport?.send({ jsonrpc: '2.0', id: rpcId, result: { outcome: { outcome: 'cancelled' } } })
       return
     }
+    // Owner rule 2026-10-20: never a card whose only buttons are reject / Cancel turn. A request
+    // Grok offers no way to allow is rejected here with an informational notice, never raised.
+    const allows = (option: PermissionOption): boolean => option.kind === 'allow_once' || option.kind === 'allow_always'
+    if (!options.some(allows)) {
+      if (rejectOnce) return answer(rejectOnce, `Conductor declined “${title}” without asking you: Grok offered no way to allow it.`)
+      this.transport?.send({ jsonrpc: '2.0', id: rpcId, result: { outcome: { outcome: 'cancelled' } } })
+      this.emit({ turnId: this.turnId, itemId: toolCallId ? `${toolCallId}:answer` : undefined, data: { type: 'notice', message: `Conductor cancelled “${title}” without asking you: Grok offered no way to allow it.` }, native: { method, payload: json(params) } })
+      return
+    }
     const held = this.policy === 'auto' || this.policy === 'edits' ? this.ownerOnlyBoundary(tool) : undefined
     const edit = tool && ['edit', 'delete', 'move'].includes(tool.kind ?? '') && tool.paths.length > 0 && tool.paths.every(path => inside(this.options.cwd, path)) && !toolCommand(tool.input)
     if (allowOnce && !held && (this.policy === 'auto' || this.policy === 'edits' && edit)) return answer(allowOnce, `${this.policy === 'auto' ? 'Auto' : 'Edit mode'} allowed “${title}” without asking.`)
     if (held) this.emit({ turnId: this.turnId, itemId: toolCallId, data: { type: 'notice', message: `${this.policy === 'auto' ? 'Auto' : 'Edit mode'} left “${title}” to you: ${held}. The native request is pending; review it and choose an offered action.` } })
-    // A request Auto held for the owner is one exact action, never a lasting grant.
-    const offered = this.policy === 'auto' ? options.filter(option => option.kind !== 'allow_always') : options
+    // A request Auto held for the owner is one exact action, never a lasting grant, unless the
+    // lasting grant is the only way Grok offers to allow it.
+    const once = options.filter(option => option.kind !== 'allow_always')
+    const offered = this.policy === 'auto' && once.some(allows) ? once : options
     const interaction: PendingInteraction = {
       id: key, kind: 'approval', title, input: json({ toolCall, options }), status: 'pending',
       choices: [...offered.map(option => ({ id: option.optionId, label: option.name, ...(option.kind === 'allow_always' ? { description: 'Grok remembers this grant for the project and stops asking for matching calls.' } : {}) })), { id: 'cancel', label: 'Cancel turn' }]

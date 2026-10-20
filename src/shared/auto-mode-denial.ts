@@ -11,6 +11,10 @@ import { grantRequestSummary, type PermissionGrantRequest } from './permission-g
 export interface AutoModeDenial { tool: string; reason: string; toolUseId: string; request?: DenialGrantRequest }
 /** The narrow approval a denial turns into (permission-grants.ts), minus what the grant service adds. */
 export type DenialGrantRequest = Omit<PermissionGrantRequest, 'id' | 'source' | 'status' | 'requestedAt'>
+/** Whether a denial is a "needs you" moment: one Conductor refuses itself (a request with no rule:
+ *  permission settings, hooks, instructions, a wildcard) has nothing for the owner to answer, so it
+ *  plays no sound, lights no tab and reaches no phone (owner 2026-10-20). */
+export const denialAsksOwner = (denial: Pick<AutoModeDenial, 'request'>): boolean => !denial.request || Boolean(denial.request.rule)
 
 /** The CLI's wording, with the bracketed reason it appends: `Permission for this action was denied
  *  by the Claude Code auto mode classifier. Reason: [Security Weaken]. If it keeps failing, …`.

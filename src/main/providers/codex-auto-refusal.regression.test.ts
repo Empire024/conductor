@@ -155,13 +155,12 @@ describe('Auto refusal incident: native approval lifecycle', () => {
     expect(ownerOnlyEscalation(JSON.stringify({ network: { enabled: true } }))).toBeUndefined()
   })
 
-  it('a request that offers no plain accept stays pending in Auto with the offered choices, and the owner can still answer', async () => {
+  // conductor-task:refused-request-no-card: a Deny-only card is never raised (owner 2026-10-20).
+  it('a request that offers no way to allow it is declined without a card, with a notice', async () => {
     const f = fixture(); await f.start(); f.request('commandExecution', 'Write-Output synthetic', ['decline', 'cancel'])
-    expect({ pending: f.pending().map(interaction => interaction.choices.map(choice => choice.id)), responses: f.responses(), last: f.events.at(-1)?.data })
-      .toMatchObject({ pending: [['decline', 'cancel']], responses: [], last: { type: 'session', phase: 'waiting_approval' } })
-    expect(f.notices(/^Auto could not approve .*no plain accept/)).toBe(1)
-    await f.answer('cancel')
-    expect(f.responses()).toEqual([{ id: nativeRequestId, result: { decision: 'cancel' } }])
+    expect({ pending: f.pending().length, responses: f.responses() }).toEqual({ pending: 0, responses: [{ id: nativeRequestId, result: { decision: 'decline' } }] })
+    expect(f.events.some(event => event.data.type === 'session' && event.data.phase === 'waiting_approval')).toBe(false)
+    expect(f.notices(/^Conductor declined .* without asking you: Codex offered no way to allow it/)).toBe(1)
   })
 
   it('an exact repeated native request in Auto gets one accept, and a reused identity with other arguments is refused', async () => {

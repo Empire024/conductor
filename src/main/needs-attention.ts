@@ -1,5 +1,6 @@
 import type { AgentActivityPhase, DetachedWindowRecord, LayoutNode, PaneTab, SessionRecord } from '../shared/models'
 import { ATTENTION_LIMIT, sortAttention, type AttentionEntry, type AttentionReason, type AttentionSnapshot } from '../shared/needs-attention'
+import { grantAsksOwner } from '../shared/permission-grants'
 import type { SessionProjection } from '../shared/structured-agent'
 import { PROVIDER_USAGE_LIMIT } from '../shared/structured-agent'
 import { handedOffIn, tabSeenAt } from '../shared/workspace-clarity'
@@ -24,7 +25,7 @@ export interface NeedsAttentionSources {
   agents(): AttentionAgentRow[]
   snapshot(id: string): SessionProjection | null
   /** Pending request_permission cards (PermissionGrants.state().requests). */
-  permissionRequests?(): Array<{ agentSessionId: string; status: string; reason?: string; resource?: string; requestedAt?: string; command?: string; path?: string; url?: string; createdAt?: string }>
+  permissionRequests?(): Array<{ agentSessionId: string; status: string; reason?: string; resource?: string; requestedAt?: string; command?: string; path?: string; url?: string; createdAt?: string; rule?: string; source?: string; nativeAvailable?: boolean }>
   /** Taken over by another conversation (agents.supersede): its failure is not the owner's to chase. */
   superseded?(projectId: string, id: string): boolean
 }
@@ -59,7 +60,7 @@ export function computeNeedsAttention(sources: NeedsAttentionSources, now = new 
   }
   const listed = new Set<string>()
   for (const request of sources.permissionRequests?.() ?? []) {
-    if (request.status !== 'pending' || listed.has(request.agentSessionId) || !shown.has(request.agentSessionId)) continue
+    if (!grantAsksOwner(request) || listed.has(request.agentSessionId) || !shown.has(request.agentSessionId)) continue
     listed.add(request.agentSessionId)
     // A PermissionGrantRequest names its call as resource and its time as requestedAt.
     add(request.agentSessionId, 'permission', [request.resource ?? request.command ?? request.path ?? request.url, request.reason].filter(Boolean).join(' — '), request.requestedAt ?? request.createdAt)

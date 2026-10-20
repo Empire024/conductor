@@ -37,6 +37,8 @@ export interface AdapterOptions {
    *  call has run, refused() when the classifier refused a call a rule was granted for. */
   /** denied: a classifier denial's card (its notice item) was shown, so it is a pending owner request from now on. */
   permissionGrants?: { rules(): Array<{ rule: string; once: boolean }>; used(rule: string): void; refused?(rule: string): void; denied?(itemId: string, request: DenialGrantRequest): void;
+    /** The rule of the owner's "Always allow" covering exactly this call, read before each tool runs. */
+    standing?(tool: string, input: unknown): string | undefined;
     nativePending?(call: NativeGrantCall): PermissionGrantRequest | undefined;
     executionStarted?(call: NativeGrantCall, evidence: 'tool-progress'): void;
     executionFinished?(call: NativeGrantCall, outcome: 'succeeded' | 'failed' | 'blocked' | 'cancelled' | 'unknown'): void }

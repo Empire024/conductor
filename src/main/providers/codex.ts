@@ -243,6 +243,21 @@ export const codexExecpolicyAmendment = (decisions: readonly unknown[]): string[
   return undefined
 }
 
+/** The network rule Codex offers to allow a host for a command approval, exactly as offered. A
+ *  rule that denies the host is no way to allow the request and is not returned. */
+export const codexNetworkAllowAmendment = (decisions: readonly unknown[]): { host: string; action: 'allow' } & Record<string, unknown> | undefined => {
+  for (const decision of decisions) {
+    const amendment = record(decision) && record(decision.applyNetworkPolicyAmendment) ? decision.applyNetworkPolicyAmendment.network_policy_amendment : undefined
+    if (record(amendment) && typeof amendment.host === 'string' && amendment.host && amendment.action === 'allow') return amendment as { host: string; action: 'allow' } & Record<string, unknown>
+  }
+  return undefined
+}
+
+/** Card choices that let a Codex request run; a card without one of them is never raised. */
+const CODEX_ALLOW_CHOICES = new Set(['accept', 'acceptForSession', 'acceptWithExecpolicyAmendment', 'applyNetworkPolicyAmendment'])
+/** Allow choices that write something lasting or cover more than this one request. */
+const CODEX_LASTING_CHOICES = new Set(['acceptForSession', 'acceptWithExecpolicyAmendment', 'applyNetworkPolicyAmendment'])
+
 /** A project's own Codex sandbox settings, beside .conductor/delivery.json. */
 export const CODEX_SANDBOX_FILE = '.conductor/codex-sandbox.json'
 /** Project folders a sandboxed command writes without asking whenever they exist as real folders:
@@ -1318,8 +1333,18 @@ export class CodexAdapter implements ProviderAdapter {
         // a separate "Always allow".
         const amendment = codexExecpolicyAmendment(request.params.availableDecisions)
         const shown = amendment?.join(' ') ?? ''
-        if (amendment && choices.some(choice => choice.id === 'acceptForSession')) choices.splice(1, 0, { id: 'acceptWithExecpolicyAmendment', label: `Always allow \`${shown}\``, description: 'Codex saves this prefix as a rule and runs matching commands without asking again, in this and later conversations.' })
-        else if (amendment) choices.splice(1, 0, { id: 'acceptForSession', label: 'Allow for this session', description: `Codex saves \`${shown.length > 160 ? shown.slice(0, 159) + '…' : shown}\` as an allow rule and runs it again without asking, in this and later conversations; Conductor also allows commands of the same kind for the rest of this conversation.` })
+        const afterAccept = choices.some(choice => choice.id === 'accept') ? 1 : 0
+        if (amendment && choices.some(choice => choice.id === 'acceptForSession')) choices.splice(afterAccept, 0, { id: 'acceptWithExecpolicyAmendment', label: `Always allow \`${shown}\``, description: 'Codex saves this prefix as a rule and runs matching commands without asking again, in this and later conversations.' })
+        else if (amendment) choices.splice(afterAccept, 0, { id: 'acceptForSession', label: 'Allow for this session', description: `Codex saves \`${shown.length > 160 ? shown.slice(0, 159) + '…' : shown}\` as an allow rule and runs it again without asking, in this and later conversations; Conductor also allows commands of the same kind for the rest of this conversation.` })
+        // Codex's network rule for a host (an object decision the string filter above drops). Where
+        // the card has no session choice yet it is that choice, so a wizard, the phone and
+        // agents.approve with scope "session" can give it (decisionResult answers with the rule).
+        const network = codexNetworkAllowAmendment(request.params.availableDecisions)
+        if (network) {
+          const rule = { label: `Always allow network access to ${network.host}`, description: `Codex saves ${network.host} as an allowed network host and stops asking for it, in this and later conversations.` }
+          const at = choices.findIndex(choice => !CODEX_ALLOW_CHOICES.has(choice.id))
+          choices.splice(at < 0 ? choices.length : at, 0, { id: choices.some(choice => choice.id === 'acceptForSession') ? 'applyNetworkPolicyAmendment' : 'acceptForSession', ...rule })
+        }
       }
     } else if (request.method === 'item/permissions/requestApproval') {
       title = request.params.reason ?? 'Grant requested permissions'
@@ -1329,6 +1354,17 @@ export class CodexAdapter implements ProviderAdapter {
       choices = [{ id: 'accept', label: 'Allow once' }, ...(mcpApproval.persist.includes('session') ? [{ id: 'acceptForSession', label: 'Allow for this session' }] : []), { id: 'decline', label: 'Deny' }]
     }
     const isQuestion = request.method === 'item/tool/requestUserInput'
+    // Owner rule 2026-10-20: never a card whose only buttons are Deny / Cancel turn, or none. A
+    // request Codex offers no way to allow (availableDecisions ['decline', 'cancel'], or []) is
+    // declined here, or cancelled when decline is not on offer, with an informational notice; the
+    // session never waits on it, and no phone push, Needs attention or wizard wake follows.
+    if (!isQuestion && !choices.some(choice => CODEX_ALLOW_CHOICES.has(choice.id))) {
+      const decision = choices.some(choice => choice.id === 'decline') || !choices.some(choice => choice.id === 'cancel') ? 'decline' : 'cancel'
+      const offered = request.method === 'item/commandExecution/requestApproval' && Array.isArray(request.params.availableDecisions)
+        ? request.params.availableDecisions.map(entry => typeof entry === 'string' ? entry : Object.keys(entry)[0] ?? 'unknown').join(', ') : ''
+      this.answerItself(request, id, decision, { message: `Conductor ${decision === 'decline' ? 'declined' : 'cancelled'} “${title}” without asking you: Codex offered no way to allow it (${offered ? `only ${offered}` : 'no decisions at all'}).` })
+      return
+    }
     // What the request reaches. An owner-only boundary is never answered here, never offered for a
     // session, never forms a session class, and its card says it is the owner's (required).
     const check = isQuestion || mcpApproval ? undefined : this.ownerOnlyEscalation(request)
@@ -1373,8 +1409,12 @@ export class CodexAdapter implements ProviderAdapter {
       }
     }
     // An owner-only boundary is one exact action in every mode, and so is an isolated reviewer's or
-    // an Auto request held for the owner: never a session grant or a lasting Codex rule.
-    if (!isQuestion && !mcpApproval && (ownerOnly || this.unattended || this.options.approvalReviewer)) choices = choices.filter(choice => choice.id !== 'acceptForSession' && choice.id !== 'acceptWithExecpolicyAmendment')
+    // an Auto request held for the owner: never a session grant or a lasting Codex rule, unless that
+    // rule is the only way Codex offers to allow it (a card is never Deny-only).
+    if (!isQuestion && !mcpApproval && (ownerOnly || this.unattended || this.options.approvalReviewer)) {
+      const exact = choices.filter(choice => !CODEX_LASTING_CHOICES.has(choice.id))
+      if (exact.some(choice => CODEX_ALLOW_CHOICES.has(choice.id))) choices = exact
+    }
     const interaction: PendingInteraction = {
       id, kind: isQuestion ? 'question' : 'approval', title: isQuestion ? 'Codex needs your input' : title,
       input: json(params), choices: isQuestion ? [] : choices, status: 'pending', ...(ownerOnly ? { required: true } : {}),
@@ -1467,11 +1507,18 @@ export class CodexAdapter implements ProviderAdapter {
   private decisionResult(request: ServerRequest, decision: string): Json {
     if (request.method === 'item/commandExecution/requestApproval') {
       // Where Codex offers no session grant of its own, the session choice is its execpolicy rule.
+      // Failing that, the session choice is its network rule for the host (see the card's choices).
       const offered = request.params.availableDecisions
-      if (decision === 'acceptWithExecpolicyAmendment' || decision === 'acceptForSession' && Array.isArray(offered) && !offered.includes('acceptForSession')) {
-        const amendment = codexExecpolicyAmendment(offered ?? [])
-        if (!amendment) throw new Error('Codex offered no command prefix rule for this request')
-        return { decision: { acceptWithExecpolicyAmendment: { execpolicy_amendment: amendment } } }
+      const sessionRule = decision === 'acceptForSession' && Array.isArray(offered) && !offered.includes('acceptForSession')
+      const execpolicy = codexExecpolicyAmendment(offered ?? [])
+      if (decision === 'acceptWithExecpolicyAmendment' || sessionRule && execpolicy) {
+        if (!execpolicy) throw new Error('Codex offered no command prefix rule for this request')
+        return { decision: { acceptWithExecpolicyAmendment: { execpolicy_amendment: execpolicy } } }
+      }
+      if (decision === 'applyNetworkPolicyAmendment' || sessionRule) {
+        const network = codexNetworkAllowAmendment(offered ?? [])
+        if (!network) throw new Error(sessionRule ? 'Codex offered no command prefix or network rule for this request' : 'Codex offered no network rule for this request')
+        return { decision: { applyNetworkPolicyAmendment: { network_policy_amendment: json(network) } } }
       }
     }
     const granted = decision === 'accept' || decision === 'acceptForSession'

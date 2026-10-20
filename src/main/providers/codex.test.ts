@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { CodexAdapter, CODEX_PROTOCOL_BASELINE, codexChanges, codexReviewTarget, codexDiffCounts, codexInput, codexEvaluationThreadConfig, codexLaunchArguments, validateCodexLiveConfiguration, codexLiveSkillOverrides } from './codex'
-import { JsonLineTransport } from './transport'
+import { JsonLineTransport, type TransportOptions } from './transport'
 import { SteeringUnavailableError, type AdapterOptions } from './adapter'
 import type { AdapterEvent, AgentEvent, Json, SessionSettings } from '../../shared/structured-agent'
 import { replayAgentEvents } from '../../shared/structured-agent-reducer'
@@ -659,5 +659,96 @@ describe('composer slash commands through the App Server (docs/slash-commands.md
     expect(events.some(event => event.data.type === 'session' && event.data.phase === 'disconnected')).toBe(false)
     await adapter.submit('synthetic:steer', settings)
     await expect(adapter.slashCommand('compact', '')).rejects.toThrow(/Wait for the current Codex turn/)
+  })
+})
+
+// Owner rule 2026-10-20: no approval card whose only buttons are Deny / Cancel turn, or none.
+// One in-memory App Server per test: requests are injected, responses read from what was sent.
+function wired(permission: SessionSettings['permission'] = 'default') {
+  const sessionSettings: SessionSettings = { permission, plan: false }
+  const events: AdapterEvent[] = [], sent: Json[] = []
+  let wire!: TransportOptions, connected = false
+  const asJson = (value: unknown): Json => JSON.parse(JSON.stringify(value)) as Json
+  const inject = (message: unknown) => wire.onMessage(asJson(message))
+  const adapter = new CodexAdapter({ executable: 'never-launched', cwd: process.cwd(), runtimeId: 'wired-runtime', settings: sessionSettings, emit: event => events.push(event) }, {
+    version: async () => `codex-cli ${CODEX_PROTOCOL_BASELINE}`,
+    transport: options => {
+      wire = options
+      return {
+        start: () => { connected = true }, close: () => { connected = false }, get connected() { return connected },
+        send: message => {
+          sent.push(asJson(message))
+          const packet = message as { id?: number; method?: string }
+          if (!packet.method) return
+          const result = packet.method === 'initialize' ? { userAgent: 'synthetic-no-allow' }
+            : packet.method === 'thread/start' ? { thread: { id: 'wired-thread', status: { type: 'idle' }, turns: [] }, model: 'synthetic-model', reasoningEffort: 'low', modelProvider: 'openai', approvalPolicy: 'on-request', sandbox: { type: 'workspaceWrite' }, instructionSources: [] }
+              : packet.method === 'model/list' ? { data: [] }
+                : packet.method === 'turn/start' ? { turn: { id: 'wired-turn', status: 'inProgress', items: [] } } : undefined
+          if (result) queueMicrotask(() => inject({ id: packet.id, result }))
+        }
+      }
+    }
+  })
+  cleanup.push(async () => adapter.dispose())
+  const command = (id: number, availableDecisions: unknown[], extra: Record<string, unknown> = {}) => inject({ id, method: 'item/commandExecution/requestApproval', params: {
+    threadId: 'wired-thread', turnId: 'wired-turn', itemId: `item-${id}`, reason: `Synthetic request ${id}`, command: 'npm install left-pad', cwd: process.cwd(), availableDecisions, ...extra
+  } })
+  return {
+    adapter, events, command,
+    start: () => adapter.submit('Synthetic no-allow check', sessionSettings),
+    cards: () => events.flatMap(event => event.data.type === 'interaction' ? [event.data.interaction] : []),
+    notices: () => events.flatMap(event => event.data.type === 'notice' ? [event.data.message] : []),
+    phases: () => events.flatMap(event => event.data.type === 'session' ? [event.data.phase] : []),
+    responses: (id: number) => sent.filter(packet => (packet as { id?: number; method?: string }).id === id && !(packet as { method?: string }).method),
+    answer: (id: number, decision: string) => adapter.respond({ sessionId: 'wired-session', runtimeId: 'wired-runtime', requestId: `number:${id}`, decision })
+  }
+}
+const networkRule = { applyNetworkPolicyAmendment: { network_policy_amendment: { host: 'registry.npmjs.org', action: 'allow' } } }
+const networkContext = { networkApprovalContext: { host: 'registry.npmjs.org', protocol: 'https' } }
+
+describe('Codex approvals never raise a Deny-only card', () => {
+  it.each([
+    ['default', ['decline', 'cancel'], 'decline', 'only decline, cancel'],
+    ['auto', ['decline', 'cancel'], 'decline', 'only decline, cancel'],
+    ['default', [], 'decline', 'no decisions at all'],
+    ['default', ['cancel'], 'cancel', 'only cancel'],
+    ['default', [{ applyNetworkPolicyAmendment: { network_policy_amendment: { host: 'evil.example', action: 'deny' } } }, 'decline'], 'decline', 'only applyNetworkPolicyAmendment, decline']
+  ] as const)('%s with %j is answered %s with an informational notice, no card and no wait', async (permission, decisions, decision, offered) => {
+    const f = wired(permission); await f.start()
+    f.command(801, [...decisions])
+    expect(f.responses(801)).toEqual([{ id: 801, result: { decision } }])
+    expect(f.cards()).toEqual([])
+    expect(f.phases()).not.toContain('waiting_approval')
+    expect(f.notices()).toContainEqual(expect.stringContaining(`Codex offered no way to allow it (${offered})`))
+    // A repeated delivery gets no second answer.
+    f.command(801, [...decisions])
+    expect(f.responses(801)).toHaveLength(1)
+  })
+
+  it('offers a network rule that is the only allow on offer, and answers it with the rule', async () => {
+    const f = wired('default'); await f.start()
+    f.command(811, [networkRule, 'decline', 'cancel'], networkContext)
+    const [card] = f.cards()
+    expect(card?.choices.map(choice => [choice.id, choice.label])).toEqual([['acceptForSession', 'Always allow network access to registry.npmjs.org'], ['decline', 'Deny'], ['cancel', 'Cancel turn']])
+    expect(f.phases().at(-1)).toBe('waiting_approval')
+    await f.answer(811, 'acceptForSession')
+    expect(f.responses(811)).toEqual([{ id: 811, result: { decision: networkRule } }])
+  })
+
+  it('keeps the network rule beside a plain accept as its own choice', async () => {
+    const f = wired('default'); await f.start()
+    f.command(821, ['accept', 'acceptForSession', networkRule, 'decline'], networkContext)
+    expect(f.cards()[0]?.choices.map(choice => choice.id)).toEqual(['accept', 'acceptForSession', 'applyNetworkPolicyAmendment', 'decline'])
+    await f.answer(821, 'applyNetworkPolicyAmendment')
+    expect(f.responses(821)).toEqual([{ id: 821, result: { decision: networkRule } }])
+  })
+
+  it('does not strip a lasting rule in Auto when it is the only allow on offer', async () => {
+    const f = wired('auto'); await f.start()
+    f.command(831, [networkRule, 'decline', 'cancel'], networkContext)
+    expect(f.responses(831)).toEqual([])
+    expect(f.cards()[0]?.choices.map(choice => choice.id)).toEqual(['acceptForSession', 'decline', 'cancel'])
+    await f.answer(831, 'acceptForSession')
+    expect(f.responses(831)).toEqual([{ id: 831, result: { decision: networkRule } }])
   })
 })

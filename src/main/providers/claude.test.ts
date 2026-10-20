@@ -345,7 +345,7 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     ])
   })
   it('links an unrepresentable native grant to one approval interaction without losing the exact native request', async () => {
-    const nativePending = vi.fn(() => ({ id: 'native-grant:exact' } as import('../../shared/permission-grants').PermissionGrantRequest))
+    const nativePending = vi.fn(() => ({ id: 'native-grant:exact', status: 'pending', nativeAvailable: true } as import('../../shared/permission-grants').PermissionGrantRequest))
     const f = fixture({ permissionGrants: { rules: () => [], used: vi.fn(), nativePending } })
     await f.adapter.start()
     f.transport.receive({ type: 'system', subtype: 'init', session_id: 'native-grant-session', permissionMode: 'manual' })
@@ -356,6 +356,24 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     expect(nativePending).toHaveBeenCalledTimes(1)
     await f.adapter.respond({ sessionId: 'session', runtimeId: 'incarnation-A', requestId: 'pending-native', decision: 'allow' })
     expect(f.transport.sent.at(-1)).toMatchObject({ response: { request_id: 'pending-native', response: { behavior: 'allow', toolUseID: 'tool-exact' } } })
+  })
+
+  // conductor-task:refused-request-no-card: a settled grant card must not hide the only Allow.
+  it('keeps the native interaction\'s own buttons when its grant card can no longer answer, and ends the card with the turn', async () => {
+    const executionFinished = vi.fn()
+    const nativePending = vi.fn(() => ({ id: 'native-grant:old', status: 'ineffective', nativeAvailable: false } as import('../../shared/permission-grants').PermissionGrantRequest))
+    const f = fixture({ permissionGrants: { rules: () => [], used: vi.fn(), nativePending, executionFinished } })
+    await f.adapter.start()
+    f.transport.receive({ type: 'system', subtype: 'init', session_id: 'native-grant-session', permissionMode: 'manual' })
+    await f.adapter.submit('Run', settings)
+    f.transport.receive(permission('pending-old', 'tool-old', 'Bash', { command: 'echo old' }))
+    await flush()
+    const interaction = f.projection().items.find(item => item.data.type === 'interaction' && item.data.interaction.id === 'pending-old')?.data
+    expect(interaction).toMatchObject({ interaction: { status: 'pending' } })
+    expect(interaction).not.toHaveProperty('interaction.permissionGrantId')
+    await f.adapter.interrupt()
+    await flush()
+    expect(executionFinished).toHaveBeenCalledWith(expect.objectContaining({ requestId: 'pending-old', tool: 'Bash' }), 'cancelled')
   })
 
   it('does not replay a cached allow after the native request changes arguments', async () => {
@@ -1954,5 +1972,26 @@ describe('the owner\'s auto-approve policy in a Claude runtime', () => {
     expect(beforeTool).toHaveBeenCalledWith('write', ['out/a.txt'])
     expect(order).toEqual(['snapshot'])
     expect(approvalPolicy).toHaveBeenCalledWith(expect.objectContaining({ kind: 'file-write', paths: ['out/a.txt'] }), expect.objectContaining({ requestId: 'hook:write', tool: 'Write' }))
+  })
+
+  // conductor-task:refused-request-no-card: the owner's "Always allow" of one exact call.
+  it('allows an always-allowed call at the PreToolUse hook, even with the policy off, and nothing else', async () => {
+    const standing = vi.fn((tool: string, input: unknown) => tool === 'Bash' && (input as { command?: string }).command === 'bash deploy.sh' ? 'Bash(bash deploy.sh)' : undefined)
+    const f = fixture({ permissionGrants: { rules: () => [], used: vi.fn(), standing } })
+    await f.adapter.start()
+    f.transport.receive(hook('pre-deploy', 'conductor_before', 'deploy', 'Bash', { command: 'bash deploy.sh' }))
+    f.transport.receive(hook('pre-other', 'conductor_before', 'other', 'Bash', { command: 'bash deploy.sh --all' }))
+    await vi.waitFor(() => expect(f.transport.sent.filter(entry => (entry as { type?: string }).type === 'control_response').length).toBeGreaterThanOrEqual(2))
+    const answer = (requestId: string) => (f.transport.sent.find(entry => (entry as { response?: { request_id?: string } }).response?.request_id === requestId) as { response: { response: unknown } }).response.response
+    expect(answer('pre-deploy')).toEqual({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', permissionDecisionReason: 'Conductor\'s auto-approve policy (always allowed by the owner: Bash(bash deploy.sh))' } })
+    expect(answer('pre-other')).toEqual({})
+    // A plan never runs it.
+    standing.mockClear()
+    const planned = fixture({ permissionGrants: { rules: () => [], used: vi.fn(), standing }, settings: { ...settings, plan: true } })
+    await planned.adapter.start()
+    planned.transport.receive(permission('plan', 'p', 'Bash', { command: 'bash deploy.sh' }))
+    await flush()
+    expect(standing).not.toHaveBeenCalled()
+    expect(planned.events.some(event => event.data.type === 'interaction' && event.data.interaction.id === 'plan')).toBe(true)
   })
 })

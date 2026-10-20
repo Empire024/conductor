@@ -16,17 +16,21 @@ function create(settings: SessionSettings = ask, options: { nativeSessionId?: st
   const events: AdapterEvent[] = []
   const sent: Json[] = []
   let closed = true
+  let wire: { onMessage(message: Json): void } | undefined
   const adapter = new GrokAdapter({ executable: 'not-a-real-provider', cwd, runtimeId: 'runtime-1', settings, nativeSessionId: options.nativeSessionId, mcpConfig: options.mcpConfig, approvalReviewer: options.approvalReviewer, environment: { ...process.env, ...options.environment }, emit: event => events.push(event) }, {
     version: async () => `grok ${GROK_BASELINE} (4220f3b224a6)`,
     requestTimeoutMs: 3000,
     transport: transportOptions => {
       closed = false
+      wire = transportOptions
       const transport = new JsonLineTransport({ ...transportOptions, executable: process.execPath, args: [fixture, ...transportOptions.args], onExit: (code, signal) => { closed = true; transportOptions.onExit?.(code, signal) } })
       return { start: () => transport.start(), send: message => { sent.push(message); transport.send(message) }, close: () => transport.close(), get connected() { return transport.connected } }
     }
   })
   cleanup.push(async () => { adapter.dispose(); await waitFor(() => closed); rmSync(cwd, { recursive: true, force: true, maxRetries: 3, retryDelay: 30 }) })
-  return { adapter, events, sent, cwd }
+  /** Delivers a message as if Grok had written it, for requests the scripted fixture never makes. */
+  const inject = (message: Json): void => wire!.onMessage(message)
+  return { adapter, events, sent, cwd, inject }
 }
 async function waitFor(predicate: () => boolean): Promise<void> {
   const until = Date.now() + 4000
@@ -145,6 +149,33 @@ describe('Grok ACP adapter against the scripted fixture (zero inference)', () =>
     const card = pending(events)!
     expect(card.data.type === 'interaction' && card.data.interaction.choices.map(choice => choice.id)).toEqual(['allow-once', 'reject-once', 'cancel'])
     expect(notices(events).some(message => /left .* to you: it reaches the registry/.test(message))).toBe(true)
+  })
+
+  // Owner rule 2026-10-20: no approval card whose only buttons are reject / Cancel turn.
+  const permissionRequest = (sessionId: string, id: number, options: Json[]): Json => ({ jsonrpc: '2.0', id, method: 'session/request_permission', params: { sessionId, toolCall: { title: `Synthetic request ${id}` }, options } })
+  const sessionOf = (events: AdapterEvent[]) => events.flatMap(event => event.data.type === 'session' && event.data.nativeSessionId ? [event.data.nativeSessionId] : [])[0]!
+
+  it('Auto keeps allow_always when it is the only allow Grok offers', async () => {
+    const auto: SessionSettings = { permission: 'auto', plan: false }
+    const { adapter, events, inject } = create(auto)
+    await adapter.start()
+    inject(permissionRequest(sessionOf(events), 9001, [{ optionId: 'allow-always', name: 'Yes, and don\'t ask again', kind: 'allow_always' }, { optionId: 'reject-once', name: 'No', kind: 'reject_once' }]))
+    const card = pending(events)!
+    expect(card.data.type === 'interaction' && card.data.interaction.choices.map(choice => choice.id)).toEqual(['allow-always', 'reject-once', 'cancel'])
+    // Beside an allow_once it is still dropped.
+    inject(permissionRequest(sessionOf(events), 9002, [{ optionId: 'allow-always', name: 'Always', kind: 'allow_always' }, { optionId: 'allow-once', name: 'Yes', kind: 'allow_once' }, { optionId: 'reject-once', name: 'No', kind: 'reject_once' }]))
+    const second = pending(events)!
+    expect(second.data.type === 'interaction' && second.data.interaction.choices.map(choice => choice.id)).toEqual(['allow-once', 'reject-once', 'cancel'])
+  })
+
+  it('declines a request Grok offers no way to allow, with a notice and no card', async () => {
+    const { adapter, events, sent, inject } = create()
+    await adapter.start()
+    inject(permissionRequest(sessionOf(events), 9011, [{ optionId: 'reject-once', name: 'No', kind: 'reject_once' }, { optionId: 'reject-always', name: 'Never', kind: 'reject_always' }]))
+    expect(sent).toContainEqual({ jsonrpc: '2.0', id: 9011, result: { outcome: { outcome: 'selected', optionId: 'reject-once' } } })
+    expect(pending(events)).toBeUndefined()
+    expect(phase(events, 'waiting_approval')).toBe(false)
+    expect(notices(events)).toContainEqual(expect.stringContaining('Grok offered no way to allow it'))
   })
 
   it('Plan declines every escalation and tells Grok to plan only', async () => {
