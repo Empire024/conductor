@@ -69,6 +69,7 @@ import type { CloudRuns } from './cloud/runs'
 import type { RemoteJobService } from './remote-jobs/service'
 import type { LocalMachineReadiness } from '../shared/always-on'
 import { ControlActivityRecorder, type PreparedCall } from './control-activity'
+import { grantCoversInteraction } from '../shared/permission-grants'
 import { callPermissions, PERMISSION_METHOD_SIGNATURES, PERMISSION_METHODS, PERMISSION_OWNER_SIGNATURES } from './permission-grants/control'
 import { callWizardApprovals, classify, pendingOf, toolOf, WIZARD_APPROVAL_METHODS, WIZARD_APPROVAL_SIGNATURES, type AnswerableConversation, type WizardApprovalScope } from './wizard-approvals'
 import { ApprovalWakes, approvalDecisions, awaitWakeText, cardKey, controllerWakeText, grantDecisions, offersAllow, type PendingCard } from './approval-wakes'
@@ -1653,8 +1654,9 @@ export class AgentControl {
       let pending = 0
       if (state && spec) for (const { item, interaction } of pendingOf(state)) {
         pending++
-        // A native request with a permission card is answered there (permissions.decide).
-        if (interaction.permissionGrantId) continue
+        // A native request with a permission card is answered there (permissions.decide), while
+        // that card still asks; one that settled while the provider waits is answered here.
+        if (interaction.permissionGrantId && grantCoversInteraction((this.deps.permissionGrants?.state().requests ?? []).find(request => request.agentSessionId === id && request.id === interaction.permissionGrantId), interaction.status)) continue
         // A card whose runtime offers no allow (Deny only, or no choice) is not offered as something to answer.
         const decisions = approvalDecisions(interaction)
         if (!offersAllow(decisions)) continue

@@ -35,17 +35,21 @@ export interface GrantStore {
 }
 
 export const permissionGrantsIpcChannels = ['permission-grants:state', 'permission-grants:decide', 'permission-grants:revoke', 'permission-grants:revoke-standing', 'permission-grants:interrupt'] as const
-/** Verify the provider still has the exact native request and tool arguments the owner saw. */
+/** Verify the provider still has the exact native request the owner saw. The request's own input
+ *  is what the CLI runs (it is sent back as updatedInput); the tool item only has to be the same
+ *  call, because the CLI normalizes a command for its permission check (claude 2.1.301 drops a
+ *  leading `cd <cwd> &&`), so the streamed tool input can differ (videos 2026-10-21: every such
+ *  approval was refused as stale while the CLI kept waiting). */
 export function nativeResponseTarget(state: Pick<SessionProjection, 'items' | 'runtimeId' | 'nativeSessionId'> | null | undefined, call: GrantCallIdentity): boolean {
   if (!state || state.runtimeId !== call.runtimeId || state.nativeSessionId !== call.nativeSessionId || !call.requestId) return false
   const pending = state.items.filter(item => item.runtimeId === call.runtimeId && item.data.type === 'interaction' &&
     item.data.interaction.id === call.requestId).at(-1)
   const tool = state.items.filter(item => item.runtimeId === call.runtimeId && item.nativeItemId === call.toolUseId && item.data.type === 'tool').at(-1)
   if (!pending || pending.data.type !== 'interaction' || pending.data.interaction.status !== 'pending' ||
-      !tool || tool.data.type !== 'tool' || tool.data.name !== call.tool || !tool.data.input) return false
+      !tool || tool.data.type !== 'tool' || tool.data.name !== call.tool) return false
   const digest = (input: Json): string => grantCallIdentity({ runtimeId: call.runtimeId, nativeSessionId: call.nativeSessionId,
     toolUseId: call.toolUseId, tool: call.tool, input, requestId: call.requestId }).argsDigest
-  return digest(pending.data.interaction.input) === call.argsDigest && digest(tool.data.input) === call.argsDigest
+  return digest(pending.data.interaction.input) === call.argsDigest
 }
 /** Phases in which a message can only follow the turn (StructuredSessions.queue) or be steered into it. */
 const TURN_UNDER_WAY = new Set(['starting', 'running', 'waiting_input', 'waiting_approval'])

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { denialAsksOwner } from './auto-mode-denial'
-import { alwaysAllowable, callMatchesRule, changesDirectoryBeforeInput, commandHost, describeGrantRequest, escapeRuleContent, grantAsksOwner, grantStatusOf, nativeGrantRules, permissionGrantOf, posixPath, standingRuleProblem } from './permission-grants'
+import { alwaysAllowable, callMatchesRule, changesDirectoryBeforeInput, commandHost, describeGrantRequest, escapeRuleContent, grantAsksOwner, grantCoversInteraction, grantStatusOf, nativeGrantRules, permissionGrantOf, posixPath, standingRuleProblem } from './permission-grants'
 
 const cwd = 'C:\\Users\\owner\\site\\theme'
 
@@ -107,6 +107,14 @@ describe('the native rules one grant installs (permission-approval-delivery-clas
 
 // conductor-task:refused-request-no-card
 describe('what asks the owner, and what Always allow may cover', () => {
+  it('lets a permission card stand in for its native request only while it still asks', () => {
+    expect(grantCoversInteraction({ status: 'pending', source: 'native', nativeAvailable: true }, 'pending')).toBe(true)
+    expect(grantCoversInteraction({ status: 'approved-once', source: 'native', nativeAvailable: true }, 'pending')).toBe(false)
+    expect(grantCoversInteraction({ status: 'pending', source: 'native', nativeAvailable: false }, 'pending')).toBe(false)
+    expect(grantCoversInteraction({ status: 'approved-once', source: 'native' }, 'resolved')).toBe(true)
+    expect(grantCoversInteraction(undefined, 'pending')).toBe(true)
+  })
+
   it('asks only with an allow to offer', () => {
     expect(grantAsksOwner({ status: 'pending', rule: 'Bash(npm test)', source: 'agent' })).toBe(true)
     expect(grantAsksOwner({ status: 'pending', source: 'agent' })).toBe(false)

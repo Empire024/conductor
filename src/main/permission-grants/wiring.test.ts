@@ -25,8 +25,20 @@ describe('one native response is bound to the live tool and arguments', () => {
     expect(check({ ...state, runtimeId: 'restarted' })).toBe(false)
     expect(check({ ...state, nativeSessionId: 'another' })).toBe(false)
     expect(check({ ...state, items: [tool, { ...pending, data: { ...pending.data, interaction: { ...pending.data.interaction, status: 'resolved' } } }] })).toBe(false)
-    expect(check({ ...state, items: [{ ...tool, data: { ...tool.data, input: { command: 'cd app && cat < other.txt' } } }, pending] })).toBe(false)
+    expect(check({ ...state, items: [tool, { ...pending, data: { ...pending.data, interaction: { ...pending.data.interaction, input: { command: 'cd app && cat < other.txt' } } } }] })).toBe(false)
+    expect(check({ ...state, items: [{ ...tool, data: { ...tool.data, name: 'PowerShell' } }, pending] })).toBe(false)
     expect(nativeResponseTarget(state as never, { ...call, toolUseId: 'another' })).toBe(false)
+  })
+})
+
+// videos 2026-10-21: a wizard's Allow came back "no longer pending" while the CLI kept waiting.
+describe('the CLI normalizes the command it asks about', () => {
+  it('answers the request the CLI asked about even when the streamed tool input still carries the leading cd', () => {
+    const asked = { command: 'ls render/fx | head -3; rm -f $D/*.matte.png', description: 'stage frames' }
+    const call = grantCallIdentity({ runtimeId: 'runtime', nativeSessionId: 'native', requestId: 'request', toolUseId: 'tool', tool: 'Bash', input: asked })
+    const tool = { runtimeId: 'runtime', nativeItemId: 'tool', data: { type: 'tool', name: 'Bash', input: { ...asked, command: 'cd /c/Users/o/videos && ' + asked.command }, status: 'awaiting_approval' } }
+    const pending = { runtimeId: 'runtime', data: { type: 'interaction', interaction: { id: 'request', status: 'pending', input: asked } } }
+    expect(nativeResponseTarget({ runtimeId: 'runtime', nativeSessionId: 'native', items: [tool, pending] } as never, call)).toBe(true)
   })
 })
 

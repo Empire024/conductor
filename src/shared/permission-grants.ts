@@ -189,6 +189,14 @@ export interface GrantRule { rule: string; once: boolean }
 export const grantAsksOwner = (request: { status: string; rule?: string; source?: string; nativeAvailable?: boolean }): boolean =>
   request.status === 'pending' && (request.source === 'native' ? request.nativeAvailable === true : Boolean(request.rule))
 
+/** Whether a native interaction is answered through its permission card (permissionGrantId), so
+ *  its own buttons are hidden and it is not offered elsewhere: only while that card still asks the
+ *  owner. A card that settled (answered, cancelled, expired) while the provider still waits gives
+ *  the interaction back its own buttons (videos 2026-10-21: "Request cancelled" over a CLI still
+ *  waiting for approval). Unknown grant: covered, as before. */
+export const grantCoversInteraction = (grant: { status: string; rule?: string; source?: string; nativeAvailable?: boolean } | undefined, interactionStatus: string): boolean =>
+  interactionStatus !== 'pending' || !grant || grantAsksOwner(grant)
+
 /** Production and external actions reach the owner's phone even while the turn goes on. */
 export const grantNeedsPhone = (request: Pick<PermissionGrantRequest, 'class'>): boolean => request.class === 'external' || request.class === 'shared' || request.class === 'destructive'
 
