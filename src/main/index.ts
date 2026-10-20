@@ -2866,6 +2866,7 @@ app.whenReady().then(async () => {
     openBrowserTab: async scope => { await control.call(scope, 'tabs.open', { kind: 'browser', title: 'Browser' }) },
     rendererPath: join(__dirname, '../renderer/index.html'),
     createDetachedWindow: createDetachedBrowserWindow,
+    projectRoot: projectId => { const project = database.getProject(projectId); return project && !project.remote ? project.path : undefined },
     publishState: state => { for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('browser:state', state) }
   })
   browserMcp = new BrowserMcpServer(browserViews)

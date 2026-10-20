@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AdapterEvent, AgentEvent, Json, SessionSettings } from '../../shared/structured-agent'
 import { replayAgentEvents } from '../../shared/structured-agent-reducer'
 import { autoModeDenialOf } from '../../shared/auto-mode-denial'
-import { ClaudeAdapter, CLAUDE_COMPATIBILITY, claudeCompatibility, claudeHookHealth, HOOK_FREE_READ_TOOLS, PRE_TOOL_USE_MATCHER, resetClaudeHookHealth } from './claude'
+import { BROWSER_MCP_ALLOWED_TOOLS, ClaudeAdapter, CLAUDE_COMPATIBILITY, claudeCompatibility, claudeHookHealth, HOOK_FREE_READ_TOOLS, PRE_TOOL_USE_MATCHER, resetClaudeHookHealth } from './claude'
 import { JsonLineDecoder, JsonLineTransport, type TransportOptions } from './transport'
 import { SteeringUnavailableError, type AdapterOptions } from './adapter'
 import type { PolicyRequest } from '../approval-policy'
@@ -1742,6 +1742,18 @@ describe('owner permission grants (src/main/permission-grants)', () => {
       const isolated = fixture({ ...options, conductorMcpConfig: 'conductor.json' }); await isolated.adapter.start()
       expect(isolated.transport.options.args).not.toContain('--settings')
     }
+  })
+
+  it('allows every project-browser tool by exact name when the tab has the browser server', async () => {
+    const settingsOf = (args: string[]) => JSON.parse(readFileSync(args[args.indexOf('--settings') + 1]!, 'utf8'))
+    const browser = ['present', 'navigate', 'snapshot', 'screenshot', 'video_frames', 'download', 'console', 'click', 'type', 'evaluate'].map(tool => `mcp__conductor-browser__browser_${tool}`)
+    expect([...BROWSER_MCP_ALLOWED_TOOLS]).toEqual(browser)
+    const f = fixture({ mcpConfig: 'browser.json', conductorMcpConfig: 'conductor.json' }); await f.adapter.start()
+    expect(settingsOf(f.transport.options.args)).toEqual({ permissions: { allow: ['mcp__conductor__request_permission', 'mcp__conductor__list_permissions', ...browser] } })
+    const none = fixture(); await none.adapter.start()
+    expect(none.transport.options.args).not.toContain('--settings')
+    const reviewer = fixture({ mcpConfig: 'browser.json', approvalReviewer: true }); await reviewer.adapter.start()
+    expect(reviewer.transport.options.args).not.toContain('--settings')
   })
 
   it('reports a CLI that cannot take flag settings while it runs as unsupported', async () => {

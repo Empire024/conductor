@@ -4,7 +4,7 @@ import { request as httpRequest } from 'node:http'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { BrowserMcpServer } from './browser-mcp'
 import { BrowserViews } from './browser-views'
-import { browserUrl, BROWSER_TOOLS, type BrowserMcpHost, type BrowserMcpScope, type BrowserView } from '../shared/browser-mcp'
+import { browserUrl, BROWSER_MCP_INSTRUCTIONS, BROWSER_TOOLS, VIDEO_FRAMES, type BrowserMcpHost, type BrowserMcpScope, type BrowserView, type DownloadRequest, type VideoFramesRequest } from '../shared/browser-mcp'
 import type { AgentSpec } from '../shared/models'
 
 // browser-views.ts reaches for BrowserWindow and webContents at import time; the attach-side tests
@@ -13,7 +13,7 @@ vi.mock('electron', () => ({ BrowserWindow: { getAllWindows: () => [] }, webCont
 
 const spec = (over: Partial<AgentSpec> = {}): AgentSpec => ({ id: 'agent-1', projectId: 'project-1', sessionId: 'workspace-1', provider: 'claude', title: 'Claude', cwd: 'C:/tmp', ...over })
 
-interface Calls { scopes: BrowserMcpScope[]; navigated: string[] }
+interface Calls { scopes: BrowserMcpScope[]; navigated: string[]; frames?: VideoFramesRequest[]; downloads?: DownloadRequest[] }
 function fakeHost(calls: Calls, fail?: string): BrowserMcpHost {
   const view: BrowserView = {
     tabId: 'tab-browser-1',
@@ -24,7 +24,9 @@ function fakeHost(calls: Calls, fail?: string): BrowserMcpHost {
     evaluate: async () => ({ ok: true }),
     click: async selector => ({ clicked: true, selector }),
     type: async ({ selector }) => ({ typed: true, selector }),
-    present: async () => {}
+    present: async () => {},
+    videoFrames: async request => { (calls.frames ??= []).push(request); return { directory: 'C:/p/.conductor/browser-captures/s', frames: [{ path: 'C:/p/.conductor/browser-captures/s/frame-0001.png', time: 0 }, { path: 'C:/p/.conductor/browser-captures/s/frame-0002.png', time: 1 }], width: 320, height: 180, mode: 'seek', bytes: 10, audio: { unavailable: 'the video has no audio track' } } },
+    download: async request => { (calls.downloads ??= []).push(request); return { path: 'C:/p/refs/clip.mp4', relativePath: 'refs/clip.mp4', bytes: 2048, contentType: 'video/mp4', url: request.url ?? 'https://cdn.example/clip.mp4', finalUrl: request.url ?? 'https://cdn.example/clip.mp4' } }
   }
   return { view: async scope => { calls.scopes.push(scope); if (fail) throw new Error(fail); return view } }
 }
@@ -91,7 +93,7 @@ describe('browser MCP bridge', () => {
     expect((await post(endpoint, token, { jsonrpc: '2.0', method: 'notifications/initialized' })).status).toBe(202)
     const tools = await post(endpoint, token, { jsonrpc: '2.0', id: 2, method: 'tools/list' })
     expect(tools.body.result.tools.map((tool: { name: string }) => tool.name)).toEqual([
-      'browser_present', 'browser_navigate', 'browser_snapshot', 'browser_screenshot', 'browser_console', 'browser_click', 'browser_type', 'browser_evaluate'
+      'browser_present', 'browser_navigate', 'browser_snapshot', 'browser_screenshot', 'browser_video_frames', 'browser_download', 'browser_console', 'browser_click', 'browser_type', 'browser_evaluate'
     ])
     expect(tools.body.result.tools.every((tool: { inputSchema: { type: string } }) => tool.inputSchema.type === 'object')).toBe(true)
   })
@@ -114,6 +116,53 @@ describe('browser MCP bridge', () => {
     expect(shot.body.result.content[1]).toEqual({ type: 'image', data: 'AAAA', mimeType: 'image/png' })
     const logs = await post(endpoint, token, { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'browser_console', arguments: { limit: 10 } } })
     expect(logs.body.result.content[0].text).toContain('[error] boom (app.js:12)')
+  })
+
+  it('never returns an empty screenshot: a 0x0 capture is an error that says what to do', async () => {
+    const host: BrowserMcpHost = { view: async () => ({ ...await fakeHost(calls).view({ projectId: 'p', sessionId: 's', agentSessionId: 'a' }), screenshot: async () => ({ data: '', mimeType: 'image/png', width: 0, height: 0 }) }) }
+    const empty = new BrowserMcpServer(host, false)
+    await empty.start()
+    try {
+      const configuration = empty.configure(spec())
+      const shot = await post(endpointOf(configuration), tokenOf(configuration), { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'browser_screenshot', arguments: {} } })
+      expect(shot.body.result.isError).toBe(true)
+      expect(shot.body.result.content).toHaveLength(1)
+      expect(shot.body.result.content[0].text).toMatch(/empty 0×0 image.*browser_snapshot.*browser_present\(\{mode:"detached"\}\)/s)
+    } finally { empty.close() }
+  })
+
+  it('tells agents to use browser_download and browser_video_frames for reference media', async () => {
+    const configuration = server.configure(spec())
+    const init = await post(endpointOf(configuration), tokenOf(configuration), { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })
+    expect(init.body.result.instructions).toBe(BROWSER_MCP_INSTRUCTIONS)
+    expect(BROWSER_MCP_INSTRUCTIONS).toMatch(/browser_download and browser_video_frames instead of curl/)
+    expect(BROWSER_MCP_INSTRUCTIONS).toMatch(/analysis only/)
+  })
+
+  it('checks and caps video frame and download arguments before touching the page', async () => {
+    const configuration = server.configure(spec())
+    const endpoint = endpointOf(configuration), token = tokenOf(configuration)
+    const call = (name: string, args: Record<string, unknown>) => post(endpoint, token, { jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name, arguments: args } })
+    const frames = await call('browser_video_frames', { maxFrames: 100_000, start: 2, end: 5, fps: 2 })
+    expect(frames.body.result.isError).toBeUndefined()
+    expect(calls.frames).toEqual([{ selector: undefined, start: 2, end: 5, fps: 2, maxFrames: VIDEO_FRAMES.maxFrames, scale: 1, format: 'png', mode: 'auto', audio: false }])
+    expect(frames.body.result.content[0].text).toContain('frame-0001.png')
+    expect(frames.body.result.content[0].text).toContain('Audio not recorded: the video has no audio track')
+    for (const [args, reason] of [[{ fps: 31 }, /fps must be a number from 0.01 to 30/], [{ start: 5, end: 2 }, /end must be later than start/], [{ scale: 2 }, /scale must be/], [{ mode: 'record' }, /mode must be one of/], [{ audio: 'yes' }, /audio must be true or false/]] as const) {
+      const refused = await call('browser_video_frames', args)
+      expect(refused.body.result.isError).toBe(true)
+      expect(refused.body.result.content[0].text).toMatch(reason)
+    }
+    expect(calls.frames).toHaveLength(1)
+    const saved = await call('browser_download', { url: 'https://cdn.example/clip.mp4', maxMB: 1 })
+    expect(saved.body.result.content[0].text).toBe('Saved 2048 bytes (video/mp4) from https://cdn.example/clip.mp4 to C:/p/refs/clip.mp4')
+    expect(calls.downloads).toEqual([{ url: 'https://cdn.example/clip.mp4', fromVideo: false, selector: undefined, path: undefined, maxBytes: 1024 * 1024 }])
+    for (const [args, reason] of [[{ url: 'file:///C:/Windows/win.ini' }, /Only http/], [{ url: 'https://a.example/x', fromVideo: true }, /either url or fromVideo/], [{ fromVideo: false }, /Provide url/], [{ url: 'https://a.example/x', maxMB: 4096 }, /maxMB must be/], [{ url: 'https://a.example/x', selector: 'video' }, /selector picks the <video>/]] as const) {
+      const refused = await call('browser_download', args)
+      expect(refused.body.result.isError).toBe(true)
+      expect(refused.body.result.content[0].text).toMatch(reason)
+    }
+    expect(calls.downloads).toHaveLength(1)
   })
 
   it('reports a tool failure as a readable result rather than a protocol error', async () => {

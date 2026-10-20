@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentSpec } from '../shared/models'
-import { BROWSER_MCP_SERVER_NAME, BROWSER_TOOLS, type BrowserMcpHost, type BrowserMcpScope, type BrowserToolResult } from '../shared/browser-mcp'
+import { BROWSER_MCP_INSTRUCTIONS, BROWSER_MCP_SERVER_NAME, BROWSER_TOOLS, type BrowserMcpHost, type BrowserMcpScope, type BrowserToolResult } from '../shared/browser-mcp'
 
 /** MCP revisions Claude Code 2.1.x negotiates with this bridge. An unknown revision is answered
  *  with the newest one we speak, which is what the specification asks an older server to do. */
@@ -178,7 +178,7 @@ export class BrowserMcpServer {
           protocolVersion: PROTOCOL_VERSIONS.includes(requested) ? requested : PROTOCOL_VERSIONS[0],
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: BROWSER_MCP_SERVER_NAME, title: 'Conductor browser', version: '1' },
-          instructions: 'These tools drive this project\'s isolated Conductor browser. It may be visible, detached, or running in the background; use browser_present when presentation matters.'
+          instructions: BROWSER_MCP_INSTRUCTIONS
         } }
       }
       if (message.method === 'ping') return { ...envelope, result: {} }

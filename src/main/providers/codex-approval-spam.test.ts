@@ -355,7 +355,7 @@ describe('the owner\'s auto-approve policy answers a Codex request before any ca
     expect(auto.notices().at(-1)?.message).toMatch(/^Auto allowed .* without asking\.$/)
     const edit = fixture('accept-edits', { approvalPolicy }); await edit.start()
     edit.inject({ id: 833, method: 'item/permissions/requestApproval', params: { threadId, turnId, itemId: 'item-833', reason: 'Synthetic permission', permissions: { network: { enabled: true } } } })
-    edit.inject({ id: 834, method: 'mcpServer/elicitation/request', params: { threadId, turnId, serverName: 'conductor-browser', mode: 'form', message: 'Allow the conductor-browser MCP server to run tool "browser_snapshot"?', requestedSchema: { type: 'object', properties: {} }, _meta: { codex_approval_kind: 'mcp_tool_call', persist: ['session'] } } })
+    edit.inject({ id: 834, method: 'mcpServer/elicitation/request', params: { threadId, turnId, serverName: 'chrome-devtools', mode: 'form', message: 'Allow the chrome-devtools MCP server to run tool "navigate_page"?', requestedSchema: { type: 'object', properties: {} }, _meta: { codex_approval_kind: 'mcp_tool_call', persist: ['session'] } } })
     expect(approvalPolicy).not.toHaveBeenCalled()
     expect(reviewer.pending().map(interaction => interaction.id)).toEqual(['number:831'])
     expect(edit.pending().map(interaction => interaction.id)).toEqual(['number:833', 'number:834'])

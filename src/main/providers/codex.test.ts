@@ -214,23 +214,41 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
 
   it('surfaces an MCP tool approval as a real card in Edit and answers it itself in Auto', async () => {
     const edit = create({}, undefined, 3000, { ...settings, permission: 'accept-edits' })
-    await edit.adapter.submit('synthetic:mcp-approval', { ...settings, permission: 'accept-edits' })
+    await edit.adapter.submit('synthetic:mcp-approval:chrome-devtools:navigate_page', { ...settings, permission: 'accept-edits' })
     await waitFor(() => Boolean(pendingId(edit.events)))
     const card = edit.events.filter(event => event.data.type === 'interaction').at(-1)!.data as Extract<AdapterEvent['data'], { type: 'interaction' }>
-    expect(card.interaction.title).toBe('Allow the conductor-browser MCP server to run tool "browser_snapshot"?')
+    expect(card.interaction.title).toBe('Allow the chrome-devtools MCP server to run tool "navigate_page"?')
     expect(card.interaction.choices.map(choice => choice.id)).toEqual(['accept', 'acceptForSession', 'decline'])
     await edit.adapter.respond({ sessionId: 's', runtimeId: 'runtime-1', requestId: pendingId(edit.events)!, decision: 'acceptForSession' })
     await waitFor(() => completed(edit.events))
     expect(edit.sent.find(message => (message as { id?: unknown }).id === 502)).toEqual({ id: 502, result: { action: 'accept', content: {}, _meta: { persist: 'session' } } })
-    expect(edit.events.some(event => event.data.type === 'tool' && event.data.name === 'conductor-browser/browser_snapshot' && event.data.status === 'completed')).toBe(true)
+    expect(edit.events.some(event => event.data.type === 'tool' && event.data.name === 'chrome-devtools/navigate_page' && event.data.status === 'completed')).toBe(true)
 
     const auto = create({}, undefined, 3000, { ...settings, permission: 'auto' })
-    await auto.adapter.submit('synthetic:mcp-approval', { ...settings, permission: 'auto' })
+    await auto.adapter.submit('synthetic:mcp-approval:chrome-devtools:navigate_page', { ...settings, permission: 'auto' })
     await waitFor(() => completed(auto.events))
     expect(auto.events.some(event => event.data.type === 'interaction')).toBe(false)
     expect(auto.sent.find(message => (message as { id?: unknown }).id === 502)).toEqual({ id: 502, result: { action: 'accept', content: {}, _meta: { persist: 'session' } } })
-    expect(auto.events.some(event => event.data.type === 'notice' && event.data.message === 'Auto allowed conductor-browser/browser_snapshot without asking.')).toBe(true)
-    expect(auto.events.some(event => event.data.type === 'tool' && event.data.name === 'conductor-browser/browser_snapshot' && event.data.status === 'completed')).toBe(true)
+    expect(auto.events.some(event => event.data.type === 'notice' && event.data.message === 'Auto allowed chrome-devtools/navigate_page without asking.')).toBe(true)
+    expect(auto.events.some(event => event.data.type === 'tool' && event.data.name === 'chrome-devtools/navigate_page' && event.data.status === 'completed')).toBe(true)
+  })
+
+  it('runs the project-browser tools without a card in every mode, but Read only keeps the cards of the ones that write files', async () => {
+    for (const permission of ['accept-edits', 'auto', 'read-only', 'default'] as const) {
+      for (const tool of ['browser_snapshot', 'browser_navigate', 'browser_download', 'browser_video_frames']) {
+        const run = create({}, undefined, 3000, { ...settings, permission })
+        await run.adapter.submit(`synthetic:mcp-approval:conductor-browser:${tool}`, { ...settings, permission })
+        if (permission === 'read-only' && (tool === 'browser_download' || tool === 'browser_video_frames')) {
+          await waitFor(() => Boolean(pendingId(run.events)))
+          expect(run.events.filter(event => event.data.type === 'interaction').at(-1)!.data).toMatchObject({ interaction: { title: `Allow the conductor-browser MCP server to run tool "${tool}"?` } })
+          continue
+        }
+        await waitFor(() => completed(run.events))
+        expect(run.events.some(event => event.data.type === 'interaction'), `${permission} ${tool}`).toBe(false)
+        expect(run.sent.find(message => (message as { id?: unknown }).id === 502)).toEqual({ id: 502, result: { action: 'accept', content: {}, _meta: { persist: 'session' } } })
+        expect(run.events.some(event => event.data.type === 'notice' && event.data.message === `Conductor allowed conductor-browser/${tool} without asking: project-browser tools run without approval.`)).toBe(true)
+      }
+    }
   })
 
   it('answers a native sandbox escalation itself in Auto, and still asks questions', async () => {

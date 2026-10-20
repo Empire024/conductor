@@ -128,6 +128,9 @@ export const HOOK_FREE_READ_TOOLS: readonly string[] = [
   ...LOCAL_ASSIST_TOOLS.filter(tool => tool.annotations?.readOnlyHint).map(tool => `mcp__${LOCAL_ASSIST_MCP_SERVER_NAME}__${tool.name}`),
   ...BROWSER_TOOLS.filter(tool => tool.annotations?.readOnlyHint).map(tool => `mcp__${BROWSER_MCP_SERVER_NAME}__${tool.name}`)
 ]
+/** Allow rules for every conductor-browser tool, by exact name (a server-wide rule is broader than
+ *  the tools Conductor ships). */
+export const BROWSER_MCP_ALLOWED_TOOLS: readonly string[] = BROWSER_TOOLS.map(tool => `mcp__${BROWSER_MCP_SERVER_NAME}__${tool.name}`)
 /** Claude Code tests a hook matcher that is not a plain `A|B` list as a JavaScript RegExp against
  *  the tool name (and its legacy aliases, none of which name a read): every tool but those. */
 export const PRE_TOOL_USE_MATCHER = `^(?!(?:${HOOK_FREE_READ_TOOLS.map(name => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})$)`
@@ -706,11 +709,13 @@ export class ClaudeAdapter implements ProviderAdapter {
   }
 
   /** The flag-settings allow list: exact rules for Conductor's request tools when this tab has the
-   *  conductor server (filing a request is never the classifier's to refuse), then the owner's
-   *  current grants. A reviewer or evaluation turn gets neither. */
+   *  conductor server (filing a request is never the classifier's to refuse), exact rules for every
+   *  project-browser tool when this tab has the browser server (they act only on the project's own
+   *  isolated browser and write only new files inside the project, so the owner asked for them to
+   *  run without cards), then the owner's current grants. A reviewer or evaluation turn gets none. */
   private flagAllowRules(): string[] {
     if (this.options.approvalReviewer || this.options.profile === 'evaluation') return []
-    return [...this.options.conductorMcpConfig ? CONDUCTOR_MCP_ALLOWED_TOOLS : [], ...(this.options.permissionGrants?.rules() ?? []).flatMap(entry => nativeGrantRules(entry.rule))]
+    return [...this.options.conductorMcpConfig ? CONDUCTOR_MCP_ALLOWED_TOOLS : [], ...this.options.mcpConfig ? BROWSER_MCP_ALLOWED_TOOLS : [], ...(this.options.permissionGrants?.rules() ?? []).flatMap(entry => nativeGrantRules(entry.rule))]
   }
 
   /** Hands the running CLI the owner's current grants (permissionGrants.rules()) in its flag

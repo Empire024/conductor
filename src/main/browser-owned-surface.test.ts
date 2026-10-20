@@ -27,14 +27,20 @@ const electronFake = vi.hoisted(() => {
     openDevTools(): void {}
     enableDeviceEmulation(parameters: { viewSize: { width: number; height: number }; scale: number }): void { this.emulation = parameters }
     async executeJavaScript(): Promise<string> { return 'null' }
-    capturePage(): never { throw new Error('not used') }
+    async capturePage(): Promise<unknown> {
+      const size = capture(this)
+      const image = (current: { width: number; height: number }): unknown => ({ isEmpty: () => !current.width, getSize: () => current, resize: ({ width }: { width: number }) => image({ width, height: Math.round(current.height * width / current.width) }), toPNG: () => Buffer.from(current.width ? 'png' : '') })
+      return image(size)
+    }
     close(): void { this.destroyed = true; this.emit('destroyed') }
   }
+  let capture = (_contents: FakeContents): { width: number; height: number } => ({ width: 0, height: 0 })
   const created: FakeView[] = []
   class FakeView {
     webContents = new FakeContents(); bounds = { x: 0, y: 0, width: 0, height: 0 }; visible = false
     constructor(readonly options: { webPreferences: { partition: string } }) { created.push(this) }
     setBounds(bounds: typeof this.bounds): void { this.bounds = bounds }
+    getBounds(): typeof this.bounds { return this.bounds }
     setVisible(visible: boolean): void { this.visible = visible }
   }
   class FakeWindow extends Emitter {
@@ -43,12 +49,15 @@ const electronFake = vi.hoisted(() => {
     contentView = { addChildView: (view: FakeView): void => { if (!this.children.includes(view)) this.children.push(view) }, removeChildView: (view: FakeView): void => { this.children = this.children.filter(item => item !== view) } }
     isDestroyed(): boolean { return this.destroyed }
     isVisible(): boolean { return this.visible }
+    isMinimized(): boolean { return false }
+    setContentSize(width: number, height: number): void { this.contentSize = { width, height } }
+    contentSize?: { width: number; height: number }
     showInactive(): void { this.visible = true }
     getContentBounds(): { x: number; y: number; width: number; height: number } { return { x: 0, y: 0, width: 900, height: 700 } }
     close(): void { this.destroyed = true; this.emit('closed') }
   }
   const windows: FakeWindow[] = []
-  return { created, windows, FakeWindow, FakeView, reset: (): void => { created.splice(0); windows.splice(0); nextContentsId = 20 } }
+  return { created, windows, FakeWindow, FakeView, setCapture: (fn: typeof capture): void => { capture = fn }, reset: (): void => { created.splice(0); windows.splice(0); nextContentsId = 20; capture = () => ({ width: 0, height: 0 }) } }
 })
 
 vi.mock('electron', () => ({
@@ -127,6 +136,65 @@ describe('main-owned project browser surfaces', () => {
     expect(second.webContentsId).toBe(first.webContentsId)
     expect(created).toHaveLength(1)
     expect(created[0]?.webContents.popup?.({ url: 'https://evil.test' })).toEqual({ action: 'deny' })
+  })
+
+  it('captures a background browser through its off-screen parking host and puts it back', async () => {
+    const manager = new BrowserViews({ tabs: () => [], openBrowserTab: async () => {}, rendererPath: 'C:/out/index.html' })
+    const owner = new FakeWindow(); owner.visible = true
+    await manager.mount(owner as never, { projectId: 'project-a', surfaceId: 'surface-a', initialUrl: 'https://example.test', bounds: { x: 0, y: 0, width: 800, height: 600 }, visible: true })
+    manager.present('project-a', 'background')
+    const guest = created[0]!
+    expect(owner.children).toEqual([guest])
+    expect(guest.visible).toBe(false)
+    // Like Chromium: a guest hidden in a shown window has no surface and captures as 0x0; shown in
+    // the hidden, off-desktop parking host it captures at its laid-out size.
+    const hosts: Array<Record<string, unknown>> = []
+    electronFake.setCapture(() => {
+      const host = windows.find(window => !window.destroyed && window.children.includes(guest))
+      hosts.push(host?.options ?? {})
+      return host?.options.show === false && guest.visible ? { width: guest.bounds.width, height: guest.bounds.height } : { width: 0, height: 0 }
+    })
+    const shot = await (await manager.view({ projectId: 'project-a', sessionId: 'workspace-a', agentSessionId: 'agent-a' })).screenshot()
+    expect(shot).toMatchObject({ width: 800, height: 600, mimeType: 'image/png' })
+    expect(shot.data).not.toBe('')
+    expect(hosts).toEqual([expect.objectContaining({ show: false, focusable: false, skipTaskbar: true, x: -32_000, y: -32_000 })])
+    expect(windows.find(window => window.options.show === false)?.contentSize).toEqual({ width: 800, height: 600 })
+    // Back where its presentation keeps it, still hidden, and the borrowed host is gone.
+    expect(owner.children).toEqual([guest])
+    expect(guest.visible).toBe(false)
+    expect(windows.filter(window => window !== owner).every(window => window.destroyed)).toBe(true)
+    expect(owner.visible).toBe(true)
+  })
+
+  it('captures an emulated Desktop viewport at its own size and scale 1, then restores the pane scale', async () => {
+    const manager = new BrowserViews({ tabs: () => [], openBrowserTab: async () => {}, rendererPath: 'C:/out/index.html' })
+    const owner = new FakeWindow(); owner.visible = true
+    await manager.mount(owner as never, { projectId: 'project-a', surfaceId: 'surface-a', initialUrl: 'https://example.test', bounds: { x: 48, y: 80, width: 288, height: 620 }, viewport: { width: 1440, height: 900 }, visible: true })
+    manager.present('project-a', 'background')
+    const guest = created[0]!
+    const scales: number[] = []
+    electronFake.setCapture(contents => { scales.push(contents.emulation!.scale); return windows.some(window => !window.destroyed && window.options.show === false && window.children.includes(guest)) ? { width: guest.bounds.width, height: guest.bounds.height } : { width: 0, height: 0 } })
+    const shot = await (await manager.view({ projectId: 'project-a', sessionId: 'workspace-a', agentSessionId: 'agent-a' })).screenshot()
+    expect(shot).toMatchObject({ width: 1440, height: 900 })
+    expect(scales).toEqual([1])
+    expect(guest.webContents.emulation?.viewSize).toEqual({ width: 1440, height: 900 })
+    expect(guest.webContents.emulation?.scale).toBeCloseTo(288 / 1440)
+    expect(guest.bounds).toEqual({ x: 48, y: 80, width: 288, height: 620 })
+    expect(owner.children).toEqual([guest])
+  })
+
+  it('captures a visible pane where it is, and refuses rather than returning an empty image', async () => {
+    const manager = new BrowserViews({ tabs: () => [], openBrowserTab: async () => {}, rendererPath: 'C:/out/index.html' })
+    const owner = new FakeWindow(); owner.visible = true
+    await manager.mount(owner as never, { projectId: 'project-a', surfaceId: 'surface-a', initialUrl: 'https://example.test', bounds: { x: 0, y: 0, width: 640, height: 480 }, visible: true })
+    electronFake.setCapture(() => ({ width: 640, height: 480 }))
+    const view = await manager.view({ projectId: 'project-a', sessionId: 'workspace-a', agentSessionId: 'agent-a' })
+    expect((await view.screenshot()).width).toBe(640)
+    expect(windows).toEqual([owner])
+    electronFake.setCapture(() => ({ width: 0, height: 0 }))
+    await expect(view.screenshot()).rejects.toThrow(/could not capture the browser view \(the off-screen capture host returned an empty image\).*browser_present/)
+    expect(owner.children).toEqual([created[0]])
+    expect(created[0]?.visible).toBe(true)
   })
 
   it('never resurrects a parking host while the application is closing', async () => {

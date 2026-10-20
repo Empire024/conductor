@@ -18,6 +18,50 @@ export interface BrowserView {
   type(options: { selector: string; text: string; submit: boolean }): Promise<Record<string, unknown>>
   /** Presentation choices that do not steal the owner's current workspace selection. */
   present(mode: 'background' | 'detached'): Promise<void>
+  /** Frames of the page's video (or of the viewport) written as image files under the project. */
+  videoFrames(request: VideoFramesRequest): Promise<VideoFramesResult>
+  /** A file fetched with this browser's own session, written into the project. */
+  download(request: DownloadRequest): Promise<DownloadResult>
+}
+
+/** Bounds of browser_video_frames. A frame is a full PNG on disk, so the byte cap is what keeps a
+ *  long clip at a high rate from filling the owner's drive. budgetMs keeps one call inside the 60 s
+ *  an MCP client gives an HTTP tool call (Claude Code's default): a longer window stops early and
+ *  says where to continue, rather than the client dropping a call that is still writing files. */
+export const VIDEO_FRAMES = { maxFrames: 300, defaultFrames: 20, maxFps: 30, defaultFps: 1, maxBytes: 256 * 1024 * 1024, budgetMs: 48_000, maxRealtimeSeconds: 45, maxWidth: 1920 } as const
+/** Bounds of browser_download: reference media, not disk images. */
+export const DOWNLOADS = { defaultMaxBytes: 512 * 1024 * 1024, maxBytes: 2 * 1024 * 1024 * 1024, defaultFolder: 'refs' } as const
+
+export interface VideoFramesRequest {
+  selector?: string
+  start?: number
+  end?: number
+  fps: number
+  maxFrames: number
+  /** Output size relative to the captured pixels, 0.1 to 1. */
+  scale: number
+  format: 'png' | 'jpeg'
+  /** auto seeks a seekable video and plays anything else in real time; play forces real time. */
+  mode: 'auto' | 'seek' | 'play'
+  audio: boolean
+}
+export interface VideoFramesResult {
+  directory: string
+  frames: Array<{ path: string; time: number }>
+  width: number
+  height: number
+  mode: 'seek' | 'play' | 'viewport'
+  bytes: number
+  video?: { source: string; duration: number | null }
+  audio?: { path: string; seconds: number; sampleRate: number } | { unavailable: string }
+  /** Why fewer frames were written than the window asked for. */
+  truncated?: string
+}
+export interface DownloadRequest { url?: string; fromVideo: boolean; selector?: string; path?: string; maxBytes: number }
+export interface DownloadResult {
+  path: string; relativePath: string; bytes: number; contentType?: string; url: string; finalUrl: string; referer?: string
+  /** Still arriving when the call had to answer: it continues and is renamed to path when complete. */
+  inProgress?: boolean; partialPath?: string
 }
 export interface BrowserMcpHost {
   /** Resolves the browser view belonging to this scope. Implementations must derive the view
@@ -38,6 +82,64 @@ const count = (args: Record<string, unknown>, key: string, fallback: number, max
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 1) throw new Error(`${key} must be a positive number`)
   return Math.min(Math.floor(value), max)
 }
+const decimal = (args: Record<string, unknown>, key: string, min: number, max: number): number | undefined => {
+  const value = args[key]
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) throw new Error(`${key} must be a number from ${min} to ${max}`)
+  return value
+}
+const choice = <T extends string>(args: Record<string, unknown>, key: string, values: readonly T[], fallback: T): T => {
+  const value = args[key]
+  if (value === undefined || value === null) return fallback
+  if (typeof value !== 'string' || !values.includes(value as T)) throw new Error(`${key} must be one of ${values.join(', ')}`)
+  return value as T
+}
+const optionalText = (args: Record<string, unknown>, key: string, limit: number): string | undefined =>
+  args[key] === undefined || args[key] === null ? undefined : text(args, key, limit)
+
+/** The arguments of browser_video_frames, checked and capped before any page is touched. */
+export function videoFramesRequest(args: Record<string, unknown>): VideoFramesRequest {
+  const start = decimal(args, 'start', 0, 86_400), end = decimal(args, 'end', 0, 86_400)
+  if (start !== undefined && end !== undefined && end <= start) throw new Error('end must be later than start')
+  if (args.audio !== undefined && typeof args.audio !== 'boolean') throw new Error('audio must be true or false')
+  return {
+    selector: optionalText(args, 'selector', 500),
+    ...(start !== undefined ? { start } : {}), ...(end !== undefined ? { end } : {}),
+    fps: decimal(args, 'fps', 0.01, VIDEO_FRAMES.maxFps) ?? VIDEO_FRAMES.defaultFps,
+    maxFrames: count(args, 'maxFrames', VIDEO_FRAMES.defaultFrames, VIDEO_FRAMES.maxFrames),
+    scale: decimal(args, 'scale', 0.1, 1) ?? 1,
+    format: choice(args, 'format', ['png', 'jpeg'] as const, 'png'),
+    mode: choice(args, 'mode', ['auto', 'seek', 'play'] as const, 'auto'),
+    audio: args.audio === true
+  }
+}
+
+/** The arguments of browser_download. A URL and fromVideo are exclusive: one names the file. */
+export function downloadRequest(args: Record<string, unknown>): DownloadRequest {
+  if (args.fromVideo !== undefined && typeof args.fromVideo !== 'boolean') throw new Error('fromVideo must be true or false')
+  const fromVideo = args.fromVideo === true
+  const url = fromVideo ? undefined : browserUrl(text(args, 'url', 8000))
+  if (fromVideo && args.url !== undefined) throw new Error('Give either url or fromVideo:true, not both')
+  if (!fromVideo && args.selector !== undefined) throw new Error('selector picks the <video> for fromVideo:true; a url download takes none')
+  const maxMB = decimal(args, 'maxMB', 0.001, DOWNLOADS.maxBytes / 1024 / 1024)
+  return {
+    ...(url ? { url } : {}), fromVideo,
+    selector: optionalText(args, 'selector', 500),
+    path: optionalText(args, 'path', 1000),
+    maxBytes: maxMB === undefined ? DOWNLOADS.defaultMaxBytes : Math.floor(maxMB * 1024 * 1024)
+  }
+}
+
+/** The one place a capture is judged: an image with no pixels is a failure the agent must read,
+ *  never a "Captured … (0×0)" success it would reason about. */
+export function assertCapturedImage(shot: { data: string; width: number; height: number }): void {
+  if (!shot.data || !(shot.width > 0) || !(shot.height > 0)) {
+    throw new Error(`The browser view produced an empty ${shot.width || 0}×${shot.height || 0} image, so nothing was captured. The page is still loaded: read it with browser_snapshot, or call browser_present({mode:"detached"}) to show it in its own window (it does not take focus) and capture again.`)
+  }
+}
+
+/** Shown to the agent at MCP initialize, so it reaches every conversation that has these tools. */
+export const BROWSER_MCP_INSTRUCTIONS = 'These tools drive this project\'s isolated Conductor browser. It may be visible, detached, or running in the background; use browser_present when presentation matters. For reference media (a video, image or file a page shows, including behind the browser\'s sign-in), use browser_download and browser_video_frames instead of curl or a shell download: they use this browser\'s session and write into the project. Reference media is for analysis only.'
 const ONLY_PAGES = 'Only http:// and https:// URLs can be opened in the Conductor browser'
 /** Schemes that must be refused outright rather than reinterpreted. The host:port rule below
  *  reads `javascript:1` and `file:8080/C:/Windows/win.ini` as a bare host and a port and quietly
@@ -128,12 +230,59 @@ export const BROWSER_TOOLS: BrowserTool[] = [
   {
     name: 'browser_screenshot',
     annotations: { readOnlyHint: true },
-    description: 'Capture what the Conductor browser view is showing right now, as a PNG image.',
+    description: 'Capture what the Conductor browser view is showing right now, as a PNG image. Works in every presentation, background included; a capture that cannot be made is an error that says why, never an empty image.',
     inputSchema: schema({}),
     async run(host, scope) {
       const view = await host.view(scope)
       const shot = await view.screenshot()
+      assertCapturedImage(shot)
       return { text: `Captured the browser view (${shot.width}×${shot.height}).`, image: { data: shot.data, mimeType: shot.mimeType } }
+    }
+  },
+  {
+    name: 'browser_video_frames',
+    description: `Watch the page's <video>: seek or play it and write frames as image files under the project (.conductor/browser-captures/<stamp>/frame-0001.png), returning their paths and media times; read them with your file tools. Without a video (or with a selector that is not one) it captures that element or the viewport over time. Seekable videos are seeked frame by frame (mode auto/seek); live or unseekable ones play in real time with the page muted. audio:true plays the window in real time and also records it as a WAV when the page allows it, and says why when it does not. At most ${VIDEO_FRAMES.maxFrames} frames, ${VIDEO_FRAMES.maxFps} fps, ${VIDEO_FRAMES.maxBytes / 1024 / 1024} MB and about ${Math.round(VIDEO_FRAMES.budgetMs / 1000)} s per call (${VIDEO_FRAMES.maxRealtimeSeconds} s of real-time playback); a longer window stops early and says the start to continue from. Reference media is for analysis only.`,
+    inputSchema: schema({
+      selector: { type: 'string', description: 'CSS selector of the <video> (or of an element containing one, or any element to film). Default: the largest video on the page, else the viewport.' },
+      start: { type: 'number', description: 'Media time in seconds of the first frame (default: 0 when seeking, now when playing).' },
+      end: { type: 'number', description: 'Media time in seconds to stop at (default: the video\'s end, or start + maxFrames / fps).' },
+      fps: { type: 'number', description: `Frames per second of media time (default ${VIDEO_FRAMES.defaultFps}, max ${VIDEO_FRAMES.maxFps}).` },
+      maxFrames: { type: 'number', description: `Stop after this many frames (default ${VIDEO_FRAMES.defaultFrames}, max ${VIDEO_FRAMES.maxFrames}).` },
+      scale: { type: 'number', description: `Output size relative to the captured pixels, 0.1 to 1 (default 1; never wider than ${VIDEO_FRAMES.maxWidth}px).` },
+      format: { type: 'string', enum: ['png', 'jpeg'], description: 'Image format of the frames (default png).' },
+      mode: { type: 'string', enum: ['auto', 'seek', 'play'], description: 'auto (default) seeks a seekable video and plays anything else; play forces real-time playback.' },
+      audio: { type: 'boolean', description: `Also record the window's audio as a WAV (plays it in real time, at most ${VIDEO_FRAMES.maxRealtimeSeconds} s).` }
+    }),
+    async run(host, scope, args) {
+      const request = videoFramesRequest(args)
+      const view = await host.view(scope)
+      const result = await view.videoFrames(request)
+      const first = result.frames[0]?.path, last = result.frames.at(-1)?.path
+      const audio = result.audio && 'path' in result.audio ? ` Audio: ${result.audio.path} (${result.audio.seconds.toFixed(1)} s).` : result.audio ? ` Audio not recorded: ${result.audio.unavailable}` : ''
+      return {
+        text: `Wrote ${result.frames.length} ${result.width}×${result.height} frame${result.frames.length === 1 ? '' : 's'} (${result.mode}) to ${result.directory}${first ? `: ${first}${last && last !== first ? ` … ${last}` : ''}` : ''}.${audio}${result.truncated ? ` Stopped early: ${result.truncated}` : ''}`,
+        structured: result as unknown as Record<string, unknown>
+      }
+    }
+  },
+  {
+    name: 'browser_download',
+    description: `Download a file with this browser's own session (its cookies, user agent and the current page as referer) into the project: ${DOWNLOADS.defaultFolder}/ by default, or path, which must stay inside the project and never replaces an existing file. fromVideo:true saves the source of the page's <video> (selector picks one); a blob: or streaming (MSE) source cannot be saved as a file, so use browser_video_frames for it. At most ${DOWNLOADS.defaultMaxBytes / 1024 / 1024} MB unless maxMB says otherwise (up to ${DOWNLOADS.maxBytes / 1024 / 1024} MB). Use this instead of curl for reference media; it is for analysis only.`,
+    inputSchema: schema({
+      url: { type: 'string', description: 'An http:// or https:// URL to fetch.' },
+      fromVideo: { type: 'boolean', description: 'Save the current <video> source instead of a URL.' },
+      selector: { type: 'string', description: 'With fromVideo: CSS selector of the <video> (default: the largest video on the page).' },
+      path: { type: 'string', description: `Project-relative file or folder (ending in /) to write to (default ${DOWNLOADS.defaultFolder}/<name from the server or URL>).` },
+      maxMB: { type: 'number', description: `Size cap in megabytes (default ${DOWNLOADS.defaultMaxBytes / 1024 / 1024}).` }
+    }),
+    async run(host, scope, args) {
+      const request = downloadRequest(args)
+      const view = await host.view(scope)
+      const result = await view.download(request)
+      const text = result.inProgress
+        ? `Still downloading ${result.finalUrl}: ${result.bytes} bytes so far${result.contentType ? ` (${result.contentType})` : ''}. It continues in the background as ${result.partialPath} and is renamed to ${result.path} when complete; check for that file before reading it.`
+        : `Saved ${result.bytes} bytes${result.contentType ? ` (${result.contentType})` : ''} from ${result.finalUrl} to ${result.path}`
+      return { text, structured: result as unknown as Record<string, unknown> }
     }
   },
   {

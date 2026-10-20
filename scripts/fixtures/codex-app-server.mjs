@@ -60,7 +60,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     }
     if (pending.mcp) {
       const allowed = message.result?.action === 'accept'
-      itemEvent('item/completed', { type: 'mcpToolCall', id: 'mcp-1', server: 'conductor-browser', tool: 'browser_snapshot', arguments: {}, status: allowed ? 'completed' : 'failed', result: allowed ? { content: [{ type: 'text', text: 'synthetic snapshot' }], structuredContent: null } : null, error: allowed ? null : { message: 'user rejected MCP tool call' }, durationMs: 3 })
+      itemEvent('item/completed', { type: 'mcpToolCall', id: 'mcp-1', server: pending.server ?? 'conductor-browser', tool: pending.tool ?? 'browser_snapshot', arguments: {}, status: allowed ? 'completed' : 'failed', result: allowed ? { content: [{ type: 'text', text: 'synthetic snapshot' }], structuredContent: null } : null, error: allowed ? null : { message: 'user rejected MCP tool call' }, durationMs: 3 })
       itemEvent('item/completed', { type: 'agentMessage', id: 'mcp-answer', text: JSON.stringify(message.result), phase: null, memoryCitation: null, delivery: null, questions: null })
       finish()
       return
@@ -387,10 +387,13 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     send({ id: 501, method: 'item/tool/requestUserInput', params: { threadId, turnId: currentTurn, itemId: 'question-1', questions: [{ id: 'flavor', header: 'Flavor', question: 'Choose a synthetic option', isOther: false, isSecret: false, options: [{ label: 'Vanilla', description: 'Option one' }, { label: 'Café', description: 'Option two' }] }], isBlocking: true, autoResolutionMs: null } })
     return
   }
-  if (scenario === 'synthetic:mcp-approval') {
-    // Exactly what codex-cli 0.155.1 sends for an MCP tool that is not annotated read-only under on-request.
-    approval = { id: 502, mcp: true }
-    send({ id: 502, method: 'mcpServer/elicitation/request', params: { threadId, turnId: currentTurn, serverName: 'conductor-browser', mode: 'form', _meta: { codex_approval_kind: 'mcp_tool_call', persist: ['session', 'always'], tool_description: 'Read the page', tool_params: { maxChars: 1000 } }, message: 'Allow the conductor-browser MCP server to run tool "browser_snapshot"?', requestedSchema: { type: 'object', properties: {} } } })
+  const mcpApproval = /^synthetic:mcp-approval(?::([\w-]+):([\w-]+))?$/.exec(scenario)
+  if (mcpApproval) {
+    // Exactly what codex-cli 0.155.1 sends for an MCP tool that is not annotated read-only under
+    // on-request; synthetic:mcp-approval:<server>:<tool> names another server or tool.
+    const server = mcpApproval[1] ?? 'conductor-browser', tool = mcpApproval[2] ?? 'browser_snapshot'
+    approval = { id: 502, mcp: true, server, tool }
+    send({ id: 502, method: 'mcpServer/elicitation/request', params: { threadId, turnId: currentTurn, serverName: server, mode: 'form', _meta: { codex_approval_kind: 'mcp_tool_call', persist: ['session', 'always'], tool_description: 'Read the page', tool_params: { maxChars: 1000 } }, message: 'Allow the ' + server + ' MCP server to run tool "' + tool + '"?', requestedSchema: { type: 'object', properties: {} } } })
     return
   }
   // Escalations shaped like codex-cli 0.155.1 on Windows: the command wrapped in the interpreter's

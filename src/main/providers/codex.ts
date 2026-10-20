@@ -369,6 +369,9 @@ export function codexMcpToolApproval(params: unknown): { serverName: string; too
   return { serverName: params.serverName, tool, message: message || `Allow the ${params.serverName} MCP server to run tool "${tool}"?`, persist }
 }
 
+/** Browser tools that write files into the project (captures, downloads). */
+const BROWSER_WRITING_TOOLS = new Set(['browser_video_frames', 'browser_download'])
+
 const LIVE_DISABLED_FEATURES = ['hooks', 'plugins', 'apps', 'multi_agent', 'multi_agent_v2', 'browser_use', 'browser_use_external', 'computer_use', 'memories', 'unbounded_connection_retries'] as const
 
 /** What a lean evaluation turn (AgentSpec.profile) switches off: optional features that only add tools
@@ -567,6 +570,8 @@ export class CodexAdapter implements ProviderAdapter {
   private mcpRelayed = false
   /** Auto answers enabled MCP requests; other native approvals remain pending. */
   private unattended = false
+  /** The current turn runs in Read only: the browser tools that write files keep their cards. */
+  private readOnly = false
   /** A changed payload cannot reuse its old card identity again in this runtime. */
   private invalidApprovalRequests = new Set<string>()
   /** Requests Auto answered itself, by canonical arguments: a repeated delivery gets no second
@@ -649,6 +654,7 @@ export class CodexAdapter implements ProviderAdapter {
   private async initialize(): Promise<void> {
     this.emit({ data: { type: 'session', phase: 'starting' } })
     this.unattended = codexPreset(this.options.settings).unattended
+    this.readOnly = codexPreset(this.options.settings).sandbox === 'read-only'
     try {
       const version = await (this.dependencies.version?.() ?? new Promise<string>((resolve, reject) => {
         execFile(this.options.executable, ['--version'], { cwd: this.options.cwd, env: providerEnvironment(this.options.environment ?? process.env), windowsHide: true, timeout: 10_000, maxBuffer: 4096 }, (error, stdout) => error ? reject(error) : resolve(stdout.trim()))
@@ -782,6 +788,7 @@ export class CodexAdapter implements ProviderAdapter {
     }
     const networkAccess = preset.network && workspace?.network !== false
     this.unattended = preset.unattended
+    this.readOnly = preset.sandbox === 'read-only'
     if (!this.capabilities.sandboxModes!.includes(sandbox) || !this.capabilities.approvalPolicies!.includes(approvalPolicy)) throw new Error('Unsupported Codex sandbox or approval policy')
     const params: TurnStartParams = {
       threadId: this.threadId, input: codexInput(text, attachments), cwd: this.options.cwd, model,
@@ -1364,6 +1371,16 @@ export class CodexAdapter implements ProviderAdapter {
         ? request.params.availableDecisions.map(entry => typeof entry === 'string' ? entry : Object.keys(entry)[0] ?? 'unknown').join(', ') : ''
       this.answerItself(request, id, decision, { message: `Conductor ${decision === 'decline' ? 'declined' : 'cancelled'} “${title}” without asking you: Codex offered no way to allow it (${offered ? `only ${offered}` : 'no decisions at all'}).` })
       return
+    }
+    // The project browser's own tools act only on this project's isolated browser and write only new
+    // files inside the project; the owner asked for them to run without cards (Read only keeps the
+    // cards of the two that write files).
+    if (mcpApproval?.serverName === BROWSER_MCP_SERVER_NAME && !this.options.approvalReviewer && !(this.readOnly && BROWSER_WRITING_TOOLS.has(mcpApproval.tool))) {
+      const decision = mcpApproval.persist.includes('session') ? 'acceptForSession' : 'accept'
+      if (choices.some(choice => choice.id === decision)) {
+        this.answerItself(request, id, decision, { message: `Conductor allowed ${mcpApproval.serverName}/${mcpApproval.tool} without asking: project-browser tools run without approval.` })
+        return
+      }
     }
     // What the request reaches. An owner-only boundary is never answered here, never offered for a
     // session, never forms a session class, and its card says it is the owner's (required).
