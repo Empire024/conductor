@@ -5,6 +5,7 @@ import { PortMappingError, lanAddress, releasePortMapping, requestPortMapping, P
 import { RelayServer } from '../relay-server/server'
 import { createRemoteTlsIdentity, tlsIdentityUsable, type RemoteTlsIdentity } from './remote-tls'
 import { globalIpv6Addresses, localAddresses, primaryMacAddress } from './network-addresses'
+import { loopbackOnly } from './test-loopback-guard'
 import type { SecretKeyValueStore } from './secret-store'
 
 /**
@@ -200,9 +201,11 @@ export class RelayHost {
       }
       const inUse = (): boolean => /EADDRINUSE/.test(last instanceof Error ? last.message : String(last))
 
-      let started = await tryBind('::', port)
-      if (!started && !inUse()) started = await tryBind('0.0.0.0', port)
-      if (!started && port !== 0) started = await tryBind('::', 0) ?? await tryBind('0.0.0.0', 0)
+      // A test instance stays on loopback (./test-loopback-guard), and says so in its addresses.
+      const loopback = loopbackOnly()
+      let started = await tryBind(loopback ? '127.0.0.1' : '::', port)
+      if (!started && !loopback && !inUse()) started = await tryBind('0.0.0.0', port)
+      if (!started && port !== 0) started = loopback ? await tryBind('127.0.0.1', 0) : await tryBind('::', 0) ?? await tryBind('0.0.0.0', 0)
       if (!started) throw last ?? new Error('The relay could not listen anywhere.')
       if (intent !== this.intent) { await started.server.close(); return this.getStatus() }
       this.server = started.server
@@ -219,7 +222,7 @@ export class RelayHost {
         // a machine out in the world can reach it once the router allows it, and a machine on this
         // network reaches it directly, with no router involved at all. Only the two most stable are
         // carried, since the rest are temporary addresses that will have rotated by tomorrow.
-        addresses: [
+        addresses: loopback ? [`wss://127.0.0.1:${started.port}${RELAY_SOCKET_PATH}`] : [
           ...this.ipv6().slice(0, 2).map(address => `wss://[${address}]:${started.port}${RELAY_SOCKET_PATH}`),
           ...localAddresses().map(address => `wss://${address}:${started.port}${RELAY_SOCKET_PATH}`)
         ],

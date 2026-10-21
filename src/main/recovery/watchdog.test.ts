@@ -10,6 +10,9 @@ const arm = (kind: StopKind, extra: Partial<ArmRecord> = {}): ArmRecord => ({
 
 interface FakeExe { error?: string; exitCode?: number | null; output?: string; becomesReadyAfterMs?: number; newPid?: number }
 
+/** Another Conductor that armed itself: it holds the single-instance lock from `armAtMs`. */
+interface FakeSuccessor { pid: number; armAtMs: number; readyAtMs?: number; watchedAtMs?: number; diesAtMs?: number }
+
 /** A fake machine: a clock that sleep advances, the old pid, a control-owner answer that appears
  *  at a set time, and exes/agents whose behaviour each test scripts. */
 function machine(options: {
@@ -20,6 +23,7 @@ function machine(options: {
   agent?: (request: AgentRequest) => { readyAfterMs?: number; run?: Partial<AgentRun> }
   installerUntilMs?: number
   recentRecoveries?: number
+  successor?: FakeSuccessor
 }) {
   let now = 0
   let readyAt: number | null = options.readyAtMs ?? null
@@ -30,15 +34,21 @@ function machine(options: {
   const reports: RecoveryReport[] = []
   const announced: RecoveryReport[] = []
   let recorded = 0
+  const next = options.successor
   const deps: WatchdogDeps = {
     now: () => now,
     sleep: async ms => { now += ms },
-    alive: pid => pid === OLD && now < (options.appDiesAtMs ?? 0),
-    readArm: () => options.armed,
-    ready: async previous => readyAt !== null && now >= readyAt && readyPid !== previous ? { pid: readyPid } : null,
+    alive: pid => (pid === OLD && now < (options.appDiesAtMs ?? 0)) || (pid === next?.pid && now >= next.armAtMs && now < (next.diesAtMs ?? Infinity)),
+    readArm: () => next && now >= next.armAtMs ? arm('running', { appPid: next.pid }) : options.armed,
+    ready: async previous => {
+      if (next && now >= next.armAtMs && now >= (next.readyAtMs ?? Infinity) && now < (next.diesAtMs ?? Infinity)) return { pid: next.pid }
+      return readyAt !== null && now >= readyAt && readyPid !== previous ? { pid: readyPid } : null
+    },
+    watched: pid => pid === next?.pid && now >= (next.watchedAtMs ?? Infinity),
     installerRunning: () => now < (options.installerUntilMs ?? 0),
     launch: async (exe, args) => {
       launches.push({ exe, args })
+      now += 500 // spawning takes a moment
       const script = options.exes?.[exe] ?? {}
       if (script.becomesReadyAfterMs !== undefined) { readyAt = now + script.becomesReadyAfterMs; readyPid = script.newPid ?? 300 }
       const process: LaunchedProcess = {
@@ -189,6 +199,58 @@ describe('recovery watchdog', () => {
   it('notices a Conductor that came back late on its own before relaunching', async () => {
     const m = machine({ armed: arm('restart'), appDiesAtMs: 0, readyAtMs: 61_000 })
     expect(await runWatchdog(m.deps, m.config)).toMatchObject({ result: 'returned' })
+    expect(m.launches).toEqual([])
+  })
+
+  // 2026-10-21: the restarted Conductor (pid 13852) spent two minutes in a launch prune before its
+  // control server answered; the watchdog gave up after 60 s and raced relaunches against it.
+  it('waits for a newer Conductor that armed itself and is slow to answer, launching nothing', async () => {
+    const m = machine({ armed: arm('restart'), appDiesAtMs: 1000, successor: { pid: 13852, armAtMs: 3000, readyAtMs: 150_000 } })
+    expect(await runWatchdog(m.deps, m.config)).toMatchObject({ result: 'returned', pid: 13852 })
+    expect(m.launches).toEqual([])
+    expect(m.agentCalls).toEqual([])
+  })
+
+  it('stands down once the newer Conductor runs its own watchdog', async () => {
+    const m = machine({ armed: arm('running'), appDiesAtMs: 0, successor: { pid: 13852, armAtMs: 2000, watchedAtMs: 90_000 } })
+    expect(await runWatchdog(m.deps, m.config)).toMatchObject({ result: 'superseded', pid: 13852 })
+    expect(m.launches).toEqual([])
+    expect(m.notifications).toEqual([])
+  })
+
+  it('never launches next to a Conductor that holds the lock but never answers; the agent hears why', async () => {
+    const m = machine({ armed: arm('restart'), appDiesAtMs: 0, successor: { pid: 13852, armAtMs: 1000 } })
+    expect((await runWatchdog(m.deps, m.config)).result).toBe('down')
+    expect(m.launches).toEqual([])
+    expect(m.now).toBeGreaterThanOrEqual(m.config.startingMaxMs)
+    expect(m.agentCalls[0]!.error).toContain('Conductor pid 13852 is running and holds the single-instance lock but never answered')
+  })
+
+  it('keeps waiting while its own attempt is alive and slow, and never starts a second one next to it', async () => {
+    const m = machine({ armed: arm('restart'), appDiesAtMs: 0, exes: { 'C:\\Programs\\Conductor.exe': { becomesReadyAfterMs: 150_000 } } })
+    expect((await runWatchdog(m.deps, m.config)).result).toBe('relaunched')
+    expect(m.launches).toHaveLength(1)
+  })
+
+  it('a live attempt that never answers is not joined by a second attempt; the agent takes over', async () => {
+    const m = machine({ armed: arm('restart'), appDiesAtMs: 0 })
+    expect((await runWatchdog(m.deps, m.config)).result).toBe('down')
+    expect(m.launches).toHaveLength(1)
+    expect(m.agentCalls[0]!.error).toContain('#1 C:\\Programs\\Conductor.exe: running but never answered app control')
+  })
+
+  it('an attempt that exits against the lock waits for whoever holds it instead of trying again', async () => {
+    // The owner (or the meta-wizard) started one just as the watchdog did; the watchdog's exits at once.
+    const m = machine({ armed: arm('running'), appDiesAtMs: 0, exes: { 'C:\\Programs\\Conductor.exe': { exitCode: 0 } }, successor: { pid: 777, armAtMs: 12_200, readyAtMs: 200_000 } })
+    const result = await runWatchdog(m.deps, m.config)
+    expect(m.launches).toHaveLength(1)
+    expect(result).toMatchObject({ result: 'relaunched' })
+    expect((result as { report: RecoveryReport }).report.readyPid).toBe(777)
+  })
+
+  it('a Conductor started during the backoff is waited for, not launched over', async () => {
+    const m = machine({ armed: arm('running'), appDiesAtMs: 0, successor: { pid: 778, armAtMs: 10_500, readyAtMs: 120_000 } })
+    expect(await runWatchdog(m.deps, m.config)).toMatchObject({ result: 'returned', pid: 778 })
     expect(m.launches).toEqual([])
   })
 

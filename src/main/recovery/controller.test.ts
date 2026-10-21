@@ -57,6 +57,16 @@ describe('recovery controller', () => {
     expect(createRecovery(options(userData, { pid: 9999 })).previousArm).toMatchObject({ appPid: 4321, kind: 'quit' })
   })
 
+  it('claims the arm record as soon as it is created, so a slow startup is seen as starting', () => {
+    const userData = mkdtempSync(join(tmpdir(), 'recovery-controller-'))
+    mkdirSync(join(userData, 'recovery'), { recursive: true })
+    writeFileSync(join(userData, 'recovery', ARM_FILE), JSON.stringify({ appPid: 1111, kind: 'restart', at: '2026-10-21T17:12:00.000Z', fromVersion: '0.1.90', foreground: false, launch: { exe: 'C:\\P\\Conductor.exe', args: [] }, checkout: null, packaged: true }))
+    const recovery = createRecovery(options(userData))
+    // How the previous one stopped is read first, then this launch claims the record.
+    expect(recovery.previousArm).toMatchObject({ appPid: 1111, kind: 'restart' })
+    expect(parseArmRecord(readFileSync(join(userData, 'recovery', ARM_FILE), 'utf8'))).toMatchObject({ appPid: 4321, kind: 'running', fromVersion: '0.1.90' })
+  })
+
   it('does nothing when off', async () => {
     const userData = mkdtempSync(join(tmpdir(), 'recovery-controller-'))
     const startDetached = vi.fn()

@@ -18,6 +18,16 @@ const run = promisify(execFile)
 const sleep = ms => new Promise(done => setTimeout(done, ms))
 const KEEP_LAUNCH_LOGS = 10
 
+/** CPU seconds the process has used, or null. Busy-versus-hung is read from it rising. */
+async function cpuSeconds(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null
+  try {
+    const { stdout } = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-Process -Id ${pid} -ErrorAction Stop).TotalProcessorTime.TotalSeconds`], { windowsHide: true, timeout: 15_000 })
+    const value = Number(String(stdout).trim().replace(',', '.'))
+    return Number.isFinite(value) ? value : null
+  } catch { return null }
+}
+
 /** Kills a Conductor process tree, only when the pid still names Conductor.exe or electron.exe. */
 async function killConductor(pid) {
   if (process.platform !== 'win32') { process.kill(pid, 'SIGKILL'); return 'killed' }
@@ -41,6 +51,7 @@ export function createService({
   const kill = deps.kill ?? killConductor
   const spawnApp = deps.spawn ?? spawn
   const alive = deps.pidAlive ?? pidAlive
+  const cpuOf = deps.cpuSeconds ?? cpuSeconds
   const bootAt = deps.bootAt ?? (Date.now() - uptime() * 1000)
   const statePath = join(dir, 'state.json')
   let state = null
@@ -164,13 +175,27 @@ export function createService({
     return { steers: planned.steers, alerts: planned.alerts, findings: judged.findings }
   }
 
+  /** Rewrites the arm record of the Conductor being replaced as a restart by the meta-wizard. */
+  async function recordRestart(armed, oldPid, decision) {
+    if (!armed?.launch || !oldPid || armed.appPid !== oldPid) return
+    const record = { ...armed, kind: 'restart', at: new Date(now()).toISOString(), foreground: false, by: 'meta-wizard', action: decision.action, reason: decision.reason }
+    try {
+      await writeJsonAtomic(join(userData, 'recovery', 'armed.json'), record)
+      await journal.write('armed', { pid: oldPid, kind: 'restart', action: decision.action })
+    } catch (error) { await journal.write('error', { during: 'arm', error: error?.message ?? String(error) }) }
+  }
+
   /** One pass. Returns how long to wait before the next one. */
   async function tick({ dryRun = false } = {}) {
     await load()
     const credential = await readCredential(userData, { isAlive: alive })
     const probed = credential.ok ? await probe(credential.credential) : null
     const armed = await readArmed(userData)
-    const decision = decideLiveness({ now: now(), credential, probe: probed, armed, armedAppAlive: Boolean(armed?.appPid && alive(armed.appPid)), bootAt, memory: { ...(state.liveness ?? {}), workInProgress: state.workInProgress }, timings })
+    const armedAppAlive = Boolean(armed?.appPid && alive(armed.appPid))
+    // Only sampled when something is silent: a busy main process is told apart from a hung one.
+    const silentPid = credential.ok && probed !== 'ok' ? credential.credential.pid : !credential.ok && armed?.kind === 'running' && armedAppAlive ? armed.appPid : null
+    const cpu = silentPid ? await cpuOf(silentPid).catch(() => null) : null
+    const decision = decideLiveness({ now: now(), credential, probe: probed, armed, armedAppAlive, cpu, bootAt, memory: { ...(state.liveness ?? {}), workInProgress: state.workInProgress }, timings })
     if (!dryRun) state.liveness = decision.memory
     const said = `${decision.action}: ${decision.reason}`
     if (decision.action !== 'ok' && said !== state.lastLiveness) await journal.write('liveness', { action: decision.action, reason: decision.reason })
@@ -186,6 +211,10 @@ export function createService({
         if (dryRun) await journal.write('planned-start', { action: decision.action, reason: decision.reason })
         else {
           const oldPid = credential.credential?.pid ?? armed?.appPid ?? null
+          // Told to the recovery watchdog first (armed.json, docs/recovery-mode.md): the pid it
+          // watches is going away as a restart, not a crash, so it waits for the Conductor started
+          // here instead of relaunching its own next to it.
+          await recordRestart(armed, oldPid, decision)
           if (decision.action === 'kill-and-start' && oldPid) await journal.write('kill', { pid: oldPid, result: await kill(oldPid).catch(error => error.message) })
           state.liveness.restarts = [...state.liveness.restarts, now()]
           state.pendingStartReason = decision.reason

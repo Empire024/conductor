@@ -65,11 +65,19 @@ A restart nobody was watching still comes back without taking the screen.
      and answers `tools.list` on app control. The watchdog waits 60 s after a restart, 180 s after
      an update install, extended while the updater's installer process still runs (up to 10 min,
      plus 60 s after it ends), and 10 s after a crash (`running` left behind).
+     **Never race a live one** (2026-10-21: a restarted Conductor spent two minutes in a launch
+     prune and the watchdog relaunched next to it). A launch claims `armed.json` as soon as it
+     holds the single-instance lock, before the long part of startup. While `armed.json` names a
+     newer live pid, that Conductor is starting: the watchdog waits for it (up to
+     `startingMaxMs`, 10 min) and launches nothing; once that one's own watchdog runs
+     (`watchdog.json` names it), the old watchdog stands down (`superseded`). One that holds the
+     lock and never answers goes straight to the agent: another launch would only exit.
   4. Not ready: start the armed exe itself (the installed `Conductor.exe`, no arguments), up to 2
-     attempts with 2 s and 15 s backoff. Each attempt has 60 s to answer. Each records its pid, its
-     exit code, and its stdout/stderr (`recovery/launch-*.log`; the newest 10 are kept). A second
-     Conductor that exits at once because a hung one holds the single-instance lock shows up here
-     as a quick exit.
+     attempts with 2 s and 15 s backoff. An attempt whose process is alive has up to 10 min
+     (`attemptWaitMs`) to answer, and no second attempt is started next to it, since it holds the
+     lock. Each records its pid, its exit code, and its stdout/stderr (`recovery/launch-*.log`;
+     the newest 10 are kept). An attempt that exits at once against the lock of a Conductor someone
+     else started waits for that one instead of trying again.
   5. Still down: call the **recovery agent** with the exact error (below), then wait 60 s more.
   - Crash loop guard: after 3 recovery launches in 15 min it stops relaunching and goes to the agent.
 - **Owner notice.** A Windows toast (`io.conductor.desktop`) when a relaunch brought Conductor back,

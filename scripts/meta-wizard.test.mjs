@@ -193,6 +193,36 @@ describe('liveness', () => {
     assert.equal(decide({ credential: ok, probe: 'timeout', memory: { strikes: 2 }, armed: { kind: 'update-install', appPid: 10, at: iso(-MIN) } }).action, 'wait')
   })
 
+  // 2026-10-21: twice killed with taskkill /T /F after ~60 s of silence while main was busy in a
+  // launch prune. A main process whose CPU time keeps rising is busy: it gets busyMaxMs.
+  it('a silent process whose CPU time keeps rising is busy, not hung, until busyMaxMs', () => {
+    let memory = {}
+    let at = T0
+    const step = cpu => { const result = decideLiveness({ now: at, bootAt: T0 - 3_600_000, credential: ok, probe: 'timeout', cpu, memory }); memory = result.memory; at += TIMINGS.recheckMs; return result }
+    const actions = []
+    let cpu = 100
+    while (at - T0 < TIMINGS.busyMaxMs + 3 * TIMINGS.recheckMs) { const result = step(cpu += 15); actions.push(result.action); if (result.action === 'kill-and-start') { assert.match(result.reason, /busy past 240 s/); break } }
+    assert.equal(actions.at(-1), 'kill-and-start')
+    // Killed only after busyMaxMs of silence, never at the third strike.
+    assert.ok(actions.length * TIMINGS.recheckMs > TIMINGS.busyMaxMs, `killed after ${actions.length} probes`)
+  })
+
+  it('a silent process whose CPU time is flat is hung after three strikes', () => {
+    let memory = {}
+    const actions = [1, 2, 3].map(index => { const result = decideLiveness({ now: T0 + index * TIMINGS.recheckMs, credential: ok, probe: 'timeout', cpu: 100, memory }); memory = result.memory; return result })
+    assert.deepEqual(actions.map(result => result.action), ['recheck', 'recheck', 'kill-and-start'])
+    assert.match(actions[2].reason, /hung: its CPU time is not rising/)
+  })
+
+  it('a starting process past its grace waits while its CPU time rises', () => {
+    const armed = { kind: 'running', appPid: 11, at: iso(-4 * MIN) }
+    const first = decide({ credential: { ok: false }, armed, armedAppAlive: true, cpu: 50 })
+    assert.equal(first.action, 'kill-and-start', 'no earlier sample: nothing proves it busy')
+    const busy = decide({ credential: { ok: false }, armed, armedAppAlive: true, cpu: 58, memory: { cpu: { pid: 11, seconds: 50 } } })
+    assert.equal(busy.action, 'wait')
+    assert.equal(decide({ credential: { ok: false }, armed: { ...armed, at: iso(-8 * MIN) }, armedAppAlive: true, cpu: 58, memory: { cpu: { pid: 11, seconds: 50 } } }).action, 'kill-and-start')
+  })
+
   it('a crash: waits for the recovery watchdog, then starts', () => {
     const armed = { kind: 'running', appPid: 10, at: iso(-3_600_000) }
     const first = decide({ credential: { ok: false, stale: true }, armed })
@@ -298,6 +328,34 @@ describe('service tick', () => {
       // Steered once: the next tick says nothing more.
       await service.tick()
       assert.equal(calls.filter(call => call.method === 'agents.steer').length, 1)
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  it('records its kill and relaunch in armed.json, so the recovery watchdog does not relaunch next to it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'meta-wizard-armed-'))
+    try {
+      await writeFile(join(root, 'control-owner.json'), JSON.stringify({ version: 1, endpoint: 'http://127.0.0.1:5555/control', token: 'ab', pid: 1, startedAt: iso(-3_600_000) }))
+      await mkdir(join(root, 'recovery'), { recursive: true })
+      await writeFile(join(root, 'recovery', 'armed.json'), JSON.stringify({ kind: 'running', appPid: 1, at: iso(-3_600_000), fromVersion: '0.1.90', foreground: true, launch: { exe: 'C:\\Conductor.exe', args: [] }, checkout: null, packaged: true }))
+      const order = []
+      let now = T0
+      const controlCall = async () => { const error = new Error('timeout'); error.code = 'timeout'; throw error }
+      const service = createService({
+        userData: root, timings: { startWaitMs: 4000 }, testProfile: true,
+        deps: {
+          now: () => now, controlCall, pidAlive: () => true, toast: async () => 'ok', sleep: async () => { now += 2000 }, cpuSeconds: async () => 100,
+          kill: async pid => { order.push(['kill', pid, JSON.parse(await readFile(join(root, 'recovery', 'armed.json'), 'utf8')).kind]); return 'killed' },
+          spawn: exe => { order.push(['spawn', exe]); return { pid: 2, on() {}, unref() {} } }
+        }
+      })
+      for (let index = 0; index < 3; index += 1) { await service.tick(); now += TIMINGS.recheckMs }
+      assert.deepEqual(order, [['kill', 1, 'restart'], ['spawn', 'C:\\Conductor.exe']])
+      const armed = JSON.parse(await readFile(join(root, 'recovery', 'armed.json'), 'utf8'))
+      assert.equal(armed.appPid, 1)
+      assert.equal(armed.kind, 'restart')
+      assert.equal(armed.by, 'meta-wizard')
+      assert.equal(armed.foreground, false)
+      assert.equal(armed.launch.exe, 'C:\\Conductor.exe')
     } finally { await rm(root, { recursive: true, force: true }) }
   })
 

@@ -8,8 +8,17 @@ import { TIMINGS } from './detect.mjs'
 
 const age = (now, iso) => { const at = Date.parse(iso ?? ''); return Number.isFinite(at) ? now - at : Infinity }
 
-export function decideLiveness({ now = Date.now(), credential, probe, armed, armedAppAlive = false, bootAt = 0, memory = {}, timings = TIMINGS }) {
-  const next = { strikes: memory.strikes ?? 0, downSince: memory.downSince ?? null, restarts: (memory.restarts ?? []).filter(at => now - at < timings.restartWindowMs), standDownUntil: memory.standDownUntil ?? null }
+/**
+ * `cpu` is the CPU time, in seconds, of the main process in question (the credential's pid, or the
+ * armed pid while it starts), sampled this tick; null when it could not be read. It rising between
+ * two ticks means the process is working, so a silent one is busy rather than hung.
+ */
+export function decideLiveness({ now = Date.now(), credential, probe, armed, armedAppAlive = false, cpu = null, bootAt = 0, memory = {}, timings = TIMINGS }) {
+  const next = { strikes: memory.strikes ?? 0, downSince: memory.downSince ?? null, restarts: (memory.restarts ?? []).filter(at => now - at < timings.restartWindowMs), standDownUntil: memory.standDownUntil ?? null, silentSince: memory.silentSince ?? null, cpu: typeof cpu === 'number' ? { pid: memory.cpu?.pid, seconds: cpu } : null }
+  const sampledPid = credential?.ok ? credential.credential.pid : armedAppAlive ? armed?.appPid : null
+  if (next.cpu) next.cpu.pid = sampledPid
+  const rising = typeof cpu === 'number' && memory.cpu?.pid === sampledPid && typeof memory.cpu?.seconds === 'number' && cpu - memory.cpu.seconds >= 0.05
+  const busy = rising ? `its CPU time rose ${(cpu - memory.cpu.seconds).toFixed(1)} s since the last probe` : ''
   const result = (action, reason, extra = {}) => ({ action, reason, memory: next, ...extra })
   const restart = (action, reason) => {
     if (next.standDownUntil && now < next.standDownUntil) return result('stand-down', `crash-loop guard: not starting Conductor again before ${new Date(next.standDownUntil).toISOString()} (${reason})`)
@@ -21,21 +30,27 @@ export function decideLiveness({ now = Date.now(), credential, probe, armed, arm
   }
 
   if (credential?.ok && probe === 'ok') {
-    next.strikes = 0; next.downSince = null; next.standDownUntil = null
+    next.strikes = 0; next.downSince = null; next.standDownUntil = null; next.silentSince = null
     return result('ok', `pid ${credential.credential.pid} answers`)
   }
   const stopping = armed && ['restart', 'update-install', 'quit', 'update-on-quit'].includes(armed.kind)
   if (credential?.ok) {
     // The process is there and does not answer: hung, or on its way out of a restart or install.
     next.strikes += 1
+    next.silentSince ??= now
     if (next.strikes < timings.hungStrikes) return result('recheck', `pid ${credential.credential.pid} did not answer (${probe}); ${next.strikes} of ${timings.hungStrikes}`)
     if (stopping && armed.appPid === credential.credential.pid && age(now, armed.at) < timings.updateGraceMs) return result('wait', `pid ${credential.credential.pid} is stopping (${armed.kind} at ${armed.at})`)
-    return restart('kill-and-start', `pid ${credential.credential.pid} has not answered app control ${next.strikes} times in a row (hung)`)
+    const silentFor = now - next.silentSince
+    // 2026-10-21: a main process busy in a two-minute launch prune was killed twice after about 60 s.
+    if (rising && silentFor < timings.busyMaxMs) return result('recheck', `pid ${credential.credential.pid} is busy, not hung: silent for ${Math.round(silentFor / 1000)} s but ${busy}; allowed ${Math.round(timings.busyMaxMs / 1000)} s`)
+    return restart('kill-and-start', `pid ${credential.credential.pid} has not answered app control ${next.strikes} times in a row over ${Math.round(silentFor / 1000)} s (${rising ? `busy past ${Math.round(timings.busyMaxMs / 1000)} s` : 'hung: its CPU time is not rising'})`)
   }
   next.strikes = 0
+  next.silentSince = null
   if (armed?.kind === 'running' && armedAppAlive) {
     // Up, but no control endpoint yet: starting, or hung before its control server.
     if (age(now, armed.at) < timings.startingGraceMs) return result('wait', `pid ${armed.appPid} is starting`)
+    if (rising && age(now, armed.at) < timings.startingGraceMs + timings.busyMaxMs) return result('wait', `pid ${armed.appPid} is still starting: ${busy}`)
     return restart('kill-and-start', `pid ${armed.appPid} runs but has had no control endpoint since ${armed.at}`)
   }
   next.downSince ??= now

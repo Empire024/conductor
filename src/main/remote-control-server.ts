@@ -8,6 +8,7 @@ import type { RemoteControlHost } from './remote-control-host'
 import { NONCE_HEADER, PEER_HEADER, RemoteAccessError, SIGNATURE_HEADER, TIMESTAMP_HEADER, type RemotePeers } from './remote-peers'
 import type { SecretKeyValueStore, SecretVault } from './secret-store'
 import { createRemoteTlsIdentity, tlsIdentityUsable, type RemoteTlsIdentity } from './remote-tls'
+import { loopbackOnly } from './test-loopback-guard'
 import { INSTALL_TAILSCALE_MESSAGE, isTailscaleAddress, type TailscaleReader } from './tailscale'
 
 const CERT_SETTING = 'remote-control.tls.certificate'
@@ -35,12 +36,15 @@ const MAX_UPGRADE_HEADER_BYTES = 8 * 1024
  * anything else would be the one promise this exposure exists to keep, broken silently. Nothing
  * else in the server may widen the bind address.
  */
-export function resolveBindHost(settings: Pick<RemoteControlSettings, 'exposure'>, tailscaleAddress?: string | null): string | null {
+export function resolveBindHost(settings: Pick<RemoteControlSettings, 'exposure'>, tailscaleAddress?: string | null, env: NodeJS.ProcessEnv = process.env): string | null {
+  let host: string | null
   if (settings.exposure === 'tailscale') {
     const address = String(tailscaleAddress ?? '').trim()
-    return address && isTailscaleAddress(address) ? address : null
-  }
-  return settings.exposure === 'network' ? '0.0.0.0' : '127.0.0.1'
+    host = address && isTailscaleAddress(address) ? address : null
+  } else host = settings.exposure === 'network' ? '0.0.0.0' : '127.0.0.1'
+  // A test instance never listens beyond loopback, whatever exposure its smoke asked for: a new
+  // candidate electron.exe that does puts a Windows Firewall dialog on the owner's screen.
+  return host && loopbackOnly(env) ? '127.0.0.1' : host
 }
 
 /** A socket that is about to be upgraded, before anything has been written to it. */

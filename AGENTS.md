@@ -30,6 +30,11 @@ Conductor is a local desktop application for its owner. GitHub is used only as t
   `CONDUCTOR_BACKGROUND_WINDOWS=1` to park a dev launch too.
 - `CONDUCTOR_BACKGROUND_WINDOWS=0` forces a visible window when someone deliberately wants to watch
   a run.
+- A launch with `CONDUCTOR_TEST_USER_DATA` set never listens beyond loopback: every listener (phone
+  access and remote control on any exposure, the relay, raw sockets) binds 127.0.0.1
+  (`src/main/test-loopback-guard.ts`). Each candidate `electron.exe` is a new path to Windows
+  Firewall, and a non-loopback listener puts an Allow dialog on the owner's screen.
+  `CONDUCTOR_TEST_ALLOW_NETWORK=1` is the explicit opt-out; no smoke needs it.
 
 ## Update experience
 

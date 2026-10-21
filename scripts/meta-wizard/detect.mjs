@@ -6,6 +6,9 @@ export const TIMINGS = {
   probeTimeoutMs: 10_000,
   recheckMs: 20_000,
   hungStrikes: 3,
+  // A silent main process whose CPU time keeps rising is busy (a long prune, a big migration), not
+  // hung: it gets this long, counted from its first unanswered probe, before it is killed.
+  busyMaxMs: 240_000,
   crashGraceMs: 60_000,
   restartGraceMs: 180_000,
   updateGraceMs: 600_000,

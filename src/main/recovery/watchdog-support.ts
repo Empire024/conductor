@@ -17,7 +17,7 @@ export function toastScript(appId = CONDUCTOR_APP_ID): string {
   ].join('; ')
 }
 
-const TIMING_KEYS = ['pollMs', 'restartWaitMs', 'installWaitMs', 'installMaxMs', 'crashWaitMs', 'attemptWaitMs', 'afterAgentWaitMs', 'maxRecoveries', 'recoveryWindowMs'] as const
+const TIMING_KEYS = ['pollMs', 'restartWaitMs', 'installWaitMs', 'installMaxMs', 'crashWaitMs', 'attemptWaitMs', 'startingMaxMs', 'afterAgentWaitMs', 'maxRecoveries', 'recoveryWindowMs'] as const
 
 /** Test profiles only: shorter waits (CONDUCTOR_RECOVERY_TIMINGS, JSON) and the attempt executables
  *  (CONDUCTOR_RECOVERY_TEST_EXES, a JSON array) the parked smoke uses to make a relaunch fail. */

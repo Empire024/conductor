@@ -69,6 +69,10 @@ export function createRecovery(options: RecoveryOptions): RecoveryController {
       current = record
     } catch (error) { options.log(`recovery: could not arm the watchdog: ${error instanceof Error ? error.message : String(error)}`) }
   }
+  // Claimed at once, before the long part of startup: the previous Conductor's watchdog (and the
+  // meta-wizard) then see this launch as starting and wait for it instead of starting another next
+  // to it, which would only exit against the single-instance lock. start() fills in the rest.
+  if (enabled) write({ appPid: options.pid, kind: 'running', at: new Date().toISOString(), fromVersion: previousArm?.fromVersion ?? '', foreground: false, launch: launchSpec(options), checkout: previousArm?.checkout ?? null, packaged: options.packaged })
   return {
     enabled,
     previousArm,

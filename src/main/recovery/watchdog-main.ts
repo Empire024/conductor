@@ -71,6 +71,12 @@ const deps: WatchdogDeps = {
       return response.ok ? { pid } : null
     } catch { return null }
   },
+  watched(pid) {
+    try {
+      const lock = JSON.parse(readFileSync(lockPath, 'utf8')) as WatchdogLock
+      return lock.appPid === pid && lock.pid !== process.pid && alive(lock.pid)
+    } catch { return false }
+  },
   installerRunning() {
     if (process.platform !== 'win32') return false
     try {

@@ -42,7 +42,12 @@ mechanisms miss, including the app being dead or hung.
 
 1. **Alive?** The credential's pid is running and `tools.list` answers within 10 s.
    - Not answering: two quick rechecks (20 s apart). A hung process (pid alive, no answer 3 times)
-     is killed (`taskkill /T /F`) and started again.
+     is killed (`taskkill /T /F`) and started again. A silent main process whose CPU time keeps
+     rising between probes is **busy, not hung** (2026-10-21: two kills of a main process busy in a
+     launch prune): it gets `busyMaxMs` (4 min) from its first unanswered probe, and a starting
+     one gets the same past its starting grace. Before it kills or starts anything it rewrites the
+     replaced pid's `armed.json` as `kind: "restart", by: "meta-wizard"`, so the recovery watchdog
+     waits for the Conductor started here instead of relaunching its own next to it.
    - Gone: after a crash (the recovery watchdog's `armed.json` still says `running`) or a
      restart/update that did not come back within its window, start the installed exe
      (`armed.json` `launch`, else `%LOCALAPPDATA%\Programs\conductor-desktop\Conductor.exe`). A
