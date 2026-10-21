@@ -49,6 +49,7 @@ import { installContextMenu } from './context-menu'
 import { app, BrowserWindow, clipboard, ipcMain, Menu, Notification, powerMonitor, screen, shell, webContents } from 'electron'
 import * as testDialogs from './test-mode-dialogs'
 import { startTestModeWatchdog } from './test-mode-watchdog'
+import { installMainErrorLog } from './main-error-log'
 import { SystemMetricsSampler } from './system-metrics.ts'
 import type { SystemMetricsSnapshot } from '../shared/system-metrics.ts'
 import { CloseConfirmation, hasRunningWork, hasSessionWork } from './close-confirmation'
@@ -331,15 +332,11 @@ if (testMode) {
   // runtime host keep watching the smoke that started the run, not the previous app process.
   if (!process.env.CONDUCTOR_TEST_PARENT_PID) process.env.CONDUCTOR_TEST_PARENT_PID = String(process.ppid)
   startTestModeWatchdog()
-  const mainErrorsLog = join(resolve(process.env.CONDUCTOR_TEST_USER_DATA!), 'main-errors.log')
-  const logMainError = (kind: string, detail: string): void => {
-    try { appendFileSync(mainErrorsLog, `${new Date().toISOString()} [${kind}] ${detail}\n`) } catch { /* logging never blocks anything */ }
-  }
-  // Electron's default handling for these is a modal "A JavaScript error occurred" dialog, which
-  // is exactly the kind of native window a parked test instance must never put on a real screen.
-  process.on('uncaughtException', error => logMainError('uncaughtException', error.stack ?? error.message))
-  process.on('unhandledRejection', reason => logMainError('unhandledRejection', reason instanceof Error ? reason.stack ?? reason.message : String(reason)))
 }
+// Electron's default handling of an uncaught main-process error is a modal "A JavaScript error
+// occurred" box that blocks the main thread until someone clicks OK: a parked test instance must
+// never put it on a real screen, and the installed app must never wait on it unattended.
+installMainErrorLog(join(testMode ? resolve(process.env.CONDUCTOR_TEST_USER_DATA!) : app.getPath('userData'), 'main-errors.log'))
 /** Smoke runs and probes drive a real window, but they must never take the desktop from whoever
  *  is working: an automation profile (CONDUCTOR_TEST_USER_DATA) parks its windows off-screen,
  *  out of the taskbar, and never activates or raises them. Set CONDUCTOR_BACKGROUND_WINDOWS=0 to
