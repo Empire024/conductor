@@ -2,7 +2,7 @@ import { recoverClaudeMessageDuplicates } from '../shared/claude-message-recover
 import { randomUUID } from 'node:crypto'
 import { PhoneActivityStore, activityReceipt } from './phone-activity'
 import { UsageWeeksStore } from './usage-weeks-store'
-import { mkdirSync, readFileSync, renameSync, writeFileSync, readdirSync, statSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, writeFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
 import type { AgentEvent, AgentEventData, ConversationHistoryEntry, ConversationSearchGroup, ConversationSearchResult, DiffArtifact, SessionProjection, SessionSettings, StructuredProvider, TimelineItem } from '../shared/structured-agent'
@@ -11,7 +11,7 @@ import { emptyProjection, projectAgentEvent } from '../shared/structured-agent-r
 import { emptyArchiveTail, growArchiveTail, settleArchiveTail, type ArchiveTail } from './conversation-history'
 import { liveCostLimits, liveReplacementAuthorization } from './live-test-policy'
 import { anonymousConversations } from './local-models/anonymous'
-import { pruneDiffSnapshots, pruneOutputArtifacts } from './agent-artifacts'
+import { listArtifactEntries, pruneDiffSnapshots, pruneOutputArtifacts, type ArtifactEntry, type PruneLedger, type PruneResult } from './agent-artifacts'
 
 /** Events beyond this many for a conversation live only in the durable transcript archive, never
  *  in the bounded journal `checkpoint` trims below it. */
@@ -164,9 +164,25 @@ function usageEvent(row: Record<string, unknown>, data: AgentEventData): WeeklyU
 }
 
 const ARTIFACT_ALLOWANCE_BYTES = 512 * 1024 * 1024
+/** Past this a write schedules a background prune, so the allowance itself is rarely reached. */
+const ARTIFACT_PRUNE_MARK_BYTES = 448 * 1024 * 1024
+/** A prune a write schedules starts at most this often; one that finds nothing costs no reads. */
+const ARTIFACT_PRUNE_INTERVAL_MS = 60_000
 
 export class StructuredAgentStore {
+  /** Sum of `artifactIndex` plus files written before the launch listing finished. */
   private artifactBytes = 0
+  /** Every artifact file with its size and age, listed once per launch without blocking and kept
+   *  current by writes and prunes, so neither the allowance check nor a prune stats the directory
+   *  (about 30,000 files on the owner's machine). Null until the listing finishes. */
+  private artifactIndex: Map<string, ArtifactEntry> | null = null
+  private artifactIndexLoading?: Promise<Map<string, ArtifactEntry>>
+  /** Written while the launch listing ran; merged into the index when it lands. */
+  private artifactWrites = new Map<string, ArtifactEntry>()
+  /** Files the prune knows have nothing left to take (structured_artifact_settled), loaded once. */
+  private settledArtifacts?: Set<string>
+  private artifactPrune?: Promise<PruneResult>
+  private artifactPruneStarted = 0
   private projections = new Map<string, SessionProjection>()
   /** Top-level usage reports projected this run, per conversation: the token burn meter's cache
    *  key (token-burn.ts), so a reading cached before a report never hides that report. */
@@ -192,7 +208,7 @@ export class StructuredAgentStore {
     this.usageWeeks = new UsageWeeksStore(db)
     this.artifactDirectory = join(dataDirectory, 'agent-artifacts')
     mkdirSync(this.artifactDirectory, { recursive: true, mode: 0o700 })
-    this.artifactBytes = this.countArtifactBytes()
+    void this.loadArtifactIndex().catch(error => console.warn('The agent artifact directory could not be listed; its allowance is checked once it can be', error))
     db.exec(`
       CREATE TABLE IF NOT EXISTS structured_sessions (
         id TEXT PRIMARY KEY REFERENCES agent_sessions(id) ON DELETE CASCADE,
@@ -214,6 +230,7 @@ export class StructuredAgentStore {
         id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES structured_sessions(id) ON DELETE CASCADE,
         kind TEXT NOT NULL, filename TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS structured_artifact_settled (filename TEXT PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS structured_transcript_archive (
         session_id TEXT NOT NULL REFERENCES structured_sessions(id) ON DELETE CASCADE,
         sequence INTEGER NOT NULL, item_json TEXT NOT NULL, PRIMARY KEY(session_id, sequence)
@@ -739,25 +756,83 @@ export class StructuredAgentStore {
     return id
   }
   artifact(sessionId: string, id: string): DiffArtifact { return JSON.parse(this.readArtifact(sessionId, id, 'diff')) as DiffArtifact }
-  private countArtifactBytes(): number {
-    return readdirSync(this.artifactDirectory).filter(name => /^[a-f0-9-]+\.(json|txt)$/.test(name)).reduce((sum, name) => sum + statSync(join(this.artifactDirectory, name)).size, 0)
+  /** The artifact index, listed once without blocking (stat runs on the thread pool) and merged
+   *  with whatever was written meanwhile. */
+  private loadArtifactIndex(): Promise<Map<string, ArtifactEntry>> {
+    if (this.artifactIndex) return Promise.resolve(this.artifactIndex)
+    this.artifactIndexLoading ??= listArtifactEntries(this.artifactDirectory).then(entries => {
+      const index = new Map(entries.map(entry => [entry.name, entry]))
+      // A file the listing saw was stat'ed after it was written, so the listing's entry stands.
+      for (const [name, entry] of this.artifactWrites) if (!index.has(name)) index.set(name, entry)
+      this.artifactWrites.clear()
+      this.artifactIndex = index
+      this.artifactBytes = [...index.values()].reduce((sum, entry) => sum + entry.size, 0)
+      if (this.artifactBytes > ARTIFACT_PRUNE_MARK_BYTES) this.scheduleArtifactPrune()
+      return index
+    }).finally(() => { this.artifactIndexLoading = undefined })
+    return this.artifactIndexLoading
+  }
+  private noteArtifactSize(name: string, size: number, at = Date.now()): void {
+    const entries = this.artifactIndex ?? this.artifactWrites, previous = entries.get(name)
+    this.artifactBytes += size - (previous?.size ?? 0)
+    entries.set(name, { name, size, at: previous?.at ?? at })
+  }
+  private pruneLedger(): PruneLedger {
+    if (!this.settledArtifacts) {
+      try { this.settledArtifacts = new Set((this.db.prepare('SELECT filename FROM structured_artifact_settled').all() as Array<{ filename: string }>).map(row => row.filename)) }
+      catch { this.settledArtifacts = new Set() }
+    }
+    const settled = this.settledArtifacts
+    return {
+      settled,
+      settle: names => {
+        for (const name of names) settled.add(name)
+        // One transaction per batch, unless a caller's is already open; only ours is ever rolled back.
+        let began = false
+        try {
+          if (!(this.db as { isTransaction?: boolean }).isTransaction) { this.db.exec('BEGIN'); began = true }
+          const insert = this.db.prepare('INSERT OR IGNORE INTO structured_artifact_settled(filename) VALUES(?)')
+          for (const name of names) insert.run(name)
+          if (began) this.db.exec('COMMIT')
+        } catch { if (began) try { this.db.exec('ROLLBACK') } catch { /* The database closed under a background prune. */ } }
+      },
+      resized: (name, size) => this.noteArtifactSize(name, size)
+    }
   }
   /** Bound the artifact directory (old diff snapshots and old command output keep only their patch
-   *  or tail) and recount what is left, so the allowance below is measured against the pruned
-   *  directory rather than the launch-time total. Runs on launch, daily, and when a write would
-   *  otherwise hit the allowance. */
-  pruneArtifacts(now = Date.now()): { pruned: number; freedBytes: number } {
-    const diffs = pruneDiffSnapshots(this.artifactDirectory, now)
-    const outputs = pruneOutputArtifacts(this.artifactDirectory, now)
-    try { this.artifactBytes = this.countArtifactBytes() } catch { this.artifactBytes = Math.max(0, this.artifactBytes - diffs.freedBytes - outputs.freedBytes) }
-    return { pruned: diffs.pruned + outputs.pruned, freedBytes: diffs.freedBytes + outputs.freedBytes }
+   *  or tail). Runs on launch, daily, and when writes pass the prune mark, always in the
+   *  background: it lists from the in-memory index, skips every file the ledger knows is already
+   *  pruned, reads and rewrites the rest asynchronously, and yields between files. A launch and a
+   *  write never wait for it (2026-10-21: the synchronous version re-read 17,000 pruned files on a
+   *  write and held the main thread past the supervisor's liveness limit). Concurrent calls share
+   *  one run. */
+  pruneArtifacts(now = Date.now()): Promise<PruneResult> {
+    if (this.artifactPrune) return this.artifactPrune
+    this.artifactPruneStarted = Date.now()
+    const run = (async (): Promise<PruneResult> => {
+      const index = await this.loadArtifactIndex(), entries = [...index.values()], ledger = this.pruneLedger()
+      const diffs = await pruneDiffSnapshots(this.artifactDirectory, now, undefined, undefined, { entries, ledger })
+      const outputs = await pruneOutputArtifacts(this.artifactDirectory, now, undefined, undefined, undefined, { entries, ledger })
+      return { pruned: diffs.pruned + outputs.pruned, freedBytes: diffs.freedBytes + outputs.freedBytes, read: diffs.read + outputs.read }
+    })()
+    this.artifactPrune = run.finally(() => { this.artifactPrune = undefined })
+    return this.artifactPrune
+  }
+  /** A prune a write asks for: at most one a minute, never awaited. */
+  private scheduleArtifactPrune(): void {
+    if (this.artifactPrune || Date.now() - this.artifactPruneStarted < ARTIFACT_PRUNE_INTERVAL_MS) return
+    void this.pruneArtifacts().catch(error => console.warn('Background agent artifact prune failed; the next write past the mark retries it', error))
   }
   private writeArtifact(filename: string, data: string): void {
     const bytes = Buffer.byteLength(data)
-    if (this.artifactBytes + bytes > ARTIFACT_ALLOWANCE_BYTES) this.pruneArtifacts()
-    if (this.artifactBytes + bytes > ARTIFACT_ALLOWANCE_BYTES) throw new Error('Private agent artifact storage reached its 512 MiB allowance; existing history was preserved')
+    if (this.artifactBytes + bytes > ARTIFACT_ALLOWANCE_BYTES) {
+      // Refused, not pruned in place: the caller keeps a bounded tail, and the prune runs off this path.
+      this.scheduleArtifactPrune()
+      throw new Error('Private agent artifact storage reached its 512 MiB allowance; existing history was preserved and older artifacts are being pruned')
+    }
     writeFileSync(join(this.artifactDirectory, filename), data, { flag: 'wx', mode: 0o600 })
-    this.artifactBytes += bytes
+    this.noteArtifactSize(filename, bytes)
+    if (this.artifactBytes > ARTIFACT_PRUNE_MARK_BYTES) this.scheduleArtifactPrune()
   }
   output(sessionId: string, id: string): string { return this.readArtifact(sessionId, id, 'output') }
   private volatileArtifact(sessionId: string): Map<string, { kind: 'diff' | 'output'; data: string }> {
@@ -889,7 +964,7 @@ export class StructuredAgentStore {
         const temporary = `${path}.${process.pid}.tmp`
         writeFileSync(temporary, masked, { mode: 0o600 })
         renameSync(temporary, path)
-        this.artifactBytes += Buffer.byteLength(masked) - Buffer.byteLength(text)
+        this.noteArtifactSize(name, Buffer.byteLength(masked))
         changed++
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') console.warn(`An output artifact could not be masked and was skipped: ${name}`, error)

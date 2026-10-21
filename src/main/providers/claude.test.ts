@@ -668,6 +668,21 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     expect(f.projection().items.find((item) => item.nativeItemId === 'one')?.data).toMatchObject({ name: 'Bash', output: 'actual failure', stderr: 'stderr', exitCode: 2, status: 'failed' })
   })
 
+  it('keeps an image tool_result as a one-line description, not pretty-printed base64', async () => {
+    const f = fixture()
+    await f.adapter.start()
+    // The 2026-10-21 frames carried 192k-375k characters of base64 per Read of a .jpg.
+    const data = Buffer.alloc(300 * 1024, 7).toString('base64')
+    f.transport.receive(toolUse('photo', 'Read', { file_path: 'arms-native2.jpg' }))
+    f.transport.receive({ type: 'user', uuid: 'photo-result', tool_use_result: { type: 'image', file: { base64: data, type: 'image/jpeg' } }, message: { content: [{ type: 'tool_result', tool_use_id: 'photo', content: [{ type: 'image', source: { type: 'base64', data, media_type: 'image/jpeg' } }] }] } })
+    f.transport.receive(toolUse('shot', 'mcp__browser__screenshot', {}))
+    f.transport.receive({ type: 'user', uuid: 'shot-result', message: { content: [{ type: 'tool_result', tool_use_id: 'shot', content: [{ type: 'text', text: 'Captured the page' }, { type: 'image', source: { type: 'base64', data: 'iVBORw0KGgo=', media_type: 'image/png' } }] }] } })
+    const photo = f.projection().items.find((item) => item.nativeItemId === 'photo')?.data
+    expect(photo).toMatchObject({ name: 'Read', status: 'completed', output: '[Image image/jpeg, 300 KiB; not stored in the transcript]' })
+    expect(f.projection().items.find((item) => item.nativeItemId === 'shot')?.data).toMatchObject({ output: 'Captured the page\n[Image image/png, 1 KiB; not stored in the transcript]' })
+    expect(JSON.stringify(f.events)).not.toContain(data.slice(0, 200))
+  })
+
   it('captures auto-approved edit only at genuine pre/post hooks and waits before acknowledging', async () => {
     let release!: () => void
     const beforeTool = vi.fn(() => new Promise<void>((resolve) => { release = resolve }))

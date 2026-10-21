@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { DatabaseSync } from 'node:sqlite'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -204,7 +204,7 @@ describe('bounding local snapshot storage', () => {
     const stale = Date.now() / 1000 - 90 * 24 * 60 * 60
     const file = join(f.store.artifactDirectory, change!.artifactId! + '.json')
     utimesSync(file, stale, stale)
-    expect(pruneDiffSnapshots(f.store.artifactDirectory).pruned).toBe(1)
+    expect((await pruneDiffSnapshots(f.store.artifactDirectory)).pruned).toBe(1)
 
     const pruned = f.store.artifact('session', change!.artifactId!)
     expect(pruned.before).toBeNull()
@@ -214,8 +214,10 @@ describe('bounding local snapshot storage', () => {
     expect(pruned.limitation).toMatch(/pruned/)
     expect((await f.artifacts.undo(f.workspace, pruned)).outcome).toBe('conflict')
     expect(f.read('kept.txt')).toBe('agent version\n')
+    // The rewrite keeps the file's age, so it does not jump to the front of the next prune's order.
+    expect(Math.abs(statSync(file).mtimeMs / 1000 - stale)).toBeLessThan(2)
     // Pruning is idempotent: a second sweep has nothing left to take.
-    expect(pruneDiffSnapshots(f.store.artifactDirectory).pruned).toBe(0)
+    expect((await pruneDiffSnapshots(f.store.artifactDirectory)).pruned).toBe(0)
   })
 
   it('keeps recent snapshots and prunes only what is over the byte budget', async () => {
@@ -225,37 +227,99 @@ describe('bounding local snapshot storage', () => {
     for (const name of ['one.txt', 'two.txt', 'three.txt']) {
       const [change] = await f.edit('session', name, name.repeat(200))
       ids.push(change!.artifactId!)
+      // Distinct ages, newest last, so the budget keeps exactly the newest one.
+      const at = Date.now() / 1000 - 60 + ids.length
+      utimesSync(join(f.store.artifactDirectory, change!.artifactId! + '.json'), at, at)
     }
     const budget = readFileSync(join(f.store.artifactDirectory, ids.at(-1)! + '.json')).byteLength + 100
-    expect(pruneDiffSnapshots(f.store.artifactDirectory, Date.now(), 30 * 24 * 60 * 60 * 1000, budget).pruned).toBe(2)
+    expect((await pruneDiffSnapshots(f.store.artifactDirectory, Date.now(), 30 * 24 * 60 * 60 * 1000, budget)).pruned).toBe(2)
     const survivors = ids.filter(id => (JSON.parse(readFileSync(join(f.store.artifactDirectory, id + '.json'), 'utf8')) as DiffArtifact).after !== null)
     expect(survivors).toEqual([ids.at(-1)])
   })
 
-  it('cuts aged-out command output to its tail and keeps the id readable', () => {
+  it('cuts aged-out command output to its tail and keeps the id readable', async () => {
     const f = fixture()
     const recent = f.store.putOutput('session', 'recent '.repeat(2000))
     const old = f.store.putOutput('session', 'head '.repeat(4000) + 'THE END')
     const stale = Date.now() / 1000 - 90 * 24 * 60 * 60
     utimesSync(join(f.store.artifactDirectory, old + '.txt'), stale, stale)
-    expect(pruneOutputArtifacts(f.store.artifactDirectory).pruned).toBe(1)
+    expect((await pruneOutputArtifacts(f.store.artifactDirectory)).pruned).toBe(1)
     const pruned = f.store.output('session', old)
     expect(pruned).toMatch(/^\[Older command output was pruned/)
     expect(pruned.endsWith('THE END')).toBe(true)
     expect(pruned.length).toBeLessThan(5 * 1024)
     expect(f.store.output('session', recent)).toBe('recent '.repeat(2000))
-    expect(pruneOutputArtifacts(f.store.artifactDirectory).pruned).toBe(0)
+    expect((await pruneOutputArtifacts(f.store.artifactDirectory)).pruned).toBe(0)
   })
 
-  it('prunes instead of refusing when a write would reach the allowance', () => {
+  it('refuses a write past the allowance without pruning on the write path, prunes in the background, then accepts it', async () => {
     const f = fixture()
     const old = f.store.putOutput('session', 'x'.repeat(64 * 1024))
     const stale = Date.now() / 1000 - 90 * 24 * 60 * 60
     utimesSync(join(f.store.artifactDirectory, old + '.txt'), stale, stale)
+    // As a later launch finds it: listed from disk, with its age.
+    const store = f.store as unknown as { artifactIndex: unknown; loadArtifactIndex(): Promise<unknown> }
+    await store.loadArtifactIndex()
+    store.artifactIndex = null
+    await store.loadArtifactIndex()
     // Simulate a directory that a previous run filled to the allowance.
-    ;(f.store as unknown as { artifactBytes: number }).artifactBytes = 512 * 1024 * 1024
+    const internals = f.store as unknown as { artifactBytes: number; artifactPrune?: Promise<unknown> }
+    internals.artifactBytes = 512 * 1024 * 1024
+    expect(() => f.store.putOutput('session', 'new output')).toThrow(/allowance/)
+    // The write returned before the prune touched anything; the prune is running behind it.
+    expect(f.store.output('session', old)).toBe('x'.repeat(64 * 1024))
+    expect(internals.artifactPrune).toBeInstanceOf(Promise)
+    await internals.artifactPrune
+    expect(f.store.output('session', old)).toMatch(/^\[Older command output was pruned/)
+    // The index followed the rewrite, so the allowance is measured against the pruned file.
     const fresh = f.store.putOutput('session', 'new output')
     expect(f.store.output('session', fresh)).toBe('new output')
-    expect(f.store.output('session', old)).toMatch(/^\[Older command output was pruned/)
+  })
+
+  it('reads 17,000 already-pruned snapshots once, never again, and keeps the event loop answering', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'conductor-prune-ledger-')); roots.push(root)
+    const directory = join(root, 'agent-artifacts'); mkdirSync(directory)
+    const prunedDiff = JSON.stringify({ id: 'x', sessionId: 'session', path: 'a.txt', before: null, after: null, patch: '@@ -1 +1 @@\n-a\n+b\n', additions: 1, deletions: 1, canUndo: false, snapshotPruned: true })
+    for (let index = 0; index < 17_000; index++) writeFileSync(join(directory, `${randomUUID()}.json`), prunedDiff)
+    const live = Array.from({ length: 40 }, () => randomUUID())
+    for (const id of live) writeFileSync(join(directory, `${id}.json`), JSON.stringify({ id, sessionId: 'session', path: 'b.txt', before: 'old\n'.repeat(500), after: 'new\n'.repeat(500), patch: '@@', additions: 1, deletions: 1, canUndo: true }))
+    for (let index = 0; index < 500; index++) writeFileSync(join(directory, `${randomUUID()}.txt`), 'line\n'.repeat(2000))
+    const db = new DatabaseSync(':memory:'); databases.push(db)
+    db.exec('CREATE TABLE agent_sessions(id TEXT PRIMARY KEY)')
+
+    const constructed = performance.now()
+    const store = new StructuredAgentStore(db, root)
+    // A launch does not list, stat or prune 17,540 files before it goes on.
+    expect(performance.now() - constructed).toBeLessThan(1000)
+    expect((store as unknown as { artifactIndex: unknown }).artifactIndex).toBeNull()
+
+    let last = performance.now(), worst = 0
+    const ticker = setInterval(() => { const at = performance.now(); worst = Math.max(worst, at - last); last = at }, 5)
+    const later = Date.now() + 90 * 24 * 60 * 60 * 1000
+    try {
+      const first = await store.pruneArtifacts(later)
+      expect(first.pruned).toBe(40 + 500)
+      expect(first.read).toBe(17_000 + 40 + 500)
+      // The second run, like every later one, reads nothing: the ledger knows all of it is pruned.
+      const second = await store.pruneArtifacts(later)
+      expect(second).toEqual({ pruned: 0, freedBytes: 0, read: 0 })
+    } finally { clearInterval(ticker) }
+    // Nothing held the main thread anywhere near the supervisor's 60 s; a generous bound for a loaded runner.
+    expect(worst).toBeLessThan(500)
+
+    // The ledger outlives the process: a new launch on the same database reads nothing either.
+    const relaunched = new StructuredAgentStore(db, root)
+    expect(await relaunched.pruneArtifacts(later)).toEqual({ pruned: 0, freedBytes: 0, read: 0 })
+    expect(readdirSync(directory).filter(name => name.endsWith('.tmp'))).toEqual([])
+  }, 120_000)
+
+  it('shares one background run between a launch prune and a write-triggered one', async () => {
+    const f = fixture()
+    const first = f.store.pruneArtifacts(), second = f.store.pruneArtifacts()
+    expect(second).toBe(first)
+    await first
+    const third = f.store.pruneArtifacts()
+    expect(third).not.toBe(first)
+    await third
   })
 })

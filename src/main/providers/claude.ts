@@ -76,6 +76,20 @@ function settingsDiagnosticSummary(response: ObjectValue): ObjectValue {
 const CLASSIFIER_OUTAGE_RESULT = /auto mode classifier gave no verdict|^Auto mode unavailable\b|^Auto mode could not evaluate this action/im
 const safeguardRefusal = (message: string): boolean => /API Error:\s*.+?s safeguards flagged this message/i.test(message)
 const display = (value: Json | undefined): string => typeof value === 'string' ? value : value === undefined ? '' : JSON.stringify(value, null, 2)
+/** One tool_result content entry as timeline text. An image (a Read of a .jpg, a screenshot tool)
+ *  is base64 the timeline only ever showed as text, and pretty-printed whole it was 97% of the
+ *  output artifacts written on 2026-10-21 (117.5 of 120.6 MiB), each one pushing the store toward
+ *  the prune that hung the app. A one-line description stands in for it; the image itself is the
+ *  file the tool call names. */
+export function toolResultText(entry: Json | undefined): string {
+  const block = object(entry)
+  if (block.type === 'image') {
+    const source = object(block.source), data = string(source.data)
+    const bytes = data ? Math.floor(data.replace(/=+$/, '').length * 3 / 4) : 0
+    return `[Image${string(source.media_type) ? ' ' + string(source.media_type) : ''}${bytes ? `, ${Math.max(1, Math.round(bytes / 1024))} KiB` : ''}; not stored in the transcript]`
+  }
+  return string(block.text) ?? display(entry)
+}
 /** A roster name is a one-line label, but a task summary can be an agent's entire final
  *  report, which would otherwise be pasted verbatim into the subagent list heading. */
 export const taskLabel = (value: string | undefined): string | undefined => {
@@ -973,7 +987,7 @@ export class ClaudeAdapter implements ProviderAdapter {
           this.declareTool(block.id, string(block.name) ?? 'Unknown tool', block.input ?? {}, parentId)
         } else if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
           const id = block.tool_use_id
-          const output = Array.isArray(block.content) ? block.content.map((entry) => string(object(entry).text) ?? display(entry)).join('\n') : display(block.content)
+          const output = Array.isArray(block.content) ? block.content.map(toolResultText).join('\n') : toolResultText(block.content)
           const details = object(message.tool_use_result)
           const priorStatus = this.tools.get(id)?.status
           this.updateTool(id, { status: priorStatus === 'rejected' || priorStatus === 'interrupted' || priorStatus === 'failed' ? priorStatus : block.is_error === true || (number(details.exitCode) ?? 0) !== 0 ? 'failed' : 'completed' }, {

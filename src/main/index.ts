@@ -3390,8 +3390,9 @@ app.whenReady().then(async () => {
   registerIpc()
   installApplicationMenu()
   // Local snapshots are the only pre-git safety net, so they are kept generously but not
-  // forever: age them out on launch and once a day, the way the event journal is compacted.
-  const pruneSnapshots = (): void => { try { database.structured.pruneArtifacts() } catch (error) { console.error('Ignoring agent snapshot prune failure', error) } }
+  // forever: age them out on launch and once a day, the way the event journal is compacted. The
+  // prune runs in the background; the launch never waits for it.
+  const pruneSnapshots = (): void => { void database.structured.pruneArtifacts().catch(error => console.error('Ignoring agent snapshot prune failure', error)) }
   pruneSnapshots()
   snapshotPruneTimer = setInterval(pruneSnapshots, 24 * 60 * 60 * 1000)
   snapshotPruneTimer.unref?.()

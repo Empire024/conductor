@@ -1,5 +1,5 @@
-import { realpath, lstat, open, unlink } from 'node:fs/promises'
-import { realpathSync, lstatSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { realpath, lstat, open, unlink, readdir, readFile, rename, rm, stat as statAsync, utimes, writeFile } from 'node:fs/promises'
+import { realpathSync, lstatSync, readFileSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { createTwoFilesPatch, parsePatch, applyPatch, reversePatch } from 'diff'
 import type { DiffArtifact, FileChange } from '../shared/structured-agent'
@@ -326,38 +326,106 @@ function block(plan: RevertPlan, path: string, reason: string): void {
   if (!plan.blocked.some(existing => pathKey(existing.path) === pathKey(path))) plan.blocked.push({ path, reason })
 }
 
+/** One file in the artifact directory as the prune sees it: its name, size and age. */
+export interface ArtifactEntry { name: string; size: number; at: number }
+
+/** What the prune remembers between runs. `settled` names files with nothing left to take (already
+ *  pruned, or holding no versions), so a later run never reads them again: on the owner's machine
+ *  17,362 of 17,374 aged-out diffs were already pruned, and re-reading and parsing them on every
+ *  write past the allowance held the main thread for minutes until the supervisor killed the app
+ *  (2026-10-20 and 10-21). `resized` reports the new size of a file the prune rewrote. */
+export interface PruneLedger {
+  settled: ReadonlySet<string>
+  settle(names: string[]): void
+  resized?(name: string, size: number): void
+}
+
+export interface PruneResult { pruned: number; freedBytes: number; read: number }
+
+/** Files the prune rewrites are replaced whole (temporary file, then rename) so a reader on the
+ *  main thread sees either version, never a half-written one. A temporary left by a quit
+ *  mid-prune carries this suffix and is removed by the next listing. */
+const PRUNE_TEMPORARY = /\.prune-\d+\.tmp$/
+const ARTIFACT_NAME = /^[a-f0-9-]+\.(json|txt)$/
+/** The prune hands the event loop back at least this often while it walks cached entries. */
+const YIELD_EVERY = 64
+
+const yieldToEventLoop = (): Promise<void> => new Promise(resolve => setImmediate(resolve))
+
+/** Every artifact in the directory with its size and modification time, read without blocking:
+ *  `stat` runs on the thread pool a bounded batch at a time. A file that vanishes is skipped. */
+export async function listArtifactEntries(directory: string, batch = 64): Promise<ArtifactEntry[]> {
+  const names = await readdir(directory)
+  const entries: ArtifactEntry[] = []
+  for (let index = 0; index < names.length; index += batch) {
+    const slice = names.slice(index, index + batch)
+    await Promise.all(slice.map(async name => {
+      if (PRUNE_TEMPORARY.test(name)) { await rm(join(directory, name), { force: true }).catch(() => undefined); return }
+      if (!ARTIFACT_NAME.test(name)) return
+      try { const stat = await statAsync(join(directory, name)); entries.push({ name, size: stat.size, at: stat.mtimeMs }) }
+      catch { /* Removed while listing. */ }
+    }))
+  }
+  return entries
+}
+
+/** Replace one artifact with its pruned bytes, keeping its modification time so the file keeps its
+ *  place in the age order (a rewrite used to make every pruned file the newest one). */
+async function replaceArtifact(file: string, data: string, at: number): Promise<number> {
+  const temporary = `${file}.prune-${process.pid}.tmp`
+  await writeFile(temporary, data, { mode: 0o600 })
+  const time = new Date(at)
+  await utimes(temporary, time, time).catch(() => undefined)
+  await rename(temporary, file)
+  return Buffer.byteLength(data)
+}
+
+/** The candidates of one prune: newest first, everything past the retention window or over the
+ *  byte budget, minus what the ledger already knows has nothing left to take. */
+async function* pruneCandidates(entries: ArtifactEntry[], now: number, maxAgeMs: number, budgetBytes: number, settled: ReadonlySet<string>): AsyncGenerator<ArtifactEntry & { release: (bytes: number) => void }> {
+  const sorted = [...entries].sort((left, right) => right.at - left.at)
+  let kept = 0, walked = 0
+  for (const entry of sorted) {
+    if (++walked % YIELD_EVERY === 0) await yieldToEventLoop()
+    kept += entry.size
+    if (now - entry.at <= maxAgeMs && kept <= budgetBytes) continue
+    if (settled.has(entry.name)) continue
+    yield { ...entry, release: (bytes: number) => { kept -= bytes } }
+  }
+}
+
 /** Bound private snapshot storage the way the event journal is bounded: history stays
  *  readable, but the heavy `before`/`after` bytes behind old edits are dropped once they are
  *  past the retention window or over budget. A pruned artifact keeps its patch and its id, so
- *  the timeline still renders and a restore refuses instead of failing to find its snapshot. */
-export function pruneDiffSnapshots(directory: string, now = Date.now(), maxAgeMs = 30 * 24 * 60 * 60 * 1000, budgetBytes = 128 * 1024 * 1024): { pruned: number; freedBytes: number } {
-  let entries: Array<{ file: string; size: number; at: number }>
-  try {
-    entries = readdirSync(directory).filter(name => /^[a-f0-9-]+\.json$/.test(name)).map(name => {
-      const stat = statSync(join(directory, name))
-      return { file: join(directory, name), size: stat.size, at: stat.mtimeMs }
-    }).sort((left, right) => right.at - left.at)
-  } catch { return { pruned: 0, freedBytes: 0 } }
-  let kept = 0, pruned = 0, freedBytes = 0
-  for (const entry of entries) {
-    kept += entry.size
-    if (now - entry.at <= maxAgeMs && kept <= budgetBytes) continue
+ *  the timeline still renders and a restore refuses instead of failing to find its snapshot.
+ *  Asynchronous and yielding: it never holds the main thread for more than one file. */
+export async function pruneDiffSnapshots(directory: string, now = Date.now(), maxAgeMs = 30 * 24 * 60 * 60 * 1000, budgetBytes = 128 * 1024 * 1024, options: { entries?: ArtifactEntry[]; ledger?: PruneLedger } = {}): Promise<PruneResult> {
+  let entries: ArtifactEntry[]
+  try { entries = (options.entries ?? await listArtifactEntries(directory)).filter(entry => entry.name.endsWith('.json')) } catch { return { pruned: 0, freedBytes: 0, read: 0 } }
+  const settledNow: string[] = []
+  let pruned = 0, freedBytes = 0, read = 0
+  for await (const entry of pruneCandidates(entries, now, maxAgeMs, budgetBytes, options.ledger?.settled ?? new Set())) {
+    const file = join(directory, entry.name)
     try {
-      const artifact = JSON.parse(readFileSync(entry.file, 'utf8')) as DiffArtifact & { snapshotPruned?: boolean }
-      if (artifact.snapshotPruned || (artifact.before === null && artifact.after === null)) continue
+      read++
+      const artifact = JSON.parse(await readFile(file, 'utf8')) as DiffArtifact & { snapshotPruned?: boolean }
+      if (artifact.snapshotPruned || (artifact.before === null && artifact.after === null)) { settledNow.push(entry.name); continue }
       const replacement: DiffArtifact & { snapshotPruned: true } = {
         ...artifact, before: null, after: null, canUndo: false, snapshotPruned: true,
         patch: artifact.patch.slice(0, 64 * 1024),
         limitation: 'The stored before/after versions for this edit were pruned to bound local snapshot storage. The patch is kept; restoring is no longer possible.'
       }
-      const data = JSON.stringify(replacement)
-      writeFileSync(entry.file, data, { mode: 0o600 })
-      kept -= entry.size - Buffer.byteLength(data)
-      freedBytes += entry.size - Buffer.byteLength(data)
+      const size = await replaceArtifact(file, JSON.stringify(replacement), entry.at)
+      entry.release(entry.size - size)
+      freedBytes += entry.size - size
       pruned++
+      settledNow.push(entry.name)
+      options.ledger?.resized?.(entry.name, size)
     } catch { /* An unreadable or concurrently written artifact is left exactly as it is. */ }
+    if (settledNow.length >= 256) options.ledger?.settle(settledNow.splice(0))
   }
-  return { pruned, freedBytes }
+  if (settledNow.length) options.ledger?.settle(settledNow)
+  return { pruned, freedBytes, read }
 }
 
 const PRUNED_OUTPUT_MARKER = '[Older command output was pruned to bound local artifact storage; its last lines are kept.]\n'
@@ -366,29 +434,27 @@ const PRUNED_OUTPUT_MARKER = '[Older command output was pruned to bound local ar
  *  grown to most of the private allowance on the owner's machine. Past the window or over budget an
  *  output keeps only its tail behind a marker, so its id still resolves and the timeline still shows
  *  how the command ended. */
-export function pruneOutputArtifacts(directory: string, now = Date.now(), maxAgeMs = 30 * 24 * 60 * 60 * 1000, budgetBytes = 192 * 1024 * 1024, tailBytes = 4 * 1024): { pruned: number; freedBytes: number } {
-  let entries: Array<{ file: string; size: number; at: number }>
-  try {
-    entries = readdirSync(directory).filter(name => /^[a-f0-9-]+\.txt$/.test(name)).map(name => {
-      const stat = statSync(join(directory, name))
-      return { file: join(directory, name), size: stat.size, at: stat.mtimeMs }
-    }).sort((left, right) => right.at - left.at)
-  } catch { return { pruned: 0, freedBytes: 0 } }
-  let kept = 0, pruned = 0, freedBytes = 0
-  for (const entry of entries) {
-    kept += entry.size
-    if (now - entry.at <= maxAgeMs && kept <= budgetBytes) continue
+export async function pruneOutputArtifacts(directory: string, now = Date.now(), maxAgeMs = 30 * 24 * 60 * 60 * 1000, budgetBytes = 192 * 1024 * 1024, tailBytes = 4 * 1024, options: { entries?: ArtifactEntry[]; ledger?: PruneLedger } = {}): Promise<PruneResult> {
+  let entries: ArtifactEntry[]
+  try { entries = (options.entries ?? await listArtifactEntries(directory)).filter(entry => entry.name.endsWith('.txt')) } catch { return { pruned: 0, freedBytes: 0, read: 0 } }
+  const settledNow: string[] = []
+  let pruned = 0, freedBytes = 0, read = 0
+  for await (const entry of pruneCandidates(entries, now, maxAgeMs, budgetBytes, options.ledger?.settled ?? new Set())) {
     if (entry.size <= tailBytes + PRUNED_OUTPUT_MARKER.length) continue
+    const file = join(directory, entry.name)
     try {
-      const text = readFileSync(entry.file, 'utf8')
-      if (text.startsWith(PRUNED_OUTPUT_MARKER)) continue
-      const data = PRUNED_OUTPUT_MARKER + text.slice(-tailBytes)
-      writeFileSync(entry.file, data, { mode: 0o600 })
-      const freed = entry.size - Buffer.byteLength(data)
-      kept -= freed
-      freedBytes += freed
+      read++
+      const text = await readFile(file, 'utf8')
+      if (text.startsWith(PRUNED_OUTPUT_MARKER)) { settledNow.push(entry.name); continue }
+      const size = await replaceArtifact(file, PRUNED_OUTPUT_MARKER + text.slice(-tailBytes), entry.at)
+      entry.release(entry.size - size)
+      freedBytes += entry.size - size
       pruned++
+      settledNow.push(entry.name)
+      options.ledger?.resized?.(entry.name, size)
     } catch { /* An unreadable or concurrently written artifact is left exactly as it is. */ }
+    if (settledNow.length >= 256) options.ledger?.settle(settledNow.splice(0))
   }
-  return { pruned, freedBytes }
+  if (settledNow.length) options.ledger?.settle(settledNow)
+  return { pruned, freedBytes, read }
 }
