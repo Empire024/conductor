@@ -1347,7 +1347,9 @@ export class StructuredSessions {
         const { stat } = await import('node:fs/promises')
         const size = (await stat(imagePath)).size
         imageBytes += size
-        if (size > 10 * 1024 * 1024 || live.spec.provider === 'claude' && imageBytes > 4 * 1024 * 1024) throw new Error('Image context exceeds the provider limit (10 MiB per image; 4 MiB total for Claude JSON transport)')
+        // Claude's 4 MiB message budget is not checked against file sizes here: its adapter fits the
+        // images into the message (re-encoding them smaller) and only refuses what cannot fit.
+        if (size > 10 * 1024 * 1024 || imageBytes > 60 * 1024 * 1024) throw new Error('Image context exceeds the provider limit (10 MiB per image, 60 MiB per message)')
         item.path = imagePath
         context += `\n\n[Attached image: ${item.name}; path: ${item.path}; ${size} bytes. Native image content is submitted separately.]`
         continue

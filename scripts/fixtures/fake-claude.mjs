@@ -214,6 +214,14 @@ for await (const line of input) {
       emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263' })
       text('Synthetic native images received: ' + images.length); finish(); continue
     }
+    if (typeof prompt === 'string' && prompt.startsWith('SYNTHETIC PHOTOS')) {
+      // Large phone photos fitted into one message (src/main/providers/claude.ts userMessage):
+      // reports what actually arrived so a smoke can check count, type, bytes and the message size.
+      const images = blocks.filter(item => item.type === 'image')
+      const decodable = images.every(item => item.source.type === 'base64' && /^(ffd8ff|89504e47)/.test(Buffer.from(item.source.data, 'base64').subarray(0, 4).toString('hex')))
+      text(`Synthetic photos received: ${images.length}; types: ${images.map(item => item.source.media_type).join(',')}; decodable: ${decodable ? 'yes' : 'no'}; message bytes: ${Buffer.byteLength(JSON.stringify(message))}`)
+      finish(); continue
+    }
     // An isolated approval reviewer's one turn (src/main/approval-review-routing.ts), answered with
     // the decision the test chose, as the Opus model the routing requires. Only when a test asks.
     const reviewerDecision = process.env.CONDUCTOR_TEST_REVIEWER_DECISION

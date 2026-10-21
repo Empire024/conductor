@@ -31,11 +31,12 @@ class FakeTransport {
 const adapters: ClaudeAdapter[] = []
 const imageRoots: string[] = []
 afterEach(() => { for (const adapter of adapters.splice(0)) adapter.dispose(); for (const root of imageRoots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 5 }) })
-function fixture(overrides: Partial<AdapterOptions> = {}, autoInitialize = true, runtimeVersion = CLAUDE_COMPATIBILITY) {
+function fixture(overrides: Partial<AdapterOptions> = {}, autoInitialize = true, runtimeVersion = CLAUDE_COMPATIBILITY, fitImage?: (bytes: Buffer, maxBytes: number) => Buffer | null) {
   const events: AdapterEvent[] = []
   let transport!: FakeTransport
   const adapter = new ClaudeAdapter({ executable: 'synthetic-claude', cwd: process.cwd(), runtimeId: 'incarnation-A', settings, emit: (event) => events.push(event), ...overrides }, {
-    version: async () => runtimeVersion, createTransport: (options) => transport = new FakeTransport(options, autoInitialize)
+    version: async () => runtimeVersion, createTransport: (options) => transport = new FakeTransport(options, autoInitialize),
+    ...(fitImage ? { fitImage } : {})
   })
   adapters.push(adapter)
   return { adapter, events, get transport() { return transport }, projection: () => replayAgentEvents('session', events.map((event, i): AgentEvent => ({ schemaVersion: 1, id: `event-${i}`, sequence: i + 1, sessionId: 'session', runtimeId: 'incarnation-A', provider: 'claude', projectId: 'project', workspaceId: 'workspace', cwd: process.cwd(), timestamp: '2026-09-07T00:00:00.000Z', ...event }))) }
@@ -851,29 +852,60 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     const root = mkdtempSync(join(tmpdir(), 'conductor-image-boundary-')); imageRoots.push(root)
     const cwd = join(root, 'workspace'); mkdirSync(cwd)
     writeFileSync(join(cwd, 'invalid.png'), 'not an image')
-    writeFileSync(join(cwd, 'oversized.png'), Buffer.alloc(3 * 1024 * 1024 + 1))
+    writeFileSync(join(cwd, 'oversized.png'), Buffer.alloc(20 * 1024 * 1024 + 1))
     const outside = join(root, 'outside'); mkdirSync(outside); writeFileSync(join(outside, 'private.png'), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
     symlinkSync(outside, join(cwd, 'junction'), process.platform === 'win32' ? 'junction' : 'dir')
     const f = fixture({ cwd }); await f.adapter.start()
     const sent = f.transport.sent.length
-    for (const [path, expected] of [['invalid.png', 'PNG, JPEG'], ['oversized.png', '3 MiB'], ['../outside/private.png', 'outside'], ['junction/private.png', 'junction']]) {
+    for (const [path, expected] of [['invalid.png', 'PNG, JPEG'], ['oversized.png', '20 MiB'], ['../outside/private.png', 'outside'], ['junction/private.png', 'junction']]) {
       await expect(f.adapter.submit('Never sent', settings, [{ id: 'image', kind: 'image', name: 'Invalid fixture', path }])).rejects.toThrow(expected)
     }
     expect(f.transport.sent).toHaveLength(sent)
   })
 
-  it('bounds the combined encoded image message before dispatch', async () => {
+  /* Three phone photos (each stored at up to 2 MiB, ~2.7 MiB base64) were refused after the owner
+     pressed Send (haf-stuff, 2026-10-21). They are now fitted into the message instead. */
+  const phonePhotos = (): { root: string; bytes: Buffer } => {
     const root = mkdtempSync(join(tmpdir(), 'conductor-image-limit-')); imageRoots.push(root)
     const bytes = Buffer.alloc(2 * 1024 * 1024, 65)
-    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(bytes)
-    writeFileSync(join(root, 'large.png'), bytes)
-    const f = fixture({ cwd: root }); await f.adapter.start()
+    Buffer.from([255, 216, 255, 224]).copy(bytes)
+    for (const name of ['IMG_0428.jpg', 'IMG_0429.jpg', 'IMG_0430.jpg']) writeFileSync(join(root, name), bytes)
+    return { root, bytes }
+  }
+  const photos = ['IMG_0428.jpg', 'IMG_0429.jpg', 'IMG_0430.jpg'].map(name => ({ id: name, kind: 'image' as const, name, path: name }))
+
+  it('fits several large images into one message by re-encoding them, instead of refusing the send', async () => {
+    const { root } = phonePhotos()
+    const asked: number[] = []
+    const fitted = Buffer.concat([Buffer.from([255, 216, 255, 219]), Buffer.alloc(900 * 1024, 66)])
+    const f = fixture({ cwd: root }, true, CLAUDE_COMPATIBILITY, (_bytes, maxBytes) => { asked.push(maxBytes); return fitted }); await f.adapter.start()
+    await f.adapter.submit('Make sure the binder fits the three holes', settings, photos)
+    const message = f.transport.sent.at(-1) as { message: { content: Array<{ type: string; source?: { media_type: string; data: string }; text?: string }> } }
+    expect(message.message.content.map(block => block.type)).toEqual(['image', 'image', 'image', 'text'])
+    expect(message.message.content.slice(0, 3).every(block => block.source?.media_type === 'image/jpeg' && block.source.data === fitted.toString('base64'))).toBe(true)
+    expect(message.message.content[3]!.text).toBe('Make sure the binder fits the three holes')
+    // Each image was asked to fit an equal share of what the message has room for.
+    expect(asked).toHaveLength(3)
+    expect(asked.every(share => share === asked[0] && share * 3 * 4 / 3 < 4 * 1024 * 1024)).toBe(true)
+    expect(Buffer.byteLength(JSON.stringify(message))).toBeLessThanOrEqual(4 * 1024 * 1024)
+  })
+
+  it('refuses before anything is sent only when the images cannot be made to fit', async () => {
+    const { root } = phonePhotos()
+    const f = fixture({ cwd: root }, true, CLAUDE_COMPATIBILITY, () => null); await f.adapter.start()
     const sent = f.transport.sent.length
-    await expect(f.adapter.submit('Never sent', settings, [
-      { id: 'one', kind: 'image', name: 'One synthetic image', path: 'large.png' },
-      { id: 'two', kind: 'image', name: 'Two synthetic images', path: 'large.png' }
-    ])).rejects.toThrow('4 MiB combined')
+    await expect(f.adapter.submit('Never sent', settings, photos)).rejects.toThrow(/4 MiB combined message limit and could not be made smaller: send fewer images at once/)
     expect(f.transport.sent).toHaveLength(sent)
+  })
+
+  it('leaves images that already fit exactly as they are', async () => {
+    const { root, bytes } = phonePhotos()
+    const fit = vi.fn(() => null)
+    const f = fixture({ cwd: root }, true, CLAUDE_COMPATIBILITY, fit); await f.adapter.start()
+    await f.adapter.submit('One photo', settings, [photos[0]!])
+    expect(fit).not.toHaveBeenCalled()
+    const message = f.transport.sent.at(-1) as { message: { content: Array<{ source?: { media_type: string; data: string } }> } }
+    expect(message.message.content[0]!.source).toEqual({ type: 'base64', media_type: 'image/jpeg', data: bytes.toString('base64') })
   })
 })
 

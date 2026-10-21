@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { open } from 'node:fs/promises'
 import { workspacePath } from '../agent-artifacts'
+import { fitImageForMessage } from '../prompt-images'
 import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter, type RuntimeDetachment } from './adapter'
 import { captureAdapterState, restoreAdapterState, settled } from './adapter-state'
 import { currentRuntimeHost, JsonLineTransport, type HostedRuntimeHandle, type TransportOptions } from './transport'
@@ -163,7 +164,18 @@ function recordHookFailure(detail: string): void {
  *  because Conductor's hook was not answered. */
 export const hookUnreachableMessage = (tool: string, count: number): string =>
   `Conductor did not answer Claude Code's tool hook in time (the app was restarting, stalled or unreachable), so Claude Code refused ${tool}${count > 1 ? ` and ${count - 1} more call${count > 2 ? 's' : ''} this session` : ''}. Read-only tools (${HOOK_FREE_READ_TOOLS.slice(0, 4).join(', ')} and read-only Conductor MCP tools) do not wait for the hook; the rest work again once Conductor answers. The agent is told to retry them with its next message.`
-interface Dependencies { createTransport?(options: TransportOptions): Transport; version?(executable: string): Promise<string> }
+interface Dependencies {
+  createTransport?(options: TransportOptions): Transport
+  version?(executable: string): Promise<string>
+  /** Re-encodes an image into at most `maxBytes` (JPEG), or null; defaults to fitImageForMessage. */
+  fitImage?(bytes: Buffer, maxBytes: number): Buffer | null
+}
+/** What one stream-json user message may carry; images are fitted into it rather than refused. */
+const CLAUDE_MESSAGE_BYTES = 4 * 1024 * 1024
+/** Room kept for the message envelope, the prompt text and JSON escaping beyond the image data. */
+const CLAUDE_MESSAGE_MARGIN = 96 * 1024
+/** The largest image file read for a message at all; it is fitted to the budget after reading. */
+const CLAUDE_IMAGE_READ_BYTES = 20 * 1024 * 1024
 interface Tool { name: string; input: Json; parentId?: string; status: 'preparing' | 'running' | 'awaiting_approval' | 'completed' | 'failed' | 'rejected' | 'interrupted'; detached?: boolean; captured?: boolean }
 interface Block { id: string; kind: string; input: string; text: string }
 class ClaudeControlRejectedError extends Error {}
@@ -561,19 +573,33 @@ export class ClaudeAdapter implements ProviderAdapter {
 
   private async userMessage(text: string, attachments: ContextAttachment[], messageId: string): Promise<Json> {
     if (/^\/(clear|reset|new)(?:\s|$)/i.test(text.trim())) throw new Error('Conversation reset requires a new Conductor session; the existing native conversation is preserved')
-    const imageBlocks: Json[] = []
-    let encodedImageBytes = 0
-    for (const image of attachments.filter((item) => item.kind === 'image')) {
-      const block = await this.imageInput(image)
-      encodedImageBytes += Buffer.byteLength(JSON.stringify(block))
-      if (encodedImageBytes > 4 * 1024 * 1024) throw new Error('Claude image attachments exceed the 4 MiB combined message limit')
-      imageBlocks.push(block)
-    }
     // Only explicitly selected context is included. The host validates/loads file bytes.
     const context = attachments.filter((item) => item.kind !== 'image').map((item) => `\n\n--- Attached ${item.kind}: ${item.name}${item.path ? ` (${item.path})` : ''}${item.startLine ? ` lines ${item.startLine}-${item.endLine ?? item.startLine}` : ''} ---\n${item.content ?? ''}`)
-    const content: Json = imageBlocks.length ? [...imageBlocks, { type: 'text', text: text + context.join('') }] : text + context.join('')
+    const prose = text + context.join('')
+    const images: Array<{ bytes: Buffer; mediaType: string }> = []
+    for (const image of attachments.filter((item) => item.kind === 'image')) images.push(await this.imageInput(image))
+    // The images share what the message has room for. One that does not fit its share is
+    // re-encoded smaller (fitImageForMessage) instead of the whole message being refused after the
+    // owner pressed Send; only images that cannot be made to fit at a legible size are refused.
+    if (images.length) {
+      const room = CLAUDE_MESSAGE_BYTES - CLAUDE_MESSAGE_MARGIN - Buffer.byteLength(JSON.stringify(prose))
+      const base64 = (bytes: Buffer): number => Math.ceil(bytes.length / 3) * 4
+      if (images.reduce((total, image) => total + base64(image.bytes), 0) > room) {
+        const share = Math.floor(room / images.length / 4) * 3
+        const fit = this.dependencies.fitImage ?? fitImageForMessage
+        for (const image of images) {
+          if (image.bytes.length <= share) continue
+          const fitted = share > 0 ? fit(image.bytes, share) : null
+          if (!fitted) throw new Error(`Claude image attachments exceed the 4 MiB combined message limit and could not be made smaller: send ${images.length > 1 ? 'fewer images at once' : 'a smaller image'}.`)
+          image.bytes = fitted
+          image.mediaType = 'image/jpeg'
+        }
+      }
+    }
+    const imageBlocks: Json[] = images.map((image) => ({ type: 'image', source: { type: 'base64', media_type: image.mediaType, data: image.bytes.toString('base64') } }))
+    const content: Json = imageBlocks.length ? [...imageBlocks, { type: 'text', text: prose }] : prose
     const message: Json = { type: 'user', uuid: messageId, session_id: this.nativeSessionId ?? '', parent_tool_use_id: null, message: { role: 'user', content } }
-    if (imageBlocks.length && Buffer.byteLength(JSON.stringify(message)) > 4 * 1024 * 1024) throw new Error('Claude image attachments exceed the 4 MiB combined message limit')
+    if (imageBlocks.length && Buffer.byteLength(JSON.stringify(message)) > CLAUDE_MESSAGE_BYTES) throw new Error('Claude image attachments exceed the 4 MiB combined message limit and could not be made smaller: send fewer images at once.')
     return message
   }
 
@@ -825,13 +851,13 @@ export class ClaudeAdapter implements ProviderAdapter {
       throw error
     }
   }
-  private async imageInput(attachment: ContextAttachment): Promise<Json> {
+  private async imageInput(attachment: ContextAttachment): Promise<{ bytes: Buffer; mediaType: string }> {
     if (!attachment.path) throw new Error('Claude image attachment requires a local workspace path')
     const path = await workspacePath(this.options.cwd, attachment.path)
     const file = await open(path, 'r')
     try {
-      const metadata = await file.stat(), maximum = 3 * 1024 * 1024
-      if (!metadata.isFile() || metadata.size > maximum) throw new Error('Claude image attachment must be a file no larger than 3 MiB')
+      const metadata = await file.stat(), maximum = CLAUDE_IMAGE_READ_BYTES
+      if (!metadata.isFile() || metadata.size > maximum) throw new Error('Claude image attachment must be a file no larger than 20 MiB')
       // Bounded descriptor read protects memory even if the source grows after stat.
       const buffer = Buffer.alloc(metadata.size + 1)
       let offset = 0
@@ -847,7 +873,7 @@ export class ClaudeAdapter implements ProviderAdapter {
         : ['GIF87a', 'GIF89a'].includes(bytes.subarray(0, 6).toString('ascii')) ? 'image/gif'
         : bytes.length >= 12 && bytes.subarray(0, 4).toString('ascii') === 'RIFF' && bytes.subarray(8, 12).toString('ascii') === 'WEBP' ? 'image/webp' : undefined
       if (!mediaType) throw new Error('Claude images must contain PNG, JPEG, GIF, or WebP bytes')
-      return { type: 'image', source: { type: 'base64', media_type: mediaType, data: bytes.toString('base64') } }
+      return { bytes: Buffer.from(bytes), mediaType }
     } finally { await file.close() }
   }
   private emitSettingsSummary(summary: ObjectValue): void {
