@@ -13,7 +13,7 @@ import {
   DEFAULT_PHONE_NOTIFICATION_PREFS, DEFAULT_PHONE_SETTINGS, PHONE_IMAGE_LIMIT, PHONE_IMAGE_PATH, PHONE_PAIRING_TTL_MS, PHONE_STATE_LIMITS,
   type PhoneAccessSettings, type PhoneImage, type PhoneAccessState, type PhoneConversation, type PhoneDevice, type PhoneMessageMode, type PhoneMetrics,
   type PhoneNotification, type PhoneNotificationPrefs, type PhoneOpenTabRequest, type PhoneOpenTabResult, type PhonePairingOffer, type PhoneProjectTaskPage, type PhoneProjectTaskRequest, type PhoneProjectTaskResult, type PhonePushSubscription,
-  type PhoneSelf, type PhoneSessionSummary, type PhoneState, type PhoneTailnetView, type PhoneTimelineItem, type PhoneUsageWindow
+  type PhoneSelf, type PhoneSessionSummary, type PhoneSharedFile, type PhoneSharedFiles, type PhoneState, type PhoneTailnetView, type PhoneTimelineItem, type PhoneUsageWindow
 } from '../shared/phone-access'
 import { rememberedPermission } from './app-settings'
 import type { AgentActivityRow } from './project-activity'
@@ -25,9 +25,9 @@ import type { SecretKeyValueStore, SecretVault } from './secret-store'
 import { generateVapidKeys, isValidVapidKeys, sendWebPush, type VapidKeys } from './web-push'
 import { PhoneLock } from './phone-lock'
 import { anonymousConversations } from './local-models/anonymous'
-import { conversationLinkedFiles, linkedPathKey } from './phone-delivered-files'
+import { conversationLinkedFileEntries, conversationLinkedFiles, linkedPathKey, type LinkedFile } from './phone-delivered-files'
 import { confined } from './phone-files'
-import { realpath } from 'node:fs/promises'
+import { realpath, stat } from 'node:fs/promises'
 import type { WeeklyModelUsageReport } from '../shared/weekly-model-usage'
 import type { AccountLimitsReport } from '../shared/usage-accounting'
 import type { ProviderAllowanceRow } from '../shared/provider-allowance'
@@ -55,6 +55,28 @@ const PAIR_LOCKOUT_MS = 10 * 60 * 1000
 /** How often the phone list's "last seen" is written back; every request would be a write per tap. */
 const SEEN_WRITE_INTERVAL_MS = 30_000
 const REFRESH_DEBOUNCE_MS = 400
+/** A Files sheet lists at most this many files, newest first, from at most this many coworkers. */
+const SHARED_FILES_LIMIT = 300
+const SHARED_FILES_COWORKERS = 24
+
+const fileBaseName = (path: string): string => path.replace(/\\/g, '/').replace(/\/+$/, '').split('/').pop() || path
+
+function sharedFileKind(path: string): PhoneSharedFile['kind'] {
+  const extension = /\.([a-z0-9]+)$/i.exec(fileBaseName(path))?.[1]?.toLowerCase() ?? ''
+  if (extension === 'pdf') return 'pdf'
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'heic', 'heif', 'avif', 'bmp', 'svg'].includes(extension)) return 'image'
+  if (['zip', '7z', 'rar', 'tar', 'gz', 'tgz', 'bz2', 'xz'].includes(extension)) return 'archive'
+  return 'other'
+}
+
+/** The folder a file sits in, relative to its project when inside it, else its last two folders. */
+function folderHint(path: string, projectRoot: string | null): string {
+  const parts = path.replace(/\\/g, '/').replace(/\/+$/, '').split('/').slice(0, -1)
+  const root = projectRoot ? projectRoot.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase() : ''
+  const folder = parts.join('/')
+  if (root && (folder.toLowerCase() === root || folder.toLowerCase().startsWith(root + '/'))) return folder.slice(root.length + 1) || 'Project folder'
+  return parts.length > 2 ? '…/' + parts.slice(-2).join('/') : folder
+}
 
 /** Keep input evidence separate from chat; a successful POST is not delivery. */
 export function phoneInputDeliveries(projection: SessionProjection | null): NonNullable<PhoneConversation['inputDeliveries']> {
@@ -993,13 +1015,101 @@ export class PhoneAccessService {
       }
     }
     if (project.remote) throw new PhoneAccessError(`${project.name} lives on ${project.remote.machineName || 'another machine'}, and this conversation is not mirrored from it.`, 409)
+    const found = await this.localLinkedFile(linked, await this.fileRoots(id, project))
+    if (found === 'missing') throw new PhoneAccessError('That file does not exist any more.', 404)
+    if (found === 'refused') throw new PhoneAccessError('That file is outside this conversation’s project, or in a folder the phone is never sent (hidden folders, node_modules).', 403)
+    return found.path
+  }
+
+  /** The real folders a conversation's files may be served from: its project and its working folder. */
+  private async fileRoots(id: string, project: ProjectRecord): Promise<string[]> {
     const cwd = this.deps.database.structured.spec<AgentSpec>(id)?.cwd
-    const roots = (await Promise.all([project.path, cwd].filter((value): value is string => typeof value === 'string' && value.length > 0).map(path => realpath(path).catch(() => ''))))
+    return (await Promise.all([project.path, cwd].filter((value): value is string => typeof value === 'string' && value.length > 0).map(path => realpath(path).catch(() => ''))))
       .filter(Boolean)
+  }
+
+  /** deliveredFile's check of one linked path on this disk, shared with the Files list so the two never disagree. */
+  private async localLinkedFile(linked: string, roots: string[]): Promise<{ path: string; size: number } | 'missing' | 'refused'> {
     let target: string
-    try { target = await realpath(linked) } catch { throw new PhoneAccessError('That file does not exist any more.', 404) }
-    if (!roots.some(root => confined(root, target))) throw new PhoneAccessError('That file is outside this conversation’s project, or in a folder the phone is never sent (hidden folders, node_modules).', 403)
-    return target
+    try { target = await realpath(linked) } catch { return 'missing' }
+    if (!roots.some(root => confined(root, target))) return 'refused'
+    const info = await stat(target).catch(() => null)
+    if (!info) return 'missing'
+    return { path: target, size: info.isFile() ? info.size : 0 }
+  }
+
+  /**
+   * Every file a conversation delivered or linked, newest first, with its coworkers' (the tabs it
+   * controls now, and the ones it dispatched that finished), for the phone's Files sheet. Each
+   * entry passed the same check deliveredFile makes for its own conversation, so a listed file is
+   * one the capability hands over, or answers "does not exist any more" for; a refused path is
+   * left out. Everything is read from projections already in memory; the disk work is one async
+   * realpath and stat per file, bounded by SHARED_FILES_LIMIT.
+   */
+  async sharedFiles(id: string): Promise<PhoneSharedFiles> {
+    const { project } = this.located(id)
+    const conversations = [{ id, from: undefined as string | undefined }, ...this.coworkersOf(id)]
+    const candidates: Array<{ sessionId: string; from?: string; linked: LinkedFile }> = []
+    let notes: string[] = []
+    let coworkers = 0
+    for (const conversation of conversations) {
+      const projection = this.deps.database.structured.snapshot(conversation.id)
+      if (!projection) continue
+      if (conversation.id !== id) coworkers += 1
+      for (const linked of conversationLinkedFileEntries(projection).values()) candidates.push({ sessionId: conversation.id, ...(conversation.from ? { from: conversation.from } : {}), linked })
+    }
+    candidates.sort((left, right) => right.linked.lastAt.localeCompare(left.linked.lastAt))
+    const truncated = candidates.length > SHARED_FILES_LIMIT
+    const files: PhoneSharedFile[] = []
+    const roots = new Map<string, Promise<{ project: ProjectRecord; roots: string[] } | null>>()
+    const rootsOf = (sessionId: string) => {
+      if (!roots.has(sessionId)) roots.set(sessionId, (async () => {
+        const spec = this.deps.database.structured.spec<AgentSpec>(sessionId)
+        const owner = spec ? this.deps.database.getProject(spec.projectId) : null
+        return owner ? { project: owner, roots: owner.remote ? [] : await this.fileRoots(sessionId, owner) } : null
+      })())
+      return roots.get(sessionId)!
+    }
+    for (const candidate of candidates.slice(0, SHARED_FILES_LIMIT)) {
+      const { sessionId, linked } = candidate
+      const entry = { sessionId, path: linked.path, name: fileBaseName(linked.path), kind: sharedFileKind(linked.path), sharedAt: linked.lastAt, ...(candidate.from ? { from: candidate.from } : {}) }
+      if (this.deps.remote?.isRemote(sessionId)) {
+        // Read through the project grant on demand; nothing to check on this disk.
+        const machine = this.deps.database.getProject(this.deps.database.structured.spec<AgentSpec>(sessionId)?.projectId ?? '')?.remote?.machineName || 'the other machine'
+        const note = `Files from ${machine} are fetched through its pairing when opened; images, videos and documents only.`
+        if (!notes.includes(note)) notes = [...notes, note]
+        files.push({ ...entry, folder: folderHint(linked.path, null), size: null, missing: false })
+        continue
+      }
+      const owner = await rootsOf(sessionId)
+      if (!owner || owner.project.remote) continue
+      const found = await this.localLinkedFile(linked.path, owner.roots)
+      if (found === 'refused') continue
+      files.push({ ...entry, folder: folderHint(found === 'missing' ? linked.path : found.path, owner.project.path), size: found === 'missing' ? null : found.size, missing: found === 'missing' })
+    }
+    if (project.remote && !this.deps.remote?.isRemote(id)) notes = [...notes, `${project.name} lives on ${project.remote.machineName || 'another machine'}, and this conversation is not mirrored from it.`]
+    return { files, coworkers, truncated, ...(notes.length ? { note: notes.join(' ') } : {}) }
+  }
+
+  /** The conversations `id` controls (open tabs linked to it) and the coworkers it dispatched that finished, bounded. */
+  private coworkersOf(id: string): Array<{ id: string; from: string }> {
+    const found = new Map<string, string>()
+    for (const project of this.deps.database.listProjects()) {
+      for (const workspace of this.deps.database.listSessions(project.id)) {
+        const detached = this.deps.database.listDetachedWindows().filter(window => window.sessionId === workspace.id).flatMap(window => layoutTabs(window.layout.root))
+        for (const tab of [...layoutTabs(workspace.layout.root), ...detached]) {
+          if (tab.kind !== 'agent' || !tab.resourceId || tab.resourceId === id || found.has(tab.resourceId)) continue
+          if (this.controllerId(tab.resourceId) === id) found.set(tab.resourceId, this.deps.database.structured.snapshot(tab.resourceId)?.title || tab.title || 'Coworker')
+        }
+      }
+    }
+    const finished = parseJson<unknown>(this.deps.store.getSetting('agentControlFinishedBy:' + id), [])
+    for (const child of Array.isArray(finished) ? finished.slice(-SHARED_FILES_COWORKERS) : []) {
+      if (typeof child !== 'string' || child === id || found.has(child)) continue
+      const title = this.deps.database.structured.snapshot(child)?.title
+      if (title !== undefined || this.deps.database.structured.spec(child)) found.set(child, title || 'Coworker')
+    }
+    return [...found].slice(-SHARED_FILES_COWORKERS).map(([child, from]) => ({ id: child, from }))
   }
 
   private async importImage(cwd: string, name: unknown, bytes: Uint8Array): Promise<PhoneImage> {

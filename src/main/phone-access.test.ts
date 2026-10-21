@@ -10,6 +10,9 @@ import { answerableInteractions, normalizePairingCode, normalizePhoneSettings, P
 import { describeTransition, NOTIFICATION_BATCH_MS, phoneSessionState } from './phone-notifications'
 import { autoModeDenialMessage, autoModeDenialPayload } from '../shared/auto-mode-denial'
 import { MemoryVault, type SecretKeyValueStore } from './secret-store'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 class MapStore implements SecretKeyValueStore {
   readonly values = new Map<string, string>()
@@ -777,5 +780,75 @@ describe('B1: the phone shows the conversation the desktop shows', () => {
     const conversation = fix.service.conversation('agent-1')
     expect(conversation.items.map(entry => entry.id)).toEqual(['item-1', 'item-6', 'item-7'])
     expect(JSON.stringify(conversation.items)).not.toContain('thinking_tokens')
+  })
+})
+
+describe('the Files sheet of a conversation (feature-list chat-header-shared-files)', () => {
+  let root = ''
+  beforeEach(async () => { root = await mkdtemp(join(tmpdir(), 'conductor-shared-files-')) })
+  afterEach(async () => { await rm(root, { recursive: true, force: true }) })
+
+  const reply = (sequence: number, text: string): TimelineItem => item(sequence, { type: 'text', role: 'assistant', text, mode: 'snapshot' })
+  const slash = (path: string): string => path.replaceAll('\\', '/')
+
+  it('lists every file the conversation and its coworkers linked, newest first, and only paths the capability serves', async () => {
+    const fix = fixture()
+    const project = join(root, 'haf-stuff'), outside = join(root, 'elsewhere')
+    await mkdir(join(project, 'tests', 'logs'), { recursive: true }); await mkdir(join(project, 'node_modules', 'pkg'), { recursive: true }); await mkdir(outside, { recursive: true })
+    const pdf = join(project, 'tests', 'logs', 'HAF scale log.pdf'), png = join(project, 'shot.png'), zip = join(project, 'tests', 'bundle.zip')
+    const gone = join(project, 'tests', 'logs', 'old run.pdf'), secret = join(project, '.env'), dependency = join(project, 'node_modules', 'pkg', 'readme.pdf'), foreign = join(outside, 'other.pdf')
+    for (const path of [pdf, png, zip, secret, dependency, foreign]) await writeFile(path, 'bytes')
+    fix.projects[0]!.path = project
+    openConversation(fix, 'agent-1', { items: [
+      item(1, { type: 'text', role: 'user', text: 'Mentioned by the owner: ' + slash(join(project, 'user.pdf')), mode: 'snapshot' }),
+      reply(2, `First run: [old](<${slash(gone)}>) and [deps](${slash(dependency)}) and ${slash(foreign)} and ${slash(secret)}`),
+      reply(4, `Delivered [HAF scale log.pdf](<${slash(pdf)}>) and ${png}`)
+    ] })
+    fix.specs.get('agent-1')!.cwd = project
+    // A coworker this conversation controls, and one it dispatched that has finished (its tab closed).
+    openConversation(fix, 'worker-1', { title: 'Scale tests', items: [reply(3, `Bundle: ${slash(zip)}`)] })
+    fix.specs.get('worker-1')!.cwd = project
+    fix.store.setSetting('agentControlParent:worker-1', JSON.stringify({ controllerAgentSessionId: 'agent-1', targetAgentSessionId: 'worker-1' }))
+    fix.specs.set('worker-2', { id: 'worker-2', projectId: 'project-a', sessionId: 'ws-a', provider: 'claude', title: 'Done worker', cwd: project })
+    fix.projections.set('worker-2', projection('worker-2', { title: 'Done worker', items: [reply(5, `Again the log ${slash(pdf)}`)] }))
+    fix.store.setSetting('agentControlFinishedBy:agent-1', JSON.stringify(['worker-2']))
+    // A tab nobody controls stays out.
+    openConversation(fix, 'stranger', { items: [reply(9, slash(png))] })
+
+    const listed = await fix.service.sharedFiles('agent-1')
+    expect(listed.coworkers).toBe(2)
+    expect(listed.files.map(file => [file.sessionId, file.name, file.kind, file.folder, file.missing, file.from ?? null])).toEqual([
+      ['worker-2', 'HAF scale log.pdf', 'pdf', 'tests/logs', false, 'Done worker'],
+      ['agent-1', 'HAF scale log.pdf', 'pdf', 'tests/logs', false, null],
+      ['agent-1', 'shot.png', 'image', 'Project folder', false, null],
+      ['worker-1', 'bundle.zip', 'archive', 'tests', false, 'Scale tests'],
+      ['agent-1', 'old run.pdf', 'pdf', 'tests/logs', true, null]
+    ])
+    expect(listed.files[1]!.size).toBe(5)
+    expect(listed.files[1]!.sharedAt).toBe(item(4, { type: 'text', role: 'user', text: '', mode: 'snapshot' }).timestamp)
+
+    // Authority: every listed file is one the capability hands over (or answers 404 for), and
+    // every path the conversations named that the capability refuses is absent from the list.
+    for (const file of listed.files) {
+      if (file.missing) await expect(fix.service.deliveredFile(file.sessionId, file.path)).rejects.toMatchObject({ status: 404 })
+      else await expect(fix.service.deliveredFile(file.sessionId, file.path)).resolves.toBeTruthy()
+    }
+    for (const path of [secret, dependency, foreign, join(project, 'user.pdf')]) {
+      await expect(fix.service.deliveredFile('agent-1', slash(path))).rejects.toMatchObject({ status: 403 })
+      expect(listed.files.some(file => slash(file.path).toLowerCase() === slash(path).toLowerCase())).toBe(false)
+    }
+  })
+
+  it('lists a mirrored conversation’s files without reading this disk and says where they come from', async () => {
+    const fix = fixture()
+    fix.specs.set('mirror-1', { id: 'mirror-1', projectId: 'project-b', sessionId: 'ws-b', provider: 'claude', title: 'Remote', cwd: 'D:\\render' })
+    fix.projections.set('mirror-1', projection('mirror-1', { items: [reply(1, 'Rendered D:/render/out/frame.png')] }))
+    const listed = await fix.service.sharedFiles('mirror-1')
+    expect(listed.files).toEqual([expect.objectContaining({ sessionId: 'mirror-1', name: 'frame.png', kind: 'image', missing: false, size: null })])
+    expect(listed.note).toMatch(/Empirium.*pairing/)
+  })
+
+  it('refuses a conversation that is not open', async () => {
+    await expect(fixture().service.sharedFiles('nobody')).rejects.toMatchObject({ status: 404 })
   })
 })

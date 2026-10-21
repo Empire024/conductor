@@ -428,6 +428,39 @@ export interface PhoneState {
 /** A timeline item as the phone shows it: same shape as the desktop's, with long text trimmed. */
 export type PhoneTimelineItem = Pick<TimelineItem, 'id' | 'sequence' | 'timestamp' | 'parentId' | 'data'>
 
+/**
+ * One file a conversation (or one of its coworkers) delivered or linked, for the conversation's
+ * Files sheet. Every entry is one the file capability (POST /api/sessions/:sessionId/file) would
+ * hand over for `sessionId`, or would answer 404 for (`missing`); a path it would refuse is never
+ * listed.
+ */
+export interface PhoneSharedFile {
+  /** The conversation that linked it: open it through this conversation's file capability. */
+  sessionId: string
+  /** The path exactly as the conversation's reply wrote it (the capability's lookup key). */
+  path: string
+  name: string
+  kind: 'pdf' | 'image' | 'archive' | 'other'
+  /** Where it is, relative to its project when inside it ("output/reports"). */
+  folder: string
+  /** The latest reply that linked it. */
+  sharedAt: string
+  size: number | null
+  /** No longer on disk. */
+  missing: boolean
+  /** The tab's title, for a coworker's file; absent for the conversation's own. */
+  from?: string
+}
+
+export interface PhoneSharedFiles {
+  files: PhoneSharedFile[]
+  /** Coworker conversations whose replies were read along with this one. */
+  coworkers: number
+  truncated: boolean
+  /** Said once in the sheet: a mirrored conversation's files come from the other machine. */
+  note?: string
+}
+
 export interface PhoneConversation {
   summary: PhoneSessionSummary
   sequence: number

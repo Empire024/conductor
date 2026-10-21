@@ -283,6 +283,9 @@
 .structured-agent-pane .sa-session-bar { min-height: 25px; height: 25px; padding: 0 8px; gap: 5px; }
 .sa-session-bar > button { min-height: 22px; height: 22px; padding: 2px 4px; }
 .sa-session-bar .agent-view-switch { height: 22px; padding: 0; border: 0; background: transparent; }
+/* The empty middle of the header: a click opens the Links & files rail. */
+.sa-session-bar > button.sa-header-links { flex: 1 1 auto; min-width: 12px; padding: 0; border: 0; border-radius: 4px; background: transparent; cursor: pointer; }
+.sa-session-bar > button.sa-header-links:hover { background: color-mix(in srgb, var(--text-3) 10%, transparent); }
 .sa-session-bar .agent-view-switch button { min-height: 20px; height: 20px !important; padding: 0 5px !important; }
 .sa-session-bar .agent-view-switch svg { width: 11px; height: 11px; }
 .sa-timeline-content { min-width: 0; display: flow-root; }

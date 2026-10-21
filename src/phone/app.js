@@ -3219,6 +3219,15 @@
         const facts = [summary.projectName, summary.workspaceName]
         if (summary.machineId && summary.machineId !== 'local') facts.push(summary.machineName)
         heading.appendChild(el('p', 'conversation-facts', dotRow(facts.concat([providerWord(summary.provider), summary.model]))))
+        /* Tapping the title shows every file shared in this conversation. */
+        heading.classList.add('opens-files')
+        heading.setAttribute('role', 'button')
+        heading.tabIndex = 0
+        heading.title = 'Files shared in this conversation'
+        heading.setAttribute('aria-description', 'Shows the files shared in this conversation')
+        const openFiles = () => openSharedFiles(id, summary.title || 'Untitled')
+        heading.addEventListener('click', openFiles)
+        heading.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); openFiles() } })
       }
       const line = el('div', 'topbar-main')
       line.appendChild(back)
@@ -4131,6 +4140,81 @@
       if (closed) return
       note.textContent = errorMessage(error) || 'The computer could not hand this file over.'
       note.className = 'pending-error file-sheet-note'
+    })
+  }
+
+  /* Every file a conversation and its coworkers delivered or linked, newest first: the sheet the
+     conversation's header opens (owner, 2026-10-21: "if I tap the header of this chat I can see
+     stuff like the files (like these pdfs) shared within these chats"). The computer builds the
+     list from the same rule its file capability checks (src/main/phone-access.ts sharedFiles), so
+     every row opens in the file sheet above; a file deleted since shows as no longer on disk. */
+  const SHARED_KIND_LABEL = { pdf: 'PDF', image: 'Image', archive: 'ZIP', other: 'File' }
+  const SHARED_KIND_TITLE = { all: 'All', pdf: 'PDFs', image: 'Images', archive: 'ZIPs', other: 'Other' }
+  const openSharedFiles = (sessionId, title) => {
+    if (!sessionId) return
+    const view = el('div', 'file-sheet shared-files-sheet')
+    view.setAttribute('role', 'dialog')
+    view.setAttribute('aria-modal', 'true')
+    view.setAttribute('aria-label', 'Files in this conversation')
+    const panel = el('div', 'file-sheet-panel')
+    const heading = el('strong', 'file-sheet-name', 'Files')
+    const subtitle = el('p', 'card-note file-sheet-note', (title ? title + ' · ' : '') + 'Asking the computer…')
+    const filters = el('div', 'shared-files-filters')
+    const list = el('div', 'shared-files-list')
+    let closed = false
+    let filter = 'all'
+    let listed = null
+    const close = () => {
+      if (closed) return
+      closed = true
+      document.removeEventListener('keydown', onKey)
+      if (view.parentNode) view.parentNode.removeChild(view)
+    }
+    const onKey = event => { if (event.key === 'Escape' && !document.querySelector('.file-sheet:not(.shared-files-sheet)')) close() }
+    document.addEventListener('keydown', onKey)
+    view.addEventListener('click', event => { if (event.target === view) close() })
+    fill(panel, [heading, subtitle, filters, list, button('ghost wide file-sheet-close', 'Close', close)])
+    view.appendChild(panel)
+    document.body.appendChild(view)
+
+    const draw = () => {
+      clear(filters)
+      clear(list)
+      const files = listed.files || []
+      const counts = { all: files.length, pdf: 0, image: 0, archive: 0, other: 0 }
+      for (const file of files) counts[file.kind] = (counts[file.kind] || 0) + 1
+      if (files.length) for (const kind of ['all', 'pdf', 'image', 'archive', 'other']) {
+        if (kind !== 'all' && !counts[kind]) continue
+        const chip = button('shared-files-filter' + (filter === kind ? ' active' : ''), SHARED_KIND_TITLE[kind] + ' ' + counts[kind], () => { filter = kind; draw() })
+        chip.setAttribute('aria-pressed', filter === kind ? 'true' : 'false')
+        filters.appendChild(chip)
+      }
+      const shown = files.filter(file => filter === 'all' || file.kind === filter)
+      for (const file of shown) {
+        const row = button('shared-file' + (file.missing ? ' missing' : ''), null, file.missing ? null : () => openDeliveredFile(file.sessionId, file.path, file.name))
+        row.disabled = Boolean(file.missing)
+        row.appendChild(el('span', 'shared-file-kind kind-' + file.kind, SHARED_KIND_LABEL[file.kind] || 'File'))
+        const main = el('span', 'shared-file-main')
+        main.appendChild(el('span', 'shared-file-name', file.name))
+        main.appendChild(el('span', 'shared-file-meta', dotRow([file.folder, file.missing ? 'No longer on disk' : file.size !== null && file.size !== undefined ? fileSize(file.size) : '', relativeTime(file.sharedAt)])))
+        if (file.from) main.appendChild(el('span', 'shared-file-from', 'Shared by ' + file.from))
+        row.appendChild(main)
+        list.appendChild(row)
+      }
+      if (!files.length) list.appendChild(emptyNote('No files yet.', 'Files the agent delivers or links in this conversation, and in the tabs it controls, appear here.'))
+      const facts = [title, files.length === 1 ? '1 file' : files.length + ' files']
+      if (listed.coworkers) facts.push('with ' + listed.coworkers + (listed.coworkers === 1 ? ' coworker' : ' coworkers'))
+      subtitle.textContent = dotRow(facts) + (listed.truncated ? ' · newest shown' : '') + (listed.note ? '. ' + listed.note : '')
+    }
+
+    void api('/api/sessions/' + encodeURIComponent(sessionId) + '/files').then(result => {
+      if (closed) return
+      listed = result || { files: [] }
+      draw()
+    }).catch(error => {
+      if (closed) return
+      subtitle.textContent = errorMessage(error) || 'The computer could not list this conversation’s files.'
+      subtitle.className = 'pending-error file-sheet-note'
     })
   }
 
