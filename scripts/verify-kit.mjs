@@ -662,7 +662,7 @@ export function assertPackagedReceipt(inst, receipt) {
  *  env adds or overrides variables (undefined deletes one); fixtures {file: source} are written to
  *  a folder named by CONDUCTOR_TEST_FIXTURE_DIR. build: another out/main/index.js (a worktree's build
  *  of an older commit, for an upgrade run); relaunchParked keeps it unless given a new one. */
-export async function launchParked({ mode = 'playwright', name, env: extraEnv = {}, fixtures, args = [], launchTimeoutMs = 60_000, build = BUILD } = {}) {
+export async function launchParked({ mode = 'playwright', name, env: extraEnv = {}, fixtures, args = [], launchTimeoutMs = 60_000, build = BUILD, seedProfile } = {}) {
   if (mode !== 'playwright' && mode !== 'spawn') throw new Error(`launchParked mode must be 'playwright' or 'spawn', got ${JSON.stringify(mode)}`)
   const packaged = packagedAcceptanceExecutable()
   if (packaged && mode !== 'spawn') throw new Error('Packaged acceptance requires spawn mode with an isolated parked profile')
@@ -675,6 +675,8 @@ export async function launchParked({ mode = 'playwright', name, env: extraEnv = 
   const root = await mkdtemp(join(packaged ? realpathSync(tmpdir()) : tmpdir(), `${packaged ? 'conductor-packaged-acceptance-' : 'conductor-'}${slug(label)}-`))
   const profile = join(root, 'profile')
   await mkdir(profile)
+  // Optional: write files into the empty profile (userData) before the app starts, e.g. a conductor.db with seeded settings.
+  if (seedProfile) await seedProfile(profile)
   const env = { ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_NODE_EXECUTABLE: process.execPath, CONDUCTOR_TEST_USER_DATA: profile, CONDUCTOR_PROJECTS_ROOT: join(root, 'projects') }
   for (const key of ['ELECTRON_RUN_AS_NODE', 'CONDUCTOR_LIVE_TESTS', 'CONDUCTOR_BACKGROUND_WINDOWS', 'CONDUCTOR_UPDATE_DEV', 'CONDUCTOR_TEST_DIALOGS']) delete env[key]
   if (fixtures) {

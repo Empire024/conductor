@@ -17,3 +17,9 @@ export function usageColor(percent: number): string {
 
 /** Gradient stops from the bottom (0%) to the top (100%) of a graph whose y axis is percent. */
 export const USAGE_STOPS: readonly number[] = [0, 75, 82, 88, 94, 100]
+
+/** The same ramp as a CSS gradient for a horizontal fill bar whose full track is 0-100%: sized so red appears only at the high end of the fill. */
+export function usageBarBackground(fillPercent: number): { backgroundImage: string; backgroundSize: string } {
+  const stops = USAGE_STOPS.map(percent => `${usageColor(percent)} ${percent}%`).join(', ')
+  return { backgroundImage: `linear-gradient(to right, ${stops})`, backgroundSize: `${(10000 / Math.max(1, Math.min(100, fillPercent))).toFixed(1)}% 100%` }
+}

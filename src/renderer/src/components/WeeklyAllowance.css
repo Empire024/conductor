@@ -10,11 +10,9 @@
 .weekly-allowance-dates b { color: var(--accent); font-weight: 600; }
 .weekly-allowance-bar { position: relative; height: 8px; border-radius: 4px; background: var(--border-soft); }
 .weekly-allowance-bar i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px; }
-.weekly-allowance-bar i.peak { background: var(--accent-muted); }
+.weekly-allowance-bar i.peak { background-repeat: no-repeat; }
 .weekly-allowance-bar i.projected { background: transparent; border: 1px dashed var(--text-3); box-sizing: border-box; }
 .weekly-allowance-bar small { position: absolute; right: -2px; top: -1px; transform: translateX(100%); font-size: 9px; color: var(--text-3); padding-left: 4px; }
-.weekly-allowance-row.used-up .weekly-allowance-bar i.peak { background: var(--danger); }
-.weekly-allowance-row.current .weekly-allowance-bar i.peak { background: var(--blue); }
 .weekly-allowance-row.none .weekly-allowance-bar { background: transparent; border: 1px dashed var(--border); box-sizing: border-box; }
 .weekly-allowance-row .weekly-allowance-bar { margin-right: 28px; }
 .weekly-allowance-verdict { color: var(--text); }

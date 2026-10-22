@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { usageColor, usageRedShare } from './usage-color'
+import { usageBarBackground, usageColor, usageRedShare } from './usage-color'
 
 describe('usage graph colour', () => {
   it('stays plain blue through most of the range', () => {
@@ -19,5 +19,11 @@ describe('usage graph colour', () => {
     expect(usageRedShare(140)).toBe(1)
     let last = 0
     for (let p = 0; p <= 100; p += 1) { const share = usageRedShare(p); expect(share).toBeGreaterThanOrEqual(last); last = share }
+  })
+  it('sizes a fill bar gradient to the whole track so a short fill stays blue', () => {
+    expect(usageBarBackground(100).backgroundSize).toBe('100.0% 100%')
+    expect(usageBarBackground(50).backgroundSize).toBe('200.0% 100%')
+    expect(usageBarBackground(0).backgroundSize).toBe('10000.0% 100%')
+    expect(usageBarBackground(93).backgroundImage).toContain('rgb(229, 57, 53) 100%')
   })
 })

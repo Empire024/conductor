@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { weekVerdict, type AllowanceWeek, type AllowanceWeekReport } from '../../../shared/usage-weeks'
 import './WeeklyAllowance.css'
+import { usageBarBackground } from './usage-color'
 
 const NAMES: Record<string, string> = { claude: 'Claude', codex: 'Codex', grok: 'Grok' }
 const tokens = (value: number): string => new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 }).format(value)
@@ -39,7 +40,7 @@ function WeekRow({ week, now }: { week: AllowanceWeek; now: number }): React.JSX
     <span className="weekly-allowance-dates" role="cell">{week.status === 'current' ? <b>This week</b> : null}{weekDates(week)}</span>
     <span className="weekly-allowance-bar" role="cell" aria-label={week.peakPercent === null ? 'No readings' : `Peak ${week.peakPercent}% used`}>
       {projected !== null && projected > peak && <i className="projected" style={{ width: `${projected}%` }} />}
-      {week.peakPercent !== null && <i className="peak" style={{ width: `${Math.min(100, peak)}%` }} />}
+      {week.peakPercent !== null && <i className="peak" style={{ width: `${Math.min(100, peak)}%`, ...usageBarBackground(peak) }} />}
       <small>{week.peakPercent === null ? '–' : `${Math.round(peak)}%`}</small>
     </span>
     <span className="weekly-allowance-verdict" role="cell" title={week.notes.join('\n') || undefined}>
