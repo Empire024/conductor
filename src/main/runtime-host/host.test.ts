@@ -41,12 +41,28 @@ const recorder = (): RuntimeListener & { frames: Recorded[]; exits: Array<{ seq:
   }
 }
 
+const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true } catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM' } }
+const drain = (set: Set<number>): number[] => { const all = [...set]; set.clear(); return all }
+/** Waits (bounded) until every runtime process has exited, killing any still running after 5 s. */
+const runtimesGone = async (list: number[]): Promise<void> => {
+  const deadline = Date.now() + 10_000
+  let killed = false
+  for (let left = list.filter(alive); left.length; left = left.filter(alive)) {
+    if (Date.now() > deadline) { console.warn('runtime-host test: runtimes still alive', left); return }
+    if (!killed && Date.now() > deadline - 5_000) { killed = true; for (const pid of left) { try { process.kill(pid) } catch { /* already gone */ } } }
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+}
+
 describe('runtime host', () => {
   let directory: string, fake: string, host: RuntimeHost, pipe: string, secret: string
-  const clients: RuntimeHostClient[] = []
+  const clients: RuntimeHostClient[] = [], pids = new Set<number>()
   const connect = async (): Promise<RuntimeHostClient> => { const client = await RuntimeHostClient.connect(pipe, secret); clients.push(client); return client }
-  const spawnFake = (client: RuntimeHostClient, runtimeId: string, listener: RuntimeListener): Promise<{ pid: number | null }> =>
-    client.spawn({ runtimeId, executable: process.execPath, args: [fake], cwd: directory, meta: { agentSessionId: 'agent-1', provider: 'claude' } }, listener)
+  const spawnFake = async (client: RuntimeHostClient, runtimeId: string, listener: RuntimeListener): Promise<{ pid: number | null }> => {
+    const spawned = await client.spawn({ runtimeId, executable: process.execPath, args: [fake], cwd: directory, meta: { agentSessionId: 'agent-1', provider: 'claude' } }, listener)
+    if (spawned.pid) pids.add(spawned.pid)
+    return spawned
+  }
 
   beforeEach(async () => {
     directory = mkdtempSync(join(tmpdir(), 'runtime-host-'))
@@ -60,8 +76,12 @@ describe('runtime host', () => {
   afterEach(async () => {
     for (const client of clients.splice(0)) client.dispose()
     await host.close()
-    await new Promise(resolve => setTimeout(resolve, 200))
-    rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
+    // On Windows a runtime that is still exiting holds its working directory (the temp folder), so
+    // removing it fails with EPERM under load: wait for every runtime to be gone first, then remove
+    // with retries. Cleanup never fails a test; a leftover temp folder is only reported.
+    await runtimesGone(drain(pids))
+    try { rmSync(directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 }) }
+    catch (error) { console.warn('runtime-host test folder left behind', directory, error) }
   })
 
   it('refuses a client without the secret', async () => {
