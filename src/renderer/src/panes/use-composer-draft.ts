@@ -134,7 +134,7 @@ export function useComposerDraft(projectId: string, sessionId: string, memoryOnl
   })), [key])
   /** One revision for an edit that changes both, such as folding a paste into an attachment. */
   const setDraft = useCallback((message: string, attachments: ContextAttachment[]) => drafts.update(key, () => ({ message, attachments })), [key])
-  const clearSubmitted = useCallback((revision: string) => drafts.clearSubmitted(key, revision), [key])
+  const clearSubmitted = useCallback((revision: string, sent?: Pick<ComposerDraft, 'message' | 'attachments'>) => drafts.clearSubmitted(key, revision, sent), [key])
   const flush = useCallback(() => drafts.flush(key), [key])
   return { view, current, setMessage, setAttachments, setDraft, clearSubmitted, flush }
 }

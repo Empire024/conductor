@@ -62,9 +62,9 @@ describe('send button intent', () => {
   it('names the send action for steering, queueing and plain sending', () => {
     expect(sendButtonIntent({ ...idle, draft: true }).label).toBe('Send message')
     expect(sendButtonIntent({ ...idle, draft: true, active: true }).label).toBe('Queue message')
-    expect(sendButtonIntent({ ...idle, draft: true, active: true }).title).toBe('Queue message after this turn · Enter')
+    expect(sendButtonIntent({ ...idle, draft: true, active: true }).title).toBe('Queue message after this turn · Ctrl+Enter')
     expect(sendButtonIntent({ ...idle, draft: true, active: true, steering: true }).label).toBe('Steer')
-    expect(sendButtonIntent({ ...idle, draft: true, active: true, steering: true }).title).toBe('Send to running turn · Enter')
+    expect(sendButtonIntent({ ...idle, draft: true, active: true, steering: true }).title).toBe('Send to running turn · Ctrl+Enter')
   })
   it('disables sending without a draft, without a submittable session or mid-submit', () => {
     expect(sendButtonIntent({ ...idle }).disabled).toBe(true)

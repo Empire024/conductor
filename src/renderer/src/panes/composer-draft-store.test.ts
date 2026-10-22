@@ -77,6 +77,31 @@ describe('conversation drafts', () => {
     expect(store.get(first).revision).not.toBe(sent.revision)
   })
 
+  it('drops the sent words from a draft the owner kept typing in while the send was in flight', () => {
+    // 2026-10-22: the first line was steered into the running turn, typing went on, and the kept
+    // draft (first line included) was sent again as the next turn.
+    const { store, values } = fixture()
+    type(store, first, 'cooking oil for rosin room 165 - 190 max ')
+    store.update(first, draft => ({ ...draft, attachments: [attachment] }))
+    const sent = store.get(first)
+    type(store, first, 'cooking oil for rosin room 165 - 190 max \nworking temperature is 70')
+    store.clearSubmitted(first, sent.revision, sent)
+    expect(store.get(first)).toMatchObject({ message: 'working temperature is 70', attachments: [] })
+    expect(JSON.parse(values.get(first)!).message).toBe('working temperature is 70')
+  })
+
+  it('leaves a draft that no longer begins with the sent words, or only repeats them, as it is', () => {
+    const { store } = fixture()
+    type(store, first, 'Send this')
+    const sent = store.get(first)
+    type(store, first, 'Rewritten: Send this and more')
+    store.clearSubmitted(first, sent.revision, sent)
+    expect(store.get(first).message).toBe('Rewritten: Send this and more')
+    type(store, first, 'Send this')
+    store.clearSubmitted(first, sent.revision, sent)
+    expect(store.get(first).message).toBe('Send this')
+  })
+
   it('preserves newly attached context while an older send is pending', () => {
     const { store } = fixture()
     type(store, first, 'Send this')

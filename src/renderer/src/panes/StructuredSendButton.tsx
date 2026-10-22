@@ -7,7 +7,7 @@ export type SendButtonState = 'send' | 'stop' | 'resume'
 export function sendButtonIntent(input: { active: boolean; interrupting: boolean; draft: boolean; needsResume: boolean; autoResumeOnSend?: boolean; steering: boolean; historical: boolean; canSubmit: boolean; submitting: boolean }): { state: SendButtonState; label: string; title: string; disabled: boolean } {
   if (input.active && !input.draft) return { state: 'stop', label: 'Stop', title: 'Stop · Esc', disabled: input.interrupting || input.historical }
   if (input.needsResume && !(input.autoResumeOnSend && input.draft)) return { state: 'resume', label: 'Resume conversation', title: 'Resume the same conversation', disabled: false }
-  return { state: 'send', label: input.steering ? 'Steer' : input.active ? 'Queue message' : 'Send message', title: input.steering ? 'Send to running turn · Enter' : input.active ? 'Queue message after this turn · Enter' : 'Send message · Enter', disabled: !input.canSubmit || !input.draft || input.submitting }
+  return { state: 'send', label: input.steering ? 'Steer' : input.active ? 'Queue message' : 'Send message', title: input.steering ? 'Send to running turn · Ctrl+Enter' : input.active ? 'Queue message after this turn · Ctrl+Enter' : 'Send message · Enter', disabled: !input.canSubmit || !input.draft || input.submitting }
 }
 /* One element for all three states: every glyph stays mounted so send/stop/resume morph in CSS instead of swapping, and only the send state submits the composer. */
 export function StructuredSendButton({ state, label, title, disabled, busy, onActivate }: { state: SendButtonState; label: string; title: string; disabled: boolean; busy: boolean; onActivate(): void }): React.JSX.Element {

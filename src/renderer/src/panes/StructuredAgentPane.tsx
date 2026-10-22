@@ -28,6 +28,7 @@ import { ConversationFindBar } from './ConversationFindBar'
 import { CLOSED_FIND, clearFindRanges, collectQueryRanges, conversationMatches, findReducer, paintFindRanges, type ConversationMatch, type FindAction } from './conversation-find'
 import { useOlderHistory, withStoredMatches } from './conversation-paging'
 import { FileAttachmentInput } from '../components/FileAttachmentInput'
+import { composerEnterSends } from './composer-enter'
 import { composerChildKey, composerSendBlock, conversationModes, modelDisplayName, nextComposerSettings, resolvedComposerSettings } from './composer-settings'
 import { activateBrowserMention, CommandAutocomplete } from './CommandAutocomplete'
 import { composerCommands, matchingComposerCommands, nativeCommandNames, type ComposerCommand } from './composer-commands'
@@ -547,7 +548,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       if (queuing && projection.capabilities?.steering && !nativeCommand) await window.conductor.structured.steer(activeId, text, settingsRef.current, sent)
       else if (queuing) await window.conductor.structured.queue(activeId, text, settingsRef.current, sent)
       else await window.conductor.structured.submit(activeId, text, settingsRef.current, sent)
-      clearSubmitted(draft.revision)
+      clearSubmitted(draft.revision, draft)
       if (firstMessage && !nativeCommand && !commandPrompt) {
         const snapshot = await window.conductor.structured.snapshot(activeId)
         // An anonymous tab is never named after what was said in it.
@@ -718,7 +719,8 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const cliOwned = Boolean(props.cliDrawer?.owned)
   const cliIdle = !activePhases.has(projection.phase) && !projection.queued
   const canSubmit = !cliOwned && !succession && ready && !historical && !resuming && sendBlocked !== 'oversized' && (!activePhases.has(projection.phase) || ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) || (projection.phase === 'starting' && metadataConnectionId.current === activeId)) && !projection.archived && (projection.phase !== 'disconnected' || unstartedConversation || Boolean(projection.nativeSessionId))
-  const steering = ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) && Boolean(projection.capabilities?.steering)
+  const turnRunning = ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase)
+  const steering = turnRunning && Boolean(projection.capabilities?.steering)
   const sendIntent = sendButtonIntent({ active: activePhases.has(projection.phase), interrupting: projection.phase === 'interrupting', draft: sendBlocked !== 'empty', needsResume, autoResumeOnSend: projection.phase === 'disconnected', steering, historical, canSubmit, submitting })
   const pendingSteering = projection.pendingSteering ?? []
   const queuedPrompts = projection.queuedPrompts ?? (projection.queued ? [projection.queued] : [])
@@ -1298,7 +1300,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       {promptChars > MAX_PROMPT_CHARS * 0.9 && <p className={'sa-prompt-limit' + (sendBlocked === 'oversized' ? ' sa-prompt-limit-over' : '')} role="status">{sendBlocked === 'oversized' ? `Too large to send: ${promptChars.toLocaleString()} of ${MAX_PROMPT_CHARS.toLocaleString()} characters including attachments. Remove or shorten an attachment, or trim the message.` : `${promptChars.toLocaleString()} / ${MAX_PROMPT_CHARS.toLocaleString()} characters`}</p>}
       {commandNotice && <div className="sa-command-notice" role="status" data-tone={commandNotice.tone}><span>{commandNotice.text}</span><button type="button" aria-label="Dismiss command message" onClick={() => setCommandNotice(null)}><X size={12} /></button></div>}
       {commandsOpen && <CommandAutocomplete id={commandListId} commands={commands} selected={Math.min(commandIndex, commands.length - 1)} loading={commandLoading} onSelect={setCommandIndex} onChoose={chooseCommand} />}
-      <ComposerTextarea projectId={props.project.id} sessionId={activeId} textareaRef={composer} aria-autocomplete="list" aria-controls={commandsOpen ? commandListId : undefined} aria-expanded={commandsOpen} aria-activedescendant={commandsOpen ? commandListId + '-' + Math.min(commandIndex, commands.length - 1) : undefined} aria-label={'Message ' + name} placeholder={sendBlocked !== 'empty' ? undefined : succession ? `Continued in ${succession.title}; send messages there` : cliOwned ? 'The native CLI has this conversation. Continue in Chat to send here.' : historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : steering ? (pendingSteering.some(input => input.status === 'sending' || input.status === 'accepted') ? 'Add another message' : 'Message after the next tool use') : activePhases.has(projection.phase) ? 'Queue a message after this turn' : 'Message ' + name} disabled={(!ready && !arriving) || historical || resuming || projection.archived || cliOwned} rows={2} onFocus={() => { if (ready && !historical && !projection.nativeSessionId && !activePhases.has(projection.phase)) void connect().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }} onBlur={() => { setCommandDismissed(true); flushDraft() }} onChange={event => {
+      <ComposerTextarea projectId={props.project.id} sessionId={activeId} textareaRef={composer} aria-autocomplete="list" aria-controls={commandsOpen ? commandListId : undefined} aria-expanded={commandsOpen} aria-activedescendant={commandsOpen ? commandListId + '-' + Math.min(commandIndex, commands.length - 1) : undefined} aria-label={'Message ' + name} placeholder={sendBlocked !== 'empty' ? undefined : succession ? `Continued in ${succession.title}; send messages there` : cliOwned ? 'The native CLI has this conversation. Continue in Chat to send here.' : historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : steering ? (pendingSteering.some(input => input.status === 'sending' || input.status === 'accepted') ? 'Add another message (Ctrl+Enter sends)' : 'Message after the next tool use (Ctrl+Enter sends)') : turnRunning ? 'Queue a message after this turn (Ctrl+Enter sends)' : activePhases.has(projection.phase) ? 'Queue a message after this turn' : 'Message ' + name} disabled={(!ready && !arriving) || historical || resuming || projection.archived || cliOwned} rows={2} onFocus={() => { if (ready && !historical && !projection.nativeSessionId && !activePhases.has(projection.phase)) void connect().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }} onBlur={() => { setCommandDismissed(true); flushDraft() }} onChange={event => {
         // A long paste or drop folds into a "[Pasted text #N: L lines]" chip, as the Claude CLI does.
         // Only an event that could have inserted a long run pays for diffing the whole draft.
         const input = event.nativeEvent as Partial<InputEvent>
@@ -1322,7 +1324,9 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
           if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); setCommandIndex(current => (current + (event.key === 'ArrowDown' ? 1 : commands.length - 1)) % commands.length); return }
           if ((event.key === 'Enter' && !event.shiftKey) || event.key === 'Tab') { event.preventDefault(); chooseCommand(commands[Math.min(commandIndex, commands.length - 1)]!, event.key === 'Tab'); return }
         }
-        if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submit() }
+        // While a turn runs, Enter is a newline: words reach the running turn only from Send or
+        // Ctrl+Enter, never from the key that ends a line (composer-enter.ts).
+        if (composerEnterSends(event, turnRunning)) { event.preventDefault(); void submit() }
       }} />
       <footer className="agent-prompt-controls">
         <PromptImageUpload key={composerChildKey('images', activeId)} projectId={props.project.id} disabled={historical || !capabilities?.imageAttachments} unavailable={props.project.remote?.machineId ? `Images are saved into the project folder, which is on ${props.project.remote.machineName || 'the other machine'}. Attach them from Conductor there.` : undefined} onError={setError} onAttach={(images) => setAttachments(current => { if (current.length + images.length > 20) { setError('A prompt can have up to 20 attachments. Remove some and attach these images again.'); return current }; return [...current, ...images] })} />

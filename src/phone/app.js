@@ -30,6 +30,13 @@
   /* iOS suspends a backgrounded fetch stream without ending it; a silent minute means dead. */
   const STREAM_STALE_MS = 75000
   const MAX_COMPOSER_LINES = 5
+  /* What was typed after a sent message while the field still begins with it; null when it does
+     not or nothing was added. The desktop's draftAfterSent (composer-draft-store.ts) does the same. */
+  const composerDraftAfterSent = (current, sent) => {
+    const prefix = String(sent || '').replace(/\s+$/, '')
+    if (!prefix || current.length <= prefix.length || current.slice(0, prefix.length) !== prefix) return null
+    return current.slice(prefix.length).replace(/^\s+/, '')
+  }
   /* The smallest on-screen keyboard is well over this; browser toolbars and rounding are under it. */
   const KEYBOARD_MIN_HEIGHT = 120
   /* The Tasks list is read again on a stream tick at most this often. */
@@ -3106,6 +3113,7 @@
       const resume = conversation && conversation.needsResume
       if (!resume && !text && !chatImages.length) return
       dictation.stop()
+      const sentDraft = input.value
       const images = chatImages.slice()
       const rows = messageRows(id)
       const stopAtSend = state.stops[id]
@@ -3140,6 +3148,12 @@
           if (!row.acknowledged) row.status = row.mode === 'queue' ? 'queued' : row.mode === 'steer' ? 'steered' : 'sent'
         }
         if (state.drafts[id] === input.value && input.value.trim() === text) { state.drafts[id] = ''; input.value = '' }
+        else if (state.drafts[id] === input.value) {
+          /* Typing on while it was sending must not leave the sent words in the field for the next
+             Send to deliver twice; only what was added after them stays (composerDraftAfterSent). */
+          const rest = composerDraftAfterSent(input.value, sentDraft)
+          if (rest !== null) { state.drafts[id] = rest; input.value = rest }
+        }
         for (const image of images) {
           const index = chatImages.indexOf(image)
           if (index >= 0) chatImages.splice(index, 1)

@@ -33,7 +33,8 @@ try {
     // Backend snapshots can lead the batched renderer event by 32 ms.
     // Exercise Enter only once the intended action is actually offered by the UI.
     await expect(pane.getByRole('button', { name: action, exact: true })).toBeEnabled()
-    await input().press('Enter')
+    // While a turn runs Enter is a newline; Ctrl+Enter sends into it (composer-enter.ts).
+    await input().press(action === 'Send message' ? 'Enter' : 'Control+Enter')
   }
   const users = async text => (await snapshot()).items.filter(item => item.data.type === 'text' && item.data.role === 'user' && item.data.text === text)
   await send('SYNTHETIC STEERING WAIT')

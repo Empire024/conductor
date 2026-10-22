@@ -23,6 +23,14 @@ const timers: DraftSaveScheduler = { set: (run, delayMs) => setTimeout(run, dela
 export const composerDraftKey = (projectId: string, sessionId: string): string =>
   'conductor.structured.draft.' + JSON.stringify([projectId, sessionId])
 
+/** What the owner typed after a sent message, when the composer still begins with that message;
+ *  null when it does not (the draft was edited or replaced) or nothing was added. */
+export function draftAfterSent(current: string, sent: string): string | null {
+  const prefix = sent.trimEnd()
+  if (!prefix || current.length <= prefix.length || !current.startsWith(prefix)) return null
+  return current.slice(prefix.length).replace(/^\s+/, '')
+}
+
 function readDraft(raw: string | null): ComposerDraft {
   if (!raw) return emptyDraft
   try {
@@ -86,9 +94,20 @@ export class ComposerDraftStore {
     this.listeners.get(key)?.forEach(listener => listener())
   }
 
-  clearSubmitted(key: string, revision: string): void {
+  clearSubmitted(key: string, revision: string, sent?: Pick<ComposerDraft, 'message' | 'attachments'>): void {
     // An acknowledgement may arrive after the owner has started another draft.
-    if (this.get(key).revision !== revision) return
+    if (this.get(key).revision !== revision) {
+      // Typing on after Send must not leave the words already sent in the composer, where the
+      // next send delivers them a second time (owner, 2026-10-22: "i didnt send this message
+      // twice"). Only what was added after them stays; an identical retype is left alone.
+      const current = this.get(key)
+      const remainder = sent ? draftAfterSent(current.message, sent.message) : null
+      if (remainder === null) return
+      const sentIds = new Set(sent!.attachments.map(item => item.id))
+      this.update(key, () => ({ message: remainder, attachments: current.attachments.filter(item => !sentIds.has(item.id)) }))
+      this.flush(key)
+      return
+    }
     this.update(key, () => emptyDraft)
     // Sent text leaves storage at once so a crash cannot bring it back.
     this.flush(key)
