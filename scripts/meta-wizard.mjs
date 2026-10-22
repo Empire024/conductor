@@ -6,7 +6,10 @@
 //
 //   node scripts/meta-wizard.mjs install | uninstall | status [--json] | run | tick [--dry-run]
 //   test knobs for run/tick: --user-data <dir> --interval-sec <n> --timings <json> --launch <json> --launch-env <json>
+//     --checkout <dir> (the repository a repair worktree is made from; docs/startup-diagnostics.md)
+//   test-profile-only environment: CONDUCTOR_REPAIR_AGENT_COMMAND (JSON argv), CONDUCTOR_META_ROLLBACK_COMMAND (JSON argv prefix)
 import { execFileSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { join, resolve } from 'node:path'
@@ -27,10 +30,21 @@ const testProfile = userData.toLowerCase() !== installed.toLowerCase()
 const dir = stateDir(userData)
 const self = fileURLToPath(import.meta.url)
 
-function service() {
+/** The checkout a repair worktree is made from: --checkout, else the one install recorded (the
+ *  service runs from a copy), else this script's own checkout. A test profile gets one only from
+ *  --checkout, so no test ever makes a worktree of the owner's real checkout. */
+async function repairCheckout() {
+  if (option('--checkout')) return resolve(option('--checkout'))
+  if (testProfile) return null
+  const installedFrom = (await readJsonFile(join(checkoutOf(self), 'VERSION.json'), null))?.checkout
+  if (installedFrom && existsSync(installedFrom)) return installedFrom
+  return existsSync(join(checkoutOf(self), '.git')) ? checkoutOf(self) : null
+}
+
+async function service() {
   const timings = { ...json('--timings', {}) }
   if (option('--interval-sec')) timings.tickMs = Number(option('--interval-sec')) * 1000
-  return createService({ userData, timings, launch: json('--launch', null), launchEnv: json('--launch-env', {}), testProfile, echo: flag('--verbose') ? line => process.stdout.write(line + '\n') : undefined })
+  return createService({ userData, timings, launch: json('--launch', null), launchEnv: json('--launch-env', {}), testProfile, checkout: await repairCheckout(), echo: flag('--verbose') ? line => process.stdout.write(line + '\n') : undefined })
 }
 
 async function runLoop() {
@@ -41,7 +55,7 @@ async function runLoop() {
   const version = await readJsonFile(join(checkoutOf(self), 'VERSION.json'), null)
   const record = { pid: process.pid, startedAt: new Date().toISOString(), userData, script: self, commit: version?.commit ?? null, lastTickAt: null }
   await writeFile(lockPath, JSON.stringify(record, null, 2) + '\n')
-  const supervisor = service()
+  const supervisor = await service()
   await supervisor.journal.write('service-start', { pid: process.pid, commit: record.commit, testProfile })
   let stopping = false
   const stop = async signal => {
@@ -77,6 +91,8 @@ async function status() {
     working: (state.working ?? []).map(tab => `${tab.title} (${tab.agentSessionId}): ${tab.phase}`),
     pendingResume: state.pendingResume ? { pid: state.pendingResume.pid, dueAt: new Date(state.pendingResume.dueAt).toISOString(), tabs: state.pendingResume.snapshot.length } : null,
     openFindings: state.openFindings ?? [],
+    incident: state.incident ? { id: state.incident.id, openedAt: new Date(state.incident.openedAt).toISOString(), failures: state.incident.failures.map(failure => `${failure.rung}: ${failure.line}`), rungs: state.incident.rungs.map(rung => `${new Date(rung.at).toISOString()} ${rung.rung} ${rung.detail}`), rolledBack: state.incident.rolledBack ?? null } : null,
+    repair: state.repair ? { id: state.repair.id, phase: state.repair.phase, outcome: state.repair.outcome ?? null, branch: state.repair.branch, worktree: state.repair.worktree, report: join(state.repair.dir, 'report.md') } : null,
     journal: join(dir, 'journal.jsonl'),
     recent: await journalTail(dir, 15)
   }
@@ -87,6 +103,8 @@ async function status() {
   line('conductor', credential.ok ? `pid ${report.conductor.pid} ${report.conductor.version ?? ''}` : `down: ${report.conductor.down}`)
   line('liveness', report.liveness ?? '-')
   line('working', report.working.length ? report.working.join('; ') : 'none')
+  if (report.incident) line('incident', `${report.incident.id}: ${report.incident.failures.length} failed starts; ${report.incident.failures.at(-1) ?? ''}`)
+  if (report.repair) line('repair', `${report.repair.id} ${report.repair.phase}${report.repair.outcome ? ` (${report.repair.outcome})` : ''}; ${report.repair.branch}; report ${report.repair.report}`)
   if (report.pendingResume) line('resume due', `${report.pendingResume.dueAt} (${report.pendingResume.tabs} tabs)`)
   line('findings', report.openFindings.length ? '' : 'none')
   for (const finding of report.openFindings) console.log(`  - ${finding.kind}: ${finding.target ?? ''}`)
@@ -98,7 +116,7 @@ async function status() {
 async function main() {
   if (command === 'run') return runLoop()
   if (command === 'tick') {
-    const result = await service().tick({ dryRun: flag('--dry-run') })
+    const result = await (await service()).tick({ dryRun: flag('--dry-run') })
     console.log(JSON.stringify({ decision: { action: result.decision.action, reason: result.decision.reason }, findings: (result.findings ?? []).map(f => ({ kind: f.kind, target: f.target?.title ?? null, fingerprint: f.fingerprint })), steers: (result.steers ?? []).map(s => ({ target: s.target.title, agentSessionId: s.target.agentSessionId, kind: s.kind, prompt: s.prompt })), alerts: result.alerts ?? [] }, null, 2))
     return 0
   }
@@ -112,7 +130,7 @@ async function main() {
     return 0
   }
   if (command === 'uninstall') { await uninstall(); console.log('Removed the scheduled task. The journal stays in ' + dir); return 0 }
-  console.log('usage: node scripts/meta-wizard.mjs install | uninstall | status [--json] | run | tick [--dry-run]\n  test knobs: --user-data <dir> --interval-sec <n> --timings <json> --launch <json {exe,args,cwd}> --launch-env <json> --verbose')
+  console.log('usage: node scripts/meta-wizard.mjs install | uninstall | status [--json] | run | tick [--dry-run]\n  test knobs: --user-data <dir> --interval-sec <n> --timings <json> --launch <json {exe,args,cwd}> --launch-env <json> --checkout <dir> --verbose')
   return command ? 2 : 0
 }
 

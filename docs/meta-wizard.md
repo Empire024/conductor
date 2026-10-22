@@ -56,7 +56,8 @@ mechanisms miss, including the app being dead or hung.
      snapshot had work in progress (a tab mid-turn or waiting): a Windows shutdown in the middle of
      the night is a quit too, and the tasks must come back.
    - Crash-loop guard: at most 3 starts in 30 minutes, then alert the owner and stand down for 30
-     minutes.
+     minutes (or, on the repair ladder below, start the repair agent).
+   - A failed start climbs the **repair ladder** (next section) instead of only restarting.
 2. **Resume after any restart** (the pid changed, by us or anyone): 90 s after the new app answers
    (the app's own resume runs 4 s after its windows open), every tab that was mid-turn in the last
    snapshot before the restart and is now settled without activity since the restart is steered:
@@ -90,6 +91,61 @@ and the meta-wizard sends at most 20 per hour (then it alerts the owner once).
 
 Every steer starts with `[Meta-wizard]` and says where it comes from, so the receiving agent knows
 this is the owner's supervisor and not a peer.
+
+## The repair ladder
+
+Design and background (the 2026-10-22 outage, boot diagnostics, the owner-scale startup check):
+[docs/startup-diagnostics.md](startup-diagnostics.md). Decisions are pure in
+`scripts/meta-wizard/escalation.mjs`; the effects are in `service.mjs` (`climb`, `rollback`,
+`beginRepair`, `repairTick`) and `repair.mjs`; the detached runner is `repair-run.mjs`.
+
+- **Verdict.** Every failed start reads the boot verdict (`boot.mjs` `readBootVerdict`: the child
+  pid, its exit code and the launch log tail), e.g. *died in stage structured-store 4.1 s after
+  start: V8 heap out of memory …*. The alert says it instead of a bare exit code; without boot
+  diagnostics the exit code and log decide (`fallbackVerdict`: a V8 fatal exit code or "heap out of
+  memory" in the log is `oom`).
+- **Incident** (`state.json` `incident`): opens at the first failed start the meta-wizard makes
+  (or when the crash-loop guard trips) and closes once Conductor has answered for 10 minutes
+  (`incidentCloseMs`) with no repair busy. It holds every failure (`rung`, `signature`, `version`,
+  `line`), the rungs taken, and `rolledBack`. A start of ours that answered and then died inside
+  the incident counts as that rung failing.
+- **Rungs.** (1) restart while fewer than `restartAttempts` (2) restarts failed with the latest
+  signature on the same version; (2) roll back once to `pickRestorePoint(restore-points.json)`: not
+  the failing version, `firstLaunchedAt` set, installer still in `<userData>/local-updates`; pinned
+  or known-good first, then without crashes, then newest; run `<installer> /S` and start; (3) the
+  repair agent when the rolled-back build fails (same signature: "data or environment, not the
+  build"; any other failure: "fails too"), when there is no restore point, or when the crash-loop
+  guard trips. After a repair: one plain start, then repair again while the cap allows. When no
+  rung is left (`exhausted`), plain restarts under the crash-loop guard as before.
+- **Repair gating**: one at a time (`meta-wizard/repair/active.json` names a live runner pid within
+  its time limit), at most 2 per 24 hours (`state.json` `repairs`). While a repair runs or has just
+  ended (`repairAnswerGraceMs`, 3 minutes for Conductor to answer), the meta-wizard starts and
+  kills nothing (`repair-holds` in the journal).
+- **The runner** (`node repair-run.mjs <repair>/<id>/request.json`, detached): `git worktree add -b
+  repair/<id> <checkout>/../conductor-repairs/<id> HEAD`; `robocopy node_modules /E` (a real copy);
+  the agent with the prompt (`prompt.md`) on stdin, cwd the worktree, its environment stripped of
+  `ELECTRON_RUN_AS_NODE`, `NODE_OPTIONS`, `CONDUCTOR_TEST_*` and control tokens; the whole tree
+  killed after 90 minutes. It writes `report.md` (stdout), `result.json` `{id, startedAt,
+  finishedAt, exitCode, timedOut, error, branch, worktree, base, commits, report}` (the service adds
+  `conductorAnswered`) and `runner.log`, and removes `active.json`. `<id>` is the UTC minute
+  `YYYY-MM-DD-HHmm` (`-2`, `-3` when taken).
+- **The agent**: `claude -p --model opus --effort high --output-format text --max-turns 300
+  --permission-mode acceptEdits --allowedTools Read Edit Write Grep Glob Bash PowerShell
+  --disallowedTools …` (git push, gh, npm run dev, git reset/clean/checkout main/switch main/branch
+  -D/tag/worktree remove, rm/rmdir/del/rd/Remove-Item, and `Edit`/`Write` under userData). The prompt
+  (`repairPrompt`) carries the incident, `boot.json`, `boot-last-failure.json`, `boot-sample.json`,
+  launch log tails, the newest recovery report, the paths, the steps and the rules.
+- **Afterwards**: "Repaired: …" (Conductor answered; toast and phone push) or "Repair failed: …".
+  Once Conductor answers, the wizard tabs (`supervisor.overview` `wizard: true`) are steered once
+  with the report path, branch, commits and "ship it to main with git.ship" (`repair-announced`).
+- **The recovery watchdog alongside**: while `recovery/watchdog.json` names a live watchdog whose
+  `appPid` is the dead pid, a start waits for it, at most 20 minutes (`watchdog-wait`).
+- **Checkout**: `--checkout <dir>`, else the checkout `install` recorded in `service/VERSION.json`,
+  else the script's own checkout, else (installed profile) `armed.json` `checkout`. A test profile
+  only ever uses `--checkout`. With none, the owner is alerted once and restarts go on.
+
+Journal events: `incident-failure`, `rollback`, `repair-start`, `repair-holds`, `repair-finished`,
+`repair-outcome`, `repair-announced`, `incident-closed`, `watchdog-wait`.
 
 ## Owner alerts
 
@@ -136,11 +192,26 @@ node scripts/meta-wizard.mjs tick        one pass [--dry-run]: print findings an
 ```
 
 Test knobs (`run`/`tick`): `--user-data <dir>` (a test profile: toasts go to the file),
-`--interval-sec`, `--timings <json>`, `--launch <json {exe,args,cwd}>`, `--launch-env <json>`.
+`--interval-sec`, `--timings <json>`, `--launch <json {exe,args,cwd}>`, `--launch-env <json>`,
+`--checkout <dir>` (a scratch repository for repair worktrees). Honoured for a test profile only:
+`CONDUCTOR_REPAIR_AGENT_COMMAND` (JSON argv; the claude arguments are appended; with none a test
+profile runs no agent and records that) and `CONDUCTOR_META_ROLLBACK_COMMAND` (JSON argv prefix the
+installer path is appended to). Ladder timings (`--timings`): `restartAttempts`, `incidentCloseMs`,
+`maxRepairsPerDay`, `repairWindowMs`, `repairTimeoutMs`, `repairAnswerGraceMs`, `watchdogWaitMs`,
+`rollbackTimeoutMs`, `exitSettleMs` (a start whose process exited is given up on this long after
+the exit when nothing answers).
 
 ## Tests
 
 - `scripts/meta-wizard.test.mjs`: every detector and the liveness decisions, pure.
+- `scripts/meta-wizard-escalation.test.mjs`: every ladder rule (incident, signatures, restore-point
+  choice, gating, rungs, watchdog wait, repair argv/prompt/environment) and the service climbing
+  the whole ladder with faked effects.
+- `scripts/smoke-meta-wizard-repair.mjs` (parked, after `npm run build`): every start dies in stage
+  `structured-store` (`CONDUCTOR_TEST_BOOT_FAIL_FILE`); restarts alert the verdict, a fake rollback
+  fails the same way, the repair runner makes a worktree of a scratch `--checkout` and a fake agent
+  deletes the fail file, starts the app and commits; "Repaired", the wizard summary, the incident
+  closes.
 - `src/main/agent-control.test.ts`: `supervisor.overview` and `supervisor.alert` answer only the
   owner credential.
 - `scripts/smoke-meta-wizard.mjs` (parked, `node scripts/smoke-lock.mjs -- node

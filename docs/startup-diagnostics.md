@@ -163,7 +163,9 @@ An **incident** opens when a start the meta-wizard makes fails (and on the crash
 closes when Conductor has answered for 10 minutes. Within one incident:
 
 1. **Restart.** As today: start the installed exe, at most `restartAttempts` (2) times with the same
-   failure signature on the same version. Each failure's verdict is recorded in the incident.
+   failure signature on the same version (two failures without a signature count as the same).
+   Each failure's verdict is recorded in the incident. A start whose process exited is given up
+   `exitSettleMs` (10 s) after the exit instead of waiting the whole start window.
 2. **Roll back** to the previous known-good restore point (`<userData>/local-updates/
    restore-points.json`): the newest point whose version is not the failing one, that ran on this
    machine (`firstLaunchedAt`), whose installer is still there, preferring `pinned`/`knownGood` and
@@ -176,19 +178,26 @@ closes when Conductor has answered for 10 minutes. Within one incident:
    - or the crash-loop guard trips (in any incident).
 
    At most one repair at a time (`meta-wizard/repair/active.json` names the live runner), at most 2
-   per 24 hours. While a repair runs, the meta-wizard starts and kills nothing: the agent owns the
-   app.
+   per 24 hours. While a repair runs, and for `repairAnswerGraceMs` (3 min) after the agent exits,
+   the meta-wizard starts and kills nothing: the agent owns the app. After a repair: one plain
+   start, then the repair rung again while the cap allows; with no rung left (`exhausted`), plain
+   restarts go on under the crash-loop guard.
+4. **No checkout** to repair from (`--checkout`, else the checkout `install` recorded in
+   `service/VERSION.json`, else the script's own, else `armed.json` `checkout`; a test profile
+   only ever uses `--checkout`): the owner gets one alert and restarts go on.
 
-Each rung alerts the owner once (toast; phone push once the app answers): "Conductor did not start:
-<verdict>. Restarting (1 of 2)" / "Rolling back to 0.1.58-local.…" / "Repair agent started (log …)" /
-"Repaired: …" or "Repair failed: …".
+Each rung alerts the owner once (toast; phone push once the app answers), titled "Conductor did not
+start" (body "Conductor did not start: <verdict>. Restarting (1 of 2)"), "Conductor: rolling back",
+"Conductor: repair agent started", "Conductor repaired" ("Repaired: …") or "Conductor repair
+failed" ("Repair failed: …").
 
 ### The repair agent
 
 `scripts/meta-wizard/repair-run.mjs`, started detached by the meta-wizard so a 90-minute repair never
 blocks a tick and survives a restart of the meta-wizard itself:
 
-1. `git worktree add -b repair/<YYYY-MM-DD-HHmm> <checkout>/../conductor-repairs/<id> HEAD`
+1. `git worktree add -b repair/<id> <checkout>/../conductor-repairs/<id> HEAD`, `<id>` the UTC
+   minute `YYYY-MM-DD-HHmm` (`-2`, `-3` when taken)
    (a fresh worktree, never the shared main tree).
 2. `robocopy` the checkout's `node_modules` into it, a real copy (a junction makes electron-builder
    drop dependencies, docs: local-update-from-worktree).
@@ -197,7 +206,8 @@ blocks a tick and survives a restart of the meta-wizard itself:
    `boot-last-failure.json`, the last sample, launch log tails, the recovery report, the paths, and
    the rules below. Killed (whole tree) after 90 minutes.
 4. Its stdout is the report, `meta-wizard/repair/<id>/report.md`; `result.json` records exit,
-   timeout, branch, worktree, the commits on the branch, and whether Conductor answered after it.
+   timeout, branch, base, worktree, command, report path and the commits on the branch; the
+   meta-wizard adds `conductorAnswered` (the pid, or null).
 
 Rules in its prompt, and denied tools where Claude Code can enforce them: edit code only in the
 worktree; run the related tests and the owner-scale startup check; build a local update from the
@@ -206,16 +216,26 @@ it answers on the owner's real profile (`node scripts/meta-wizard.mjs status --j
 cut work resumes (the meta-wizard resumes it; its journal shows `restart-seen` and the steers);
 commit on its branch. Never push, publish, tag or touch `main`; never delete or edit anything in
 userData except installing through the local feed; never `npm run dev`; never install software.
-Denied: `git push`, `gh`, `npm run dev`, `git reset/clean/checkout main`, `Remove-Item`/`rm`/`del`
-patterns, edits under userData.
+Denied: `git push`, `gh`, `npm run dev`, `git reset/clean`, checking out or switching to `main`,
+`git branch -d/-D`, `git tag`, `git worktree remove`, `git stash drop`, `Remove-Item`/`rm`/`rmdir`/
+`del`/`rd`, `NotebookEdit`, `WebFetch`, `WebSearch`, and `Edit`/`Write` under userData (Claude
+Code's POSIX path form, `//c/Users/…/Conductor/**`).
 
 When Conductor answers again after a repair, the meta-wizard steers the wizard tabs once with the
 summary (report path, branch, commits, "ship the fix to main with git.ship after review") and sends
 the owner a phone push.
 
-Test knobs (test profiles only): `CONDUCTOR_REPAIR_AGENT_COMMAND` (JSON argv; never the real CLI in
-a test), `CONDUCTOR_META_ROLLBACK_COMMAND` (JSON argv prefix the installer path is appended to),
-`--checkout <dir>` (a scratch repository for the worktree).
+Test knobs (test profiles only): `CONDUCTOR_REPAIR_AGENT_COMMAND` (JSON argv the claude arguments
+are appended to; never the real CLI in a test), `CONDUCTOR_META_ROLLBACK_COMMAND` (JSON argv prefix
+the installer path is appended to; without it a test profile runs no installer at all),
+`--checkout <dir>` (a scratch repository for the worktree). If `boot.mjs` cannot be loaded, a
+fallback verdict from the exit code and log keeps the supervisor running.
+
+Tests: `scripts/meta-wizard-escalation.test.mjs` (every rule, and the service climbing the whole
+ladder with faked effects); parked smoke `scripts/smoke-meta-wizard-repair.mjs` (the real app dies
+in `structured-store`, a fake rollback fails the same way, a fake repair agent in a scratch
+repository's worktree deletes the fail file, starts the app and commits; "Conductor repaired" goes
+out and the scratch `main` is unchanged).
 
 ### The watchdog alongside
 
