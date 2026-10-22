@@ -106,6 +106,14 @@ const MACHINE_NAME_SETTING = 'remote-control.machineName'
  * past its own timeout.
  */
 const MACHINE_PROBE_MS = DIRECT_PROBE_TIMEOUT_MS + RELAY_BACKGROUND_CALL_TIMEOUT_MS + 7_000
+/**
+ * How often a host that mirrors everything is walked again (its projects, workspaces and tabs) when
+ * nothing else asked. Scheduled probes skip a host whose push channel is up, and the channel only
+ * reports tabs in workspaces already mirrored, so without this a project or workspace made on MAIN
+ * would reach the laptop only after a restart. Background probes are held to it as well, so a host
+ * reached only through the relay is not walked every minute.
+ */
+const MIRROR_RESYNC_MS = 120_000
 /** The X25519 key relayed messages to this machine are sealed to; never leaves the credential store. */
 const RELAY_KEY_SECRET = 'remote-control.relay.sealKey'
 /**
@@ -261,6 +269,11 @@ export class RemoteControlService {
   readonly fullMirror: RemoteFullMirror
   /** What each host said about mirroring (host method mirror.state); null for a host without it. */
   private readonly hostMirrors = new Map<string, RemoteHostMirror | null>()
+  /** When each host's projects were last read and its mirror last walked; see MIRROR_RESYNC_MS. */
+  private readonly projectsReadAt = new Map<string, number>()
+  private readonly mirrorSyncedAt = new Map<string, number>()
+  /** Hosts whose push channel was up at the last transport change, to notice it coming up. */
+  private readonly streamsUp = new Set<string>()
   readonly tailscale: TailscaleService
   /** The tailnet route: the push channel this machine serves and the ones it holds to its hosts. */
   readonly transport: RemoteTransport
@@ -504,8 +517,15 @@ export class RemoteControlService {
         // The mirror polls slowly while a stream carries notices for that machine, and at its old
         // cadence the moment the stream is gone: the poll is the resync of last resort either way.
         for (const connection of this.client.list()) {
-          this.mirror.streamConnected(connection.machineId, this.transport.streaming(connection.machineId))
+          const up = this.transport.streaming(connection.machineId)
+          this.mirror.streamConnected(connection.machineId, up)
           void this.refreshSubscriptions(connection.machineId)
+          // A host's channel coming up (after pairing, a restart or a dropped link) is when the
+          // laptop catches up with it at once, rather than at a probe the channel suppresses.
+          if (up && !this.streamsUp.has(connection.machineId)) {
+            this.streamsUp.add(connection.machineId)
+            void this.refreshRemoteProjects(connection.machineId).catch(() => undefined)
+          } else if (!up) this.streamsUp.delete(connection.machineId)
         }
         this.publishState()
       },
@@ -1044,6 +1064,7 @@ export class RemoteControlService {
           // A pairing approved after this machine stopped waiting still joins the two project
           // lists; the approval is what carries that machine's projects, so they are taken here.
           this.adoptRemoteProjects(connection.machineId, this.client.remoteProjects(connection.machineId))
+          void this.refreshRemoteProjects(connection.machineId).catch(() => undefined)
         }
       } catch { /* asked again next time */ }
     }
@@ -1076,7 +1097,17 @@ export class RemoteControlService {
 
   private scheduleMachineProbe(): void {
     if (this.heartbeat) return
-    this.heartbeat = setInterval(() => { void this.probeMachines({ scheduled: true, background: true }).catch(() => undefined) }, MACHINE_PROBE_MS)
+    this.heartbeat = setInterval(() => {
+      void this.probeMachines({ scheduled: true, background: true }).catch(() => undefined)
+      // The probe leaves streaming hosts alone; a mirroring one still has to be walked now and then.
+      const now = Date.now()
+      for (const connection of this.client.list()) {
+        if (connection.detached || connection.status === 'revoked' || !this.transport.streaming(connection.machineId)) continue
+        if (this.hostMirrors.get(connection.machineId)?.mirror !== true) continue
+        if (now - (this.projectsReadAt.get(connection.machineId) ?? 0) < MIRROR_RESYNC_MS) continue
+        void this.refreshRemoteProjects(connection.machineId, { background: true }).catch(() => undefined)
+      }
+    }, MACHINE_PROBE_MS)
     this.heartbeat.unref?.()
   }
 
@@ -1119,7 +1150,10 @@ export class RemoteControlService {
   async refreshRemoteProjects(machineId: string, options: RemoteCallOptions = {}): Promise<RemoteProjectSummary[]> {
     const summaries = this.client.recordRemoteProjects(machineId, readRemoteProjectSummaries(await this.client.call(machineId, 'projects.list', {}, options)))
     this.adoptRemoteProjects(machineId, summaries)
-    void this.readHostMirror(machineId).catch(error => console.warn('Mirroring state could not be read', error))
+    this.projectsReadAt.set(machineId, Date.now())
+    // Anything the owner or a link event asked for walks the mirror now; background probes at most
+    // every MIRROR_RESYNC_MS (tab changes on the channel still sync at once).
+    void this.readHostMirror(machineId, options.background !== true).catch(error => console.warn('Mirroring state could not be read', error))
     return summaries
   }
 
@@ -1128,9 +1162,12 @@ export class RemoteControlService {
    * machine's workspaces and tabs in line with it. A host without the method is an older build:
    * recorded as null, which the UI reads as "update that machine", never as an error.
    */
-  private async readHostMirror(machineId: string): Promise<void> {
+  private async readHostMirror(machineId: string, now = true): Promise<void> {
     await this.readHostMirrorState(machineId)
-    if (this.hostMirrors.get(machineId)?.mirror) await this.fullMirror.sync(machineId, { confirmed: true })
+    if (!this.hostMirrors.get(machineId)?.mirror) return
+    if (!now && Date.now() - (this.mirrorSyncedAt.get(machineId) ?? 0) < MIRROR_RESYNC_MS) return
+    this.mirrorSyncedAt.set(machineId, Date.now())
+    await this.fullMirror.sync(machineId, { confirmed: true })
   }
 
   /** Records what the host says about mirroring now; an unreachable host leaves the last answer. */
@@ -1482,6 +1519,8 @@ export class RemoteControlService {
       // Linking two machines joins their project lists, so the other machine's projects are here
       // the moment the link is made rather than whenever the next probe happens to come round.
       this.adoptRemoteProjects(connection.machineId, connection.remoteProjects)
+      // And its conversations: a pairing that is already approved is mirrored now, not at a probe.
+      if (connection.peerId) void this.refreshRemoteProjects(connection.machineId).catch(() => undefined)
       return this.state()
     })
     handle<RemoteControlState>('remote:forget', (machineId: string) => {

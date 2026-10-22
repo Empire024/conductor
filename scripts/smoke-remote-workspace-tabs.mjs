@@ -153,8 +153,15 @@ try {
   check('the laptop launcher lists the two conversations MAIN is running, under MAIN\'s workspace')
 
   await list.getByRole('button', { name: 'Open all 2', exact: true }).click()
-  const mirroredTabs = controller.page.locator('.pane-tab').filter({ hasText: '· MAIN' })
-  await expect(mirroredTabs).toHaveCount(2, { timeout: 20000 })
+  // Counted in the saved layout, not the strip: a finished tab nobody has looked at yet leaves the
+  // strip for the sidebar's Done group, and whether the second one has been pulled as finished by
+  // now depends only on how busy the machine is.
+  await expect.poll(() => controller.page.evaluate(async id => {
+    const collect = node => node.type === 'group' ? node.tabs : node.children.flatMap(collect)
+    return (await window.conductor.sessions.list(id)).flatMap(session => collect(session.layout.root))
+      .filter(tab => tab.kind === 'agent' && tab.title.endsWith(' · MAIN')).length
+  }, remoteProject.id), { timeout: 20000 }).toBe(2)
+  await expect(controller.page.locator('.pane-tab.active')).toContainText('· MAIN')
   const pane = controller.page.locator('.structured-agent-pane:visible').last()
   const localId = await pane.getAttribute('data-structured-session')
   await expect(pane).toContainText(/synthetic links from main/i, { timeout: 30000 })

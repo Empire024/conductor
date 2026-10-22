@@ -106,10 +106,11 @@ try {
   const connecting = controller.page.evaluate(encoded => window.conductor.remote.connect(encoded), ticket.encoded)
   await expect.poll(() => host.page.evaluate(() => window.conductor.remote.state().then(state => state.pending.length)), { timeout: 40000 }).toBe(1)
   const pending = await host.page.evaluate(() => window.conductor.remote.state().then(state => state.pending[0]))
-  await host.page.evaluate(({ id, projectId }) => window.conductor.remote.approve(id, [projectId]), { id: pending.id, projectId: ticked.id })
+  // What the approval itself granted; mirroring then shares the rest as soon as the laptop connects.
+  const approved = await host.page.evaluate(({ id, projectId }) => window.conductor.remote.approve(id, [projectId]), { id: pending.id, projectId: ticked.id })
   await connecting
   const machineId = (await controller.page.evaluate(() => window.conductor.remote.state())).connections[0].machineId
-  const granted = (await host.page.evaluate(() => window.conductor.remote.state())).peers.find(entry => !entry.revokedAt).grantedProjects.map(entry => entry.projectId)
+  const granted = approved.peers.find(entry => !entry.revokedAt).grantedProjects.map(entry => entry.projectId)
   assert.deepEqual(granted, [ticked.id], 'pairing should have shared only the ticked project')
   check('MAIN and the laptop are paired over loopback; only haf-stuff was ticked')
 
@@ -134,16 +135,29 @@ try {
     return controller.page.evaluate(id => window.conductor.remote.state().then(state => JSON.stringify(state.hostMirrors?.[id] ?? 'unknown')), machineId)
   }, { timeout: 30000, intervals: [500, 1000, 2000] }).toContain('"mirror":true')
 
+  /**
+   * The MAIN-labelled conversation tabs in a laptop project's open workspaces, read from the saved
+   * layouts. The strip is not the place to count them: a finished tab nobody has looked at yet
+   * leaves the strip for the sidebar's Done group (workspace clarity), and whether a mirrored
+   * conversation has already been pulled as finished depends only on how busy the machine is.
+   */
+  const mirroredTabs = async name => controller.page.evaluate(async name => {
+    const project = (await window.conductor.projects.list()).find(entry => entry.remote?.machineId && entry.name === name)
+    if (!project) return []
+    const collect = node => node.type === 'group' ? node.tabs : node.children.flatMap(collect)
+    return (await window.conductor.sessions.list(project.id)).flatMap(session => collect(session.layout.root))
+      .filter(tab => tab.kind === 'agent' && tab.state?.machineName === 'MAIN').map(tab => tab.title)
+  }, name)
   await controller.page.reload()
   for (const [name, prompt] of [['haf-stuff', 'synthetic links from main haf'], ['videos', 'synthetic links from main videos']]) {
     await controller.page.locator('.project-row').filter({ hasText: name }).click()
-    const tab = controller.page.locator('.pane-tab').filter({ has: controller.page.locator('.pane-tab-machine', { hasText: 'MAIN' }) })
-    await expect(tab).toHaveCount(1, { timeout: 45000 })
-    // A settled conversation folds into the workspace's Done group; its launcher row ("open here")
-    // selects the tab already showing it, as the owner would reach it.
+    await expect.poll(() => mirroredTabs(name), { timeout: 45000 }).toEqual([expect.stringMatching(new RegExp(prompt, 'i'))])
+    // Reached the way the owner would: its launcher row ("open here") selects the tab already
+    // showing it, which then shows in the strip with its MAIN label and MAIN's history.
     const row = controller.page.locator('.launcher-remote-conversations .launcher-attach-list button').filter({ hasText: new RegExp(prompt, 'i') })
     await expect(row).toContainText('open here', { timeout: 20000 })
     await row.click()
+    await expect(controller.page.locator('.pane-tab.active .pane-tab-machine')).toHaveText('MAIN')
     const pane = controller.page.locator('.structured-agent-pane:visible').last()
     await expect(pane).toContainText(new RegExp(prompt, 'i'), { timeout: 30000 })
   }
@@ -167,8 +181,10 @@ try {
   await controller.page.locator('.project-row').filter({ hasText: 'haf-stuff' }).click()
   await expect.poll(async () => {
     await controller.page.evaluate(id => window.conductor.remote.remoteProjects(id), machineId).catch(() => [])
-    return controller.page.locator('.pane-tab-machine', { hasText: 'MAIN' }).count()
+    return (await mirroredTabs('haf-stuff')).length
   }, { timeout: 60000, intervals: [1000, 2000, 5000] }).toBe(2)
+  await controller.page.locator('.pane-add-tab').first().click()
+  await expect(controller.page.locator('.launcher-remote-conversations:visible .launcher-attach-list button').filter({ hasText: /second from MAIN/i }).last()).toContainText('open here', { timeout: 20000 })
   check('a conversation MAIN opened later appeared on the laptop by itself')
 
   // ---- the laptop's own tabs beside them --------------------------------------------------------
