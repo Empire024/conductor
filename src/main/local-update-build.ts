@@ -93,12 +93,23 @@ export class SmokeTail {
     kept.splice(0, Math.max(0, kept.length - SMOKE_TAIL_LINES))
   }
 }
+/** Requested smokes per build. The mandatory ones (MANDATORY_SMOKES) run on top and never use up
+ *  the caller's allowance. */
 const MAX_SMOKES = 12
+/** Every candidate runs these first, whatever was asked for: the parked-window guard, then the
+ *  owner-scale startup check (docs/startup-diagnostics.md, part 3) when the commit has its script,
+ *  so a commit from before it still builds. */
+const MANDATORY_SMOKES = ['smoke-background-windows', 'smoke-owner-scale-startup']
+const OPTIONAL_MANDATORY_SMOKES = new Set(['smoke-owner-scale-startup'])
 const BUILD_TIMEOUT_MS = 45 * 60 * 1000
 const COPY_TIMEOUT_MS = 20 * 60 * 1000
 const SMOKE_RUN_MINUTES = 20
-// smoke-lock waits up to an hour for the machine-wide lock, then runs for at most SMOKE_RUN_MINUTES.
-const SMOKE_TIMEOUT_MS = (60 + SMOKE_RUN_MINUTES + 10) * 60 * 1000
+/** The owner-scale check regenerates its multi-GB profile when the commit's schema differs from the
+ *  cached one (scripts/owner-scale-profile.mjs), which takes minutes on top of the boot itself. */
+const SMOKE_RUN_MINUTES_BY_NAME: Record<string, number> = { 'smoke-owner-scale-startup': 45 }
+const smokeRunMinutes = (name: string): number => SMOKE_RUN_MINUTES_BY_NAME[name] ?? SMOKE_RUN_MINUTES
+// smoke-lock waits up to an hour for the machine-wide lock, then runs for at most the smoke's run minutes.
+const smokeTimeoutMs = (name: string): number => (60 + smokeRunMinutes(name) + 10) * 60 * 1000
 const COMMIT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/~^-]{0,99}$/
 const SMOKE_PATTERN = /^smoke-[a-z0-9][a-z0-9-]*$/
 const FEED_DESCRIPTOR = 'conductor-local-build.json'
@@ -277,14 +288,15 @@ export class LocalUpdateBuilder implements LocalUpdateBuildService {
     let commit: string
     try { commit = git(root, ['rev-parse', '--verify', '--quiet', `${request.commit}^{commit}`]) } catch { throw new Error(`No commit ${request.commit} in ${root}. Commit the work first (git.ship), then pass its sha.`) }
     const exists = (path: string): boolean => { try { git(root, ['cat-file', '-e', `${commit}:${path}`]); return true } catch { return false } }
-    const smokes: string[] = []
-    for (const raw of ['smoke-background-windows', ...(request.smoke ?? [])]) {
+    const smokes = MANDATORY_SMOKES.filter(name => !OPTIONAL_MANDATORY_SMOKES.has(name) || exists(`scripts/${name}.mjs`))
+    const mandatory = smokes.length
+    for (const raw of request.smoke ?? []) {
       const name = raw.trim().replace(/^scripts[\\/]/, '').replace(/\.mjs$/, '')
       if (!SMOKE_PATTERN.test(name) || name === 'smoke-lock') throw new Error(`smoke names a scripts/smoke-*.mjs file, such as smoke-permission-grant; ${JSON.stringify(raw)} is not one.`)
       if (!exists(`scripts/${name}.mjs`)) throw new Error(`Commit ${commit.slice(0, 10)} has no scripts/${name}.mjs.`)
       if (!smokes.includes(name)) smokes.push(name)
     }
-    if (smokes.length > MAX_SMOKES) throw new Error(`At most ${MAX_SMOKES} smokes per build; they run one at a time.`)
+    if (smokes.length - mandatory > MAX_SMOKES) throw new Error(`At most ${MAX_SMOKES} requested smokes per build, besides the mandatory ${smokes.slice(0, mandatory).join(' and ')}; they run one at a time.`)
     if (smokes.length && !exists('scripts/smoke-lock.mjs')) throw new Error(`Commit ${commit.slice(0, 10)} has no scripts/smoke-lock.mjs to run its smokes under.`)
     const candidates = this.options.candidatesDirectory?.(root) ?? resolve(root, '..', 'conductor-candidates')
     // Only a candidates worktree is reused: one elsewhere at the same commit is another agent's.
@@ -368,7 +380,7 @@ export class LocalUpdateBuilder implements LocalUpdateBuildService {
     smoke.startedAt = new Date().toISOString()
     const tail = new SmokeTail()
     const file = createWriteStream(smoke.log)
-    const code = await this.run(node, [join(worktree, 'scripts', 'smoke-lock.mjs'), '--timeout-min', String(SMOKE_RUN_MINUTES), '--', node, join('scripts', `${smoke.name}.mjs`)], worktree, SMOKE_TIMEOUT_MS, {
+    const code = await this.run(node, [join(worktree, 'scripts', 'smoke-lock.mjs'), '--timeout-min', String(smokeRunMinutes(smoke.name)), '--', node, join('scripts', `${smoke.name}.mjs`)], worktree, smokeTimeoutMs(smoke.name), {
       env: smokeEnvironment(),
       onText: (text, stream) => { file.write(text); tail.add(text, stream) }
     })

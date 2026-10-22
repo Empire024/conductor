@@ -255,3 +255,15 @@ budget, and prints the verdict.
 
 `app.update` runs it for every candidate, after `smoke-background-windows`, whenever the commit has
 the script (`src/main/local-update-build.ts`).
+
+The profile (`scripts/owner-scale-profile.mjs`) has 3,000 conversations in 20 projects, 1.45 GB of
+projection JSON with non-ASCII text as the owner's has it (V8 stores those strings at two bytes per
+character, which is what made 1.27 GB of JSON fill a 4 GB heap), a 3.4 GB journal and 120 open tabs.
+The candidate creates the schema by booting once on an empty profile; the cache key covers the
+generator version, the sizing and the schema of the tables it fills, so a commit that changes those
+tables regenerates it (about 1-2 minutes). Budgets: ready within 60 s and a peak heap within 40% of
+the V8 limit, staying up 20 s more with the first window painted (`--budget-ms`,
+`--heap-budget-mb` override them). On 2026-10-22 HEAD was ready in 1.5-1.7 s with a peak of about
+300 MB, and 0db4b53 (a4c6427^, the build installed during the outage) died 10 s in with the V8
+out-of-memory error and exit code 4294930435. The mandatory smokes do not count toward the 12
+requested ones; this one may run 45 minutes (a regeneration).

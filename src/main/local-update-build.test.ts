@@ -128,6 +128,27 @@ describe('local update builds', () => {
     expect(() => builder.start(root, { commit: head })).toThrow(/junction in node_modules \(node_modules\/electron-builder\)/)
     expect(builder.status().state).toBe('idle')
   })
+  it('runs the owner-scale startup check after the window guard whenever the commit has it, outside the requested allowance', async () => {
+    if (process.platform !== 'win32') return
+    const { root, candidates, feed, git } = repository()
+    const builder = new LocalUpdateBuilder({ feedDirectory: () => feed, candidatesDirectory: () => candidates })
+    const requested = Array.from({ length: 12 }, (_, i) => `smoke-extra-${i}`)
+    for (const name of requested) writeFileSync(join(root, 'scripts', `${name}.mjs`), "console.log('ok')\n", 'utf8')
+    git('add', '.'); git('commit', '-q', '-m', 'twelve smokes')
+    // A commit from before the owner-scale script still builds, with the guard alone in front.
+    expect(builder.validate(root, { commit: 'HEAD', smoke: requested })).toBeUndefined()
+    expect(() => builder.validate(root, { commit: 'HEAD', smoke: [...requested, 'smoke-ok'] })).toThrow(/At most 12 requested smokes per build, besides the mandatory smoke-background-windows;/)
+    writeFileSync(join(root, 'scripts', 'smoke-owner-scale-startup.mjs'), "console.log('OWNER SCALE PASSED')\n", 'utf8')
+    git('add', '.'); git('commit', '-q', '-m', 'owner-scale check')
+    // Twelve requested smokes still fit: the mandatory ones never use up the caller's allowance.
+    expect(builder.validate(root, { commit: 'HEAD', smoke: requested })).toBeUndefined()
+    expect(() => builder.validate(root, { commit: 'HEAD', smoke: [...requested, 'smoke-ok'] })).toThrow(/besides the mandatory smoke-background-windows and smoke-owner-scale-startup;/)
+    // Asking for it by name runs it once, in its mandatory place.
+    expect(builder.start(root, { commit: 'HEAD', smoke: ['smoke-ok', 'smoke-owner-scale-startup'] }).smokes.map(smoke => smoke.name)).toEqual(['smoke-background-windows', 'smoke-owner-scale-startup', 'smoke-ok'])
+    await vi.waitFor(() => expect(builder.status().state).not.toBe('running'), { timeout: 60_000, interval: 200 })
+    expect(builder.status()).toMatchObject({ state: 'succeeded', verified: true })
+    expect(readFileSync(builder.status().smokes[1]!.log!, 'utf8')).toContain('OWNER SCALE PASSED')
+  }, 120_000)
   it('blocks a failed batch before packaging and names the commit and builder to contact', async () => {
     if (process.platform !== 'win32') return
     const { root, candidates, feed, git } = repository()
