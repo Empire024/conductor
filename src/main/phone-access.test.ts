@@ -72,6 +72,7 @@ function fixture(options: { now?: () => number } = {}): Fixture {
     listAgentActivity: () => [...specs.values()].map(spec => ({ id: spec.id, projectId: spec.projectId, sessionId: spec.sessionId, activityPhase: (activity.get(spec.id) ?? 'idle') as AgentActivityPhase })),
     structured: {
       snapshot: id => projections.get(id) ?? null,
+      resident: id => projections.get(id) ?? null,
       spec: <T>(id: string) => (specs.get(id) ?? null) as T | null,
       history: projectId => [...specs.values()].filter(spec => spec.projectId === projectId).map(spec => ({ id: spec.id, title: spec.title, provider: spec.provider as 'claude', archived: projections.get(spec.id)?.archived ?? false, phase: projections.get(spec.id)?.phase ?? 'idle' })),
       update: (id, values) => { const current = projections.get(id); if (current) projections.set(id, { ...current, ...values }) }

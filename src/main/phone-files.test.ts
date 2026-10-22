@@ -163,6 +163,7 @@ async function listener(conversation?: ConversationFixture) {
       listSessions: (projectId: string) => conversation && projectId === 'miron' ? [{ id: 'workspace-a', projectId: 'miron', name: 'Workspace', layout: { version: 1, root: { type: 'group', id: 'group-a', tabs: [], activeTabId: '' } }, createdAt: 't', updatedAt: 't' }] as never : [],
       listDetachedWindows: () => [], listProcesses: () => [], listAgentActivity: () => [],
       structured: {
+        resident: () => null,
         snapshot: (id: string) => conversation && id === 'session-a' ? { sessionId: id, phase: 'completed', sequence: 2, items: [
           { id: 'item-1', sequence: 1, data: { type: 'text', role: 'user', text: 'Make the logo. Also read ' + join(outside, 'passwords.txt') } },
           { id: 'item-2', sequence: 2, data: { type: 'text', role: 'assistant', text: conversation.text(root, outside) } }

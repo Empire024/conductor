@@ -31,12 +31,20 @@ was not the problem.
   something asks for it: its stored snapshot plus the journal after it, with the previous process's
   runtime state normalised exactly as the constructor used to do it (`restore`). A launch costs the
   same with ten conversations as with ten thousand.
-- **Idle resident conversations are bounded** (`RESIDENT_BUDGET_BYTES`, 256 MB of JSON text).
+- **Idle resident conversations are bounded** (`RESIDENT_BUDGET_BYTES`, 768 MB of JSON text: the
+  owner's open tabs, which the renderer and the phone read on every refresh, fit with room; eviction
+  below that would reload them on each pass).
   Past it, the least recently used conversations that are not mid-turn are checkpointed and
   dropped (`evictIdle`); a later read loads them back from the row they were just written to. A
   reload of a snapshot this process wrote is not normalised again (`ownSnapshots`): nothing ran it
   in between. Conversations in `starting`, `running`, `waiting_approval`, `waiting_input` or
   `interrupting` are never evicted; anonymous (volatile) ones neither.
+- **Busy sweeps read only what is resident.** `resident(id)` returns a conversation only if it is
+  resident and never loads. The once-a-second update gate (`installBlockers`) and the quit question
+  (`runningWork`) use it: a conversation nothing has used since launch has no runtime and no live
+  phase, so it cannot block anything, and loading hundreds of them every second to learn that
+  would turn the budget into a reload loop. The phone's list of closed conversations is built from
+  the stored summary shaped as a projection (`historyStandIn`, phone-access.ts), not a load.
 - **Scans never make a project resident.** `peek(id)` reads a conversation without keeping it;
   `searchMessages` and the artifact prune's cross-conversation edit scan use it.
 - **Listing reads a stored summary.** `structured_sessions.summary_json` (phase, item count,
@@ -57,7 +65,8 @@ was not the problem.
 
 - No query in the store may read `projection_json` for more than one conversation
   (`structured-store.test.ts` checks the source: every such `SELECT` carries `WHERE id=?`).
-- A read over many conversations goes through `peek` or the summary column, never `snapshot`.
+- A read over many conversations goes through `peek`, `resident` or the summary column, never
+  `snapshot`. A periodic sweep uses `resident` or the summary, never `peek` either.
 - Anything new that must be known for every conversation goes into `summary_json` at checkpoint,
   not into a startup scan.
 

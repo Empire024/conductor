@@ -5,7 +5,8 @@ import { makeId, type AgentProviderInfo, type AgentSpec, type DetachedWindowReco
 import type { MachineDescriptor } from '../shared/remote-control'
 import { LOCAL_MACHINE_ID } from '../shared/remote-control'
 import { PROJECT_TASK_MAX_LENGTH, projectTaskKinds, projectTaskPriorities, projectTaskWeights, type ProjectTaskKind, type ProjectTaskPriority, type ProjectTaskWeight } from '../shared/project-backlog'
-import type { ContextAttachment, InteractionResponse, InteractionResponseResult, PendingInteraction, PromptOrigin, SessionProjection, SessionSettings, StructuredProvider, TimelineItem } from '../shared/structured-agent'
+import type { ContextAttachment, ConversationHistoryEntry, InteractionResponse, InteractionResponseResult, PendingInteraction, PromptOrigin, SessionProjection, SessionSettings, StructuredProvider, TimelineItem } from '../shared/structured-agent'
+import { emptyProjection } from '../shared/structured-agent-reducer'
 import { isAsyncQuestion, settingsForRuntime } from '../shared/structured-agent'
 import type { SystemMetricsSnapshot } from '../shared/system-metrics'
 import { normalizeUsageWindows, summarizeUsage, updatedSequence, usageWindowAppliesToModel, type UsageWindow } from '../shared/usage-accounting'
@@ -123,8 +124,10 @@ export interface PhoneDatabase {
   listAgentActivity(): AgentActivityRow[]
   structured: {
     snapshot(id: string): SessionProjection | null
+    /** Resident only, never loads (structured-store.ts); the list of closed conversations reads summaries instead. */
+    resident(id: string): SessionProjection | null
     spec<T>(id: string): T | null
-    history(projectId: string): Array<{ id: string; title: string; provider: StructuredProvider; archived: boolean; phase: SessionProjection['phase'] }>
+    history(projectId: string): ConversationHistoryEntry[]
     update(id: string, values: Partial<Pick<SessionProjection, 'title' | 'archived' | 'settings'>>): void
   }
 }
@@ -813,7 +816,9 @@ export class PhoneAccessService {
         const spec = this.deps.database.structured.spec<AgentSpec>(entry.id)
         const workspace = spec ? workspaces.find(candidate => candidate.id === spec.sessionId) : undefined
         if (!spec || !workspace) continue
-        sessions.push(this.summarize(entry.id, project, workspace, null, this.deps.database.structured.snapshot(entry.id), activity.get(entry.id), processes.get(entry.id), machines))
+        // A closed conversation nothing has used since launch is listed from its stored summary;
+        // loading every one of them for each phone poll was the owner's whole journal, every few seconds.
+        sessions.push(this.summarize(entry.id, project, workspace, null, this.deps.database.structured.resident(entry.id) ?? historyStandIn(entry), activity.get(entry.id), processes.get(entry.id), machines))
       }
     }
     return {
@@ -1338,6 +1343,18 @@ const topicFor = (sessionId: string): string => createHash('sha256').update(sess
  *  is attached now, or a Codex async question of the conversation's current thread (that one is
  *  answered by a later message, so it outlives the runtime that asked it). A pending item left behind
  *  by an earlier runtime can no longer be answered and is not offered. */
+/** A closed conversation as its stored listing summary (structured-store.ts history): title,
+ *  phase, model and last message shaped as a projection, so the phone's list needs no load. A
+ *  stand-in has no cards, no queue and no usage window; it is idle until something opens it. */
+export function historyStandIn(entry: ConversationHistoryEntry): SessionProjection {
+  return {
+    ...emptyProjection(entry.id), phase: entry.phase, title: entry.title, archived: entry.archived, sequence: entry.updatedSequence ?? 0,
+    settings: { permission: 'default', plan: false, ...(entry.model ? { model: entry.model } : {}) },
+    items: entry.snippet && entry.lastRole && entry.lastRole !== 'status'
+      ? [{ id: entry.id + ':summary', runtimeId: '', sequence: entry.updatedSequence ?? 0, timestamp: entry.updatedAt ?? '', data: { type: 'text', role: entry.lastRole, text: entry.snippet, mode: 'snapshot' } }]
+      : []
+  }
+}
 export function answerableInteractions(projection: SessionProjection): PendingInteraction[] {
   return projection.items.flatMap(item => {
     if (item.data.type !== 'interaction' || item.data.interaction.status !== 'pending') return []

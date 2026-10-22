@@ -27,7 +27,7 @@ function serviceFixture(): { service: PhoneAccessService; store: MapStore; ui: R
   const importImage = vi.fn(async (_cwd: string, name: string) => ({ id: 'image-1', kind: 'image' as const, name, path: '.conductor/prompt-images/00000001-0000-4000-8000-000000000000.png' }))
   const service = new PhoneAccessService({
     store, vault: new MemoryVault(), importImage,
-    database: { listProjects: () => [project], getProject: id => id === project.id ? project : null, listSessions: () => [], listDetachedWindows: () => [], listProcesses: () => [], listAgentActivity: () => [], structured: { snapshot: () => null, spec: () => null, history: () => [], update: () => undefined } },
+    database: { listProjects: () => [project], getProject: id => id === project.id ? project : null, listSessions: () => [], listDetachedWindows: () => [], listProcesses: () => [], listAgentActivity: () => [], structured: { snapshot: () => null, resident: () => null, spec: () => null, history: () => [], update: () => undefined } },
     sessions: { ensure: () => ({ id: 'x', available: false, status: 'unavailable', transcript: '' }), connectSession: async () => undefined, submit: async () => undefined, steer: async () => undefined, queue: async () => undefined, respond: async () => undefined, interrupt: async () => undefined, resume: async () => undefined },
     providers: () => [], machines: () => [{ id: LOCAL_MACHINE_ID, name: 'MAIN', kind: 'local', status: 'online', accountLogin: null, projects: [], connection: LOCAL_CONNECTION }],
     machineName: () => 'MAIN', version: '0.1.3', ui, projectTasks: { list: listTasks, create: createTask },

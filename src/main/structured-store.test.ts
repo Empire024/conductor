@@ -474,9 +474,11 @@ describe('conversations are resident only while used', () => {
     expect(store.history('project', 'second').map(entry => entry.id)).toEqual(['two'])
     expect(store.peek('one')).toMatchObject({ phase: 'disconnected', sequence: 2, title: 'First prompt' })
     expect(store.residentStats().count).toBe(0)
+    expect(store.resident('one')).toBeNull()
     expect(store.snapshot('one')).toMatchObject({ phase: 'disconnected', sequence: 2, title: 'First prompt' })
     expect(store.residentStats()).toMatchObject({ count: 1, live: 0 })
     expect(store.residentStats().bytes).toBeGreaterThan(100)
+    expect(store.resident('one')).toMatchObject({ sequence: 2 })
   })
   it('drops the least recently used idle conversations past the budget, never a live one, and reloads them intact', () => {
     const root = mkdtempSync(join(tmpdir(), 'conductor-store-fixture-')); roots.push(root)

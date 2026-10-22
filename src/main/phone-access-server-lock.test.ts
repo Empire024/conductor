@@ -110,7 +110,7 @@ async function fixture(options: { terminals?: PhoneTerminalRuntime } = {}) {
   const workspace = { id: 'ws-1', projectId: 'project-a', name: 'main', createdAt: 't', updatedAt: 't', layout: { root: { type: 'group', id: 'g', tabs: [], activeTabId: null } } } as never
   const service = new PhoneAccessService({
     store, vault: new MemoryVault(),
-    database: { listProjects: () => [project], getProject: id => id === project.id ? project : null, listSessions: () => [workspace], listDetachedWindows: () => [], listProcesses: () => [], listAgentActivity: () => [], structured: { snapshot: () => null, spec: () => null, history: () => [], update: () => undefined } },
+    database: { listProjects: () => [project], getProject: id => id === project.id ? project : null, listSessions: () => [workspace], listDetachedWindows: () => [], listProcesses: () => [], listAgentActivity: () => [], structured: { snapshot: () => null, resident: () => null, spec: () => null, history: () => [], update: () => undefined } },
     sessions: { ensure: () => ({ id: 'x', available: false, status: 'unavailable', transcript: '' }), connectSession: async () => undefined, submit: async () => undefined, steer: async () => undefined, queue: async () => undefined, respond: async () => undefined, interrupt: async () => undefined, resume: async () => undefined },
     providers: () => [], machines: () => [{ id: LOCAL_MACHINE_ID, name: 'MAIN', kind: 'local', status: 'online', accountLogin: null, projects: [], connection: LOCAL_CONNECTION }],
     machineName: () => 'MAIN', version: '0.1.3', ui: async () => ({}),

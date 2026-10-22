@@ -3226,7 +3226,8 @@ export class AgentControl {
     const busy: Array<{ agentSessionId: string; title: string; project: string | null; work: string }> = []
     for (const process of this.deps.database.listProcesses()) {
       if (process.kind !== 'agent') continue
-      const state = this.deps.database.structured.snapshot(process.id)
+      // Not resident means nothing has used it since launch: no runtime, nothing in flight.
+      const state = this.deps.database.structured.resident(process.id)
       if (!state) continue
       const inTurn = process.id !== scope?.agentSessionId && ['running', 'waiting_approval', 'waiting_input', 'interrupting'].includes(state.phase) && this.deps.sessions.hasRuntime(process.id)
       const { backgroundTasks } = this.background(process.id, state)

@@ -35,7 +35,7 @@ export const CHECKPOINT_INTERVAL_MS = 1000
  * were just written to. Live conversations are never evicted, and a read-only scan (history,
  * search, the artifact prune) uses `peek`, which never makes anything resident.
  */
-export const RESIDENT_BUDGET_BYTES = 256 * 1024 * 1024
+export const RESIDENT_BUDGET_BYTES = 768 * 1024 * 1024
 /** A conversation in one of these phases has a runtime behind it and stays resident. */
 const LIVE_PHASES = new Set<SessionProjection['phase']>(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
 /** The few fields the conversation lists (sidebar history, phone) read for every conversation of
@@ -502,6 +502,11 @@ export class StructuredAgentStore {
     if (resident) { this.touched.set(id, ++this.clock); return resident }
     return this.load(id, true)
   }
+  /** The conversation's state only if it is resident; never loads. For the sweeps that ask whether
+   *  anything is busy (install blockers, quit questions): a conversation nothing has used since
+   *  launch has no runtime and no live phase, so it cannot be, and loading hundreds of them every
+   *  second to learn that would turn the budget into a reload loop. */
+  resident(id: string): SessionProjection | null { return this.projections.get(id) ?? null }
   /** The conversation's current state for a one-off read: the resident one if there is one,
    *  otherwise loaded and not kept. For scans over many conversations (history, search, the
    *  artifact prune), which must not make a whole project resident. */

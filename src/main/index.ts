@@ -1270,7 +1270,7 @@ const showDecision = async (owner: BrowserWindow | null, options: Electron.Messa
 }
 
 const runningWork = (): ReturnType<ConductorDatabase['listProcesses']> => database.listProcesses().filter(process =>
-  hasRunningWork(process, process.kind === 'agent' ? database.structured.snapshot(process.id) : null, process.kind === 'agent' ? agents.structured.hasRuntime(process.id) : undefined)
+  hasRunningWork(process, process.kind === 'agent' ? database.structured.resident(process.id) : null, process.kind === 'agent' ? agents.structured.hasRuntime(process.id) : undefined)
 )
 
 /** The work a quit or restart would ask the owner about now, or null when it would go ahead. */
