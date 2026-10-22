@@ -5,6 +5,7 @@ import { UsageWeeksStore } from './usage-weeks-store'
 import { mkdirSync, readFileSync, renameSync, writeFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
+import * as v8 from 'node:v8'
 import type { AgentEvent, AgentEventData, ConversationHistoryEntry, ConversationSearchGroup, ConversationSearchResult, DiffArtifact, SessionProjection, SessionSettings, StructuredProvider, TimelineItem } from '../shared/structured-agent'
 import type { WeeklyUsageConversation, WeeklyUsageEvent } from '../shared/weekly-model-usage'
 import { emptyProjection, projectAgentEvent } from '../shared/structured-agent-reducer'
@@ -23,6 +24,34 @@ const JOURNAL_WINDOW = 20_000
  *  (typing-lag-long-conversation). The journal still gets every event at once, and a restore
  *  replays what came after the snapshot, so nothing is lost by a snapshot a second old. */
 export const CHECKPOINT_INTERVAL_MS = 1000
+/**
+ * Conversations are resident in memory only while something uses them. Until 2026-10-22 the
+ * store parsed every stored projection at construction and kept all of them forever; the owner's
+ * 1,666 conversations had grown to 1.27 GB of projection JSON (one holds up to 2,000 timeline
+ * items), the main process ran out of its 4 GB V8 heap about four seconds after every launch, and
+ * nothing could start Conductor until the data was smaller. Now a projection is read when it is
+ * first asked for, and once the idle (not mid-turn) resident ones exceed this much JSON text, the
+ * least recently used are checkpointed and dropped; a later read loads them back from the row they
+ * were just written to. Live conversations are never evicted, and a read-only scan (history,
+ * search, the artifact prune) uses `peek`, which never makes anything resident.
+ */
+export const RESIDENT_BUDGET_BYTES = 256 * 1024 * 1024
+/** A conversation in one of these phases has a runtime behind it and stays resident. */
+const LIVE_PHASES = new Set<SessionProjection['phase']>(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
+/** The few fields the conversation lists (sidebar history, phone) read for every conversation of
+ *  a project, stored beside the projection at every checkpoint so listing never parses one. */
+export interface SessionSummary { phase: SessionProjection['phase']; items: number; model?: string; snippet?: string; lastRole?: 'user' | 'assistant' | 'status' }
+export function summarizeProjection(state: SessionProjection): SessionSummary {
+  let messageData: { role: 'user' | 'assistant' | 'status'; text: string } | undefined
+  for (let index = state.items.length - 1; index >= 0; index--) {
+    const data = state.items[index]!.data
+    if (data.type === 'text' && data.text.trim()) { messageData = data; break }
+  }
+  const text = messageData?.text.replace(/\s+/g, ' ').trim().slice(0, 180)
+  return { phase: state.phase, items: state.items.length, ...(state.settings.model ? { model: state.settings.model } : {}), ...(text && messageData ? { snippet: text, lastRole: messageData.role } : {}) }
+}
+/** Escapes a LIKE pattern so the needle matches literally. */
+function likeNeedle(needle: string): string { return `%${needle.replace(/[\\%_]/g, match => `\\${match}`)}%` }
 
 /** Exact credentials a live server hands out (agent-control-server: the owner token and every
  *  conversation's control token). A 64-hex run anywhere in a stored string that one of these
@@ -183,7 +212,17 @@ export class StructuredAgentStore {
   private settledArtifacts?: Set<string>
   private artifactPrune?: Promise<PruneResult>
   private artifactPruneStarted = 0
+  /** The resident conversations: everything registered, imported or read through `snapshot` in
+   *  this process that `evictIdle` has not dropped. Never a complete picture of the database. */
   private projections = new Map<string, SessionProjection>()
+  /** Approximate size of each resident projection as JSON text (its last snapshot's length). */
+  private residentBytes = new Map<string, number>()
+  /** Last use of each resident projection on a monotonic clock, for least-recently-used eviction. */
+  private touched = new Map<string, number>()
+  private clock = 0
+  /** Conversations whose stored snapshot this process wrote. A load of one of these is a reload
+   *  of state this process already normalised, never a previous process's lost runtime state. */
+  private ownSnapshots = new Set<string>()
   /** Top-level usage reports projected this run, per conversation: the token burn meter's cache
    *  key (token-burn.ts), so a reading cached before a report never hides that report. */
   private usageReports = new Map<string, number>()
@@ -203,7 +242,7 @@ export class StructuredAgentStore {
   readonly artifactDirectory: string
   readonly activity: PhoneActivityStore
   readonly usageWeeks: UsageWeeksStore
-  constructor(private db: DatabaseSync, dataDirectory: string) {
+  constructor(private db: DatabaseSync, dataDirectory: string, private options: { residentBudgetBytes?: number } = {}) {
     this.activity = new PhoneActivityStore(db)
     this.usageWeeks = new UsageWeeksStore(db)
     this.artifactDirectory = join(dataDirectory, 'agent-artifacts')
@@ -255,22 +294,108 @@ export class StructuredAgentStore {
       );
     `)
     this.ensureAccountingSchema()
+    // The listing summary beside each projection (RESIDENT_BUDGET_BYTES). Rows from before the
+    // column, and rows the archive import writes, are summarised the first time a list reads them.
+    const columns = db.prepare('PRAGMA table_info(structured_sessions)').all() as Array<{ name: string }>
+    if (!columns.some(column => column.name === 'summary_json')) db.exec('ALTER TABLE structured_sessions ADD COLUMN summary_json TEXT')
     this.redactionPending = !this.redactionCursor().done
-    // Historical projection is independent of reconnect. Never retry uncertain execution.
-    const rows = db.prepare('SELECT id, provider, projection_json FROM structured_sessions').all() as Array<{ id: string; provider: string; projection_json: string }>
-    for (const row of rows) {
-      const state = JSON.parse(row.projection_json) as SessionProjection
-      const events = this.events(row.id, state.sequence)
-      let restored = events.reduce(projectAgentEvent, state)
-      if (['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'].includes(restored.phase)) restored = { ...restored, phase: 'disconnected' }
+    // No projection is read here: a launch must cost the same with ten conversations as with ten
+    // thousand. Each is restored by `load` when it is first asked for (see RESIDENT_BUDGET_BYTES).
+  }
+  /**
+   * A conversation as the last process left it: the stored snapshot plus whatever the journal
+   * holds after it, with the runtime state that process lost marked so (a phase that needed a live
+   * runtime is `disconnected`, a steer in flight is `uncertain`, a blocking card is `expired`, a
+   * running tool `interrupted`). Historical projection is independent of reconnect; uncertain
+   * execution is never retried. A snapshot this process wrote itself is reloaded as it is: it
+   * was normalised when it was first loaded, and nothing ran it since it was evicted.
+   */
+  private restore(id: string, provider: string, snapshot: SessionProjection): SessionProjection {
+    const events = this.events(id, snapshot.sequence)
+    let restored = events.reduce(projectAgentEvent, snapshot)
+    if (!this.ownSnapshots.has(id)) {
+      if (LIVE_PHASES.has(restored.phase)) restored = { ...restored, phase: 'disconnected' }
       restored.pendingSteering = restored.pendingSteering?.map(input => ['sending', 'accepted'].includes(input.status) ? { ...input, status: 'uncertain' as const } : input)
       restored.items = restored.items.map(item => item.data.type === 'interaction' && item.data.interaction.status === 'pending' &&
         (item.data.interaction.input as { protocol?: string } | null)?.protocol !== 'codex-async-question'
         ? { ...item, data: { ...item.data, interaction: { ...item.data.interaction, status: 'expired' } } } : item)
       restored.items = restored.items.map(item => item.data.type === 'tool' && ['running', 'preparing', 'awaiting_approval'].includes(item.data.status) ? { ...item, data: { ...item.data, status: 'interrupted' } } : item)
-      if (row.provider === 'claude') restored.items = recoverClaudeMessageDuplicates(restored.items)
-      this.projections.set(row.id, restored)
+      if (provider === 'claude') restored.items = recoverClaudeMessageDuplicates(restored.items)
     }
+    // Rows written before `maskSecrets` knew a form are masked on the way in until the one-off
+    // redaction has rewritten them (its 'memory' phase only sees what is resident at the time).
+    return this.redactionPending ? maskStrings(restored) : restored
+  }
+  /** Reads one conversation from its row. With `keep` it becomes resident (and may evict an idle
+   *  one); without, nothing is kept, for scans that touch many conversations once. */
+  private load(id: string, keep: boolean): SessionProjection | null {
+    if (this.volatileSpecs.has(id)) return null
+    const row = this.db.prepare('SELECT provider, projection_json FROM structured_sessions WHERE id=?').get(id) as { provider: string; projection_json: string } | undefined
+    if (!row) return null
+    const state = this.restore(id, row.provider, JSON.parse(row.projection_json) as SessionProjection)
+    if (keep) {
+      this.projections.set(id, state)
+      this.residentBytes.set(id, row.projection_json.length)
+      this.touched.set(id, ++this.clock)
+      this.evictIdle(undefined, id)
+    }
+    return state
+  }
+  /** Drops the least recently used idle conversations until the idle resident JSON is within
+   *  `budget` (the configured budget by default; 0 drops every idle one, for memory pressure).
+   *  Each is checkpointed first, so the row it is reloaded from holds exactly what memory held.
+   *  Conversations mid-turn, anonymous ones and `keep` (the one just loaded) are never dropped. */
+  evictIdle(budget = this.options.residentBudgetBytes ?? RESIDENT_BUDGET_BYTES, keep?: string): string[] {
+    const candidates: Array<{ id: string; at: number; bytes: number }> = []
+    let idle = 0
+    for (const [id, state] of this.projections) {
+      if (this.volatileSpecs.has(id) || LIVE_PHASES.has(state.phase)) continue
+      if (id === keep) continue
+      const bytes = this.residentBytes.get(id) ?? 0, at = this.touched.get(id) ?? 0
+      idle += bytes
+      candidates.push({ id, at, bytes })
+    }
+    if (idle <= budget) return []
+    candidates.sort((a, b) => a.at - b.at)
+    const evicted: string[] = []
+    for (const candidate of candidates) {
+      if (idle <= budget) break
+      this.evict(candidate.id)
+      idle -= candidate.bytes
+      evicted.push(candidate.id)
+    }
+    return evicted
+  }
+  private evict(id: string): void {
+    this.checkpoint(id)
+    this.projections.delete(id)
+    this.archiveTails.delete(id)
+    this.residentBytes.delete(id)
+    this.touched.delete(id)
+    this.checkpointed.delete(id)
+  }
+  /** What is resident right now: how many conversations, and roughly how much JSON they were. */
+  residentStats(): { count: number; bytes: number; live: number } {
+    let bytes = 0, live = 0
+    for (const [id, state] of this.projections) { bytes += this.residentBytes.get(id) ?? 0; if (LIVE_PHASES.has(state.phase)) live++ }
+    return { count: this.projections.size, bytes, live }
+  }
+  /** Watches the V8 heap: past `fraction` of its limit every idle resident conversation is
+   *  dropped and the fact is logged, so a main process that is filling up sheds what it can before
+   *  the allocator kills it. Checked every `intervalMs`; the returned function stops it. */
+  startMemoryGuard(intervalMs = 15_000, fraction = 0.7, heap: () => { used: number; limit: number } = () => {
+    const stats = v8.getHeapStatistics()
+    return { used: stats.used_heap_size, limit: stats.heap_size_limit }
+  }): () => void {
+    const timer = setInterval(() => {
+      const { used, limit } = heap()
+      if (!limit || used < limit * fraction) return
+      const before = this.residentStats()
+      const evicted = this.evictIdle(0)
+      console.warn(`Main process heap at ${Math.round(used / 1048576)} MB of ${Math.round(limit / 1048576)} MB; dropped ${evicted.length} idle resident conversations (${before.count} resident, ${before.live} live, ${Math.round(before.bytes / 1048576)} MB of projection JSON)`)
+    }, intervalMs)
+    timer.unref?.()
+    return () => clearInterval(timer)
   }
   /**
    * Accounting reads must never scan the transcript. `structured_events` stores one opaque JSON
@@ -321,8 +446,12 @@ export class StructuredAgentStore {
       this.projections.set(id, state)
       return state
     }
-    this.db.prepare('INSERT INTO structured_sessions(id, project_id, provider, spec_json, projection_json) VALUES(?,?,?,?,?)').run(id, projectId, provider, JSON.stringify(spec), JSON.stringify(state))
+    const json = JSON.stringify(state)
+    this.db.prepare('INSERT INTO structured_sessions(id, project_id, provider, spec_json, projection_json, summary_json) VALUES(?,?,?,?,?,?)').run(id, projectId, provider, JSON.stringify(spec), json, JSON.stringify(summarizeProjection(state)))
     this.projections.set(id, state)
+    this.residentBytes.set(id, json.length)
+    this.touched.set(id, ++this.clock)
+    this.ownSnapshots.add(id)
     return state
   }
   /** Whether this conversation lives in memory only (an anonymous local conversation). */
@@ -331,6 +460,8 @@ export class StructuredAgentStore {
   forget(id: string): void {
     if (!this.volatileSpecs.delete(id)) return
     this.projections.delete(id)
+    this.residentBytes.delete(id)
+    this.touched.delete(id)
     this.archiveTails.delete(id)
     this.volatileArtifacts.delete(id)
   }
@@ -365,12 +496,24 @@ export class StructuredAgentStore {
       this.db.prepare('UPDATE structured_sessions SET spec_json=? WHERE id=?').run(JSON.stringify({ ...spec, cwd }), row.id)
     }
   }
-  snapshot(id: string): SessionProjection | null { return this.projections.get(id) ?? null }
+  /** The conversation's current state, resident from here on (loaded from its row if it was not). */
+  snapshot(id: string): SessionProjection | null {
+    const resident = this.projections.get(id)
+    if (resident) { this.touched.set(id, ++this.clock); return resident }
+    return this.load(id, true)
+  }
+  /** The conversation's current state for a one-off read: the resident one if there is one,
+   *  otherwise loaded and not kept. For scans over many conversations (history, search, the
+   *  artifact prune), which must not make a whole project resident. */
+  peek(id: string): SessionProjection | null { return this.projections.get(id) ?? this.load(id, false) }
   /** Called only after the archive transaction committed its validated, fresh identities. */
   loadImported(ids: string[]): void {
     for (const id of ids) {
       const row = this.db.prepare('SELECT projection_json FROM structured_sessions WHERE id=?').get(id) as { projection_json: string } | undefined
-      if (row) this.projections.set(id, JSON.parse(row.projection_json) as SessionProjection)
+      if (!row) continue
+      this.projections.set(id, JSON.parse(row.projection_json) as SessionProjection)
+      this.residentBytes.set(id, row.projection_json.length)
+      this.touched.set(id, ++this.clock)
     }
   }
   append(event: AgentEvent): AgentEvent {
@@ -470,10 +613,14 @@ export class StructuredAgentStore {
   checkpoint(id: string): void {
     const pending = this.checkpointTimers.get(id)
     if (pending) { clearTimeout(pending); this.checkpointTimers.delete(id) }
-    const state = this.snapshot(id)
+    // Only a resident conversation has anything to write; one that is not is already its row.
+    const state = this.projections.get(id)
     if (!state || this.volatileSpecs.has(id)) return
     this.checkpointed.set(id, { at: Date.now(), phase: state.phase })
-    this.db.prepare('UPDATE structured_sessions SET projection_json=?, title=?, archived=? WHERE id=?').run(JSON.stringify(state), state.title, state.archived ? 1 : 0, id)
+    const json = JSON.stringify(state)
+    this.db.prepare('UPDATE structured_sessions SET projection_json=?, title=?, archived=?, summary_json=? WHERE id=?').run(json, state.title, state.archived ? 1 : 0, JSON.stringify(summarizeProjection(state)), id)
+    this.residentBytes.set(id, json.length)
+    this.ownSnapshots.add(id)
     // Snapshot anchors older history before compacting the bounded event journal.
     if (state.sequence > JOURNAL_WINDOW) this.trimJournal(id, state.sequence - JOURNAL_WINDOW)
   }
@@ -678,27 +825,54 @@ export class StructuredAgentStore {
       try { return [{ observedAt: row.observedAt, limits: JSON.parse(row.limits) as unknown }] } catch { return [] }
     })
   }
+  /** The stored listing summary of one conversation, written now from its projection if the row
+   *  predates the column (or came from an archive import). One parse per such row, once. */
+  private storedSummary(id: string): { title: string; archived: boolean; summary: SessionSummary } | null {
+    const row = this.db.prepare('SELECT provider, title, archived, summary_json FROM structured_sessions WHERE id=?').get(id) as { provider: string; title: string; archived: number; summary_json: string | null } | undefined
+    if (!row) return null
+    if (row.summary_json) return { title: row.title, archived: Boolean(row.archived), summary: JSON.parse(row.summary_json) as SessionSummary }
+    const state = this.peek(id)
+    if (!state) return null
+    const summary = summarizeProjection(state)
+    this.db.prepare('UPDATE structured_sessions SET summary_json=?, title=?, archived=? WHERE id=?').run(JSON.stringify(summary), state.title, state.archived ? 1 : 0, id)
+    return { title: state.title, archived: state.archived, summary }
+  }
+  /** The conversations of a project, newest activity first. Reads the stored summaries (and the
+   *  resident projections for what is resident), never a non-resident projection, so a project
+   *  of a thousand conversations lists without a thousand parses. A query is matched inside
+   *  SQLite against the stored projection text, and in memory for resident conversations. */
   history(projectId: string, query = ''): ConversationHistoryEntry[] {
     const ids = this.db.prepare(`
       SELECT sessions.id,sessions.provider,
-        (SELECT event_json FROM structured_events WHERE session_id=sessions.id ORDER BY sequence DESC LIMIT 1) AS latest_event
+        (SELECT event_at FROM structured_events WHERE session_id=sessions.id ORDER BY sequence DESC LIMIT 1) AS updated_at,
+        (SELECT MAX(sequence) FROM structured_events WHERE session_id=sessions.id) AS updated_sequence
       FROM structured_sessions AS sessions WHERE project_id=? ORDER BY sessions.rowid DESC
-    `).all(projectId) as Array<{ id: string; provider: StructuredProvider; latest_event: string | null }>
+    `).all(projectId) as Array<{ id: string; provider: StructuredProvider; updated_at: string | null; updated_sequence: number | null }>
     const needle = query.toLocaleLowerCase()
+    const matches = needle ? this.db.prepare(`SELECT 1 FROM structured_sessions WHERE id=? AND (title LIKE ? ESCAPE '\\' OR projection_json LIKE ? ESCAPE '\\')`) : null
     // An untouched session (no items ever sent/received, never titled) is a bookkeeping row, not history.
     const entries: Array<ConversationHistoryEntry & { _rowIndex: number }> = ids.flatMap((row, rowIndex) => {
-      const state = this.snapshot(row.id)
-      if (!state || (!state.items.length && !state.title) || (needle && !JSON.stringify(state.items).toLocaleLowerCase().includes(needle) && !state.title.toLocaleLowerCase().includes(needle))) return []
-      let latest: AgentEvent | undefined
-      try { if (row.latest_event) latest = JSON.parse(row.latest_event) as AgentEvent } catch { /* malformed legacy event has no activity metadata */ }
-      const message = [...state.items].reverse().find(item => item.data.type === 'text' && item.data.text.trim())
-      const messageData = message?.data.type === 'text' ? message.data : undefined
-      const text = messageData?.text.replace(/\s+/g, ' ').trim().slice(0, 180)
+      const resident = this.projections.get(row.id)
+      let title: string, archived: boolean, summary: SessionSummary
+      if (resident) { title = resident.title; archived = resident.archived; summary = summarizeProjection(resident) }
+      else {
+        const stored = this.storedSummary(row.id)
+        if (!stored) return []
+        ;({ title, archived, summary } = stored)
+        // Nothing runs a conversation that is not resident: a stored live phase is a previous
+        // process's, and shows what `restore` will make of it when it is opened.
+        if (LIVE_PHASES.has(summary.phase)) summary = { ...summary, phase: 'disconnected' }
+      }
+      if (!summary.items && !title) return []
+      if (needle) {
+        const hit = resident ? JSON.stringify(resident.items).toLocaleLowerCase().includes(needle) || title.toLocaleLowerCase().includes(needle) : Boolean(matches!.get(row.id, likeNeedle(needle), likeNeedle(needle)))
+        if (!hit) return []
+      }
       return [{
-        id: row.id, title: state.title || 'New conversation', provider: row.provider, archived: state.archived, phase: state.phase,
-        ...(latest ? { updatedAt: latest.timestamp, updatedSequence: latest.sequence } : {}),
-        ...(state.settings.model ? { model: state.settings.model } : {}),
-        ...(text && messageData ? { snippet: text, lastRole: messageData.role } : {}),
+        id: row.id, title: title || 'New conversation', provider: row.provider, archived, phase: summary.phase,
+        ...(row.updated_at && row.updated_sequence !== null ? { updatedAt: row.updated_at, updatedSequence: row.updated_sequence } : {}),
+        ...(summary.model ? { model: summary.model } : {}),
+        ...(summary.snippet && summary.lastRole ? { snippet: summary.snippet, lastRole: summary.lastRole } : {}),
         _rowIndex: rowIndex
       }]
     })
@@ -707,8 +881,9 @@ export class StructuredAgentStore {
       return time || (b.updatedSequence ?? 0) - (a.updatedSequence ?? 0) || a._rowIndex - b._rowIndex
     }).slice(0, 200).map(({ _rowIndex: _ignored, ...entry }) => entry)
   }
-  /** Message find across a whole workspace. Projections are already resident, so this is a bounded
-   *  in-memory scan; only snippets cross the IPC boundary, never another conversation's items. */
+  /** Message find across a whole workspace: one conversation at a time through `peek`, so the
+   *  scan is bounded by the largest conversation, not the project, and leaves nothing resident;
+   *  only snippets cross the IPC boundary, never another conversation's items. */
   searchMessages(projectId: string, query: string, excludeId = ''): ConversationSearchResult {
     const needle = query.trim().toLocaleLowerCase()
     if (needle.length < MIN_SEARCH_QUERY) return { groups: [], truncated: false }
@@ -717,7 +892,7 @@ export class StructuredAgentStore {
     let truncated = false
     for (const row of rows) {
       if (row.id === excludeId) continue
-      const state = this.snapshot(row.id)
+      const state = this.peek(row.id)
       if (!state) continue
       const group: ConversationSearchGroup = { sessionId: row.id, title: state.title || 'New conversation', provider: row.provider, archived: state.archived, messages: 0, hits: [] }
       for (const item of state.items) {

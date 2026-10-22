@@ -269,15 +269,15 @@ export class AgentArtifacts {
     return history
   }
 
-  /** Newest edit per path made by any other conversation in the same project. Projections
-   *  are already in memory, so this stays a read of state Conductor holds, not a disk scan. */
+  /** Newest edit per path made by any other conversation in the same project, read one
+   *  conversation at a time (`peek`) so a project of hundreds never becomes resident for this. */
   private otherConversationEdits(sessionId: string): Map<string, { title: string; at: string }> {
     const found = new Map<string, { title: string; at: string }>()
     const projectId = this.store.spec<{ projectId?: string }>(sessionId)?.projectId
     if (!projectId) return found
     for (const row of this.store.history(projectId)) {
       if (row.id === sessionId) continue
-      for (const item of this.store.snapshot(row.id)?.items ?? []) {
+      for (const item of this.store.peek(row.id)?.items ?? []) {
         if (item.data.type !== 'changes') continue
         for (const change of item.data.changes) {
           if (change.status !== 'applied') continue

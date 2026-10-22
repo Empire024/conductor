@@ -3,6 +3,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { CHECKPOINT_INTERVAL_MS, REDACTION_TARGETS, StructuredAgentStore, maskSecrets, redactSecretsChunk, registerSecretCheck, sanitizeDiagnostic } from './structured-store'
 import type { AgentEvent, AgentEventData } from '../shared/structured-agent'
 import { emptyProjection } from '../shared/structured-agent-reducer'
@@ -67,8 +68,10 @@ describe('structured SQLite journal and immutable artifacts', () => {
     db.prepare("INSERT INTO agent_sessions(id) VALUES('imported')").run()
     db.prepare('INSERT INTO structured_sessions(id,project_id,provider,spec_json,projection_json,title,archived) VALUES(?,?,?,?,?,?,0)')
       .run('imported', 'project', 'codex', JSON.stringify({ id: 'imported' }), JSON.stringify(projection), projection.title)
-    expect(store.snapshot('imported')).toBeNull()
+    // A row written beside the store is read on demand; loadImported makes it resident up front.
+    expect(store.residentStats().count).toBe(2)
     store.loadImported(['missing', 'imported'])
+    expect(store.residentStats().count).toBe(3)
     expect(store.snapshot('imported')).toEqual(projection)
   })
   it('restores uncheckpointed events without resending work and marks lost runtime state disconnected', () => {
@@ -372,8 +375,10 @@ describe('the control token is masked in every form it is stored in (H17)', () =
     f.db.close()
     const db = new DatabaseSync(f.path); databases.push(db)
     const store = new StructuredAgentStore(db, f.root)
-    expect(JSON.stringify(store.snapshot('one'))).toContain(token)
-    // Until the walk has reached them, rows are masked as they are read back (agents.history raw).
+    // Until the walk has reached them, rows are masked as they are read back: the projection on
+    // its way into memory (it is loaded when first used, not at launch) and the journal (agents.history raw).
+    expect(JSON.stringify(store.snapshot('one'))).not.toContain(token)
+    expect(JSON.stringify(store.snapshot('one'))).toContain('CONDUCTOR_CONTROL_TOKEN=[REDACTED]')
     expect(JSON.stringify(store.journalRange('one', 0, 100, 100))).not.toContain(token)
     expect(JSON.stringify(store.events('one'))).not.toContain(token)
     expect(JSON.stringify(store.journalRange('one', 0, 100, 100))).toContain('CONDUCTOR_CONTROL_TOKEN=[REDACTED]')
@@ -443,5 +448,98 @@ describe('the control token is masked in every form it is stored in (H17)', () =
     const reopened = new StructuredAgentStore(f.db, f.root)
     expect(reopened.redactArtifactsStep()).toBe(false)
     for (const id of ids) expect(readFileSync(join(dir, `${id}.txt`), 'utf8')).toBe('CONDUCTOR_CONTROL_TOKEN=[REDACTED]')
+  })
+})
+
+// 2026-10-22: the store parsed every stored projection at construction and kept them all; the
+// owner's 1,666 conversations (1.27 GB of projection JSON) ran the main process out of its 4 GB
+// heap four seconds into every launch, and nothing could start Conductor. Conversations are now
+// loaded when first used and the idle ones are bounded.
+describe('conversations are resident only while used', () => {
+  const codex = (sequence: number, data: AgentEventData): AgentEvent => event(sequence, data, { sessionId: 'two', provider: 'codex' })
+  it('opens without reading a single projection, lists a project from stored summaries, and loads a conversation the first time it is asked for', () => {
+    const f = fixture()
+    f.store.append(event(1, { type: 'text', role: 'user', text: 'First prompt', mode: 'snapshot' }))
+    f.store.append(event(2, { type: 'session', phase: 'running', nativeSessionId: 'native' }))
+    f.store.append(codex(1, { type: 'text', role: 'user', text: 'Second room', mode: 'snapshot' }))
+    f.store.flush()
+    f.db.close()
+    const reopened = new DatabaseSync(f.path); databases.push(reopened)
+    const store = new StructuredAgentStore(reopened, f.root)
+    expect(store.residentStats()).toEqual({ count: 0, bytes: 0, live: 0 })
+    // The stored phase of 'one' is still 'running'; nothing is running it, and the list says so.
+    const listed = store.history('project').sort((a, b) => a.id.localeCompare(b.id))
+    expect(listed.map(entry => [entry.id, entry.phase, entry.snippet, entry.lastRole, entry.updatedSequence])).toEqual([['one', 'disconnected', 'First prompt', 'user', 2], ['two', 'idle', 'Second room', 'user', 1]])
+    expect(store.residentStats().count).toBe(0)
+    expect(store.history('project', 'second').map(entry => entry.id)).toEqual(['two'])
+    expect(store.peek('one')).toMatchObject({ phase: 'disconnected', sequence: 2, title: 'First prompt' })
+    expect(store.residentStats().count).toBe(0)
+    expect(store.snapshot('one')).toMatchObject({ phase: 'disconnected', sequence: 2, title: 'First prompt' })
+    expect(store.residentStats()).toMatchObject({ count: 1, live: 0 })
+    expect(store.residentStats().bytes).toBeGreaterThan(100)
+  })
+  it('drops the least recently used idle conversations past the budget, never a live one, and reloads them intact', () => {
+    const root = mkdtempSync(join(tmpdir(), 'conductor-store-fixture-')); roots.push(root)
+    const db = new DatabaseSync(join(root, 'events.sqlite')); databases.push(db)
+    db.exec("CREATE TABLE agent_sessions(id TEXT PRIMARY KEY); INSERT INTO agent_sessions(id) VALUES('one'),('two'),('three')")
+    const store = new StructuredAgentStore(db, root, { residentBudgetBytes: 1 })
+    for (const id of ['one', 'two', 'three']) store.register(id, 'project', 'claude', { cwd: 'synthetic' })
+    store.append(event(1, { type: 'session', phase: 'running', nativeSessionId: 'live' }))
+    store.append(event(1, { type: 'text', role: 'user', text: 'Two says hello', mode: 'snapshot' }, { sessionId: 'two' }))
+    store.append(event(1, { type: 'text', role: 'user', text: 'Three says hello', mode: 'snapshot' }, { sessionId: 'three' }))
+    const two = store.snapshot('two')!, three = store.snapshot('three')!
+    expect(store.residentStats()).toMatchObject({ count: 3, live: 1 })
+    // Sizes are accounted at checkpoint. Only a load or the guard evicts; 'three' was touched last, so 'two' goes first.
+    store.flush()
+    expect(store.evictIdle(JSON.stringify(three).length)).toEqual(['two'])
+    expect(store.evictIdle()).toEqual(['three'])
+    expect(store.residentStats()).toMatchObject({ count: 1, live: 1 })
+    expect(store.snapshot('one')).toMatchObject({ phase: 'running', nativeSessionId: 'live' })
+    // A reload is this process's own snapshot: nothing is marked lost, and the turn continues.
+    expect(store.snapshot('two')).toEqual(two)
+    expect(store.residentStats().count).toBe(2)
+    store.append(event(2, { type: 'text', role: 'assistant', text: 'Two is answered', mode: 'snapshot' }, { sessionId: 'two' }))
+    expect(store.snapshot('two')).toMatchObject({ sequence: 2, phase: 'idle' })
+    expect(store.events('two')).toHaveLength(2)
+    expect(store.peek('three')).toEqual(three)
+    // 'one' has neither items nor a title yet: a bookkeeping row, hidden from history as before.
+    expect(store.history('project').map(entry => entry.id).sort()).toEqual(['three', 'two'])
+  })
+  it('summarises a row from before the summary column once, from its stored projection, and lists from the summary after', () => {
+    const f = fixture()
+    f.store.append(event(1, { type: 'text', role: 'user', text: 'Legacy row', mode: 'snapshot' }))
+    f.store.flush()
+    f.db.prepare('UPDATE structured_sessions SET summary_json=NULL').run()
+    f.db.close()
+    const reopened = new DatabaseSync(f.path); databases.push(reopened)
+    const store = new StructuredAgentStore(reopened, f.root)
+    expect(store.history('project')).toEqual([{ id: 'one', title: 'Legacy row', provider: 'claude', archived: false, phase: 'idle', updatedAt: '2026-09-07T00:00:00.000Z', updatedSequence: 1, snippet: 'Legacy row', lastRole: 'user' }])
+    expect(JSON.parse((reopened.prepare("SELECT summary_json FROM structured_sessions WHERE id='one'").get() as { summary_json: string }).summary_json)).toEqual({ phase: 'idle', items: 1, snippet: 'Legacy row', lastRole: 'user' })
+    expect(store.residentStats().count).toBe(0)
+  })
+  it('the memory guard drops every idle conversation once the heap nears its limit, and says so', () => {
+    vi.useFakeTimers()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const f = fixture()
+      f.store.append(event(1, { type: 'text', role: 'user', text: 'idle one', mode: 'snapshot' }))
+      f.store.append(codex(1, { type: 'session', phase: 'running', nativeSessionId: 'busy' }))
+      let used = 10
+      const stop = f.store.startMemoryGuard(1000, 0.7, () => ({ used, limit: 100 }))
+      vi.advanceTimersByTime(1000)
+      expect(f.store.residentStats().count).toBe(2)
+      used = 80
+      vi.advanceTimersByTime(1000)
+      expect(f.store.residentStats()).toMatchObject({ count: 1, live: 1 })
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('dropped 1 idle resident conversations'))
+      stop()
+      expect(f.store.snapshot('one')).toMatchObject({ title: 'idle one', sequence: 1 })
+    } finally { warn.mockRestore(); vi.useRealTimers() }
+  })
+  it('no query in the store reads the projection of more than one conversation', () => {
+    const source = readFileSync(fileURLToPath(new URL('./structured-store.ts', import.meta.url)), 'utf8')
+    const reads = source.split('\n').filter(line => /SELECT\b/.test(line) && /projection_json/.test(line) && /structured_sessions/.test(line))
+    expect(reads.length).toBeGreaterThan(0)
+    for (const read of reads) expect(read).toMatch(/WHERE id=\?/)
   })
 })

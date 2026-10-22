@@ -242,6 +242,7 @@ let modelIntelligence: ModelIntelligence | undefined
 /** Auto model upgrade (docs/model-upgrades.md): notices a better model, prepares it, asks one OK. */
 let modelUpgrades: ModelUpgradeService | undefined
 let disposeModelObserver: (() => void) | undefined
+let disposeMemoryGuard: (() => void) | undefined
 let permissionGrants: Awaited<ReturnType<typeof startPermissionGrants>> | undefined
 let claudeFullAuto: ClaudeFullAutoPolicy
 let browserViews: BrowserViews | undefined
@@ -3438,6 +3439,9 @@ app.whenReady().then(async () => {
   // Rows stored before the journal masked every form of the control token are rewritten once, a
   // bounded chunk at a time, after startup has settled (structured-store.ts, redactSecretsStep).
   setTimeout(() => { database.structured.startSecretRedaction() }, 60_000).unref()
+  // Conversations are resident only while used (structured-store.ts, RESIDENT_BUDGET_BYTES); past 70% of
+  // the V8 heap every idle one is dropped and the fact logged, before the allocator kills the process.
+  disposeMemoryGuard = database.structured.startMemoryGuard()
 })
 
 // 'window-all-closed' is owned by the host lifecycle: it quits exactly as before unless this machine
@@ -3473,6 +3477,7 @@ app.on('will-quit', () => {
     } catch (error) { console.warn('The quit could not be recorded for the next launch', error) }
   }
   try { if (database) policyAnswerLog(database).flush() } catch (error) { console.warn('The auto-approve policy log could not be saved', error) }
+  disposeMemoryGuard?.()
   hostLifecycle?.dispose()
   // Closing each job's held stdin is what tells its node to stop it.
   void remoteJobs?.shutdown(0)
