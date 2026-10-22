@@ -7,7 +7,7 @@ import { resolve } from 'node:path'
 // CONDUCTOR_CODEX_PATH may name a scratch CLI (scripts/probe-codex-catalog.mjs installs one), so
 // the baseline can move before the owner's global CLI does.
 const executable = process.env.CONDUCTOR_CODEX_PATH || 'codex'
-const expected = '0.159.1'
+const expected = '0.163.0'
 const version = execFileSync(executable, ['--version'], { encoding: 'utf8', windowsHide: true, timeout: 10_000 }).trim()
 if (version !== `codex-cli ${expected}`) throw new Error(`Expected codex-cli ${expected}; got ${version}. Review compatibility before changing the baseline.`)
 const output = resolve('src/main/providers/generated/codex')

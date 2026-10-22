@@ -1,5 +1,5 @@
 // SYNTHETIC OFFLINE FIXTURE. No provider executable, network, credentials, or inference.
-// Raw JSONL messages mirror the generated codex-cli 0.159.1 App Server protocol, whose wire the adapter
+// Raw JSONL messages mirror the generated codex-cli 0.163.0 App Server protocol, whose wire the adapter
 // still shares with 0.155.1; CONDUCTOR_FAKE_CODEX_VERSION makes it report either (or any) version.
 import readline from 'node:readline'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 
 if (process.env.CONDUCTOR_TEST_PROVIDER_START_CAPTURE) writeFileSync(process.env.CONDUCTOR_TEST_PROVIDER_START_CAPTURE, `${process.pid}\n`)
-const codexVersion = process.env.CONDUCTOR_FAKE_CODEX_VERSION || '0.159.1'
+const codexVersion = process.env.CONDUCTOR_FAKE_CODEX_VERSION || '0.163.0'
 if (process.argv.includes('--version')) { console.log(`codex-cli ${codexVersion}`); process.exit(0) }
 
 let initialized = false
@@ -108,7 +108,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   if (!initialized || !acknowledged) throw new Error('request before initialization handshake completed')
   if (message.method === 'thread/name/set') { materialized = true; if (process.env.CONDUCTOR_TEST_EMPTY_HISTORY === '1') writeFileSync(materializedPath, 'Synthetic empty history metadata') }
   if (message.method === 'thread/read' && !materialized && process.env.CONDUCTOR_TEST_EMPTY_HISTORY === '1') { send({ id: message.id, error: { code: -32603, message: 'list_turns is not supported yet' } }); return }
-  if (message.method === 'thread/read') { send({ id: message.id, result: { thread: defaults().thread } }); return }
+  if (message.method === 'thread/read') { send({ id: message.id, result: { thread: defaults().thread, readState: null } }); return }
   if (message.method === 'config/read') {
     // The CLI's own configuration: one server left unset, one the owner made prompting, one disabled.
     if (process.env.CONDUCTOR_TEST_CONFIG_READ_UNAVAILABLE === '1') { send({ id: message.id, error: { code: -32603, message: 'synthetic configuration unavailable' } }); return }

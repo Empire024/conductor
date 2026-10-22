@@ -49,18 +49,20 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
     expect(sent.map(message => (message as { method: string }).method)).toEqual(['initialize', 'initialized', 'thread/start', 'model/list'])
     expect(adapter.capabilities.models).toEqual([{ id: 'synthetic-model', label: 'Synthetic model', effort: ['low'], defaultEffort: 'low', isDefault: true }])
     expect(adapter.capabilities.plans).toBe(false)
-    expect(adapter.capabilities.runtimeVersion).toBe('0.159.1')
+    expect(adapter.capabilities.runtimeVersion).toBe('0.163.0')
   })
 
-  it('connects to the previous verified minor (0.155.1) unlimited, flags an unverified patch, and refuses another minor', async () => {
-    const previous = create({ CONDUCTOR_FAKE_CODEX_VERSION: '0.155.1' }).adapter
-    await previous.start()
-    expect(previous.capabilities.runtimeVersion).toBe('0.155.1')
-    expect(previous.capabilities.limitations.some(text => /not fixture-verified/.test(text))).toBe(false)
-    const patch = create({ CONDUCTOR_FAKE_CODEX_VERSION: '0.159.4' }).adapter
+  it('connects to the previous verified minors (0.159.1, 0.155.1) unlimited, flags an unverified patch, and refuses another minor', async () => {
+    for (const version of ['0.159.1', '0.155.1']) {
+      const previous = create({ CONDUCTOR_FAKE_CODEX_VERSION: version }).adapter
+      await previous.start()
+      expect(previous.capabilities.runtimeVersion).toBe(version)
+      expect(previous.capabilities.limitations.some(text => /not fixture-verified/.test(text))).toBe(false)
+    }
+    const patch = create({ CONDUCTOR_FAKE_CODEX_VERSION: '0.163.2' }).adapter
     await patch.start()
-    expect(patch.capabilities.limitations).toContain('Runtime 0.159.4 is not fixture-verified; baseline is 0.159.1. Experimental features are disabled.')
-    await expect(create({ CONDUCTOR_FAKE_CODEX_VERSION: '0.156.0' }).adapter.start()).rejects.toThrow('outside the tested 0.155.x/0.159.x protocol baseline')
+    expect(patch.capabilities.limitations).toContain('Runtime 0.163.2 is not fixture-verified; baseline is 0.163.0. Experimental features are disabled.')
+    await expect(create({ CONDUCTOR_FAKE_CODEX_VERSION: '0.161.0' }).adapter.start()).rejects.toThrow('outside the tested 0.155.x/0.159.x/0.163.x protocol baseline')
   })
 
   it('tags an at-capacity refusal, in both of its statements, as PROVIDER_OVERLOADED', async () => {
@@ -488,12 +490,12 @@ describe('Codex deterministic mapping', () => {
       config: { features: Object.fromEntries(['hooks', 'plugins', 'apps', 'multi_agent', 'multi_agent_v2', 'browser_use', 'browser_use_external', 'computer_use', 'memories', 'unbounded_connection_retries'].map(key => [key, false])), web_search: 'disabled', notify: [], memories: { generate_memories: false, use_memories: false }, mcp_servers: { example: { enabled: false } } },
       layers: [], origins: {}
     } as unknown as ConfigReadResponse
-    expect(() => validateCodexLiveConfiguration(config, { requirements: null })).not.toThrow()
+    expect(() => validateCodexLiveConfiguration(config, { supportsIndependentSpeedModes: null, requirements: null })).not.toThrow()
     const enabled = structuredClone(config)
     ;(enabled.config.mcp_servers as Record<string, { enabled: boolean }>).example!.enabled = true
-    expect(() => validateCodexLiveConfiguration(enabled, { requirements: null })).toThrow('enabled MCP')
+    expect(() => validateCodexLiveConfiguration(enabled, { supportsIndependentSpeedModes: null, requirements: null })).toThrow('enabled MCP')
     config.layers!.push({ name: { type: 'system', file: 'C:/managed.toml' }, config: { hooks: { SessionStart: [] } }, version: '1', disabledReason: null })
-    expect(() => validateCodexLiveConfiguration(config, { requirements: null })).toThrow('managed integrations')
+    expect(() => validateCodexLiveConfiguration(config, { supportsIndependentSpeedModes: null, requirements: null })).toThrow('managed integrations')
   })
 
   it('disables discovered optional skills through ephemeral thread config while preserving administrator skills', () => {

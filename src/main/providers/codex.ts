@@ -45,11 +45,11 @@ import { commandClass, commandText } from '../approval-review-rules'
 import { aclRepairNotice, repairSandboxReadAccess, runIcacls, type IcaclsRunner } from './codex-sandbox-acl'
 import { defaultApprovalPolicy, MAX_WRITABLE_ROOTS, policyNotice, writableRootPaths, writableRootProblem, type PolicyDecision, type PolicyRequest } from '../approval-policy'
 
-export const CODEX_PROTOCOL_BASELINE = '0.159.1'
-/** Exact runtimes the fixture suite covers: the baseline and the previous minor, whose wire the
- *  adapter still speaks unchanged (docs/codex-compatibility.md, "Rebaseline 0.155.1 → 0.159.1"),
+export const CODEX_PROTOCOL_BASELINE = '0.163.0'
+/** Exact runtimes the fixture suite covers: the baseline and the previous minors, whose wire the
+ *  adapter still speaks unchanged (docs/codex-compatibility.md, "Rebaseline 0.159.1 → 0.163.0"),
  *  so the installed app keeps its Codex tabs across a global CLI upgrade in either order. */
-export const CODEX_VERIFIED_RUNTIMES: readonly string[] = [CODEX_PROTOCOL_BASELINE, '0.155.1']
+export const CODEX_VERIFIED_RUNTIMES: readonly string[] = [CODEX_PROTOCOL_BASELINE, '0.159.1', '0.155.1']
 /** Codex's own classification of a lost ChatGPT login or rejected API key (HTTP 401). */
 const unauthorized = (info: unknown): boolean => info === 'unauthorized'
 const safeguardRefusal = (message: string): boolean => /(?:safeguards? flagged this message|safety (?:policy|classifier).*(?:blocked|refused)|request (?:was )?refused by.*safety)/i.test(message)
@@ -660,7 +660,7 @@ export class CodexAdapter implements ProviderAdapter {
         execFile(this.options.executable, ['--version'], { cwd: this.options.cwd, env: providerEnvironment(this.options.environment ?? process.env), windowsHide: true, timeout: 10_000, maxBuffer: 4096 }, (error, stdout) => error ? reject(error) : resolve(stdout.trim()))
       }))
       this.capabilities.runtimeVersion = version.replace(/^codex-cli\s+/, '')
-      if (!/^0\.(?:155|159)\./.test(this.capabilities.runtimeVersion)) throw new Error(`Codex ${this.capabilities.runtimeVersion} is outside the tested 0.155.x/0.159.x protocol baseline; regenerate and verify the adapter before connecting`)
+      if (!/^0\.(?:155|159|163)\./.test(this.capabilities.runtimeVersion)) throw new Error(`Codex ${this.capabilities.runtimeVersion} is outside the tested 0.155.x/0.159.x/0.163.x protocol baseline; regenerate and verify the adapter before connecting`)
       const verified = CODEX_VERIFIED_RUNTIMES.includes(this.capabilities.runtimeVersion)
       if (!verified) this.capabilities.limitations.push(`Runtime ${this.capabilities.runtimeVersion} is not fixture-verified; baseline is ${CODEX_PROTOCOL_BASELINE}. Experimental features are disabled.`)
       this.experimental = (this.options.environment ?? process.env).CONDUCTOR_CODEX_EXPERIMENTAL === '1' && verified
