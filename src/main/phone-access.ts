@@ -71,12 +71,17 @@ function sharedFileKind(path: string): PhoneSharedFile['kind'] {
   return 'other'
 }
 
-/** The folder a file sits in, relative to its project when inside it, else its last two folders. */
-function folderHint(path: string, projectRoot: string | null): string {
+/** The folder a file sits in, relative to its project when inside it, else its last two folders.
+ *  A project has two spellings, the path it was opened at and its real path: a found file is a
+ *  real path while a missing one keeps the linked spelling, and they differ when the project path
+ *  holds an 8.3 short name (C:\Users\RUNNER~1), a junction or a symlink. */
+function folderHint(path: string, projectRoots: Array<string | null>): string {
   const parts = path.replace(/\\/g, '/').replace(/\/+$/, '').split('/').slice(0, -1)
-  const root = projectRoot ? projectRoot.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase() : ''
   const folder = parts.join('/')
-  if (root && (folder.toLowerCase() === root || folder.toLowerCase().startsWith(root + '/'))) return folder.slice(root.length + 1) || 'Project folder'
+  for (const projectRoot of projectRoots) {
+    const root = projectRoot ? projectRoot.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase() : ''
+    if (root && (folder.toLowerCase() === root || folder.toLowerCase().startsWith(root + '/'))) return folder.slice(root.length + 1) || 'Project folder'
+  }
   return parts.length > 2 ? '…/' + parts.slice(-2).join('/') : folder
 }
 
@@ -1067,12 +1072,14 @@ export class PhoneAccessService {
     candidates.sort((left, right) => right.linked.lastAt.localeCompare(left.linked.lastAt))
     const truncated = candidates.length > SHARED_FILES_LIMIT
     const files: PhoneSharedFile[] = []
-    const roots = new Map<string, Promise<{ project: ProjectRecord; roots: string[] } | null>>()
+    const roots = new Map<string, Promise<{ project: ProjectRecord; roots: string[]; projectRoots: Array<string | null> } | null>>()
     const rootsOf = (sessionId: string) => {
       if (!roots.has(sessionId)) roots.set(sessionId, (async () => {
         const spec = this.deps.database.structured.spec<AgentSpec>(sessionId)
         const owner = spec ? this.deps.database.getProject(spec.projectId) : null
-        return owner ? { project: owner, roots: owner.remote ? [] : await this.fileRoots(sessionId, owner) } : null
+        if (!owner) return null
+        if (owner.remote) return { project: owner, roots: [], projectRoots: [] }
+        return { project: owner, roots: await this.fileRoots(sessionId, owner), projectRoots: [owner.path, await realpath(owner.path).catch(() => null)] }
       })())
       return roots.get(sessionId)!
     }
@@ -1084,14 +1091,14 @@ export class PhoneAccessService {
         const machine = this.deps.database.getProject(this.deps.database.structured.spec<AgentSpec>(sessionId)?.projectId ?? '')?.remote?.machineName || 'the other machine'
         const note = `Files from ${machine} are fetched through its pairing when opened; images, videos and documents only.`
         if (!notes.includes(note)) notes = [...notes, note]
-        files.push({ ...entry, folder: folderHint(linked.path, null), size: null, missing: false })
+        files.push({ ...entry, folder: folderHint(linked.path, []), size: null, missing: false })
         continue
       }
       const owner = await rootsOf(sessionId)
       if (!owner || owner.project.remote) continue
       const found = await this.localLinkedFile(linked.path, owner.roots)
       if (found === 'refused') continue
-      files.push({ ...entry, folder: folderHint(found === 'missing' ? linked.path : found.path, owner.project.path), size: found === 'missing' ? null : found.size, missing: found === 'missing' })
+      files.push({ ...entry, folder: folderHint(found === 'missing' ? linked.path : found.path, owner.projectRoots), size: found === 'missing' ? null : found.size, missing: found === 'missing' })
     }
     if (project.remote && !this.deps.remote?.isRemote(id)) notes = [...notes, `${project.name} lives on ${project.remote.machineName || 'another machine'}, and this conversation is not mirrored from it.`]
     return { files, coworkers, truncated, ...(notes.length ? { note: notes.join(' ') } : {}) }

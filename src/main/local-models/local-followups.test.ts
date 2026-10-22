@@ -20,6 +20,14 @@ vi.mock('./web.ts', async original => ({
   readPublicWeb: vi.fn(async (url: string) => `Source: ${url}\nUntrusted web content.\nThe Pixel 10 scores 8/10.`)
 }))
 
+// Command output is kept in the default result store, which lives on the configured local root.
+// A machine without one (the release runner) fails every command that runs with "local root is
+// not configured", so the sessions here keep it in memory instead.
+vi.mock('./result-artifacts.ts', async original => {
+  const actual = await original<typeof import('./result-artifacts.ts')>()
+  return { ...actual, defaultResultStore: new actual.MemoryResultStore() }
+})
+
 type Sent = { messages: Array<{ role: string; content: string; tool_calls?: Array<{ function: { name: string; arguments: string } }> }>; tool_choice?: string; tools?: Array<{ function: { name: string } }> }
 const frame = (delta: Record<string, unknown>, finish?: string): string => JSON.stringify({ choices: [{ delta, finish_reason: finish ?? null }] })
 const calls = (...list: Array<[string, string, Record<string, unknown>]>): string => frame({ tool_calls: list.map(([id, name, args], index) => ({ index, id, function: { name, arguments: JSON.stringify(args) } })) }, 'tool_calls')
