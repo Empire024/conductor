@@ -968,7 +968,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       if (type === 'assistant' && !parentId && typeof body.model === 'string') {
         this.resetContextForModel(body.model)
         this.capabilities.effectiveSettings = { ...object(this.capabilities.effectiveSettings), model: body.model }
-        this.emit({ data: { type: 'session', phase: this.active ? 'running' : 'idle', capabilities: this.capabilities } })
+        this.emit({ data: { type: 'session', phase: this.livePhase(), capabilities: this.capabilities } })
       }
       if (type === 'assistant' && messageId) this.usage(object(body.usage), `usage:message:${messageId}`, 'message', parentId)
       // A lost login is answered by the CLI itself: a synthetic assistant message (model
@@ -1092,7 +1092,7 @@ export class ClaudeAdapter implements ProviderAdapter {
         this.permissionEvidence(requested, reportedMode, matches ? 'confirmed' : 'blocked', matches ? undefined : `Claude reported native permission mode ${reportedMode}; requested ${requested}`)
       }
       if (typeof message.claude_code_version === 'string') this.capabilities.runtimeVersion = message.claude_code_version
-      this.emit({ data: { type: 'session', phase: this.active ? 'running' : 'idle', nativeSessionId: this.nativeSessionId, capabilities: this.capabilities }, native: { method: 'system/init', payload: message } })
+      this.emit({ data: { type: 'session', phase: this.livePhase(), nativeSessionId: this.nativeSessionId, capabilities: this.capabilities }, native: { method: 'system/init', payload: message } })
       return
     }
     if (type === 'system' && ['task_started', 'task_progress', 'task_notification'].includes(string(message.subtype) ?? '')) {
@@ -1199,7 +1199,7 @@ export class ClaudeAdapter implements ProviderAdapter {
         if (!parentId && typeof body.model === 'string') {
           this.resetContextForModel(body.model)
           this.capabilities.effectiveSettings = { ...object(this.capabilities.effectiveSettings), model: body.model, ...(this.settings.effort ? { effort: this.settings.effort } : {}) }
-          this.emit({ data: { type: 'session', phase: this.active ? 'running' : 'idle', capabilities: this.capabilities } })
+          this.emit({ data: { type: 'session', phase: this.livePhase(), capabilities: this.capabilities } })
         }
         this.usage(object(body.usage), `usage:message:${id}`, 'message', parentId)
       }
@@ -1609,8 +1609,15 @@ export class ClaudeAdapter implements ProviderAdapter {
     try { return this.options.approvalPolicy(request, { requestId, tool: name, input }) } catch { return null }
   }
   private emitWaiting(): void {
+    this.emit({ data: { type: 'session', phase: this.stopRequested ? 'interrupting' : this.livePhase() } })
+  }
+  /** The phase while the runtime streams: a request still waiting for the owner keeps the turn
+   *  waiting on it, even while parallel tool calls or subagents go on producing messages. Every
+   *  assistant message used to report plain running, which dropped the tab from Needs attention
+   *  and its approval out of sight while the agent kept working. */
+  private livePhase(): 'waiting_input' | 'waiting_approval' | 'running' | 'idle' {
     const pending = [...this.requests.values()]
-    this.emit({ data: { type: 'session', phase: this.stopRequested ? 'interrupting' : pending.some((item) => item.interaction.kind === 'question') ? 'waiting_input' : pending.length ? 'waiting_approval' : this.active ? 'running' : 'idle' } })
+    return pending.some((item) => item.interaction.kind === 'question') ? 'waiting_input' : pending.length ? 'waiting_approval' : this.active ? 'running' : 'idle'
   }
   private expireRequest(id: string, reason: string): void {
     const pending = this.requests.get(id)

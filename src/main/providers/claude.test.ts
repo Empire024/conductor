@@ -1465,6 +1465,17 @@ describe('Claude permission actions and native approval boundaries', () => {
     } })
     expect(request(f).choices.find(choice => choice.id === 'allow-session')).toMatchObject({ disabled: true, description: expect.stringContaining('individual approval') })
   })
+  it('stays waiting on a pending approval while the turn keeps streaming messages, then runs once it is answered', async () => {
+    const f = fixture(); await f.adapter.start(); await f.adapter.submit('Synthetic', settings)
+    f.transport.receive(permission('approval', 'one', 'Bash', { command: 'npm test' }))
+    expect(f.projection().phase).toBe('waiting_approval')
+    f.transport.receive({ type: 'assistant', message: { id: 'later', model: 'claude-opus-5-5', content: [{ type: 'text', text: 'Meanwhile, reading the tests.' }] } })
+    f.transport.receive({ type: 'stream_event', event: { type: 'message_start', message: { id: 'later-stream', model: 'claude-opus-5-5' } } })
+    f.transport.receive({ type: 'system', subtype: 'init', model: 'claude-opus-5-5' })
+    expect(f.projection().phase).toBe('waiting_approval')
+    await f.adapter.respond(answer('approval', 'allow'))
+    expect(f.projection().phase).toBe('running')
+  })
   it('awaits native auto-mode confirmation, allows the selected request once, and preserves other pending requests', async () => {
     const f = fixture({ settings: { ...settings, plan: true } }); await f.adapter.start(); await f.adapter.submit('Synthetic', { ...settings, plan: true })
     f.transport.receive(permission('approval', 'one', 'Bash', { command: 'npm test' }))

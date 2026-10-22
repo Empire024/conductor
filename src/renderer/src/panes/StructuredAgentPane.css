@@ -15,7 +15,7 @@
 .sa-session-dot.status-waiting_approval, .sa-session-dot.status-waiting_input { background: #e2b872; }
 .sa-session-dot.status-failed, .sa-session-dot.status-disconnected { background: var(--danger); }
 .sa-spacer { flex: 1; }
-.sa-attention-badge { padding: 0 5px; color: #e2b872; border: 1px solid #e2b87266; border-radius: 4px; font-variant-numeric: tabular-nums; }
+.structured-agent-pane .sa-attention-badge { min-height: 0; padding: 0 5px; color: #e2b872; border: 1px solid #e2b87266; border-radius: 4px; background: none; font: inherit; font-variant-numeric: tabular-nums; cursor: pointer; }
 .sa-timeline-wrap { position: relative; min-height: 0; flex: 1; display: flex; flex-direction: column; }
 .sa-timeline { min-height: 0; flex: 1; overflow: auto; overscroll-behavior: contain; padding: 16px 20px 26px 27px; scrollbar-gutter: stable; user-select: text; }
 .sa-activity { position: relative; padding: 0 0 15px 15px; margin: 0; border-left: 1px solid var(--border); min-width: 0; overflow-wrap: anywhere; content-visibility: auto; contain-intrinsic-size: auto 90px; }
@@ -488,3 +488,19 @@
 .sa-cli-owned { display: flex; align-items: center; gap: 8px; padding: 5px 8px; margin-bottom: 4px; border: 1px solid var(--border-soft); border-radius: 6px; color: var(--text-2); font-size: 11px; background: var(--surface-1); }
 .sa-cli-owned > span { flex: 1; min-width: 0; }
 .sa-history-note { margin: 6px auto; text-align: center; color: var(--text-3); font-size: 11px; }
+/* Approvals and questions waiting for the owner, pinned above the composer until answered (PendingInteractionDock). */
+.sa-interaction-dock { flex: 0 0 auto; max-height: 45%; overflow-y: auto; margin: 0 12px 4px; padding: 3px 8px 6px; border: 1px solid #e2b87266; border-left: 2px solid #e2b872; border-radius: 6px; font-size: 12px; background: var(--surface-0, transparent); }
+.sa-interaction-dock > .sa-interaction-dock-head { display: flex; width: 100%; justify-content: space-between; align-items: baseline; gap: 10px; padding: 2px 0; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.sa-interaction-dock-head > strong { color: #e2b872; }
+.sa-interaction-dock-cards { display: flex; flex-direction: column; gap: 6px; margin: 4px 0 0; }
+.sa-interaction-dock-card > .sa-activity { margin: 0; padding: 0; }
+.sa-interaction-dock-card > .sa-activity > .sa-marker, .sa-interaction-dock-card > .sa-activity > .sa-activity-time { display: none; }
+.sa-interaction-dock-card .sa-activity:has(> .sa-interaction-docked) { position: static; }
+.sa-interaction-dock-pulse { animation: sa-interaction-dock-pulse 0.8s ease-in-out 2; }
+@keyframes sa-interaction-dock-pulse { 50% { box-shadow: 0 0 0 3px #e2b87288; } }
+.sa-interaction-in-dock { display: flex; align-items: center; gap: 8px; border-style: dashed; border-color: #e2b87266; }
+.sa-interaction-in-dock > span { display: flex; min-width: 0; flex: 1; flex-direction: column; }
+.sa-interaction-in-dock strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.sa-interaction-in-dock small { color: #e2b872; font-size: 10px; }
+.sa-interaction-in-dock > button { flex: 0 0 auto; }
+@media (prefers-reduced-motion: reduce) { .sa-interaction-dock-pulse { animation: none; } }

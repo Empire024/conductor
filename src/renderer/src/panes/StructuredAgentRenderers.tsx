@@ -376,6 +376,10 @@ interface ActivityProps {
   onRespond(item: TimelineItem, decision?: string, answers?: Record<string, string[]>): Promise<void>
   onFocusOrigin?(origin: { agentSessionId: string; label: string }): void
   onDockQuestion?(id: string, docked: boolean): void
+  /** The pending card is answered in the dock above the composer (PendingInteractionDock); its
+   *  timeline row only marks where it was asked, and onRevealDock brings the dock into view. */
+  answerInDock?: boolean
+  onRevealDock?(): void
   /** Applies a composer mode change from inside the timeline (the auto-mode denial card's "Switch to Edit mode"). Absent for a historical conversation. */
   onSwitchPermission?(permission: 'accept-edits'): void
   /** The conversation runs on another machine (a mirrored tab): its permission cards are answered
@@ -443,6 +447,14 @@ export function readableAnswerValue(value: string): string {
   const truncated = decoded.slice(0, MAX_ANSWER_VALUE_LENGTH)
   const lastSpace = truncated.lastIndexOf(' ')
   return (lastSpace > MAX_ANSWER_VALUE_LENGTH * 0.6 ? truncated.slice(0, lastSpace) : truncated).trimEnd() + '…'
+}
+/** Where a waiting request was asked; its buttons are in the dock above the composer. A component
+ *  of its own, so the row never holds a second copy of a question's draft. */
+function DockedInteractionRow({ request, onReveal }: { request: PendingInteraction; onReveal?(): void }): React.JSX.Element {
+  return <div className="sa-interaction sa-interaction-in-dock" aria-label={request.kind + ' waiting in the dock: ' + request.title}>
+    <span><strong>{request.title}</strong><small>{request.kind === 'question' ? 'Waiting for your answer' : 'Waiting for your approval'} above the message box</small></span>
+    {onReveal && <button type="button" onClick={onReveal}>Show</button>}
+  </div>
 }
 function InteractionCard({ item, sessionId, interactive, onRespond, dockedQuestion, onDockQuestion }: ActivityProps): React.JSX.Element | null {
   const [submittedAnswers, setSubmittedAnswers] = useState<Record<string, string[]> | null>(null)
@@ -652,7 +664,7 @@ export const StructuredActivity = memo(function StructuredActivity(props: Activi
       body = sent ? <AgentMessageCard direction="sent" peer={sent.to} text={sent.text} method={sent.method} projectId={props.projectId} onFocusOrigin={props.onFocusOrigin}><StructuredMarkdown text={sent.text} cwd={props.cwd} projectId={props.projectId} machineId={props.machineId} onOpenFile={props.onOpenFile} /><ToolCard {...props} /></AgentMessageCard> : <ToolCard {...props} />
       break
     }
-    case 'interaction': body = <InteractionCard {...props} />; break
+    case 'interaction': body = props.answerInDock && props.interactive && data.interaction.status === 'pending' ? <DockedInteractionRow request={data.interaction} onReveal={props.onRevealDock} /> : <InteractionCard {...props} />; break
     case 'changes': body = <section className="sa-changes" aria-label="File changes">{data.changes.map((change, index) => <div className="sa-file-change" key={change.path + '-' + index}>
       <header><button className="sa-file-link" onClick={(event) => openAgentFile(event, props.cwd, change.path, props.onOpenFile)}>{attachmentIcon(change.path)}<code>{change.oldPath ? change.oldPath + ' → ' : ''}{change.path}</code></button><span className="sa-diff-count">{change.additions !== undefined && <b>+{change.additions}</b>}{change.deletions !== undefined && <em>−{change.deletions}</em>}</span><small>{change.status}</small></header>
       {change.patch && <PatchPreview change={change} />}

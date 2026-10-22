@@ -321,7 +321,7 @@ for await (const line of input) {
     if (prompt.startsWith('SYNTHETIC STEER DATA')) { emit({ type: 'command_lifecycle', command_uuid: message.uuid, state: 'queued' }); emit({ type: 'command_lifecycle', command_uuid: message.uuid, state: 'started' }); text('Synthetic steering input received during the active turn.'); continue }
     turn++
     if (prompt.startsWith('SYNTHETIC PERMISSION ')) {
-      permissionScenario = /^SYNTHETIC PERMISSION (SCOPED|REPEAT|AUTO|REJECT|ONCE|DENY|REQUIRED|SESSION_EDIT|REPEAT_EDIT)\b/.exec(prompt)?.[1]
+      permissionScenario = /^SYNTHETIC PERMISSION (SCOPED|REPEAT|AUTO|REJECT|ONCE|DENY|REQUIRED|SESSION_EDIT|REPEAT_EDIT|BUSY)\b/.exec(prompt)?.[1]
       if (!permissionScenario) throw new Error('Unknown synthetic permission scenario')
       emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263', permissionMode })
       const command = permissionScenario === 'SCOPED' || permissionScenario === 'REPEAT' ? 'echo conductor-session-scope' : 'echo conductor-' + permissionScenario.toLowerCase()
@@ -343,6 +343,18 @@ for await (const line of input) {
         ...(permissionScenario === 'REQUIRED' ? { matched_ask_rule: { source: 'policySettings', tool_name: 'Bash' }, decision_reason: 'Synthetic policy requires approval' } : {}),
         permission_suggestions: editPermission ? [{ type: 'setMode', mode: 'acceptEdits', destination: 'session' }] : [{ type: 'addRules', behavior: 'allow', destination: 'localSettings', rules: [{ toolName: 'Bash', ruleContent: command }] }]
       } })
+      // BUSY (scripts/smoke-approval-dock.mjs): the approval stays waiting while the turn keeps
+      // working, the way parallel tool calls and subagents do, so its card falls far behind.
+      if (permissionScenario === 'BUSY') {
+        let step = 0
+        const timer = setInterval(() => {
+          const tool = tools[step % tools.length], id = `busy-tool-${turn}-${step}`
+          emit({ type: 'assistant', message: { id: `busy-message-${turn}-${step}`, model: 'synthetic-claude', content: [{ type: 'text', text: prose(step) }, { type: 'tool_use', id, name: tool, input: inputFor(tool, step) }] } })
+          result(id, outputFor(tool, step), false, tool === 'Bash' ? { stdout: outputFor(tool, step), stderr: '', exitCode: 0 } : undefined)
+          if (++step >= 40) { clearInterval(timer); steeringTimers.delete(timer) }
+        }, 60)
+        steeringTimers.add(timer)
+      }
       continue
     }
     if (prompt.startsWith('SYNTHETIC STEER START')) { emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263' }); continue }

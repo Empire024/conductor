@@ -52,6 +52,8 @@ import { cleanIpcError } from '../ipc-errors'
 import { copyText } from '../clipboard'
 import { onAgentControlGrants, onAgentControlSettings } from '../agent-control-settings'
 import { PendingGrantDock, REVEAL_CONVERSATION_EVENT } from '../components/permission-grants/PendingGrantDock'
+import { PendingInteractionDock } from './PendingInteractionDock'
+import { answerableHere, dockedInteractions } from './pending-interaction-dock'
 import { TabLineageLine } from './TabLineageLine'
 import './StructuredAgentPane.css'
 
@@ -276,6 +278,9 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const [newOutput, setNewOutput] = useState(false)
   const newOutputRef = useRef(newOutput); newOutputRef.current = newOutput
   const [dockedQuestions, setDockedQuestions] = useState<ReadonlySet<string>>(() => new Set())
+  // Bumped to bring the approval/question dock above the composer into view (PendingInteractionDock).
+  const [dockReveal, setDockReveal] = useState(0)
+  const revealDock = useCallback((): void => setDockReveal(count => count + 1), [])
   const [visibleCount, setVisibleCount] = useState(LIVE_WINDOW)
   const [readingWindow, setReadingWindow] = useState<TimelineItem[] | null>(null)
   const readingWindowRef = useRef(readingWindow); readingWindowRef.current = readingWindow
@@ -762,6 +767,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     followedFor.current = activeId
     followSuccession(succession)
   }, [ready, historical, succession, activeId, projection.sessionId, followSuccession])
+  const dockItems = useMemo(() => dockedInteractions(projection.items, projection.runtimeId, historical), [projection.items, projection.runtimeId, historical])
   const pending = useMemo(() => projection.items.filter((item) => item.data.type === 'interaction' && item.data.interaction.status === 'pending').length, [projection.items])
   const residentItems = useMemo(() => projection.items.filter(isConversationActivity), [projection.items])
   // The projection holds the latest 2000 items; anything older is paged in from the store as the
@@ -893,17 +899,14 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   }, [activeId])
   useLayoutEffect(() => {
     if (!ready || historical) return
+    // A new request is answered in the dock above the composer, which pulses once. It used to freeze
+    // the timeline at the card, so the owner then fell behind the live end, and "Jump to latest" or a
+    // Needs attention click scrolled the card away again while the agent kept working.
     const pendingItems = conversationItems.filter(item => item.runtimeId === projection.runtimeId && item.data.type === 'interaction' && item.data.interaction.status === 'pending')
-    const added = pendingItems.find(item => !presentedRequests.current.has(item.id))
+    const added = pendingItems.some(item => !presentedRequests.current.has(item.id))
     for (const item of pendingItems) presentedRequests.current.add(item.id)
-    if (!added || !nearBottom.current || hasTimelineSelection(timeline.current, window.getSelection())) return
-    const element = timeline.current
-    const card = element?.querySelector<HTMLElement>('[data-item-id="' + CSS.escape(added.id) + '"]')
-    if (!element || !card) return
-    nearBottom.current = false
-    setReadingWindow(conversationItems.slice(-visibleCount))
-    element.scrollTop += card.getBoundingClientRect().top - element.getBoundingClientRect().top - 12
-  }, [conversationItems, ready, historical, projection.runtimeId, visibleCount])
+    if (added) revealDock()
+  }, [conversationItems, ready, historical, projection.runtimeId, revealDock])
   // A plain-text question the agent ended its turn with and nobody has answered: a dot on the links
   // toggle and the top of its rail. Dismissed per conversation, by the message it was asked in.
   const asked = useMemo(() => historical ? null : unansweredQuestion(conversationItems, projection.phase), [historical, conversationItems, projection.phase])
@@ -1067,10 +1070,10 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   // so a link to the tab already on screen still shows what it pointed at (PendingGrantDock pulses).
   const jumpToLatestRef = useRef(jumpToLatest); jumpToLatestRef.current = jumpToLatest
   useEffect(() => {
-    const reveal = (event: Event): void => { if ((event as CustomEvent<{ agentSessionId?: string }>).detail?.agentSessionId === activeId) jumpToLatestRef.current() }
+    const reveal = (event: Event): void => { if ((event as CustomEvent<{ agentSessionId?: string }>).detail?.agentSessionId === activeId) { jumpToLatestRef.current(); revealDock() } }
     window.addEventListener(REVEAL_CONVERSATION_EVENT, reveal)
     return () => window.removeEventListener(REVEAL_CONVERSATION_EVENT, reveal)
-  }, [activeId])
+  }, [activeId, revealDock])
   // Same identity notion the subagent roster counts by: same color and disambiguated name
   // everywhere a given subagent shows up, not a second, independent labeling scheme.
   const subagentRoster = useMemo(() => summarizeSubagents(projection.items, projection.runtimeId, projection.phase, false), [projection.items, projection.runtimeId, projection.phase])
@@ -1231,7 +1234,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       {(earlierCount > 0 || older.status === 'idle' || older.status === 'loading') && <button ref={observeEarlier} className="sa-load-earlier" disabled={earlierCount === 0 && older.status === 'loading'} onClick={() => loadEarlierRef.current()}>{earlierCount > 0 ? `Show earlier activities (${earlierCount})` :older.status === 'loading' ? 'Loading earlier activity…' : 'Load earlier activity'}</button>}
       {earlierCount === 0 && older.status === 'unavailable' && <p className="sa-history-note">Earlier activity in this conversation is no longer stored.</p>}
       {ready && activityGroups.map(group => {
-        const activities = group.map(item => <StructuredActivity key={item.id} item={item} sessionId={activeId} projectId={props.project.id} onInspectAttachment={setInspectAttachment} cwd={fileCwd} expanded={expansion[item.id] ?? false} interactive={!historical && (item.runtimeId === projection.runtimeId || item.data.type === 'interaction' && (item.data.interaction.input as { protocol?: string } | null)?.protocol === 'codex-async-question')} dockedQuestion={dockedQuestions.has(item.id)} parentLabel={item.parentId && labelAnchors.has(item.id) ? parentLabels.get(item.runtimeId + ':' + item.parentId) : undefined} onExpand={onExpand} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} onFocusOrigin={focusOrigin} onDockQuestion={setQuestionDocked} onSwitchPermission={historical || provider !== 'claude' ? undefined : switchPermission} grantsElsewhere={grantsElsewhere} />)
+        const activities = group.map(item => <StructuredActivity key={item.id} item={item} sessionId={activeId} projectId={props.project.id} onInspectAttachment={setInspectAttachment} cwd={fileCwd} expanded={expansion[item.id] ?? false} interactive={answerableHere(item, projection.runtimeId, historical)} answerInDock onRevealDock={revealDock} dockedQuestion={dockedQuestions.has(item.id)} parentLabel={item.parentId && labelAnchors.has(item.id) ? parentLabels.get(item.runtimeId + ':' + item.parentId) : undefined} onExpand={onExpand} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} onFocusOrigin={focusOrigin} onDockQuestion={setQuestionDocked} onSwitchPermission={historical || provider !== 'claude' ? undefined : switchPermission} grantsElsewhere={grantsElsewhere} />)
         // A recall belongs to the message it was injected with, so it renders directly under it.
         const recall = group.length === 1 && group[0]!.nativeItemId ? recallByItem.get(group[0]!.nativeItemId) : undefined
         if (recall) return <div className="sa-turn" key={group[0]!.id}>{activities[0]}<MemoryRecallStrip recall={recall} onChanged={loadTurnRecalls} /></div>
@@ -1243,14 +1246,14 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
         return <details className="sa-completed-group" key={group[0]!.id}><summary><span>{coalesced ? coalescedEditLabel(coalesced) : `${group.length} completed actions`}</span>{latestTask && <span className="sa-completed-latest" title={latestTask}><b>Latest</b> {latestTask}{latestOutput && <code>OUT {latestOutput}</code>}</span>}</summary><div>{activities}</div></details>
       })}
       {(projection.phase === 'running' || projection.phase === 'starting') && <div className="sa-working" role="status"><i />{projection.phase === 'starting' ? 'Connecting…' : ['Thinking…', 'Spelunking…', 'Working…', 'Considering…'][workingWord]}<StructuredLiveTokens items={projection.items} /></div>}
-    </div></div>{newOutput && <button className="sa-jump" onClick={jumpToLatest}><ArrowDown size={13} /> New output · Jump to latest</button>}</div>, [pinnedPrompt, conversationItems, name, ready, earlierCount, older.status, observeEarlier, readingWindow, projection.items, projection.runtimeId, projection.phase, activityGroups, activeId, props.project.id, fileCwd, expansion, historical, dockedQuestions, labelAnchors, parentLabels, onExpand, onOpenFile, onRespond, focusOrigin, setQuestionDocked, provider, switchPermission, recallByItem, loadTurnRecalls, workingWord, newOutput, props.resourceId])
+    </div></div>{newOutput && <button className="sa-jump" onClick={jumpToLatest}><ArrowDown size={13} /> New output · Jump to latest</button>}</div>, [pinnedPrompt, conversationItems, name, ready, earlierCount, older.status, observeEarlier, readingWindow, projection.items, projection.runtimeId, projection.phase, activityGroups, activeId, props.project.id, fileCwd, expansion, historical, dockedQuestions, labelAnchors, parentLabels, onExpand, onOpenFile, onRespond, focusOrigin, setQuestionDocked, revealDock, provider, switchPermission, recallByItem, loadTurnRecalls, workingWord, newOutput, props.resourceId])
 
   return <AgentFileMachineContext.Provider value={fileMachineId}><section ref={pane} className="structured-agent-pane" data-provider={provider} data-structured-session={activeId} data-file-machine={fileMachineId} onFocusCapture={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id, historical } }} onPointerDown={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id, historical } }}>
     <header className="sa-session-bar">
       <ProviderIcon provider={provider} model={settings.model} size={15} />
       {props.cliDrawer && <div className="agent-view-switch"><button className={props.cliDrawer.open ? 'active' : undefined} aria-pressed={props.cliDrawer.open} title={props.cliDrawer.open ? 'Hide the CLI; nothing stops' : cliOwned ? 'Show the native CLI that holds this conversation' : cliIdle ? 'Continue this conversation in its native CLI, under the chat' : 'Watch this turn live in a CLI view under the chat'} disabled={!ready || historical} onClick={() => props.cliDrawer?.onToggle(activeId, { idle: cliIdle, sequence: projection.sequence })}><TerminalSquare size={13} /> CLI</button></div>}
       {activePhases.has(projection.phase) && <span className="sa-session-phase" role="status"><span className={'sa-session-dot status-' + projection.phase} />{projection.phase === 'starting' ? 'Connecting…' : projection.phase === 'running' ? ['Thinking', 'Spelunking', 'Working', 'Considering'][workingWord] : projection.items.some(item => item.data.type === 'interaction' && item.data.interaction.status === 'pending' && item.data.interaction.review?.phase === 'reviewing') ? 'Waiting for stronger review' : displayPhase(projection.phase)}</span>}
-      {pending > 0 && <span className="sa-attention-badge" aria-label={pending + ' pending requests'}>{pending}</span>}
+      {pending > 0 && <button type="button" className="sa-attention-badge" aria-label={pending + ' pending requests'} title="Show what is waiting for you" onClick={revealDock}>{pending}</button>}
       {/* The empty middle of the header opens the Links & files rail too, like tapping a chat title on the phone. */}
       <button type="button" className="sa-spacer sa-header-links" aria-label="Open the shared files rail" title="Files and links shared in this conversation" onClick={() => { if (!linksOpen) toggleLinks() }} />
       <button className="sa-links-toggle" aria-label="Links and files" aria-pressed={linksOpen} title={openQuestion ? 'Links & files · the agent asked you something' : deliveredUnseen ? 'Links & files · the agent delivered files' : 'Links & files in this conversation'} onClick={toggleLinks}><Link2 size={15} />{(openQuestion || deliveredUnseen) && <span className="sa-links-dot" aria-hidden="true" />}</button>
@@ -1284,6 +1287,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     <div className="sa-body">{timelineView}{linksOpen && <ConversationLinksRail items={conversationItems} cwd={fileCwd} projectId={props.project.id} machineId={fileMachineId} asked={openQuestion} delivered={delivered.links}
       onDismissAsked={itemId => { localStorage.setItem(ASKED_DISMISSED_KEY + activeId, itemId); setAskedVersion(value => value + 1) }} onJump={scrollToItem} onOpenFile={onOpenFile} onClose={toggleLinks} />}</div>
     <StructuredAgentTelemetry key={activeId} items={projection.items} runtimeId={projection.runtimeId} phase={projection.phase} truncated={projection.truncated} sessionId={activeId} cwd={fileCwd} projectId={props.project.id} interactive={!historical} onInspectAttachment={setInspectAttachment} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} />
+    <PendingInteractionDock items={dockItems} reveal={dockReveal} render={item => <StructuredActivity item={item} sessionId={activeId} projectId={props.project.id} onInspectAttachment={setInspectAttachment} cwd={fileCwd} expanded={expansion[item.id] ?? false} interactive dockedQuestion={dockedQuestions.has(item.id)} onExpand={onExpand} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} onFocusOrigin={focusOrigin} onDockQuestion={setQuestionDocked} />} />
     {!historical && !wizardActive(settings, provider) && <PendingGrantDock agentSessionId={activeId} rendered={renderedGrantCards} />}
     <form className="sa-composer agent-prompt-surface" onSubmit={event => { event.preventDefault(); void submit() }} onDragOver={event => { if (!isComposerFileDrag(event.dataTransfer.types)) return; event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'copy' }} onDrop={event => { if (!isComposerFileDrag(event.dataTransfer.types)) return; event.preventDefault(); event.stopPropagation(); void dropComposerFiles(event.dataTransfer) }}>
       {pendingSteering.length > 0 && <div className="sa-queue-list" aria-label="Pending steering messages">{pendingSteering.map(input => <div className="sa-queue sa-steering-prompt" key={input.id}>
