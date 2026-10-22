@@ -21,7 +21,8 @@ class Node {
     }
     return { toggle, add: (name: string) => toggle(name, true), remove: (name: string) => toggle(name, false), contains: (name: string) => this.className.split(' ').includes(name) }
   }
-  appendChild(node: Node) { node.parentNode = this; this.children.push(node); return node }
+  // Moves the node as the DOM does: it leaves its old parent first.
+  appendChild(node: Node) { if (node.parentNode) node.parentNode.removeChild(node); node.parentNode = this; this.children.push(node); return node }
   insertBefore(node: Node, before: Node | null) { if (node.parentNode) node.parentNode.removeChild(node); node.parentNode = this; const index = before ? this.children.indexOf(before) : -1; if (index < 0) this.children.push(node); else this.children.splice(index, 0, node); return node }
   removeChild(node: Node) { this.children = this.children.filter(child => child !== node); node.parentNode = null }
   setAttribute(name: string, value: string) { this.attributes[name] = value }

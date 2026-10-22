@@ -1234,6 +1234,29 @@ describe('phone typing survives live updates', () => {
     expect(input.value).toBe('Half a thought')
   })
 
+  it('keeps every bubble the same element while the conversation streams, and patches one that changes', async () => {
+    let reply = 'Looking'
+    const conversation = (call: AppCall) => call.path === '/api/sessions/s1'
+      ? { summary: { id: 's1', title: 'Chat', phase: 'running', state: 'working', provider: 'claude', model: 'opus' }, pending: [], queued: [], canAttachImages: true, items: [
+          { id: 'i0', sequence: 0, timestamp: '2026-10-22T10:00:00.000Z', data: { type: 'text', role: 'user', text: 'Ship it' } },
+          { id: 'i1', sequence: 1, timestamp: '2026-10-22T10:00:01.000Z', sender: { kind: 'agent', label: 'Worker', agentSessionId: 'w1' }, data: { type: 'text', role: 'user', text: 'REPORT from worker' } },
+          { id: 'i2', sequence: 2, timestamp: '2026-10-22T10:00:02.000Z', data: { type: 'text', role: 'assistant', text: reply } }
+        ] }
+      : respond(call)
+    const page = bootApp('#/session/s1', conversation, { phoneState })
+    await settleAll()
+    const bubbles = () => page.app.querySelectorAll('bubble')
+    const before = bubbles()
+    expect(before.map(node => node.textContent)).toEqual([expect.stringContaining('Ship it'), expect.stringContaining('REPORT from worker'), expect.stringContaining('Looking')])
+    await streamTicks(page, 3)
+    expect(bubbles()).toEqual(before)
+    expect(bubbles().every((node, index) => node === before[index])).toBe(true)
+    // A reply that grows keeps its element too; only its content is redrawn.
+    reply = 'Looking at the phone list now'
+    await streamTicks(page, 2)
+    expect(bubbles()[2]).toBe(before[2])
+  })
+
   it('holds a redraw of a screen that rebuilds its fields until the field lets go', async () => {
     const page = bootApp('#/phone', respond, { phoneState })
     await settleAll()

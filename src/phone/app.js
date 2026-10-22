@@ -2208,7 +2208,7 @@
       const before = tickers.length
       let node = build()
       const ticks = tickers.slice(before)
-      if (old && patch && old.node.tagName === node.tagName) {
+      if (old && patch && old.node && node && old.node.tagName === node.tagName) {
         old.node.className = node.className
         while (old.node.firstChild) old.node.removeChild(old.node.firstChild)
         while (node.firstChild) old.node.appendChild(node.firstChild)
@@ -3421,18 +3421,25 @@
       header.appendChild(line)
     }
 
+    /* Every stream event redraws the conversation (several a second while agents work). Items keep
+       their elements while what they show is unchanged (keyedNodes), so a bubble, link or tool row
+       the owner is reading or tapping is never swapped out under the finger. */
+    const timelineNodes = keyedNodes()
+    const optimisticSignature = row => JSON.stringify([row.text, row.status, row.mode, row.error || '', Boolean(row.ambiguous), row.images.map(image => image.name || '')])
     const drawTimeline = () => {
       stopWorking()
       const stick = firstPaint || atBottom()
       const top = scroll.scrollTop
       beginTicks()
-      clear(scroll)
+      const children = []
       const conversation = state.conversation
       if (!conversation) {
-        scroll.appendChild(safeSkeleton(state.conversationError ? 'Could not read this conversation.' : 'Loading conversation…', state.conversationError || null))
+        const title = state.conversationError ? 'Could not read this conversation.' : 'Loading conversation…'
+        timelineNodes.sync(scroll, [timelineNodes.keep('skeleton', title + (state.conversationError || ''), () => safeSkeleton(title, state.conversationError || null))])
+        timelineNodes.done()
         return
       }
-      if (conversation.truncated) scroll.appendChild(el('p', 'timeline-note', 'Older messages stayed on the computer.'))
+      if (conversation.truncated) children.push(timelineNodes.keep('truncated', '', () => el('p', 'timeline-note', 'Older messages stayed on the computer.')))
       const pendingIds = {}
       for (const interaction of conversation.pending || []) pendingIds[interaction.id] = true
       const items = (conversation.items || []).slice().sort((left, right) => left.sequence - right.sequence)
@@ -3440,55 +3447,71 @@
       for (let index = 0; index < items.length; index++) {
         const item = items[index], next = items[index + 1]
         if (item.data.type === 'text' && item.data.role === 'status' && next && next.data.type === 'text' && next.data.role === 'status') continue
-        const node = renderTimelineItem(item, pendingIds)
-        if (!node) continue
         const optimistic = messageRows(id).find(row => row.itemId === item.id)
-        if (optimistic) node.appendChild(messageStatus(optimistic))
-        scroll.appendChild(node)
+        const interaction = item.data.type === 'interaction' ? item.data.interaction : null
+        const sender = item.data.type === 'text' && item.sender ? item.sender : null
+        const signature = JSON.stringify([item, interaction ? Boolean(pendingIds[interaction.id]) : false, optimistic ? optimistic.status : null, sender && sender.agentSessionId ? reachableSession(sender.agentSessionId) : false, Boolean(state.expanded[item.id])])
+        const node = timelineNodes.keep('item:' + item.id, signature, () => {
+          const built = renderTimelineItem(item, pendingIds)
+          if (built && optimistic) built.appendChild(messageStatus(optimistic))
+          return built
+        }, true)
+        if (!node) continue
+        children.push(node)
         drawn += 1
       }
       for (const row of messageRows(id)) {
         if (row.itemId || row.resumeOnly) continue
-        const node = el('div', 'bubble user optimistic-message')
-        const body = el('div', 'bubble-body')
-        appendRichText(body, row.text, true)
-        node.appendChild(body)
-        if (row.images.length) {
-          const chips = el('div', 'attachments')
-          for (const image of row.images) chips.appendChild(el('span', 'attachment', image.name || 'Image'))
-          node.appendChild(chips)
-        }
-        node.appendChild(messageStatus(row))
-        if (row.error) node.appendChild(el('p', 'card-note', row.error))
-        if (row.ambiguous) node.appendChild(button('ghost', 'Check status', () => void checkMessageStatus()))
-        else if (row.status === 'failed') node.appendChild(button('ghost', 'Edit and retry', () => {
-          input.value = row.text
-          state.drafts[id] = row.text
-          for (const image of row.images) if (!chatImages.includes(image)) chatImages.push(image)
-          chatTray.paint()
-          grow()
-          paintComposer()
-          input.focus()
-        }))
-        scroll.appendChild(node)
+        children.push(timelineNodes.keep('optimistic:' + row.id, optimisticSignature(row), () => optimisticBubble(row), true))
         drawn += 1
       }
       const working = ['running', 'starting'].includes(conversation.summary.phase)
       if (!working) workingStartedAt = null
-      if (!drawn && !working) scroll.appendChild(emptyNote('Nothing said yet.', 'Send the first message below.'))
+      if (!drawn && !working) children.push(timelineNodes.keep('empty', '', () => emptyNote('Nothing said yet.', 'Send the first message below.')))
       if (working) {
         if (workingStartedAt === null) workingStartedAt = Date.now()
         const word = () => workingWords[Math.floor((Date.now() - workingStartedAt) / 7000) % workingWords.length]
-        const line = el('p', 'timeline-working', word())
-        line.setAttribute('role', 'status')
-        scroll.appendChild(line)
+        const line = timelineNodes.keep('working', '', () => {
+          const built = el('p', 'timeline-working', word())
+          built.setAttribute('role', 'status')
+          return built
+        })
+        line.textContent = word()
+        children.push(line)
         workingTimer = setInterval(() => {
           line.textContent = word()
         }, 7000)
       }
+      timelineNodes.sync(scroll, children)
+      timelineNodes.done()
       if (stick) toBottom()
       else scroll.scrollTop = top
       firstPaint = false
+    }
+
+    const optimisticBubble = row => {
+      const node = el('div', 'bubble user optimistic-message')
+      const body = el('div', 'bubble-body')
+      appendRichText(body, row.text, true)
+      node.appendChild(body)
+      if (row.images.length) {
+        const chips = el('div', 'attachments')
+        for (const image of row.images) chips.appendChild(el('span', 'attachment', image.name || 'Image'))
+        node.appendChild(chips)
+      }
+      node.appendChild(messageStatus(row))
+      if (row.error) node.appendChild(el('p', 'card-note', row.error))
+      if (row.ambiguous) node.appendChild(button('ghost', 'Check status', () => void checkMessageStatus()))
+      else if (row.status === 'failed') node.appendChild(button('ghost', 'Edit and retry', () => {
+        input.value = row.text
+        state.drafts[id] = row.text
+        for (const image of row.images) if (!chatImages.includes(image)) chatImages.push(image)
+        chatTray.paint()
+        grow()
+        paintComposer()
+        input.focus()
+      }))
+      return node
     }
 
     let pendingKey = null
