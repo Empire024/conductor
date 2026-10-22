@@ -153,7 +153,32 @@ joined, each project keeps the machine it lives on, and work opened in it runs o
   app, as a read-only copy fetched through the grant into `userData/remote-open` (kept 7 days, at
   most 500 MB). Text files open in the editor against MAIN's copy, as before.
 - Renaming a shared project on MAIN keeps it shared: the grant follows the folder, and a rename made
-  before this existed is healed when MAIN starts, provided the old folder is gone.
+  before this existed is healed when MAIN starts (and on every probe), unless the old folder still
+  holds the same working copy (a copy, not a move). A new project that took the old folder name
+  ("Untitled project 8") does not block the heal.
+
+### Mirror everything (the laptop as a full mirror of MAIN)
+
+Each paired machine on MAIN has a **Mirror everything** switch (Settings → Remote control, under the
+machine). It is on unless the owner turns it off (`RemotePeerRecord.mirror`):
+
+- MAIN shares every registered project with that machine, including projects made later by any
+  route; a project stopped one by one with **Stop sharing** stays withheld (`withheldProjects`).
+  Grants for projects that no longer exist on MAIN are dropped. `RemotePeers.syncMirror` does this
+  at start and before every `projects.list` answer, so the laptop's regular probe keeps it current.
+- The laptop asks `mirror.state` after each probe. While MAIN mirrors, `src/main/remote-full-mirror.ts`
+  gives each MAIN workspace (with conversations) a workspace here named like MAIN's, and each
+  conversation MAIN runs a tab in it, labelled **MAIN**, without anyone pressing Open. They are
+  attached mirrors with the same authority as Open (MAIN reauthorises every call under the grant).
+  A conversation that ends on MAIN closes here; one the owner closes here stays closed here until it
+  is opened again from the launcher's list; a mirrored workspace the owner closes is not recreated.
+  Until its tab is opened, an auto mirror resyncs at the slow 30 s cadence (push notices still bring
+  changes at once).
+- The laptop's own projects and tabs run beside them, unlabelled.
+- With the switch off, the remote project's launcher says so in one line and names the click. A MAIN
+  too old to answer `mirror.state` is reported as needing an update.
+- On MAIN, `machines.list` puts its GitHub login on the local row and lists the machines that control
+  it under `controlledBy`. They are never placement targets.
 
 To see whether a session is Direct or Relayed, open that machine's diagnostics: the value comes
 straight from `tailscale status --json` on this machine (`TailscalePeer.path` in

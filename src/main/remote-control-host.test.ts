@@ -657,3 +657,27 @@ describe('the task list and rename a paired machine forwards here', () => {
     expect(Object.keys(listed)).toEqual(expect.arrayContaining(['tasks.edit', 'tasks.changes', 'tasks.sourceControl', 'projects.rename']))
   })
 })
+
+describe('mirroring everything to the asking machine', () => {
+  it('brings the grants up to date before listing projects, and says whether it mirrors', async () => {
+    const local = fixture()
+    const peers = local.host['deps'].peers as unknown as Record<string, unknown>
+    const syncMirror = vi.fn(() => true)
+    peers.syncMirror = syncMirror
+    peers.listPeers = () => [peer]
+    peers.mirrorsEverything = vi.fn(() => true)
+    await local.call('projects.list', {})
+    expect(syncMirror).toHaveBeenCalledTimes(1)
+    await expect(local.call('mirror.state', {})).resolves.toEqual({ mirror: true, peerName: peer.machineName, hostName: 'Render Desktop' })
+    peers.mirrorsEverything = vi.fn(() => false)
+    await expect(local.call('mirror.state', {})).resolves.toMatchObject({ mirror: false })
+  })
+
+  it('still answers projects.list when the grants cannot be brought up to date', async () => {
+    const local = fixture()
+    const peers = local.host['deps'].peers as unknown as Record<string, unknown>
+    peers.syncMirror = () => { throw new Error('disk') }
+    const listed = await local.call('projects.list', {}) as Array<{ id: string }>
+    expect(listed.map(project => project.id)).toContain('shared-project')
+  })
+})

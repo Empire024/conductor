@@ -72,6 +72,7 @@ const strictUtf8 = (bytes: Buffer): string => {
 export const remoteToolSignatures = {
   'machine.describe': '() — this machine, the projects it shares with you and the tabs it is running',
   'projects.list': '() — only the projects this machine shared with you',
+  'mirror.state': '() — whether this machine mirrors every project and conversation to you ({mirror, peerName, hostName})',
   'projects.create': '({name}) — creates a project folder on this machine, in its own projects folder, and shares it with you',
   'projects.rename': '({projectId,name}) — renames a shared project folder on this machine, as its owner renaming it here would',
   'workspaces.list': '({projectId})',
@@ -366,6 +367,20 @@ export class RemoteControlHost {
     return `${method}${path}${title}`
   }
 
+  /**
+   * Brings every grant up to date (RemotePeers.syncMirror) and returns the peer as it stands after,
+   * so a project made here since the last probe is in the answer that probe gets.
+   */
+  private mirrored(peer: RemotePeerRecord): RemotePeerRecord {
+    try {
+      this.deps.peers.syncMirror()
+      return this.deps.peers.listPeers().find(entry => entry.id === peer.id && !entry.revokedAt) ?? peer
+    } catch (error) {
+      console.warn('Mirrored project grants could not be brought up to date', error)
+      return peer
+    }
+  }
+
   private async dispatch(peer: RemotePeerRecord, method: string, args: Args): Promise<unknown> {
     const { database, backlogs, sessions } = this.deps
     if (method === 'tools.list') return remoteToolSignatures
@@ -376,11 +391,12 @@ export class RemoteControlHost {
         observedAt: new Date().toISOString(),
         // Each project is advertised with the identity of the working copy behind it, so the
         // controlling machine can tell that it is still the project its owner confirmed.
-        projects: this.deps.peers.sharedProjects(peer),
+        projects: this.deps.peers.sharedProjects(this.mirrored(peer)),
         providers: this.deps.providers().filter(provider => provider.available).map(provider => ({ id: provider.id, models: provider.models.map(model => model.id) }))
       }
     }
-    if (method === 'projects.list') return this.deps.peers.sharedProjects(peer)
+    if (method === 'projects.list') return this.deps.peers.sharedProjects(this.mirrored(peer))
+    if (method === 'mirror.state') return { mirror: this.deps.peers.mirrorsEverything(peer), peerName: peer.machineName, hostName: this.deps.machineName() }
     /*
      * A project the owner asked for from their other machine. It is the one write outside a
      * granted project that exists, and it is bounded on purpose: a folder named from the request

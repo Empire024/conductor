@@ -1,8 +1,9 @@
 import { ipcMain } from 'electron'
 import { hostname } from 'node:os'
+import { randomUUID } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
 import type { AgentControlUiRequest, AgentFileChange } from '../shared/agent-control'
-import type { AgentProviderInfo, AgentSpec } from '../shared/models'
+import type { AgentProviderInfo, AgentSpec, PaneTab } from '../shared/models'
 import { makeId } from '../shared/models'
 import { CONDUCTOR_GITHUB_OAUTH_CLIENT_ID } from '../shared/github-oauth'
 import type {
@@ -10,6 +11,7 @@ import type {
   MachineDescriptor,
   RemoteControlSettings,
   RemoteControlState,
+  RemoteHostMirror,
   RemoteAttachedTab,
   RemoteAttachTabRequest,
   RemotePairingTicket,
@@ -24,7 +26,7 @@ import { adoptRemoteProject, adoptRemoteProjects, type RemoteProjectAdoptionDepe
 import type { ConductorDatabase } from './database'
 import { GitHubAuth, GITHUB_SCOPES } from './github-auth'
 import { MachineProbeSchedule, describeMachines, machineBriefing, tabMachineId } from './machines'
-import { projectSummary } from './project-identity'
+import { peekProjectIdentity, projectSummary } from './project-identity'
 import { findProjectRecord, routeProject } from './project-scope'
 import { RemoteProjectActions, type RemoteProjectTarget } from './remote-project-actions'
 import type { SourceControlStatus } from '../shared/source-control'
@@ -45,6 +47,7 @@ import { RELAY_BACKGROUND_CALL_TIMEOUT_MS } from '../shared/remote-relay'
 import { generateSealKey, type RelaySealKeyPair } from './relay-crypto'
 import { RemoteAccessError, RemotePeers } from './remote-peers'
 import { RemoteSessionMirror } from './remote-session-mirror'
+import { RemoteFullMirror } from './remote-full-mirror'
 import { StoredSecretVault, type SecretCipher } from './secret-store'
 import type { StructuredSessions } from './structured-sessions'
 import { RemoteAttachment } from './remote-attachment'
@@ -254,6 +257,10 @@ export class RemoteControlService {
   readonly resources: RemoteFileResourceServer
   private readonly openCache: RemoteOpenCache | null
   readonly mirror: RemoteSessionMirror
+  /** Every conversation of a host that mirrors everything, shown here without being opened. */
+  readonly fullMirror: RemoteFullMirror
+  /** What each host said about mirroring (host method mirror.state); null for a host without it. */
+  private readonly hostMirrors = new Map<string, RemoteHostMirror | null>()
   readonly tailscale: TailscaleService
   /** The tailnet route: the push channel this machine serves and the ones it holds to its hosts. */
   readonly transport: RemoteTransport
@@ -307,6 +314,8 @@ export class RemoteControlService {
       accountLogin: () => this.auth.identity()?.login ?? null,
       accountKeys: force => this.auth.accountKeys(force),
       projects: () => deps.database.listProjects().map(projectSummary),
+      // Read-only: tells a copy of a renamed project from a folder reused for a new one.
+      identityAt: path => peekProjectIdentity(path),
       // Approving a machine adds someone who might arrive on either route, which is a reason to
       // weigh the routes again rather than only to redraw the panel.
       changed: () => { this.publishState(); this.relay?.reconsider() },
@@ -459,6 +468,31 @@ export class RemoteControlService {
       call: (machineId, method, args) => this.client.call(machineId, method, args),
       publish: deps.publish
     })
+    const ui = (scope: { projectId: string; sessionId: string }, action: AgentControlUiRequest['action'], params: Record<string, unknown>): Promise<unknown> =>
+      deps.ui({ ...scope, agentSessionId: '', id: randomUUID(), action, params })
+    this.fullMirror = new RemoteFullMirror({
+      database: store,
+      call: (machineId, method, args) => this.client.call(machineId, method, args, { background: true }),
+      hosts: () => this.client.list()
+        .filter(connection => connection.status === 'connected' && !connection.detached && this.hostMirrors.get(connection.machineId)?.mirror === true)
+        .map(connection => ({
+          machineId: connection.machineId,
+          machineName: connection.machineName,
+          projects: connection.projectGrants.map(grant => ({ localProjectId: grant.localProjectId, remoteProjectId: grant.remoteProjectId }))
+        })),
+      mirror: this.mirror,
+      cwdFor: async (machineId, remoteProjectId) => this.client.remoteProjects(machineId).find(project => project.id === remoteProjectId)?.identity?.path ?? null,
+      openTab: async (scope, tab) => { await ui(scope, 'tabs.open', { tab, focus: false }) },
+      closeTab: async (scope, localSessionId) => {
+        const tabs = await ui(scope, 'tabs.list', {}) as PaneTab[]
+        const tab = (Array.isArray(tabs) ? tabs : []).find(candidate => candidate.kind === 'agent' && candidate.resourceId === localSessionId)
+        if (tab) await ui(scope, 'tabs.close', { tabId: tab.id })
+      },
+      workspacesChanged: projectId => { try { deps.publish('remote:workspaces-changed', { projectId }) } catch { /* the window may be closing */ } },
+      subscriptionsChanged: machineId => { void this.refreshSubscriptions(machineId) },
+      makeId,
+      confirm: async machineId => { await this.readHostMirrorState(machineId); return this.hostMirrors.get(machineId)?.mirror === true }
+    })
     this.transport = new RemoteTransport({
       tailscale: this.tailscale, server: this.server, peers: this.peers,
       connections: () => this.client.list(),
@@ -591,6 +625,9 @@ export class RemoteControlService {
       const want = (projectId: string, sessionId: string): void => { if (projectId && sessionId) wanted.set(`${projectId} ${sessionId}`, { projectId, sessionId }) }
       for (const binding of this.mirror.list()) if (binding.machineId === machineId) want(binding.remoteProjectId, binding.remoteSessionId)
       for (const binding of this.terminalBindings.list()) if (binding.machineId === machineId) want(binding.remoteProjectId, binding.remoteSessionId)
+      // A host that mirrors everything is heard from in every workspace shown here, so a tab it
+      // opens in one with nothing mirrored yet still arrives without waiting for the next probe.
+      for (const entry of this.fullMirror.wanted(machineId)) want(entry.projectId, entry.sessionId)
       for (const grant of connection.projectGrants) {
         if ([...wanted.values()].some(entry => entry.projectId === grant.remoteProjectId)) continue
         try {
@@ -626,6 +663,7 @@ export class RemoteControlService {
       }
       case 'tabs.changed':
         this.deps.publish('remote:tabs-changed', { machineId, projectId: frame.projectId, sessionId: frame.sessionId })
+        if (this.hostMirrors.get(machineId)?.mirror) this.fullMirror.schedule(machineId)
         return
       case 'terminal.data':
       case 'terminal.gap':
@@ -973,7 +1011,10 @@ export class RemoteControlService {
   }
 
   machines(): MachineDescriptor[] {
-    return describeMachines(this.machineName(), this.client.list(), machineId => this.transport.connection(machineId))
+    return describeMachines(this.machineName(), this.client.list(), machineId => this.transport.connection(machineId), {
+      accountLogin: this.auth.identity()?.login ?? null,
+      controlledBy: this.peers.controllers()
+    })
   }
 
   /**
@@ -1078,7 +1119,33 @@ export class RemoteControlService {
   async refreshRemoteProjects(machineId: string, options: RemoteCallOptions = {}): Promise<RemoteProjectSummary[]> {
     const summaries = this.client.recordRemoteProjects(machineId, readRemoteProjectSummaries(await this.client.call(machineId, 'projects.list', {}, options)))
     this.adoptRemoteProjects(machineId, summaries)
+    void this.readHostMirror(machineId).catch(error => console.warn('Mirroring state could not be read', error))
     return summaries
+  }
+
+  /**
+   * Asks a host whether it mirrors everything to this machine and, when it does, brings this
+   * machine's workspaces and tabs in line with it. A host without the method is an older build:
+   * recorded as null, which the UI reads as "update that machine", never as an error.
+   */
+  private async readHostMirror(machineId: string): Promise<void> {
+    await this.readHostMirrorState(machineId)
+    if (this.hostMirrors.get(machineId)?.mirror) await this.fullMirror.sync(machineId, { confirmed: true })
+  }
+
+  /** Records what the host says about mirroring now; an unreachable host leaves the last answer. */
+  private async readHostMirrorState(machineId: string): Promise<void> {
+    let answer: RemoteHostMirror | null
+    try {
+      const raw = await this.client.call(machineId, 'mirror.state', {}, { background: true }) as Partial<RemoteHostMirror> | null
+      answer = { mirror: raw?.mirror === true, peerName: typeof raw?.peerName === 'string' ? raw.peerName.slice(0, 60) : '', hostName: typeof raw?.hostName === 'string' ? raw.hostName.slice(0, 60) : '' }
+    } catch (error) {
+      if (!/Unknown remote method/i.test(error instanceof Error ? error.message : String(error))) return
+      answer = null
+    }
+    const before = this.hostMirrors.get(machineId)
+    this.hostMirrors.set(machineId, answer)
+    if (JSON.stringify(before) !== JSON.stringify(answer)) this.publishState()
   }
 
   /**
@@ -1230,6 +1297,8 @@ export class RemoteControlService {
     const remoteSessionId = String(request?.remoteSessionId ?? '')
     const remoteAgentSessionId = String(request?.remoteAgentSessionId ?? '')
     if (!sessionId || !remoteSessionId || !remoteAgentSessionId) throw new RemoteAccessError('Name the workspace here and the conversation on the other machine.', 400)
+    // Opening it by hand outranks having closed it here before; mirroring may show it again.
+    this.fullMirror.undismiss(target.machineId, remoteAgentSessionId)
     const existing = this.mirror.list().find(binding => binding.machineId === target.machineId && binding.remoteAgentSessionId === remoteAgentSessionId)
     const agents = await this.client.call(target.machineId, 'agents.list', { projectId: target.remoteProjectId, sessionId: remoteSessionId }) as Array<Record<string, unknown>>
     const entry = (Array.isArray(agents) ? agents : []).find(agent => agent?.agentSessionId === remoteAgentSessionId)
@@ -1302,7 +1371,8 @@ export class RemoteControlService {
       peers: this.peers.listPeers(),
       pending: this.peers.listPending(),
       activity: this.peers.listActivity().slice(0, 50),
-      connections: this.client.list()
+      connections: this.client.list(),
+      hostMirrors: Object.fromEntries(this.hostMirrors)
     }
   }
 
@@ -1331,7 +1401,9 @@ export class RemoteControlService {
   async start(): Promise<void> {
     // Renames made here before grants followed them left those projects refused to every paired
     // machine; heal the ones whose old folder is gone before anyone calls.
-    try { this.peers.followProjectMoves({ reason: 'renamed on this machine earlier', requireOldPathGone: true }) }
+    // The same sweep drops grants for projects that no longer exist here and, for a machine that
+    // mirrors everything, shares every project it does not have yet.
+    try { this.peers.syncMirror() }
     catch (error) { console.warn('Moved project grants could not be checked', error) }
     await this.server.apply()
     // The relay this machine runs comes up before the client that uses it, so the first connection
@@ -1433,6 +1505,10 @@ export class RemoteControlService {
       this.peers.unshareProject(String(peerId), String(projectId))
       return this.state()
     })
+    handle<RemoteControlState>('remote:set-peer-mirror', (peerId: string, mirror: boolean) => {
+      this.peers.setMirror(String(peerId), mirror === true)
+      return this.state()
+    })
     handle<MachineDescriptor[]>('remote:machines', () => this.machines())
     handle<MachineDescriptor[]>('remote:refresh-machines', () => this.probeMachines())
     handle<{ localSessionId: string; machineId: string; machineName: string }>('remote:open-tab', (request: unknown) => {
@@ -1447,7 +1523,13 @@ export class RemoteControlService {
         ...(typeof args.title === 'string' ? { title: args.title } : {})
       })
     })
-    handle<{ closed: boolean; message?: string }>('remote:close-tab', (localSessionId: string) => this.mirror.closeRemote(String(localSessionId)))
+    handle<{ closed: boolean; message?: string }>('remote:close-tab', (localSessionId: string) => {
+      // The owner closing a conversation they watch from here keeps it closed here: mirroring
+      // everything must not reopen it on the next sync. The launcher's list opens it again.
+      const binding = this.mirror.get(String(localSessionId))
+      if (binding?.attached) this.fullMirror.dismiss(binding)
+      return this.mirror.closeRemote(String(localSessionId))
+    })
     handle<string>('remote:session-machine', (localSessionId: string) => this.mirror.machineId(String(localSessionId)))
     handle<{ machineId: string; cwd: string | null }>('remote:session-file-context', (localSessionId: string) => this.mirror.fileContext(String(localSessionId)))
     handle('remote:files-list', (request: RemoteFileIdentity) => this.files.list(request))
@@ -1524,7 +1606,7 @@ export class RemoteControlService {
     if (this.registered) {
       for (const channel of ['remote:github-state', 'remote:github-sign-in', 'remote:github-cancel', 'remote:github-sign-out',
         'remote:state', 'remote:set-settings', 'remote:set-relay-server', 'remote:set-relay-hosting', 'remote:ticket', 'remote:invite', 'remote:approve', 'remote:reshare-project', 'remote:deny', 'remote:revoke',
-        'remote:connect', 'remote:forget', 'remote:remote-projects', 'remote:create-remote-project', 'remote:unshare-project',
+        'remote:connect', 'remote:forget', 'remote:remote-projects', 'remote:create-remote-project', 'remote:unshare-project', 'remote:set-peer-mirror',
         'remote:machines', 'remote:refresh-machines', 'remote:open-tab', 'remote:close-tab', 'remote:session-machine', 'remote:session-file-context', 'remote:files-list', 'remote:files-stat', 'remote:files-read',
         'remote:files-write', 'remote:files-preview', 'remote:files-revoke-preview', 'remote:files-download', 'remote:files-open-local',
         'remote:workspace-tabs', 'remote:attach-tab',
@@ -1544,6 +1626,7 @@ export class RemoteControlService {
     // than left to expire - a forwarded port that nothing listens on is not something to leave open.
     await this.relayHost.stop()
     this.mirror.stop()
+    this.fullMirror.dispose()
     this.resources.close()
     await this.server.close()
   }

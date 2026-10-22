@@ -81,6 +81,15 @@ function ignoreIdentityFile(directory: string): void {
   }
 }
 
+/**
+ * What a folder's identity file says on disk right now, bypassing the session cache and creating
+ * nothing: null when the folder or file is missing or unreadable. For asking whether an old folder
+ * still holds a given working copy, never for a project's own identity.
+ */
+export function peekProjectIdentity(projectPath: string): StoredProjectIdentity | null {
+  try { return readIdentityFile(identityFile(projectPath)) } catch { return null }
+}
+
 /** Reads the project's identity, creating it the first time. An existing key is never replaced. */
 export function readProjectIdentity(projectPath: string): StoredProjectIdentity {
   const file = identityFile(projectPath)

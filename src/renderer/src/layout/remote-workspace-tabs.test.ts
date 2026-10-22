@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { createDefaultLayout, type PaneGroupNode } from '../../../shared/models'
 import type { RemoteAttachedTab, RemoteWorkspaceTab } from '../../../shared/remote-control'
-import { conversationsToOpen, placeAttachedTabs } from './remote-workspace-tabs'
+import { conversationsToOpen, mirrorOffLine, placeAttachedTabs, tabMachineLabel } from './remote-workspace-tabs'
 
 const tab = (id: string, localSessionId?: string): RemoteWorkspaceTab => ({
   tabId: 'tab-' + id, agentSessionId: id, title: 'Conversation ' + id, provider: 'claude', ...(localSessionId ? { localSessionId } : {})
@@ -41,5 +41,26 @@ describe('showing the host\'s conversations in a workspace here', () => {
     expect(tabs.map(entry => entry.resourceId)).toEqual(['one', 'two'])
     expect((again.layout.root as PaneGroupNode).activeTabId).toBe(tabs[0]!.id)
     expect(again.elsewhere).toEqual(['Title three'])
+  })
+})
+
+describe('which machine a tab says it runs on', () => {
+  const remoteProject = { remote: { machineId: 'main', machineName: 'MAIN', remoteProjectId: 'p' } } as unknown as Parameters<typeof tabMachineLabel>[1]
+  it('labels a mirrored tab with the name it carries, a host project tab with the host, and nothing for this computer', () => {
+    expect(tabMachineLabel({ title: 'Wizard', state: { machineId: 'main', machineName: 'MAIN' } }, null)).toBe('MAIN')
+    expect(tabMachineLabel({ title: 'Builder', state: { machineId: 'main' } }, remoteProject)).toBe('MAIN')
+    expect(tabMachineLabel({ title: 'Local', state: { provider: 'claude' } }, remoteProject)).toBeNull()
+    expect(tabMachineLabel({ title: 'Local', state: { machineId: 'local' } }, null)).toBeNull()
+    // A tab opened from the launcher's list already says it in its title.
+    expect(tabMachineLabel({ title: 'Wizard · MAIN', state: { machineId: 'main', machineName: 'MAIN' } }, null)).toBeNull()
+  })
+})
+
+describe('the one line shown when the host is not mirroring', () => {
+  it('says why and what to click, and nothing while mirroring or not yet known', () => {
+    expect(mirrorOffLine('MAIN', undefined)).toBeNull()
+    expect(mirrorOffLine('MAIN', { mirror: true, peerName: 'Lap', hostName: 'MAIN' })).toBeNull()
+    expect(mirrorOffLine('MAIN', { mirror: false, peerName: 'Lap', hostName: 'MAIN' })).toBe('MAIN is not mirroring everything to Lap. On MAIN, open Settings → Remote control and switch on “Mirror everything” for Lap.')
+    expect(mirrorOffLine('MAIN', null)).toMatch(/older Conductor.*Update Conductor on MAIN/)
   })
 })

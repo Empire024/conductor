@@ -686,3 +686,86 @@ describe('owner control', () => {
     expect((error as RemoteAccessError).status).toBe(401)
   })
 })
+
+describe('mirroring everything to a paired machine', () => {
+  const reopen = (fix: ReturnType<typeof fixture>, projects: RemoteProjectSummary[], identityAt?: (path: string) => { key: string; createdAt: string } | null) => new RemotePeers({
+    store: fix.store, accountId: () => 4242, accountLogin: () => 'Empire024',
+    accountKeys: async () => [fix.owner.publicKey], projects: () => projects, identityAt, pathExists: () => true
+  })
+  const grantIds = (peers: RemotePeers) => peers.listPeers()[0]!.grantedProjects.map(entry => entry.projectId).sort()
+
+  it('shares every registered project, including ones made later, unless the owner withheld it', async () => {
+    const fix = fixture()
+    const peer = await pairAndApprove(fix, fix.owner, ['project-a'])
+    expect(fix.peers.mirrorsEverything(peer)).toBe(true)
+    expect(fix.peers.syncMirror()).toBe(true)
+    expect(grantIds(fix.peers)).toEqual(['project-a', 'project-b'])
+    // Unsharing one while mirroring is remembered, so the next sync does not share it straight back.
+    fix.peers.unshareProject(peer.id, 'project-b')
+    expect(fix.peers.syncMirror()).toBe(false)
+    expect(grantIds(fix.peers)).toEqual(['project-a'])
+    // A project made later reaches it, and the withhold survives a restart.
+    const later = { id: 'project-c', name: 'Videos', path: '/tmp/c', identity: identityOf('c'.repeat(32), '/tmp/c', 'Videos'), identityError: null }
+    const restarted = reopen(fix, [...PROJECTS, later])
+    expect(restarted.syncMirror()).toBe(true)
+    expect(grantIds(restarted)).toEqual(['project-a', 'project-c'])
+    // Sharing it again by hand outranks the withhold.
+    restarted.shareProject(peer, 'project-b', 'owner shared it again')
+    expect(restarted.listPeers()[0]!.withheldProjects ?? []).toEqual([])
+  })
+
+  it('switched off, shares nothing new and keeps what was shared; back on, shares everything again', async () => {
+    const fix = fixture()
+    const peer = await pairAndApprove(fix, fix.owner, ['project-a'])
+    fix.peers.setMirror(peer.id, false)
+    expect(fix.peers.mirrorsEverything(peer)).toBe(false)
+    expect(fix.peers.syncMirror()).toBe(false)
+    expect(grantIds(fix.peers)).toEqual(['project-a'])
+    expect(reopen(fix, PROJECTS).listPeers()[0]!.mirror).toBe(false)
+    fix.peers.setMirror(peer.id, true)
+    expect(grantIds(fix.peers)).toEqual(['project-a', 'project-b'])
+    expect(fix.activity.mock.calls.map(call => call[0].method)).toContain('peer.mirror')
+  })
+
+  it('never mirrors a project whose identity cannot be read, or to a revoked machine', async () => {
+    const fix = fixture()
+    const peer = await pairAndApprove(fix, fix.owner, ['project-a'])
+    const unreadable = { id: 'project-x', name: 'Broken', path: '/tmp/x', identity: null, identityError: 'unreadable' }
+    const peers = reopen(fix, [...PROJECTS, unreadable])
+    peers.syncMirror()
+    expect(grantIds(peers)).toEqual(['project-a', 'project-b'])
+    peers.revoke(peer.id)
+    const after = reopen(fix, [...PROJECTS, { ...unreadable, id: 'project-y', identity: identityOf('d'.repeat(32), '/tmp/y', 'New') }])
+    expect(after.syncMirror()).toBe(false)
+  })
+
+  it('drops grants for projects that no longer exist here', async () => {
+    const fix = fixture()
+    await pairAndApprove(fix, fix.owner, ['project-a', 'project-b'])
+    const peers = reopen(fix, [PROJECTS[0]!])
+    expect(peers.syncMirror()).toBe(true)
+    expect(grantIds(peers)).toEqual(['project-a'])
+  })
+
+  it('follows a project renamed away from a folder that now holds a different project, but never onto a copy', async () => {
+    const fix = fixture()
+    await pairAndApprove(fix, fix.owner, ['project-a'])
+    // "Untitled project 8" was renamed to "videos"; the next new project took the old folder name.
+    const renamed = { ...PROJECTS[0]!, name: 'videos', path: '/tmp/videos', identity: identityOf('a'.repeat(32), '/tmp/videos', 'videos') }
+    const reused = reopen(fix, [renamed], path => path === '/tmp/a' ? { key: 'e'.repeat(32), createdAt: '2026-02-01T00:00:00.000Z' } : null)
+    reused.syncMirror()
+    expect(reused.requireProject(reused.listPeers()[0]!, 'project-a').path).toBe('/tmp/videos')
+    // A copy left in the old folder carries the same key and minted time: still refused.
+    const fix2 = fixture()
+    await pairAndApprove(fix2, fix2.owner, ['project-a'])
+    const copy = reopen(fix2, [renamed], path => path === '/tmp/a' ? { key: 'a'.repeat(32), createdAt: '2026-01-01T00:00:00.000Z' } : null)
+    copy.syncMirror()
+    expect(() => copy.requireProject(copy.listPeers()[0]!, 'project-a')).toThrow(/moved from/)
+  })
+
+  it('lists the machines that control this one for the local machine row', async () => {
+    const fix = fixture()
+    await pairAndApprove(fix, fix.owner, ['project-a'])
+    expect(fix.peers.controllers()).toEqual([expect.objectContaining({ machineName: 'Laptop', accountLogin: 'Empire024', mirror: true, sharedProjects: 1, connected: false })])
+  })
+})

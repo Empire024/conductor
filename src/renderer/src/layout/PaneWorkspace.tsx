@@ -95,7 +95,7 @@ import { SessionArchiveDormantPane } from '../components/SessionArchiveDormantPa
 import { debugLog } from '../debug-log'
 import { openWorkspaceFile } from '../components/workspace-files-state'
 import { fileMachineId, isRemoteFileMachine, statMachineFile } from '../remote-files'
-import { placeAttachedTabs, type RemoteConversationChoice } from './remote-workspace-tabs'
+import { placeAttachedTabs, tabMachineLabel, type RemoteConversationChoice } from './remote-workspace-tabs'
 import type { RemoteAttachedTab } from '../../../shared/remote-control'
 import { coworkerCloseTargets, coworkerTabGroups } from './coworker-tab-groups'
 import { ControlledByBadge } from '../components/ControlActivity'
@@ -845,6 +845,7 @@ function PaneGroup({
         onDragStart={(event) => beginDrag(event, tab, undefined, bulk && selection.ids.has(tab.id) ? selectedTabs : undefined)}
       >
         {tab.kind === 'agent' ? <ProviderIcon provider={String(tab.state?.provider ?? 'codex')} model={tab.state?.model as string | undefined} size={14} /> : <Icon size={13} strokeWidth={1.8} />}
+        {(() => { const machine = tabMachineLabel(tab, workspace.project); return machine ? <span className="pane-tab-machine" title={`Runs on ${machine}`}>{machine}</span> : null })()}
         <span className="pane-tab-title" title={tab.title}>{stripLabels.get(tab.id) ?? tab.title}</span>
         {tab.state?.anonymous === true && <span className="pane-tab-anonymous" title="Anonymous: kept only in memory. Closing this tab deletes the conversation for good; files it wrote stay." aria-label="anonymous"><EyeOff size={12} /></span>}
         {newTabs.has(tab.id) && tab.id !== activeTab.id && <span className="pane-tab-new-mark" title="Opened by an agent; not viewed yet" aria-label="new" />}

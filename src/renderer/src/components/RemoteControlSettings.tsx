@@ -539,6 +539,20 @@ export function RemoteControlSettings(): React.JSX.Element {
                   </div>
                   {!peer.revokedAt && <button title="Revoke access immediately" onClick={() => void run('revoke', () => window.conductor.remote.revoke(peer.id))}><X size={13} /> Revoke</button>}
                 </div>
+                {!peer.revokedAt && (
+                  <div className="remote-mirror-line">
+                    <label>
+                      <input type="checkbox" checked={peer.mirror !== false} disabled={busy === 'mirror'}
+                        onChange={event => { const on = event.currentTarget.checked; void run('mirror', () => window.conductor.remote.setPeerMirror(peer.id, on)) }} />
+                      Mirror everything
+                    </label>
+                    <small className={peer.mirror === false ? 'remote-project-problem' : undefined}>
+                      {peer.mirror !== false
+                        ? `${peer.machineName} shows every project and conversation on this computer, live, next to its own.`
+                        : `Off: ${peer.machineName} sees only the projects below and opens chats one by one. Tick “Mirror everything” to show everything there.`}
+                    </small>
+                  </div>
+                )}
                 {!peer.revokedAt && peer.grantedProjects.map(granted => {
                   const shared = sharedProjectState(peer, state, granted.projectId)
                   const project = state.projects.find(entry => entry.id === granted.projectId)

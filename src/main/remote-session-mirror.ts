@@ -44,6 +44,12 @@ export interface RemoteSessionBinding {
    * watching it and never closes it there; a placed tab (absent) is closed where it runs.
    */
   attached?: boolean
+  /**
+   * Shown here by mirroring everything (remote-full-mirror.ts), not opened by the owner: it closes
+   * here when the conversation ends on the host, and until its tab is opened here it is only
+   * resynced at the slow cadence - a host with fifty tabs must not cost fifty calls a second.
+   */
+  auto?: boolean
 }
 
 const BINDINGS_SETTING = 'remote-control.sessionMirrors'
@@ -73,6 +79,7 @@ export function readBindings(raw: string | undefined): RemoteSessionBinding[] {
     if (typeof value.provider !== 'string') return []
     if (value.remoteTabId !== undefined && (typeof value.remoteTabId !== 'string' || !value.remoteTabId)) return []
     if (value.attached !== undefined && value.attached !== true) return []
+    if (value.auto !== undefined && value.auto !== true) return []
     return [{
       ...(value as RemoteSessionBinding),
       remoteSequence: Number.isSafeInteger(value.remoteSequence) && value.remoteSequence! >= 0 ? value.remoteSequence! : 0
@@ -169,6 +176,8 @@ export class RemoteSessionMirror {
   private readonly streaming = new Set<string>()
   /** When each mirrored tab was last fetched, which is what the slowed cadence measures against. */
   private readonly pulledAt = new Map<string, number>()
+  /** Auto mirrors whose tab has been opened (connect) since this launch; only these poll every second. */
+  private readonly viewed = new Set<string>()
 
   constructor(private readonly deps: RemoteSessionMirrorDependencies) {
     this.owners = readOwners(this.deps.database.getSetting(OWNERS_SETTING) || undefined)
@@ -393,6 +402,7 @@ export class RemoteSessionMirror {
 
   release(localSessionId: string): void {
     this.pulledAt.delete(localSessionId)
+    this.viewed.delete(localSessionId)
     if (this.bindings.delete(localSessionId)) { this.invalidate(localSessionId); this.save() }
   }
 
@@ -489,6 +499,7 @@ export class RemoteSessionMirror {
    */
   async connect(localSessionId: string): Promise<void> {
     const route = this.capture(localSessionId)
+    this.viewed.add(localSessionId)
     await this.pull(localSessionId)
     this.assertRouteCurrent(route)
     const captured = this.capture(localSessionId)
@@ -551,7 +562,8 @@ export class RemoteSessionMirror {
       for (const id of [...this.bindings.keys()]) {
         const binding = this.bindings.get(id)
         if (!binding) continue
-        if (this.streaming.has(binding.machineId) && now - (this.pulledAt.get(id) ?? 0) < STREAM_RESYNC_POLL_MS) continue
+        const slow = this.streaming.has(binding.machineId) || (binding.auto === true && !this.viewed.has(id))
+        if (slow && now - (this.pulledAt.get(id) ?? 0) < STREAM_RESYNC_POLL_MS) continue
         try { await this.pull(id) }
         catch (error) { console.warn('Remote session poll failed', error) }
       }

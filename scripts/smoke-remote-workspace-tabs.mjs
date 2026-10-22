@@ -107,6 +107,10 @@ try {
   const pending = await host.page.evaluate(() => window.conductor.remote.state().then(state => state.pending[0]))
   await host.page.evaluate(({ id, projectId }) => window.conductor.remote.approve(id, [projectId]), { id: pending.id, projectId: hostProject.id })
   await connecting
+  // This smoke covers opening MAIN's tabs by hand, so MAIN's "Mirror everything" is switched off
+  // (smoke-laptop-full-mirror covers it on).
+  const pairedPeer = (await host.page.evaluate(() => window.conductor.remote.state())).peers.find(entry => !entry.revokedAt)
+  await host.page.evaluate(id => window.conductor.remote.setPeerMirror(id, false), pairedPeer.id)
   const machineId = (await controller.page.evaluate(() => window.conductor.remote.state())).connections[0].machineId
   check('MAIN and the laptop are paired over loopback with one shared project')
 

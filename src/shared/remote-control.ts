@@ -194,6 +194,38 @@ export interface RemotePeerRecord {
   approvedAt: string
   lastSeenAt: string | null
   revokedAt: string | null
+  /**
+   * Mirror everything: every project registered on this machine is shared with the peer, including
+   * ones made later, and the peer shows every conversation running here without being asked. Absent
+   * means on (the owner's machines on one account are one desk); false is the owner's switch off,
+   * after which only the projects in grantedProjects are shared, exactly as before.
+   */
+  mirror?: boolean
+  /** Projects the owner stopped sharing one by one while mirroring; mirroring never shares them again. */
+  withheldProjects?: string[]
+}
+
+/**
+ * What a host says about mirroring to the machine asking (host method `mirror.state`). A host
+ * without the method is an older build: it mirrors nothing by itself.
+ */
+export interface RemoteHostMirror {
+  mirror: boolean
+  /** This machine's name for the asking machine, so the line telling the owner what to click names it. */
+  peerName: string
+  hostName: string
+}
+
+/** A machine that controls this one (a peer record here), as machines.list shows it on the local row. */
+export interface MachineController {
+  peerId: string
+  machineName: string
+  accountLogin: string
+  /** Seen within the last few minutes: its calls or its stream are reaching this machine. */
+  connected: boolean
+  lastSeenAt: string | null
+  mirror: boolean
+  sharedProjects: number
 }
 
 export interface PendingPairingRequest {
@@ -344,6 +376,8 @@ export interface RemoteControlState {
   pending: PendingPairingRequest[]
   activity: RemoteActivityEntry[]
   connections: RemoteConnection[]
+  /** What each host this machine connects to said about mirroring, by machine id; null = not known yet or an older host. */
+  hostMirrors?: Record<string, RemoteHostMirror | null>
 }
 
 export const LOCAL_MACHINE_ID = 'local'
@@ -362,7 +396,14 @@ export interface MachineDescriptor {
   name: string
   kind: 'local' | 'peer'
   status: MachineStatus
+  /** The GitHub account the machine is signed in as. The local row carries this machine's own (null = signed out here). */
   accountLogin: string | null
+  /**
+   * Local row only: the paired machines that control this one. They are not placement targets (a
+   * tab is never opened on a machine that controls this one), which is why they are listed here
+   * rather than as peers.
+   */
+  controlledBy?: MachineController[]
   /** Confirmed project pairs; empty for the local machine, which runs all of its own projects. */
   projects: MachineProjectLink[]
   /** How this machine is reached right now. The local machine is always 'connected' and 'direct'. */
@@ -426,6 +467,8 @@ export interface RemoteControlBridge {
   createRemoteProject(machineId: string, name: string): Promise<import('./models').ProjectRecord>
   /** Stops sharing one of this machine's projects with a paired machine, without revoking it. */
   unshareProject(peerId: string, projectId: string): Promise<RemoteControlState>
+  /** The owner's per-machine switch: mirror every project and conversation here to that machine, or only the shared projects. */
+  setPeerMirror(peerId: string, mirror: boolean): Promise<RemoteControlState>
   /**
    * Puts a project of that machine's back in this computer's list after the owner removed it.
    * Everything it shares is listed automatically; this is the way back for the one that was hidden.
@@ -472,6 +515,8 @@ export interface RemoteControlBridge {
   attachTab(request: RemoteAttachTabRequest): Promise<RemoteAttachedTab>
   /** A host's tab list changed; names the host's own project and workspace ids. */
   onTabsChanged(callback: (event: { machineId: string; projectId: string; sessionId: string }) => void): () => void
+  /** Mirroring a host made or renamed workspaces of a project here (this computer's project id). */
+  onWorkspacesChanged(callback: (event: { projectId: string }) => void): () => void
   /** Durable execution owner for a mirrored session, including released/offline tombstones. */
   sessionMachine(localSessionId: string): Promise<string>
   /** Machine and workspace root used to resolve file links for this conversation. */

@@ -1,7 +1,34 @@
-import type { WorkspaceLayout } from '../../../shared/models'
-import type { RemoteAttachedTab, RemoteWorkspaceTab } from '../../../shared/remote-control'
+import type { PaneTab, ProjectRecord, WorkspaceLayout } from '../../../shared/models'
+import type { RemoteAttachedTab, RemoteHostMirror, RemoteWorkspaceTab } from '../../../shared/remote-control'
+import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
 import { createPaneTab } from '../panes/pane-factory'
 import { activateTab, addTab, findGroup, listGroups, replaceTab } from './layout-operations'
+
+/**
+ * The machine a tab runs on, for the label on its tab: the name a mirrored tab carries, or the
+ * host's for a tab of a project that lives there. Null for a tab of this computer's, and when the
+ * title already ends with the name (a tab opened from the launcher's list is titled "… · MAIN").
+ */
+export function tabMachineLabel(tab: Pick<PaneTab, 'title' | 'state'>, project: Pick<ProjectRecord, 'remote'> | null | undefined): string | null {
+  const machineId = tab.state?.machineId
+  if (typeof machineId !== 'string' || !machineId || machineId === LOCAL_MACHINE_ID) return null
+  const named = typeof tab.state?.machineName === 'string' && tab.state.machineName ? tab.state.machineName
+    : project?.remote?.machineId === machineId && project.remote.machineName ? project.remote.machineName : null
+  if (!named || tab.title.endsWith(` · ${named}`)) return null
+  return named
+}
+
+/**
+ * The one line a project that lives on another machine shows when that machine is not mirroring
+ * everything here, saying why and what to click. Null when it is mirroring, or not known yet.
+ */
+export function mirrorOffLine(hostName: string, mirror: RemoteHostMirror | null | undefined): string | null {
+  if (mirror === undefined) return null
+  if (mirror === null) return `${hostName} runs an older Conductor that does not mirror its chats here. Update Conductor on ${hostName}; until then open them below.`
+  if (mirror.mirror) return null
+  const here = mirror.peerName || 'this computer'
+  return `${hostName} is not mirroring everything to ${here}. On ${hostName}, open Settings → Remote control and switch on “Mirror everything” for ${here}.`
+}
 
 /** A conversation on the host, named the way `remote.attachTab` needs it. */
 export interface RemoteConversationChoice {

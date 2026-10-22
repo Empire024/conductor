@@ -40,6 +40,12 @@ export interface RemotePeersDependencies {
   projects(): RemoteProjectSummary[]
   /** Whether a folder still exists; the startup heal of moved grants never follows onto a copy. */
   pathExists?(path: string): boolean
+  /**
+   * The project identity a folder holds on disk right now, read without creating one (null when it
+   * holds none or is gone). The startup heal uses it to tell a copy (same key still there) from a
+   * folder that has since been reused for a different project (a new project made under the old name).
+   */
+  identityAt?(path: string): { key: string; createdAt: string } | null
   now?(): number
   changed?(): void
   /** Remote work is surfaced in this machine's UI through here, like local agent activity. */
@@ -153,7 +159,9 @@ export class RemotePeers {
         grantedProjects: readGrantedProjects(entry),
         approvedAt: String(record.approvedAt ?? new Date(0).toISOString()),
         lastSeenAt: typeof record.lastSeenAt === 'string' ? record.lastSeenAt : null,
-        revokedAt: typeof record.revokedAt === 'string' ? record.revokedAt : null
+        revokedAt: typeof record.revokedAt === 'string' ? record.revokedAt : null,
+        ...(record.mirror === false ? { mirror: false } : {}),
+        ...(Array.isArray(record.withheldProjects) ? { withheldProjects: record.withheldProjects.filter((id): id is string => typeof id === 'string' && Boolean(id)).slice(0, 500) } : {})
       }]
     })
   }
@@ -596,6 +604,7 @@ export class RemotePeers {
     if (current.grantedProjects.some(entry => entry.projectId === projectId)) return project
     this.authorityRevision++
     current.grantedProjects = [...current.grantedProjects, { projectId, identity: project.identity }]
+    if (current.withheldProjects?.includes(projectId)) current.withheldProjects = current.withheldProjects.filter(id => id !== projectId)
     this.persist()
     this.record(current, 'peer.share', projectId, `Shared ${project.name} with ${current.machineName} — ${reason}`, 'allowed')
     this.deps.changed?.()
@@ -614,6 +623,8 @@ export class RemotePeers {
     const project = this.deps.projects().find(entry => entry.id === projectId)
     this.authorityRevision++
     peer.grantedProjects = peer.grantedProjects.filter(entry => entry.projectId !== projectId)
+    // While mirroring, the next sync would share it straight back; the owner's choice is kept.
+    if (peer.mirror !== false && !peer.withheldProjects?.includes(projectId)) peer.withheldProjects = [...(peer.withheldProjects ?? []), projectId]
     this.persist()
     this.record(peer, 'peer.unshare', projectId, `Stopped sharing ${project?.name ?? projectId} with ${peer.machineName}`, 'allowed')
     return { ...peer, grantedProjects: peer.grantedProjects.map(entry => ({ ...entry })) }
@@ -667,7 +678,7 @@ export class RemotePeers {
         if (!before) continue
         const project = projects.find(entry => entry.id === granted.projectId)
         if (!project?.identity || !sameWorkingCopy(project.identity, before) || samePath(project.identity.path, before.path)) continue
-        if (input.requireOldPathGone && exists(before.path)) continue
+        if (input.requireOldPathGone && this.oldPathStillHolds(before, exists)) continue
         granted.identity = project.identity
         healed++
         console.info(`Remote grant followed ${project.name} from ${before.path} to ${project.identity.path} for ${peer.machineName}`)
@@ -679,6 +690,91 @@ export class RemotePeers {
       this.persist()
     }
     return healed
+  }
+
+  /**
+   * Whether a grant's old folder still holds that same working copy, i.e. a copy rather than a move.
+   * A folder that now holds a different project (Conductor names each new project "Untitled project
+   * N" and the owner renames it, so the next new project reuses the old name) or none at all is not
+   * a copy, and the grant follows its project. Without identityAt only a folder that is gone counts.
+   */
+  private oldPathStillHolds(before: NonNullable<RemoteGrantedProject['identity']>, exists: (path: string) => boolean): boolean {
+    if (!this.deps.identityAt) return exists(before.path)
+    let held: { key: string; createdAt: string } | null
+    try { held = this.deps.identityAt(before.path) } catch { held = null }
+    return Boolean(held && held.key === before.key && Date.parse(held.createdAt) === Date.parse(before.keyCreatedAt))
+  }
+
+  /** Whether this peer mirrors everything; see RemotePeerRecord.mirror. */
+  mirrorsEverything(peer: Pick<RemotePeerRecord, 'id'>): boolean {
+    const current = this.peers.find(entry => entry.id === peer.id)
+    return Boolean(current && !current.revokedAt && current.mirror !== false)
+  }
+
+  /** The owner's switch for one paired machine. Turning it off keeps what is already shared. */
+  setMirror(peerId: string, mirror: boolean): RemotePeerRecord {
+    const peer = this.peers.find(entry => entry.id === peerId)
+    if (!peer) throw new RemoteAccessError('This machine does not know that peer.', 404)
+    if (peer.revokedAt) throw new RemoteAccessError('Access for this machine was revoked.', 403)
+    if (mirror) { delete peer.mirror; delete peer.withheldProjects }
+    else peer.mirror = false
+    this.authorityRevision++
+    this.persist()
+    this.record(peer, 'peer.mirror', null, mirror ? `Mirroring every project and conversation to ${peer.machineName}` : `Stopped mirroring everything to ${peer.machineName}; only the shared projects stay shared`, 'allowed')
+    if (mirror) this.syncMirror('mirroring switched on')
+    return { ...peer, grantedProjects: peer.grantedProjects.map(entry => ({ ...entry })) }
+  }
+
+  /**
+   * Brings every paired machine's grants up to date with this machine's project list:
+   *
+   * - a grant for a project no longer registered here is dropped (it could only ever answer 404);
+   * - a grant left on a renamed project's old folder follows it (followProjectMoves);
+   * - a mirroring peer is granted every registered project with a readable identity that the owner
+   *   has not withheld from it, so a project made or opened by any route reaches it.
+   *
+   * Idempotent and cheap; host `projects.list` runs it before answering, so a paired machine's
+   * regular probe is what keeps it current. Returns whether anything changed.
+   */
+  syncMirror(reason = 'mirroring everything'): boolean {
+    const registered = this.deps.projects()
+    const ids = new Set(registered.map(project => project.id))
+    let changed = false
+    for (const peer of this.peers) {
+      if (peer.revokedAt) continue
+      const kept = peer.grantedProjects.filter(entry => ids.has(entry.projectId))
+      if (kept.length === peer.grantedProjects.length) continue
+      for (const dropped of peer.grantedProjects.filter(entry => !ids.has(entry.projectId))) {
+        this.record(peer, 'peer.unshare', dropped.projectId, `Dropped ${dropped.identity?.name || dropped.projectId} from ${peer.machineName}: it is no longer a project on this machine`, 'allowed')
+      }
+      peer.grantedProjects = kept
+      changed = true
+    }
+    if (changed) { this.authorityRevision++; this.persist() }
+    if (this.followProjectMoves({ reason: 'renamed on this machine earlier', requireOldPathGone: true })) changed = true
+    for (const peer of this.peers) {
+      if (peer.revokedAt || peer.mirror === false) continue
+      for (const project of registered) {
+        if (!project.identity || peer.withheldProjects?.includes(project.id)) continue
+        if (peer.grantedProjects.some(entry => entry.projectId === project.id)) continue
+        if (this.shareProject(peer, project.id, reason)) changed = true
+      }
+    }
+    return changed
+  }
+
+  /** The machines that control this one, for the local row of machines.list. */
+  controllers(connectedWithinMs = 5 * 60000): Array<{ peerId: string; machineName: string; accountLogin: string; connected: boolean; lastSeenAt: string | null; mirror: boolean; sharedProjects: number }> {
+    const now = this.now()
+    return this.peers.filter(peer => !peer.revokedAt).map(peer => ({
+      peerId: peer.id,
+      machineName: peer.machineName,
+      accountLogin: peer.accountLogin,
+      connected: Boolean(peer.lastSeenAt && now - Date.parse(peer.lastSeenAt) < connectedWithinMs),
+      lastSeenAt: peer.lastSeenAt,
+      mirror: peer.mirror !== false,
+      sharedProjects: peer.grantedProjects.length
+    }))
   }
 
   record(peer: Pick<RemotePeerRecord, 'id' | 'machineName' | 'accountLogin'>, method: string, projectId: string | null, detail: string, outcome: 'allowed' | 'denied', message?: string): void {

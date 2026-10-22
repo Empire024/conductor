@@ -1014,6 +1014,17 @@ export function App(): React.JSX.Element {
   }, [showRestoredWorkspace])
 
   useEffect(() => window.conductor.sessions.onRestored(session => { void showRestoredWorkspace(session) }), [showRestoredWorkspace])
+  // Mirroring another machine made or renamed workspaces here: they join the list quietly, and the
+  // workspace the owner is in, and every layout already loaded, stay exactly as they are.
+  useEffect(() => window.conductor.remote.onWorkspacesChanged(({ projectId }) => {
+    if (activeProjectIdRef.current !== projectId) return
+    void window.conductor.sessions.list(projectId).then(listed => {
+      if (activeProjectIdRef.current !== projectId) return
+      const merged = listed.map(session => { const known = sessionsRef.current.find(existing => existing.id === session.id); return known ? { ...known, name: session.name } : session })
+      sessionsRef.current = merged
+      setSessions(merged)
+    }).catch(() => undefined)
+  }), [])
   useEffect(() => {
     const shortcut = (event: KeyboardEvent): void => {
       if (!(event.ctrlKey || event.metaKey) || !event.shiftKey || event.altKey || event.key.toLowerCase() !== 'z') return

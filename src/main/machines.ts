@@ -1,4 +1,4 @@
-import type { MachineConnection, MachineDescriptor, MachineProjectLink, RemoteConnection } from '../shared/remote-control'
+import type { MachineConnection, MachineController, MachineDescriptor, MachineProjectLink, RemoteConnection } from '../shared/remote-control'
 import { LOCAL_CONNECTION, LOCAL_MACHINE_ID } from '../shared/remote-control'
 import { checkRemoteProjectPlacement, type ProjectPlacement } from '../shared/project-identity'
 import type { PaneTab } from '../shared/models'
@@ -57,9 +57,16 @@ export function describeConnection(connection: RemoteConnection, live?: Partial<
   return { ...base, ...live }
 }
 
-export function describeMachines(localName: string, connections: RemoteConnection[], live?: (machineId: string) => Partial<MachineConnection> | undefined): MachineDescriptor[] {
+/**
+ * The local row says who this machine is signed in as and which paired machines control it, so a
+ * host (MAIN) is not read as "signed out, nothing paired" because the machines that drive it are
+ * not ones it drives. They are never peers here: nothing is placed on a machine that controls this one.
+ */
+export interface LocalMachineFacts { accountLogin?: string | null; controlledBy?: MachineController[] }
+
+export function describeMachines(localName: string, connections: RemoteConnection[], live?: (machineId: string) => Partial<MachineConnection> | undefined, local: LocalMachineFacts = {}): MachineDescriptor[] {
   return [
-    { id: LOCAL_MACHINE_ID, name: localName, kind: 'local', status: 'online', accountLogin: null, projects: [], connection: LOCAL_CONNECTION },
+    { id: LOCAL_MACHINE_ID, name: localName, kind: 'local', status: 'online', accountLogin: local.accountLogin ?? null, ...(local.controlledBy?.length ? { controlledBy: local.controlledBy } : {}), projects: [], connection: LOCAL_CONNECTION },
     ...connections.map((connection): MachineDescriptor => ({
       id: connection.machineId,
       name: connection.machineName,
