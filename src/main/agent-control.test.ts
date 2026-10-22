@@ -1996,6 +1996,25 @@ describe('the owner control credential', () => {
     await expect(f.control.call(owner, 'agents.handoff', { handoff: 'x' })).rejects.toThrow(/no conversation to hand off/)
   })
 
+  it('runs admin helper actions for the owner credential and a wizard tab only (docs/admin-helper.md)', async () => {
+    const f = fixture()
+    const run = vi.fn(async (request: { action: unknown; args?: unknown; by: string; waitMs?: number }) => ({ id: '20261022-abcdef123456', pending: false as const, result: { id: '20261022-abcdef123456', ok: true, action: String(request.action), exitCode: 0, output: 'Removed 20 rule(s).' } }))
+    const status = vi.fn(async () => ({ installed: true }))
+    const control = new AgentControl({ ...f.deps, adminHelper: { run, status, result: vi.fn(async () => null) } as never })
+    const owner = control.ownerScope({ projectId: f.project.id })
+    await expect(control.call(f.scope, 'admin.run', { action: 'firewall-candidate-cleanup' })).rejects.toThrow(/only the owner's own control credential .* or a wizard tab/)
+    expect(Object.keys(await control.call(f.scope, 'tools.list', {}) as object)).not.toContain('admin.run')
+    expect(Object.keys(await control.call(owner, 'tools.list', {}) as object)).toEqual(expect.arrayContaining(['admin.run', 'admin.status']))
+    expect(await control.call(owner, 'admin.run', { action: 'firewall-candidate-cleanup', args: { dryRun: true } })).toMatchObject({ pending: false, result: { ok: true } })
+    expect(run).toHaveBeenLastCalledWith({ action: 'firewall-candidate-cleanup', args: { dryRun: true }, by: 'owner', waitMs: undefined })
+    await control.call({ ...f.scope, wizard: true }, 'admin.run', { action: 'firewall-candidate-cleanup', waitSeconds: 5 })
+    expect(run).toHaveBeenLastCalledWith({ action: 'firewall-candidate-cleanup', args: undefined, by: `wizard ${f.scope.agentSessionId}`, waitMs: 5000 })
+    await expect(control.call(owner, 'admin.run', { action: 'firewall-candidate-cleanup', script: 'evil.ps1' })).rejects.toThrow(/script/)
+    await expect(control.call(owner, 'admin.run', { action: 'firewall-candidate-cleanup', waitSeconds: 600 })).rejects.toThrow(/waitSeconds must be 0-45/)
+    expect(await control.call(owner, 'admin.status', {})).toEqual({ installed: true })
+    expect(await control.call(owner, 'admin.status', { id: '20261022-abcdef123456' })).toEqual({ id: '20261022-abcdef123456', result: null })
+  })
+
   it('answers the meta-wizard its overview and alerts on the owner credential only (docs/meta-wizard.md)', async () => {
     const f = fixture()
     const worker: AgentSpec = { ...f.spec, id: 'worker', title: 'Worker' }

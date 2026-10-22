@@ -90,6 +90,7 @@ import { routeConstraints, routeUsage, type ModelIntelligence } from './model-in
 import { categorize } from './model-intelligence/categorize'
 import { EvaluationTurnError, evaluationTokens } from './model-intelligence/evaluation-ports'
 import type { ModelUpgradeService } from './model-upgrades/service'
+import { AdminRequestError, type AdminHelper } from './admin-helper'
 import { freshestCatalog } from './model-upgrades/better'
 
 type Args = Record<string, unknown>
@@ -378,6 +379,9 @@ const ownerSignatures: Record<string, string> = {
   'app.restart': '({force?}) — owner credential or wizard tab only: relaunch this Conductor (a downloaded update installs on the way out); force as above',
   'app.restart.request': '({reason}) — wizard tab only: ask the owner to restart when you cannot (or should not) restart yourself. The owner’s Restart to update control shows “Restart requested by <tab> — <reason>”, and the next launch, however the owner restarts, brings this tab back and tells it to continue, like a restart you started. Valid until the next launch or 24 h; a new request replaces the old one',
   'app.quit.confirm': '({stopWork}) — owner credential or wizard tab only: answer the open “Work is still running” quit/restart dialog (app.state pendingQuitConfirmation shows it): stopWork:true stops the work and goes ahead, false cancels the quit or restart',
+  // The elevated admin helper (docs/admin-helper.md, src/main/admin-helper.ts).
+  'admin.run': '({action,args?,waitSeconds?}) — owner credential or wizard tab only: run one allowlisted admin action through the elevated admin helper the owner installed with one UAC click (a scheduled task running only the scripts in C:\\ProgramData\\ConductorAdmin). Conductor itself never runs elevated. Actions: firewall-candidate-cleanup ({dryRun?}: remove the inbound firewall rules of candidate/smoke electron.exe copies). Waits up to waitSeconds (default 40, at most 45) and returns {id,pending:false,result:{ok,exitCode,output,log}}, or {id,pending:true} to follow with admin.status({id}). Not installed: the refusal gives the one install command',
+  'admin.status': '({id?}) — owner credential or wizard tab only: whether the admin helper is installed, its allowlisted actions with their args and its latest results; with id, that one request\'s result (null while it runs)',
   // The workspace archive's atomic close (src/main/tab-archive-eligibility.ts).
   'tabs.archive': '({tabIds,projectId?,workspaceId?}) — owner credential or wizard tab only: close these tabs into their workspace archive (history kept; reopened from the Archive or Ctrl+K). A tab that is busy (a running turn, an approval or question, a limit wait, queued or steered messages, background tasks, a git.ship it started) or protected (the live wizard, a controller with open coworkers, a remote tab) is refused and named with its reason; nothing can start in a tab between its check and its close. Returns {archived:[{tabId,title}], refused:[{tabId,title,reason,message}]}'
 }
@@ -442,6 +446,8 @@ const strings = (value: unknown, key: string, count: number, length: number): st
 
 export interface AgentControlDependencies {
   database: ConductorDatabase
+  /** admin.run / admin.status: the elevated admin helper's queue (src/main/admin-helper.ts). */
+  adminHelper?: Pick<AdminHelper, 'run' | 'status' | 'result'>
   /** tabs.archive: the workspace archive's atomic close (TabArchiver). */
   tabArchive?: { archive(projectId: string, sessionId: string, tabIds: string[]): Promise<ArchiveResult> }
   /** The app process itself, for the owner credential; absent outside the app. */
@@ -3090,8 +3096,24 @@ export class AgentControl {
   /** The owner-only methods: the app itself, not a conversation in it. Each answers at once;
    *  an install or restart is started after the reply has left, since the process it ends is
    *  the one sending the reply. */
+  private async adminCall(scope: AgentControlScope, method: string, args: Args): Promise<unknown> {
+    const helper = this.deps.adminHelper
+    if (!helper) throw new Error('The admin helper is unavailable in this Conductor')
+    if (method === 'admin.status') {
+      validateArgs(method, args, ['id'])
+      if (args.id === undefined) return helper.status()
+      if (typeof args.id !== 'string') throw new ArgumentError('id must be a request id returned by admin.run')
+      try { return { id: args.id, result: await helper.result(args.id) } } catch (error) { throw error instanceof AdminRequestError ? new ArgumentError(error.message) : error }
+    }
+    validateArgs(method, args, ['action', 'args', 'waitSeconds'])
+    if (args.waitSeconds !== undefined && (typeof args.waitSeconds !== 'number' || !Number.isFinite(args.waitSeconds) || args.waitSeconds < 0 || args.waitSeconds > 45)) throw new ArgumentError('waitSeconds must be 0-45')
+    const by = scope.owner ? 'owner' : `wizard ${scope.agentSessionId}`
+    try { return await helper.run({ action: args.action, args: args.args, by, waitMs: args.waitSeconds === undefined ? undefined : (args.waitSeconds as number) * 1000 }) } catch (error) { throw error instanceof AdminRequestError ? new ArgumentError(error.message) : error }
+  }
+
   private async ownerCall(scope: AgentControlScope, method: string, args: Args): Promise<unknown> {
     const host = this.deps.host
+    if (method === 'admin.run' || method === 'admin.status') return this.adminCall(scope, method, args)
     if (method === 'tabs.archive') {
       if (!this.deps.tabArchive) throw new Error('The tab archive is unavailable in this Conductor')
       validateArgs('tabs.archive', args, ['tabIds', 'projectId', 'workspaceId'])

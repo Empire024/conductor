@@ -1,5 +1,6 @@
 import { encodeRestartInitiator, encodeRestartRequest, launchRestartInitiator, parseRestartRequest, RESTART_INITIATOR_KEY, RESTART_REQUEST_KEY, type RestartInitiator, type RestartRequest } from './restart-initiator'
 import { APPROVAL_POLICY_SETTING, parseApprovalPolicySettings, policyAnswerLog, setApprovalPolicyProjects, setCurrentApprovalPolicy } from './approval-policy'
+import { AdminHelper } from './admin-helper'
 import { coworkerResumeMessage, encodeRestartIntent, mayInstallOnQuit, parseRestartIntent, RESTART_INTENT_KEY, restartLine, restartReason, resumeAction, resumePlan, watchChanged, wizardResumeMessage, workingSet, type RestartIntent, type ReattachBrief, type RestartKind, type ResumeAction, type ResumeCandidate, type ResumePlan } from './restart-resume'
 import { StopConfirmations, type StopDecision } from './stop-confirmation'
 import { connectRuntimeHost } from './runtime-host/launcher'
@@ -3010,7 +3011,7 @@ app.whenReady().then(async () => {
     broadcast: (channel, payload) => { for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send(channel, payload) },
     log: message => console.warn(message)
   })
-  const control: AgentControl = agentControlCore = new AgentControl({ database, sessions: agents.structured, modelUpgrades, usageWeeks,
+  const control: AgentControl = agentControlCore = new AgentControl({ database, sessions: agents.structured, modelUpgrades, usageWeeks, adminHelper: new AdminHelper(),
     // A test launch may lower the context bound at which a relay rolls to a fresh session.
     relayContextTokens: !app.isPackaged && process.env.CONDUCTOR_TEST_USER_DATA ? Number(process.env.CONDUCTOR_TEST_RELAY_CONTEXT_TOKENS) || undefined : undefined,
     orchestration, collaboration, backlogs: projectBacklogs,

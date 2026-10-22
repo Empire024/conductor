@@ -1,0 +1,12 @@
+{
+  "description": "The Conductor admin helper's allowlist (docs/admin-helper.md). The elevated runner runs only these actions, from scripts copied into C:\\ProgramData\\ConductorAdmin\\actions at install; src/main/admin-helper.ts must list the same actions (a test checks it).",
+  "actions": {
+    "firewall-candidate-cleanup": {
+      "script": "firewall-candidate-cleanup.ps1",
+      "summary": "Remove the inbound Windows Firewall rules Windows created for Conductor acceptance candidates and smoke worktrees (electron.exe under a conductor-candidates or .conductor-scratch folder). Never touches the installed Conductor.exe, the main checkout's electron.exe or any other program's rules.",
+      "args": {
+        "dryRun": { "type": "boolean", "switch": "DryRun", "summary": "list what would be removed without removing it" }
+      }
+    }
+  }
+}
