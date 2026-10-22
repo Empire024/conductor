@@ -1320,12 +1320,18 @@ describe('messages queued together are delivered together', () => {
     expect(userTexts(f).map(item => item.text)).toEqual(['Original', 'First\n\n\nSecond'])
   })
 
-  it('combines a controller steer and the owner message into one steer, labelling the controller part', async () => {
+  it('never fuses the owner message with a controller steer: each is delivered under its own sender', async () => {
     const f = fixture()
     await heldBehindRunningTurn(f, ['Owner note'], ['Controller note', controller])
-    expect(f.current.steers.map(steer => steer.text)).toEqual(['Owner note\n\n\n(Controller) Controller note'])
-    expect(userTexts(f).at(-1)).toMatchObject({ text: 'Owner note\n\n\n(Controller) Controller note' })
-    expect(userTexts(f).at(-1)?.origin).toBeUndefined()
+    await vi.waitFor(() => expect(f.current.steers.map(steer => steer.text)).toEqual(['Owner note', 'Controller note']))
+    await vi.waitFor(() => expect(userTexts(f).slice(-2).map(item => [item.text, item.origin])).toEqual([['Owner note', undefined], ['Controller note', controller]]))
+  })
+
+  it('still combines messages from one sender', async () => {
+    const f = fixture()
+    await heldBehindRunningTurn(f, ['One', controller], ['Two', controller])
+    expect(f.current.steers.map(steer => steer.text)).toEqual(['(Controller) One\n\n\n(Controller) Two'])
+    expect(userTexts(f).at(-1)?.origin).toEqual(controller)
   })
 
   it('leaves a single queued steer exactly as it was', async () => {
@@ -1335,7 +1341,7 @@ describe('messages queued together are delivered together', () => {
     expect(userTexts(f).at(-1)).toMatchObject({ text: 'Only message', origin: controller })
   })
 
-  it('starts one turn for queued messages from the owner and a controller once the turn settles', async () => {
+  it('starts the owner turn first and keeps a controller message queued under its own origin', async () => {
     const f = fixture()
     await f.manager.submit(f.spec.id, 'first', settings)
     await f.manager.queue(f.spec.id, 'owner followup', settings)
@@ -1343,8 +1349,9 @@ describe('messages queued together are delivered together', () => {
     f.current.finish()
     await vi.waitFor(() => expect(f.current.submissions).toHaveLength(2))
     await new Promise(resolve => setTimeout(resolve, 25))
-    expect(f.current.submissions.map(submission => submission.text)).toEqual(['first', 'owner followup\n\n\n(Controller) controller followup'])
-    expect(f.database.structured.snapshot(f.spec.id)?.queued).toBeNull()
+    // The owner's words go alone; the controller's wait for the next turn under its own origin.
+    expect(f.current.submissions.map(submission => submission.text)).toEqual(['first', 'owner followup'])
+    expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts?.map(prompt => [prompt.text, prompt.origin])).toEqual([['controller followup', controller]])
   })
 
   it('never folds a remote-peer message into a local batch', async () => {

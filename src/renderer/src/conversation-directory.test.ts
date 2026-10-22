@@ -156,9 +156,9 @@ describe('agent-to-agent message cards', () => {
   })
 
   it('names who sent a coordinated turn, Conductor for its own relays, and nobody for the owner', () => {
-    expect(receivedMessagePeer({ type: 'text', role: 'user', text: 'x', mode: 'snapshot', origin: { agentSessionId: 'agent_a', label: 'Fixer' } })).toEqual({ agentSessionId: 'agent_a', title: 'Fixer' })
-    expect(receivedMessagePeer({ type: 'text', role: 'user', text: 'x', mode: 'snapshot', origin: { agentSessionId: 'owner', label: 'Conductor' } })).toEqual({ title: 'Conductor' })
-    expect(receivedMessagePeer({ type: 'text', role: 'user', text: '[Conductor] approved: Bash(npm test); retry it now', mode: 'snapshot' })).toEqual({ title: 'Conductor' })
+    expect(receivedMessagePeer({ type: 'text', role: 'user', text: 'x', mode: 'snapshot', origin: { agentSessionId: 'agent_a', label: 'Fixer' } })).toEqual({ agentSessionId: 'agent_a', title: 'Fixer', kind: 'agent' })
+    expect(receivedMessagePeer({ type: 'text', role: 'user', text: 'x', mode: 'snapshot', origin: { agentSessionId: 'owner', label: 'Conductor' } })).toEqual({ title: 'Conductor', kind: 'conductor' })
+    expect(receivedMessagePeer({ type: 'text', role: 'user', text: '[Conductor] approved: Bash(npm test); retry it now', mode: 'snapshot' })).toEqual({ title: 'Conductor', kind: 'conductor' })
     expect(receivedMessagePeer({ type: 'text', role: 'user', text: 'my own words', mode: 'snapshot' })).toBeNull()
     expect(receivedMessagePeer({ type: 'text', role: 'assistant', text: '[Conductor] x', mode: 'snapshot' })).toBeNull()
   })

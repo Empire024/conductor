@@ -32,3 +32,36 @@
 .sa-conversation-link { border: 0; background: none; cursor: pointer; font: inherit; }
 .sa-conversation-ref { color: var(--accent-muted); text-decoration: underline dotted; text-underline-offset: 3px; cursor: pointer; }
 .sa-conversation-ref:hover { text-decoration-style: solid; }
+
+/* Messages that arrived from other conversations, Conductor or a paired machine: never drawn like
+   the owner's own messages (blue accent, "You", the queue). Each sender kind has its own hue, an
+   icon badge and a header naming the sender. */
+.sa-incoming-card, .sa-incoming-pending { --incoming: #f0a35e; }
+.sa-incoming-card-conductor { --incoming: #b48ef0; }
+.sa-incoming-card-machine { --incoming: #5ec4a8; }
+.sa-incoming-card-schedule { --incoming: #d98ac6; }
+.sa-incoming { margin: 6px 0 14px; }
+.sa-incoming .sa-marker { background: var(--incoming, #f0a35e); border-radius: 2px; }
+.sa-incoming-agent .sa-marker { --incoming: #f0a35e; }
+.sa-incoming-conductor .sa-marker { --incoming: #b48ef0; }
+.sa-incoming-machine .sa-marker { --incoming: #5ec4a8; }
+.sa-incoming-schedule .sa-marker { --incoming: #d98ac6; }
+.sa-agent-message.sa-incoming-card { max-width: min(92%, 860px); border: 1px dashed color-mix(in srgb, var(--incoming) 55%, transparent); border-left: 4px solid var(--incoming); border-radius: 4px 12px 12px 4px; background: color-mix(in srgb, var(--incoming) 9%, var(--surface-1)); }
+.sa-incoming-card > summary { font-size: 11.5px; }
+.sa-incoming-card .sa-agent-message-head { color: var(--text); font-weight: 600; }
+.sa-incoming-card .sa-conversation-link, .sa-incoming-pending .sa-conversation-link { color: var(--incoming) !important; }
+.sa-incoming-card .sa-agent-message-body { border-top-color: color-mix(in srgb, var(--incoming) 35%, transparent); font-size: 12.5px; }
+.sa-incoming-card .sa-agent-message-body > .sa-markdown { font-style: normal; }
+.sa-incoming-card[open] > summary .sa-agent-message-preview { display: none; }
+.sa-sender-badge { display: inline-flex; align-items: center; gap: 4px; padding: 1px 7px 1px 5px; border-radius: 999px; background: var(--incoming, #f0a35e); color: #1b1b1f; font-size: 10px; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase; white-space: nowrap; }
+.sa-incoming-from { color: var(--text-2); font-weight: 400; }
+
+/* The incoming list above the composer: its own block, never a numbered "Queued" row. */
+.sa-incoming-list { display: flex; flex-direction: column; gap: 4px; max-height: 130px; overflow-y: auto; margin: 0 0 6px; }
+.sa-incoming-pending { display: flex; flex-direction: column; gap: 2px; padding: 5px 8px; border: 1px dashed color-mix(in srgb, var(--incoming) 55%, transparent); border-left: 4px solid var(--incoming); border-radius: 4px 10px 10px 4px; background: color-mix(in srgb, var(--incoming) 9%, var(--surface-1)); font-size: 11px; }
+.sa-incoming-pending-head { display: flex; align-items: center; gap: 6px; min-width: 0; font-weight: 600; }
+.sa-incoming-pending-head small { margin-left: auto; color: var(--text-2); font-weight: 400; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sa-incoming-pending-head > button { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: var(--text-3); cursor: pointer; }
+.sa-incoming-pending-head > button:hover { background: var(--surface-3); color: var(--text); }
+.sa-incoming-pending-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
+.sa-incoming-from + .sa-conversation-link, .sa-incoming-from + .sa-conversation-name { margin-left: 4px; }

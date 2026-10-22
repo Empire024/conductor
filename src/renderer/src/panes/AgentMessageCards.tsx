@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react'
-import { ArrowLeft, ArrowRight, Link2 } from 'lucide-react'
+import { ArrowRight, Bot, CalendarClock, Link2, Monitor, Zap } from 'lucide-react'
 import type { AgentEventData, Json } from '../../../shared/structured-agent'
+import { messageSenderOf, type MessageSenderKind } from '../../../shared/message-sender'
 import { conversationLabel, findConversationRefs, focusDirectoryEntry, useConversationDirectory, type ConversationDirectory, type DirectoryEntry } from '../conversation-directory'
 
 /**
@@ -9,7 +10,7 @@ import { conversationLabel, findConversationRefs, focusDirectoryEntry, useConver
  * store — a user turn's `origin`, a Conductor MCP tool call, the sender notice control-activity.ts
  * writes — and none of it is sent to any model.
  */
-export interface MessagePeer { agentSessionId?: string; tabId?: string; title: string }
+export interface MessagePeer { agentSessionId?: string; tabId?: string; title: string; kind?: Exclude<MessageSenderKind, 'owner'> }
 type ToolData = Extract<AgentEventData, { type: 'tool' }>
 
 const record = (value: Json | undefined): Record<string, Json> => value && typeof value === 'object' && !Array.isArray(value) ? value : {}
@@ -39,12 +40,12 @@ export function mcpAgentMessageOf(tool: ToolData): { method: string; to: Message
   return { method: METHODS[kind]!, to: { ...(agentSessionId ? { agentSessionId } : {}), title: kind === 'report' ? 'the controller' : kind === 'handoff' ? str(input.title) ?? 'the successor tab' : 'another tab' }, text }
 }
 
-/** A user turn that another conversation, or Conductor itself, sent; null for the owner's own. */
+/** A user turn that another conversation, Conductor or a paired machine sent; null for the owner's own. */
 export function receivedMessagePeer(data: Extract<AgentEventData, { type: 'text' }>): MessagePeer | null {
   if (data.role !== 'user') return null
-  if (data.origin) return data.origin.agentSessionId === 'owner' ? { title: data.origin.label } : { agentSessionId: data.origin.agentSessionId, title: data.origin.label }
-  // Conductor's own relays (approvals, restarts) carry no origin, only this prefix.
-  return /^\[Conductor\]\s/.test(data.text) ? { title: 'Conductor' } : null
+  const sender = messageSenderOf(data)
+  if (sender.kind === 'owner') return null
+  return { ...(sender.agentSessionId ? { agentSessionId: sender.agentSessionId } : {}), title: sender.label, kind: sender.kind }
 }
 
 export function peerEntry(directory: ConversationDirectory, peer: MessagePeer): DirectoryEntry | null {
@@ -70,15 +71,35 @@ const firstLine = (text: string): string => {
   return line.length > 140 ? line.slice(0, 139) + '…' : line
 }
 
+const SENDER_ICONS = { agent: Bot, conductor: Zap, machine: Monitor, schedule: CalendarClock } as const
+const SENDER_WORDS = { agent: 'Agent message', conductor: 'Conductor message', machine: 'Paired machine', schedule: 'Scheduled task' } as const
+
+/** The badge an incoming message wears wherever it is drawn (timeline, queue, steering list). */
+export function SenderBadge({ kind }: { kind: NonNullable<MessagePeer['kind']> }): React.JSX.Element {
+  const Icon = SENDER_ICONS[kind]
+  return <span className={'sa-sender-badge sa-sender-' + kind}><Icon size={11} aria-hidden="true" />{SENDER_WORDS[kind]}</span>
+}
+
 export function AgentMessageCard({ direction, peer, text, method, characters, projectId, onFocusOrigin, children }: { direction: 'sent' | 'received'; peer: MessagePeer; text: string; method?: string; characters?: number; projectId?: string; onFocusOrigin?(origin: { agentSessionId: string; label: string }): void; children: ReactNode }): React.JSX.Element {
-  const Arrow = direction === 'sent' ? ArrowRight : ArrowLeft
   const truncated = characters !== undefined && characters > text.length
+  const body = <div className="sa-agent-message-body">{children}{truncated && <p className="sa-muted">First {text.length.toLocaleString()} of {characters!.toLocaleString()} characters; the receiving tab holds the whole message.</p>}</div>
+  if (direction === 'received') {
+    // Never the owner's bubble: its own colour, side, icon and a header naming the sender.
+    const kind = peer.kind ?? 'agent'
+    return <details className={'sa-agent-message sa-agent-message-received sa-incoming-card sa-incoming-card-' + kind} data-direction="received" data-sender-kind={kind} data-peer={peer.agentSessionId ?? peer.title} open={text.length <= 600 || undefined}>
+      <summary>
+        <span className="sa-agent-message-head"><SenderBadge kind={kind} /><span className="sa-incoming-from">from</span> <ConversationLink peer={peer} projectId={projectId} onFocusOrigin={onFocusOrigin} />{method && <small>{method}</small>}</span>
+        <span className="sa-agent-message-preview">{firstLine(text)}</span>
+      </summary>
+      {body}
+    </details>
+  }
   return <details className={'sa-agent-message sa-agent-message-' + direction} data-direction={direction} data-peer={peer.agentSessionId ?? peer.title}>
     <summary>
-      <span className="sa-agent-message-head"><Arrow size={12} aria-hidden="true" />{direction === 'sent' ? 'sent to' : 'from'} <ConversationLink peer={peer} projectId={projectId} onFocusOrigin={onFocusOrigin} />{method && <small>{method}</small>}</span>
+      <span className="sa-agent-message-head"><ArrowRight size={12} aria-hidden="true" />sent to <ConversationLink peer={peer} projectId={projectId} onFocusOrigin={onFocusOrigin} />{method && <small>{method}</small>}</span>
       <span className="sa-agent-message-preview">{firstLine(text)}</span>
     </summary>
-    <div className="sa-agent-message-body">{children}{truncated && <p className="sa-muted">First {text.length.toLocaleString()} of {characters!.toLocaleString()} characters; the receiving tab holds the whole message.</p>}</div>
+    {body}
   </details>
 }
 

@@ -20,7 +20,7 @@ import { ConversationLinksRail, useDeliveredOutputs } from './ConversationLinksR
 import { unansweredQuestion } from './conversation-links'
 import { StructuredComposerControls } from './StructuredComposerControls'
 import { StructuredSendButton, sendButtonIntent } from './StructuredSendButton'
-import { QueuedMessageList } from './QueuedMessageList'
+import { IncomingMessageList, incomingQueued, ownQueued, QueuedMessageList } from './QueuedMessageList'
 import { StructuredAgentTelemetry, StructuredLiveTokens, StructuredUsageSummary } from './StructuredAgentTelemetry'
 import { distinguishSubagentLabels, subagentColorIndex, subagentIdentityId, summarizeSubagents } from './usage-summary'
 import { followsBottomAfterScroll, hasTimelineSelection, latestOwnerPrompt, truncatePromptPreview } from './conversation-scroll'
@@ -1290,7 +1290,8 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     <PendingInteractionDock items={dockItems} reveal={dockReveal} render={item => <StructuredActivity item={item} sessionId={activeId} projectId={props.project.id} onInspectAttachment={setInspectAttachment} cwd={fileCwd} expanded={expansion[item.id] ?? false} interactive dockedQuestion={dockedQuestions.has(item.id)} onExpand={onExpand} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} onFocusOrigin={focusOrigin} onDockQuestion={setQuestionDocked} />} />
     {!historical && !wizardActive(settings, provider) && <PendingGrantDock agentSessionId={activeId} rendered={renderedGrantCards} />}
     <form className="sa-composer agent-prompt-surface" onSubmit={event => { event.preventDefault(); void submit() }} onDragOver={event => { if (!isComposerFileDrag(event.dataTransfer.types)) return; event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'copy' }} onDrop={event => { if (!isComposerFileDrag(event.dataTransfer.types)) return; event.preventDefault(); event.stopPropagation(); void dropComposerFiles(event.dataTransfer) }}>
-      {pendingSteering.length > 0 && <div className="sa-queue-list" aria-label="Pending steering messages">{pendingSteering.map(input => <div className="sa-queue sa-steering-prompt" key={input.id}>
+      <IncomingMessageList prompts={[...incomingQueued(pendingSteering), ...incomingQueued(queuedPrompts)]} projectId={props.project.id} onFocusOrigin={focusOrigin} onDismiss={prompt => { void window.conductor.structured.cancelQueued(activeId, prompt.id).catch((reason: unknown) => setError(String(reason))) }} />
+      {ownQueued(pendingSteering).length > 0 && <div className="sa-queue-list" aria-label="Pending steering messages">{ownQueued(pendingSteering).map(input => <div className="sa-queue sa-steering-prompt" key={input.id}>
         <strong>{input.status === 'sending' ? 'Sending' : input.status === 'accepted' ? 'Received' : input.status === 'cancelled' ? 'Not sent' : 'Delivery uncertain'}</strong>
         <span title={input.text}>{input.text}</span>
         <small role="status">{input.status === 'sending' ? 'Waiting for the agent to acknowledge this message' : input.status === 'accepted' ? 'Message will be sent after the next tool use. Esc interrupts and sends now.' : input.status === 'cancelled' ? 'The turn stopped before the agent took this message, so it was never delivered. Its text and attachments are kept here — restore it to send it again.' : 'Delivery was never confirmed. Check the conversation, then restore this message if it did not arrive.'}</small>

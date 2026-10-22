@@ -196,6 +196,19 @@ describe('structured renderer contracts (synthetic, zero inference)', () => {
     }
     expect(renderActivity({ type: 'text', role: 'user', text: 'Hello', mode: 'snapshot' })).toContain('sa-activity sa-kind-text sa-user')
   })
+  it('draws a message from another conversation or Conductor as incoming, never as the owner', () => {
+    const report = renderActivity({ type: 'text', role: 'user', text: 'Done: shipped', mode: 'snapshot', origin: { agentSessionId: 'agent_fixer1', label: 'Fixer' } })
+    expect(report).toContain('sa-activity sa-kind-text sa-incoming sa-incoming-agent')
+    expect(report).not.toContain('sa-user')
+    expect(report).not.toContain('>You<')
+    expect(report).toContain('data-sender-kind="agent"')
+    expect(report).toContain('Agent message')
+    expect(report).toContain('Fixer')
+    const conductor = renderActivity({ type: 'text', role: 'user', text: '[Conductor] approved: Bash(ls); retry it now', mode: 'snapshot' })
+    expect(conductor).toContain('sa-incoming-conductor')
+    expect(conductor).toContain('Conductor message')
+    expect(renderActivity({ type: 'text', role: 'user', text: 'Mine', mode: 'snapshot' })).toContain('>You<')
+  })
   it('uses friendly known approval outcomes without hiding unknown decisions', () => {
     expect(interactionOutcome('accept')).toBe('Accepted')
     expect(interactionOutcome('decline')).toBe('Declined')

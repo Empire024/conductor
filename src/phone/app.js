@@ -2036,13 +2036,14 @@
     }
     if (session.state === 'limited' && session.limitResumeAt) meta.appendChild(el('span', 'session-flag', 'resumes ' + clockTime(session.limitResumeAt)))
     if (session.queued) meta.appendChild(el('span', 'session-flag', session.queued + ' queued'))
+    if (session.incoming) meta.appendChild(el('span', 'session-flag incoming-flag', session.incoming + ' from agents'))
     if (session.backgroundTasks) meta.appendChild(el('span', 'session-flag', session.backgroundTasks + ' in background'))
     if (session.archived) meta.appendChild(el('span', 'session-flag', 'archived'))
     main.appendChild(meta)
 
     const preview = session.state === 'attention' && session.pendingTitle ? session.pendingTitle : session.lastText
     if (preview) {
-      const prefix = session.state !== 'attention' && session.lastRole === 'user' ? 'You: ' : ''
+      const prefix = session.state !== 'attention' && session.lastRole === 'user' ? (session.lastFrom ? session.lastFrom + ': ' : 'You: ') : ''
       main.appendChild(el('p', 'session-preview', prefix + oneLine(preview, 150)))
     }
 
@@ -2539,6 +2540,31 @@
     return { node: node, status: status, stop: stop }
   }
 
+  /* Messages that did not come from the owner: an icon, the sender kind and the sender's name,
+     which opens that conversation when this phone can see it. */
+  const SENDER_WORDS = { agent: 'Agent message', conductor: 'Conductor', machine: 'Paired machine', schedule: 'Scheduled task' }
+  const SENDER_ICONS = {
+    agent: ['M12 4v4', 'M5 8h14v11H5Z', 'M9 13h.01', 'M15 13h.01', 'M9.5 16.5h5'],
+    conductor: ['M13 2 4 14h7l-1 8 9-12h-7l1-8Z'],
+    machine: ['M3 4h18v12H3Z', 'M8 20h8', 'M12 16v4'],
+    schedule: ['M12 7v5l3 2', 'M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z']
+  }
+  const reachableSession = id => Boolean(id) && ((state.phone && state.phone.sessions) || []).some(session => session.id === id)
+  const senderHeader = sender => {
+    const head = el('div', 'sender-head')
+    const badge = el('span', 'sender-badge')
+    badge.appendChild(icon(SENDER_ICONS[sender.kind] || SENDER_ICONS.agent, 12))
+    badge.appendChild(el('span', null, SENDER_WORDS[sender.kind] || 'Agent message'))
+    head.appendChild(badge)
+    head.appendChild(el('span', 'sender-from', 'from'))
+    if (reachableSession(sender.agentSessionId)) {
+      const link = button('sender-name sender-link', sender.label, event => { event.stopPropagation(); go('#/session/' + encodeURIComponent(sender.agentSessionId)) })
+      link.title = 'Open ' + sender.label
+      head.appendChild(link)
+    } else head.appendChild(el('span', 'sender-name', sender.label))
+    return head
+  }
+
   const textItem = (item, data) => {
     const text = data.text || ''
     const attachments = data.attachments || []
@@ -2548,7 +2574,12 @@
       node.appendChild(el('span', null, oneLine(text, 200)))
       return node
     }
-    const node = el('div', 'bubble ' + (data.role === 'user' ? 'user' : 'assistant'))
+    const sender = data.role === 'user' && item.sender ? item.sender : null
+    const node = el('div', 'bubble ' + (sender ? 'incoming incoming-' + sender.kind : data.role === 'user' ? 'user' : 'assistant'))
+    if (sender) {
+      node.setAttribute('data-sender-kind', sender.kind)
+      node.appendChild(senderHeader(sender))
+    }
     const body = el('div', 'bubble-body')
     appendRichText(body, text, data.role === 'user')
     node.appendChild(body)
@@ -3354,7 +3385,21 @@
       }
 
       clear(queuedHost)
-      const queued = (conversation && conversation.queued) || []
+      const waiting = (conversation && conversation.queued) || []
+      const queued = waiting.filter(entry => !entry.sender)
+      const incoming = waiting.filter(entry => entry.sender)
+      if (incoming.length) {
+        const box = el('div', 'incoming-queue')
+        box.appendChild(el('span', 'incoming-queue-title', incoming.length === 1 ? 'Incoming, arrives after this turn' : incoming.length + ' incoming, arrive after this turn'))
+        if (!live.length) for (const entry of incoming) {
+          const row = el('div', 'incoming-queued incoming-' + entry.sender.kind)
+          row.setAttribute('data-sender-kind', entry.sender.kind)
+          row.appendChild(senderHeader(entry.sender))
+          row.appendChild(el('p', 'incoming-queued-text', oneLine(entry.text, 120)))
+          box.appendChild(row)
+        }
+        queuedHost.appendChild(box)
+      }
       if (queued.length) {
         queuedHost.appendChild(el('span', 'queued-title', queued.length === 1 ? '1 message queued' : queued.length + ' messages queued'))
         /* While a request is open, the answer is what the screen is for: the queue keeps its

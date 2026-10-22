@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentActivityPhase, AgentSpec, LayoutNode, RuntimeEnsureResult } from '../shared/models'
 import { ANSWERED_IN_CONVERSATION, isAsyncQuestion, isFrontierModel, MAX_PROMPT_CHARS, PROVIDER_AUTH_EXPIRED, PROVIDER_OVERLOADED, PROVIDER_SAFEGUARD_REFUSAL, PROVIDER_USAGE_LIMIT, settingsForRuntime, WIZARD_MODEL_HINT, wizardActive } from '../shared/structured-agent'
+import { CONDUCTOR_ORIGIN } from '../shared/message-sender'
 import type { ActivityStatus, AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, InteractionResponseResult, Json, PendingSteering, SessionProjection, PromptDispatchAuthority, PromptOrigin, QueuedPrompt, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import type { AgentChangeHistory, RevertOutcome, RevertScope } from '../shared/agent-change-history'
 import type { ConductorDatabase } from './database'
@@ -167,11 +168,14 @@ const queuedText = (prompts: QueuedPrompt[]): string => prompts.length === 1 ? p
 
 /** Queued messages that may travel as one delivery. Every message pending at drain time goes
  *  together (in order) so the agent receives one combined message instead of one request each;
- *  queuedText labels each part with its origin. A remote-peer message carries its own dispatch
+ *  queuedText labels each part with its origin. Messages batch only with the same sender (the owner's
+ *  with the owner's), so every delivery keeps one origin. A remote-peer message carries its own dispatch
  *  authority, so it only joins messages with that identical origin. The batch stops at the per-message
  *  attachment and length ceilings; the rest goes on the next drain. */
 const queuedBatch = (candidates: QueuedPrompt[]): QueuedPrompt[] => {
-  const key = (prompt: QueuedPrompt): string => prompt.origin?.authority ? JSON.stringify(prompt.origin) : 'local'
+  // The owner's own words never travel fused with another sender's: the combined turn would be
+  // recorded under no origin and drawn as the owner's message. Other senders batch by sender.
+  const key = (prompt: QueuedPrompt): string => prompt.origin?.authority ? JSON.stringify(prompt.origin) : prompt.origin ? 'from:' + prompt.origin.agentSessionId : 'owner'
   const batch: QueuedPrompt[] = []
   for (const prompt of candidates) {
     if (batch.length && key(prompt) !== key(batch[0]!)) break
@@ -401,7 +405,7 @@ export class StructuredSessions {
     this.emit(live, { data: { type: 'notice', message: 'Login restored; Conductor asked this conversation to continue.' } })
     this.flush()
     try {
-      await this.submit(id, message, state.settings, [], { agentSessionId: 'owner', label: 'Conductor' })
+      await this.submit(id, message, state.settings, [], CONDUCTOR_ORIGIN)
       return 'sent'
     } catch (error) {
       this.emit(live, { data: { type: 'notice', message: `Automatic continuation after the login came back could not be sent: ${error instanceof Error ? error.message : String(error)}` } })
@@ -1720,7 +1724,7 @@ export class StructuredSessions {
     this.emit(live, { data: { type: 'notice', message: 'Usage window reopened; Conductor asked this conversation to continue.' } })
     this.flush()
     try {
-      await this.submit(live.spec.id, 'continue', state.settings)
+      await this.submit(live.spec.id, 'continue', state.settings, [], CONDUCTOR_ORIGIN)
     } catch (error) {
       this.emit(live, { data: { type: 'notice', message: `Automatic continuation could not be sent: ${error instanceof Error ? error.message : String(error)}` } })
       this.flush()

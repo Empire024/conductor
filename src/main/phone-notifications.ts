@@ -2,7 +2,7 @@ import type { AgentActivityPhase } from '../shared/models'
 import type { PhoneAutoModeDenial, PhoneNotification, PhoneSessionState, PhoneSessionSummary } from '../shared/phone-access'
 import { autoModeDenialOf, denialAsksOwner, autoModeDenialSummary } from '../shared/auto-mode-denial'
 import { isViewing } from '../shared/project-activity'
-import type { PendingInteraction, SessionPhase, TimelineItem } from '../shared/structured-agent'
+import type { PendingInteraction, PromptOrigin, SessionPhase, TimelineItem } from '../shared/structured-agent'
 
 /** The projection fields the state word needs. Declared here rather than as a Pick so the rule
  *  reads the same whether or not the projection type in this tree already carries the usage
@@ -85,11 +85,11 @@ export function previewText(text: string, limit: number): string {
 }
 
 /** The most recent root-level text, which is what "what did it say" means on a list row. */
-export function lastMessage(items: readonly TimelineItem[]): { text: string; role: 'user' | 'assistant' } | undefined {
+export function lastMessage(items: readonly TimelineItem[]): { text: string; role: 'user' | 'assistant'; origin?: PromptOrigin } | undefined {
   for (let index = items.length - 1; index >= 0; index -= 1) {
     const item = items[index]!
     if (item.parentId || item.data.type !== 'text' || item.data.role === 'status' || !item.data.text.trim()) continue
-    return { text: item.data.text, role: item.data.role }
+    return { text: item.data.text, role: item.data.role, ...(item.data.origin ? { origin: item.data.origin } : {}) }
   }
   return undefined
 }

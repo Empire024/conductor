@@ -13,8 +13,9 @@ import {
   DEFAULT_PHONE_NOTIFICATION_PREFS, DEFAULT_PHONE_SETTINGS, PHONE_IMAGE_LIMIT, PHONE_IMAGE_PATH, PHONE_PAIRING_TTL_MS, PHONE_STATE_LIMITS,
   type PhoneAccessSettings, type PhoneImage, type PhoneAccessState, type PhoneConversation, type PhoneDevice, type PhoneMessageMode, type PhoneMetrics,
   type PhoneNotification, type PhoneNotificationPrefs, type PhoneOpenTabRequest, type PhoneOpenTabResult, type PhonePairingOffer, type PhoneProjectTaskPage, type PhoneProjectTaskRequest, type PhoneProjectTaskResult, type PhonePushSubscription,
-  type PhoneSelf, type PhoneSessionSummary, type PhoneSharedFile, type PhoneSharedFiles, type PhoneState, type PhoneTailnetView, type PhoneTimelineItem, type PhoneUsageWindow
+  type PhoneMessageSender, type PhoneSelf, type PhoneSessionSummary, type PhoneSharedFile, type PhoneSharedFiles, type PhoneState, type PhoneTailnetView, type PhoneTimelineItem, type PhoneUsageWindow
 } from '../shared/phone-access'
+import { messageSenderOf } from '../shared/message-sender'
 import { rememberedPermission } from './app-settings'
 import type { AgentActivityRow } from './project-activity'
 import { tabMachineId } from './machines'
@@ -895,10 +896,10 @@ export class PhoneAccessService {
       ...(denials.length ? { autoModeDenials: denials } : {}),
       updatedAt: latest ?? process?.updatedAt ?? new Date(this.now()).toISOString(),
       ...(turnStartedAt ? { turnStartedAt } : {}),
-      ...(last ? { lastText: previewText(last.text, PHONE_STATE_LIMITS.previewChars), lastRole: last.role } : {}),
+      ...(last ? { lastText: previewText(last.text, PHONE_STATE_LIMITS.previewChars), lastRole: last.role, ...(last.role === 'user' && phoneSender(last) ? { lastFrom: phoneSender(last)!.label } : {}) } : {}),
       ...(extra.limitResumeAt ?? process?.resumeAt ? { limitResumeAt: extra.limitResumeAt ?? process?.resumeAt } : {}),
       ...(extra.backgroundTasks ? { backgroundTasks: extra.backgroundTasks } : {}),
-      queued: projection?.queuedPrompts?.length ?? (projection?.queued ? 1 : 0),
+      ...queuedCounts(projection),
       archived: projection?.archived ?? false,
       ...(this.controllerId(id) ? { controllerId: this.controllerId(id)! } : {}),
       ...(usage ? { usage } : {})
@@ -943,7 +944,7 @@ export class PhoneAccessService {
       sequence: projection?.sequence ?? 0,
       items: kept.map(trimItem),
       pending: projection ? answerableInteractions(projection) : [],
-      queued: (projection?.queuedPrompts ?? (projection?.queued ? [projection.queued] : [])).map(prompt => ({ id: prompt.id, text: previewText(prompt.text, 400) })),
+      queued: phoneQueued(projection),
       inputDeliveries: phoneInputDeliveries(projection),
       truncated: Boolean(projection?.truncated) || kept.length < roots.length,
       canSteer: projection?.capabilities?.steering === true,
@@ -1403,5 +1404,28 @@ export function trimItem(item: TimelineItem): PhoneTimelineItem {
   } else if (data.type === 'changes') data = { ...data, changes: data.changes.map(change => ({ ...change, patch: undefined })) }
   else if (data.type === 'subagent') data = { ...data, output: data.output ? previewText(data.output, toolOutputChars) : undefined }
   else if (data.type === 'notice' && data.payload !== undefined) data = { ...data, payload: undefined }
-  return { id: item.id, sequence: item.sequence, timestamp: item.timestamp, ...(item.parentId ? { parentId: item.parentId } : {}), data }
+  const sender = data.type === 'text' && data.role === 'user' ? phoneSender(data) : null
+  return { id: item.id, sequence: item.sequence, timestamp: item.timestamp, ...(item.parentId ? { parentId: item.parentId } : {}), data, ...(sender ? { sender } : {}) }
+}
+
+/** Who sent a message that is not the owner's own, or null for the owner's (messageSenderOf). */
+export function phoneSender(message: { text?: string; origin?: PromptOrigin }): PhoneMessageSender | null {
+  const sender = messageSenderOf(message)
+  return sender.kind === 'owner' ? null : { kind: sender.kind, label: sender.label, ...(sender.agentSessionId ? { agentSessionId: sender.agentSessionId } : {}) }
+}
+
+/** What waits for the conversation: the owner's queued messages, and with their sender the ones
+ *  agents or Conductor queued or are steering into the running turn (an incoming steer is shown
+ *  until the turn takes it; the owner's own steers have their receipts in inputDeliveries). */
+export function phoneQueued(projection: SessionProjection | null): PhoneConversation['queued'] {
+  const queued = (projection?.queuedPrompts ?? (projection?.queued ? [projection.queued] : [])).map(prompt => { const sender = phoneSender(prompt); return { id: prompt.id, text: previewText(prompt.text, 400), ...(sender ? { sender } : {}) } })
+  const steering = (projection?.pendingSteering ?? []).filter(prompt => prompt.status === 'sending' || prompt.status === 'accepted').flatMap(prompt => { const sender = phoneSender(prompt); return sender ? [{ id: prompt.id, text: previewText(prompt.text, 400), sender }] : [] })
+  return [...steering, ...queued]
+}
+
+/** The owner's queued messages, and apart from them the ones agents or Conductor queued. */
+export function queuedCounts(projection: SessionProjection | null): { queued: number; incoming?: number } {
+  const prompts = projection?.queuedPrompts ?? (projection?.queued ? [projection.queued] : [])
+  const incoming = prompts.filter(prompt => phoneSender(prompt)).length
+  return { queued: prompts.length - incoming, ...(incoming ? { incoming } : {}) }
 }

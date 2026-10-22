@@ -15,6 +15,7 @@
 import type { AgentActivityPhase, AgentProviderId, RuntimeProcessSummary } from './models'
 import type { ProjectTaskKind, ProjectTaskPriority, ProjectTaskStatus, ProjectTaskWeight } from './project-backlog'
 import type { PendingInteraction, SessionPhase, StructuredProvider, TimelineItem } from './structured-agent'
+import type { MessageSenderKind } from './message-sender'
 import type { SystemMetricsSnapshot } from './system-metrics'
 import type { WeeklyModelUsageReport } from './weekly-model-usage'
 
@@ -389,9 +390,14 @@ export interface PhoneSessionSummary {
   turnStartedAt?: string
   lastText?: string
   lastRole?: 'user' | 'assistant'
+  /** Set when the last user-role message came from an agent or Conductor, not the owner. */
+  lastFrom?: string
   limitResumeAt?: string
   backgroundTasks?: number
+  /** The owner's own queued messages. */
   queued: number
+  /** Queued messages from agents or Conductor, counted apart from the owner's. */
+  incoming?: number
   archived: boolean
   /** Present when this conversation was opened and is controlled by another visible agent. */
   controllerId?: string
@@ -426,7 +432,9 @@ export interface PhoneState {
 }
 
 /** A timeline item as the phone shows it: same shape as the desktop's, with long text trimmed. */
-export type PhoneTimelineItem = Pick<TimelineItem, 'id' | 'sequence' | 'timestamp' | 'parentId' | 'data'>
+/** Who sent a message that is not the owner's own (messageSenderOf): drawn apart on the phone. */
+export interface PhoneMessageSender { kind: Exclude<MessageSenderKind, 'owner'>; label: string; agentSessionId?: string }
+export type PhoneTimelineItem = Pick<TimelineItem, 'id' | 'sequence' | 'timestamp' | 'parentId' | 'data'> & { sender?: PhoneMessageSender }
 
 /**
  * One file a conversation (or one of its coworkers) delivered or linked, for the conversation's
@@ -466,7 +474,8 @@ export interface PhoneConversation {
   sequence: number
   items: PhoneTimelineItem[]
   pending: PendingInteraction[]
-  queued: Array<{ id: string; text: string }>
+  /** Waiting messages, the owner's and (with a sender) those from agents or Conductor. */
+  queued: Array<{ id: string; text: string; sender?: PhoneMessageSender }>
   /** Bounded authoritative input receipts, including queued/steered messages not yet delivered. */
   inputDeliveries?: Array<{ id: string; text: string; status: 'queued' | 'sending' | 'accepted' | 'delivered' | 'cancelled' | 'uncertain'; sequence: number }>
   truncated: boolean

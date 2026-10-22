@@ -553,6 +553,31 @@ textarea.input { resize: none; line-height: 1.45; }
   border-bottom-left-radius: 14px;
   border-bottom-right-radius: 5px;
 }
+/* A message from an agent, Conductor or a paired machine: left side, its own hue, dashed edge and a
+   header naming the sender; never the owner's right-hand accent bubble. */
+.bubble.incoming, .incoming-queued { --incoming: #f0a35e; }
+.bubble.incoming-conductor, .incoming-queued.incoming-conductor { --incoming: #b48ef0; }
+.bubble.incoming-machine, .incoming-queued.incoming-machine { --incoming: #5ec4a8; }
+.bubble.incoming-schedule, .incoming-queued.incoming-schedule { --incoming: #d98ac6; }
+.bubble.incoming {
+  align-self: flex-start;
+  max-width: 92%;
+  background: color-mix(in srgb, var(--incoming) 10%, var(--surface-1));
+  border: 1px dashed color-mix(in srgb, var(--incoming) 60%, transparent);
+  border-left: 4px solid var(--incoming);
+  border-radius: 6px 14px 14px 6px;
+}
+.sender-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 0 0 5px; font-size: 12px; }
+.sender-badge { display: inline-flex; align-items: center; gap: 4px; padding: 1px 8px 1px 6px; border-radius: 999px; background: var(--incoming); color: #1b1b1f; font-size: 10.5px; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase; }
+.sender-from { color: var(--text-3); }
+.sender-name { font-weight: 600; color: var(--text); }
+button.sender-link { padding: 0; border: 0; background: none; color: var(--incoming); font: inherit; font-weight: 600; text-decoration: underline; cursor: pointer; }
+.incoming-queue { display: flex; flex-direction: column; gap: 5px; margin: 0 0 6px; }
+.incoming-queue-title { font-size: 12px; color: var(--text-3); }
+.incoming-queued { padding: 6px 10px; background: color-mix(in srgb, var(--incoming) 10%, var(--surface-1)); border: 1px dashed color-mix(in srgb, var(--incoming) 60%, transparent); border-left: 4px solid var(--incoming); border-radius: 6px 12px 12px 6px; }
+.incoming-queued .sender-head { margin-bottom: 2px; }
+.incoming-queued-text { margin: 0; font-size: 13px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-flag.incoming-flag { color: #f0a35e; }
 .bubble-body { font-size: 14.5px; }
 .text-block { margin: 0 0 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .text-block:last-child { margin-bottom: 0; }

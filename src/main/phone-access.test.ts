@@ -6,7 +6,7 @@ import type { AgentActivityPhase, AgentProviderInfo, DetachedWindowRecord, PaneT
 import { LOCAL_CONNECTION, LOCAL_MACHINE_ID, type MachineDescriptor } from '../shared/remote-control'
 import type { AgentEventData, SessionProjection, TimelineItem } from '../shared/structured-agent'
 import type { PhoneNotification } from '../shared/phone-access'
-import { answerableInteractions, normalizePairingCode, normalizePhoneSettings, PhoneAccessError, PhoneAccessService, recommendEndpoint, trimItem, type PhoneDatabase, type PhoneRemoteSessions, type PhoneSessions } from './phone-access'
+import { answerableInteractions, normalizePairingCode, normalizePhoneSettings, PhoneAccessError, PhoneAccessService, phoneQueued, phoneSender, queuedCounts, recommendEndpoint, trimItem, type PhoneDatabase, type PhoneRemoteSessions, type PhoneSessions } from './phone-access'
 import { describeTransition, NOTIFICATION_BATCH_MS, phoneSessionState } from './phone-notifications'
 import { autoModeDenialMessage, autoModeDenialPayload } from '../shared/auto-mode-denial'
 import { MemoryVault, type SecretKeyValueStore } from './secret-store'
@@ -333,6 +333,20 @@ describe('what the phone sees', () => {
     expect(conversation).toMatchObject({ needsResume: true, canSteer: true, truncated: false, queued: [{ id: 'q', text: 'later' }], sequence: 1 })
     expect(() => fix.service.conversation('missing')).toThrow(/not open/)
     expect(trimItem(item(1, { type: 'notice', message: 'm', payload: { big: true } })).data).toEqual({ type: 'notice', message: 'm', payload: undefined })
+  })
+
+  it('marks messages from agents and Conductor with their sender, and leaves the owner unmarked', () => {
+    expect(trimItem(item(1, { type: 'text', role: 'user', text: 'mine', mode: 'snapshot' })).sender).toBeUndefined()
+    expect(trimItem(item(2, { type: 'text', role: 'user', text: 'Done', mode: 'snapshot', origin: { agentSessionId: 'agent_fixer1', label: 'Fixer' } })).sender).toEqual({ kind: 'agent', label: 'Fixer', agentSessionId: 'agent_fixer1' })
+    expect(trimItem(item(3, { type: 'text', role: 'user', text: '[Conductor] approved', mode: 'snapshot' })).sender).toEqual({ kind: 'conductor', label: 'Conductor' })
+    expect(trimItem(item(4, { type: 'text', role: 'assistant', text: '[Conductor] x', mode: 'snapshot' })).sender).toBeUndefined()
+    expect(phoneSender({ text: 'x', origin: { agentSessionId: 'agent_a1b2', label: 'Ops (haf-stuff)' } })).toEqual({ kind: 'agent', label: 'Ops (haf-stuff)', agentSessionId: 'agent_a1b2' })
+    const settings = { permission: 'default', plan: false } as const
+    const projection = { queuedPrompts: [{ id: 'a', text: 'mine', settings, attachments: [] }, { id: 'b', text: 'theirs', settings, attachments: [], origin: { agentSessionId: 'agent_x1y2', label: 'Fixer' } }] } as unknown as Parameters<typeof queuedCounts>[0]
+    expect(queuedCounts(projection)).toEqual({ queued: 1, incoming: 1 })
+    expect(queuedCounts(null)).toEqual({ queued: 0 })
+    const steering = { ...projection, pendingSteering: [{ id: 's', text: 'steered in', settings, attachments: [], runtimeId: 'r', status: 'accepted', origin: { agentSessionId: 'agent_x1y2', label: 'Fixer' } }, { id: 'o', text: 'my steer', settings, attachments: [], runtimeId: 'r', status: 'accepted' }] } as unknown as Parameters<typeof phoneQueued>[0]
+    expect(phoneQueued(steering)).toEqual([{ id: 's', text: 'steered in', sender: { kind: 'agent', label: 'Fixer', agentSessionId: 'agent_x1y2' } }, { id: 'a', text: 'mine' }, { id: 'b', text: 'theirs', sender: { kind: 'agent', label: 'Fixer', agentSessionId: 'agent_x1y2' } }])
   })
 
   it('reports host load with the runtimes named by project and workspace', async () => {

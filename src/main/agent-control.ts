@@ -23,6 +23,7 @@ import { controlMethodFamily } from './control-method-classes'
 import type { AgentConfirmOutcome } from '../shared/agent-confirm'
 import { isMemoryKind, MEMORY_KINDS, makeId, type AgentProviderInfo, type AgentSpec, type AppUpdateState, type LayoutNode, type PaneKind, type PaneTab, type ProjectRecord } from '../shared/models'
 import type { Json, PendingInteraction, PromptOrigin, SessionProjection, SessionSettings, StructuredProvider } from '../shared/structured-agent'
+import { CONDUCTOR_ORIGIN } from '../shared/message-sender'
 import { isFrontierModel, isSessionPermission, MAX_PROMPT_CHARS, settingsForRuntime, WIZARD_MODEL_HINT, wizardActive } from '../shared/structured-agent'
 import { rememberedPermission } from './app-settings'
 import type { CreateOrchestrationTaskInput, SaveRoutineInput, UpdateOrchestrationTaskInput } from '../shared/orchestration'
@@ -1618,7 +1619,7 @@ export class AgentControl {
       const body = wake.kind === 'deadline'
         ? `[Conductor] Deadline passed: the wait you declared at ${wake.record.since}${why} ended at ${wake.record.deadline} with no message from:\n${lines}\nThe wait is over. Check agents.status or agents.history, message them again, take the work over, or declare a new agents.await.`
         : `[Conductor] Everyone you were waiting for${why} has gone quiet without messaging you:\n${lines}\nThe wait is over. Read their result with agents.history, message them again (a refused reply shows as a rejected tool in agents.status), or take the work over.`
-      try { await sessions.steerOrStart(wake.waiter, body, state.settings) } catch (error) { console.warn('Waiting-for-results wake failed', error) }
+      try { await sessions.steerOrStart(wake.waiter, body, state.settings, [], CONDUCTOR_ORIGIN) } catch (error) { console.warn('Waiting-for-results wake failed', error) }
     }
     return wakes.length
   }
@@ -1696,7 +1697,7 @@ export class AgentControl {
       const mine = due.filter(card => awaited.has(card.agentSessionId) && !delivered.has(cardKey(card)))
       const state = database.structured.snapshot(waiter)
       if (!mine.length || !state) continue
-      try { await sessions.steerOrStart(waiter, awaitWakeText(mine, { canAnswer: canAnswer(waiter), reason: record.reason, sealed: sealedFor(waiter) }), state.settings) }
+      try { await sessions.steerOrStart(waiter, awaitWakeText(mine, { canAnswer: canAnswer(waiter), reason: record.reason, sealed: sealedFor(waiter) }), state.settings, [], CONDUCTOR_ORIGIN) }
       catch (error) { console.warn('Approval wake of a waiter failed', error); continue }
       this.awaiting().clear(waiter)
       for (const card of mine) { delivered.add(cardKey(card)); ledger.mark(card) }
@@ -1708,7 +1709,7 @@ export class AgentControl {
     for (const [controller, mine] of byController) {
       const state = database.structured.snapshot(controller)
       if (!state || !canAnswer(controller)) continue
-      try { await sessions.steerOrStart(controller, controllerWakeText(mine, { canAnswer: true, sealed: sealedFor(controller) }), state.settings) }
+      try { await sessions.steerOrStart(controller, controllerWakeText(mine, { canAnswer: true, sealed: sealedFor(controller) }), state.settings, [], CONDUCTOR_ORIGIN) }
       catch (error) { console.warn('Approval wake of a controller failed', error); continue }
       for (const card of mine) ledger.mark(card)
       sent++
