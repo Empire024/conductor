@@ -43,9 +43,9 @@
 .usage-window-chart { width: 100%; height: 56px; overflow: visible; }
 .usage-window-chart .grid { stroke: var(--border-soft); stroke-width: 1; vector-effect: non-scaling-stroke; }
 .usage-window-chart .pace { stroke: var(--text-3); stroke-width: 1; stroke-dasharray: 3 3; opacity: .55; vector-effect: non-scaling-stroke; }
-.usage-window-chart .area { fill: color-mix(in srgb, var(--gauge) 20%, transparent); stroke: none; }
-.usage-window-chart .line { fill: none; stroke: var(--gauge); stroke-width: 1.5; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
-.usage-window-chart .current { fill: var(--gauge); }
+.usage-window-chart .area { fill-opacity: .26; stroke: none; }
+.usage-window-chart .line { fill: none; stroke-width: 1.5; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.usage-window-chart .current { stroke: none; }
 .usage-window-chart .now { stroke: var(--text-2); stroke-width: 1; opacity: .6; vector-effect: non-scaling-stroke; }
 .usage-window-axis { display: flex; justify-content: space-between; color: var(--text-3); font-size: 8.5px; font-variant-numeric: tabular-nums; }
 .usage-window-reset { margin: 2px 0 0; color: var(--text-2); }

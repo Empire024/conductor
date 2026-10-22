@@ -1,4 +1,6 @@
-import { memo, useEffect, useState } from 'react'
+import { memo, useEffect, useId, useState } from 'react'
+import { UsageGradient } from './UsageGradient'
+import { usageColor } from './usage-color'
 import { nextAllowanceReset, windowShortLabel, type AllowanceGauge, type ProviderAllowanceRow } from '../../../shared/provider-allowance'
 import { allowancePacing, formatTimeLeft, pacingHint } from '../../../shared/allowance-pacing'
 import './ProviderAllowance.css'
@@ -137,6 +139,7 @@ export function allowanceButtonLabel(rows: readonly ProviderAllowanceRow[], now 
 }
 
 function Gauge({ name, gauge, fallback, now, pacing: withPacing, countdown }: { name: string; gauge: AllowanceGauge | undefined; fallback: string; now: number; pacing?: boolean; countdown?: boolean }): React.JSX.Element {
+  const gradientId = `usage-spark-${useId().replace(/:/g, '')}`
   if (!gauge) return <span className="provider-allowance-gauge empty" />
   const level = allowanceLevel(gauge.usedPercent)
   const path = sparklinePath(gauge)
@@ -151,10 +154,11 @@ function Gauge({ name, gauge, fallback, now, pacing: withPacing, countdown }: { 
   const title = `${hint ? `${hint}\n` : ''}${gaugeTitle(name, gauge, now)}${elapsed}`
   return <span className={`provider-allowance-gauge ${level}${waste}`} title={title} data-window={fallback} data-pacing={pacing?.state}>
     <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} aria-hidden="true">
+      <UsageGradient id={gradientId} bottom={H - 0.5} top={0.5} />
       <line x1="0" x2={W} y1={H - 0.5} y2={H - 0.5} className="track" />
-      {path && <path className="area" d={`${path} V${H - 0.5} H${sparklineStart(gauge)} Z`} />}
-      {path && <path className="line" d={path} />}
-      {gauge.usedPercent !== null && <circle cx={sparklineX(Math.max(gauge.points.at(-1)?.[0] ?? 0, gauge.elapsed), gauge.elapsed)} cy={H - Math.min(100, gauge.usedPercent) / 100 * (H - 1) - 0.5} r="1.6" />}
+      {path && <path className="area" d={`${path} V${H - 0.5} H${sparklineStart(gauge)} Z`} fill={`url(#${gradientId})`} />}
+      {path && <path className="line" d={path} stroke={`url(#${gradientId})`} />}
+      {gauge.usedPercent !== null && <circle fill={usageColor(gauge.usedPercent)} cx={sparklineX(Math.max(gauge.points.at(-1)?.[0] ?? 0, gauge.elapsed), gauge.elapsed)} cy={H - Math.min(100, gauge.usedPercent) / 100 * (H - 1) - 0.5} r="1.6" />}
     </svg>
     <b>{gauge.usedPercent === null ? '–' : `${Math.round(gauge.usedPercent)}%`}</b>
     <small>{windowShortLabel(gauge.windowMinutes, fallback)}</small>

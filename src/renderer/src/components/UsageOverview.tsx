@@ -1,10 +1,12 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import { createPortal } from 'react-dom'
 import { Flame, Gauge, X } from 'lucide-react'
 import { windowShortLabel, type AllowanceGauge, type ProviderAllowanceRow } from '../../../shared/provider-allowance'
 import { allowancePacing, pacingHint } from '../../../shared/allowance-pacing'
 import { allowanceLevel, formatDuration, relative, useMinuteClock, useProviderAllowance, windowProgress } from './ProviderAllowance'
+import { UsageGradient } from './UsageGradient'
+import { usageColor } from './usage-color'
 import { TokenBurnList, useTokenBurn } from './TokenBurn'
 import { WeeklyAllowance } from './WeeklyAllowance'
 import { WeeklyUsage } from './WeeklyUsage'
@@ -29,6 +31,7 @@ export function windowChartPath(points: ReadonlyArray<readonly [number, number]>
 const clock = (at: number, withDay: boolean): string => new Date(at).toLocaleString(undefined, withDay ? { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' } : { hour: '2-digit', minute: '2-digit' })
 
 function WindowCard({ name, gauge, kind, now }: { name: string; gauge: AllowanceGauge; kind: 'weekly' | 'short'; now: number }): React.JSX.Element {
+  const gradientId = `usage-chart-${useId().replace(/:/g, '')}`
   const progress = windowProgress(gauge, now)
   const pacing = kind === 'weekly' ? allowancePacing(gauge, now) : null
   const hint = pacing && pacingHint(pacing)
@@ -46,13 +49,14 @@ function WindowCard({ name, gauge, kind, now }: { name: string; gauge: Allowance
       <b>{gauge.usedPercent === null ? '–' : `${Math.round(gauge.usedPercent)}%`}<small> used</small></b>
     </header>
     <svg className="usage-window-chart" viewBox={`0 0 ${CW} ${CH}`} preserveAspectRatio="none" role="img" aria-label={`${label}: use over the current window`}>
+      <UsageGradient id={gradientId} bottom={chartY(0)} top={chartY(100)} />
       <line className="grid" x1="0" x2={CW} y1={chartY(50)} y2={chartY(50)} />
       <line className="grid" x1="0" x2={CW} y1={chartY(100)} y2={chartY(100)} />
       <line className="pace" x1="0" x2={CW} y1={chartY(0)} y2={chartY(100)} />
-      {path && <path className="area" d={`${path} V${chartY(0)} H${chartX(gauge.points[0]?.[0] ?? 0)} Z`} />}
-      {path && <path className="line" d={path} />}
+      {path && <path className="area" d={`${path} V${chartY(0)} H${chartX(gauge.points[0]?.[0] ?? 0)} Z`} fill={`url(#${gradientId})`} />}
+      {path && <path className="line" d={path} stroke={`url(#${gradientId})`} />}
       <line className="now" x1={chartX(elapsed)} x2={chartX(elapsed)} y1="0" y2={CH} />
-      {gauge.usedPercent !== null && <circle className="current" cx={chartX(elapsed)} cy={chartY(gauge.usedPercent)} r="2.5" />}
+      {gauge.usedPercent !== null && <circle className="current" fill={usageColor(gauge.usedPercent)} cx={chartX(elapsed)} cy={chartY(gauge.usedPercent)} r="2.5" />}
     </svg>
     <div className="usage-window-axis"><span>{Number.isFinite(startAt) ? clock(startAt, withDay) : ''}</span><span>{Number.isFinite(resetAt) ? clock(resetAt, withDay) : ''}</span></div>
     <p className="usage-window-reset">

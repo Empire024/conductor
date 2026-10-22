@@ -1966,7 +1966,7 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 
 - [ ] when stickied message is in veiw already stick the next message (and make a simple animatiomn for it so we know t just happened) <!-- conductor-task:01b78446-de80-4344-8d57-01bfc67f4184 -->
 
-- [~] usage graph should change color gradient to red as it get closer to 100% with a caling towards 100% so biger part of bottom is bluer and then gets red suddely <!-- conductor-task:f02f8d08-5538-4e94-a29b-4fccd004ba1e agent=agent_mvifslig_1l1rozz -->
+- [x] usage graph should change color gradient to red as it get closer to 100% with a caling towards 100% so biger part of bottom is bluer and then gets red suddely Done: usage graphs (sidebar sparkline, usage dialog charts) now fill and stroke through a vertical gradient that is blue up to 75% and eases (squared) to red at 100% (usage-color.ts, UsageGradient.tsx); smoke-usage-gradient.mjs. <!-- conductor-task:f02f8d08-5538-4e94-a29b-4fccd004ba1e agent=agent_mvifslig_1l1rozz -->
 
 - [x] if this is here then task list on conductor laptop works and moves from device to device  Done: the item arrived on MAIN from the laptop, so the task list syncs between devices (owner confirmed 2026-10-22). <!-- conductor-task:800a5284-c6a2-4e00-89e4-480d6a8ca4bb agent=agent_mvifslig_1l1rozz -->
 
