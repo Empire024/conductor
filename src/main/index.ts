@@ -51,6 +51,7 @@ import { app, BrowserWindow, clipboard, ipcMain, Menu, Notification, powerMonito
 import * as testDialogs from './test-mode-dialogs'
 import { startTestModeWatchdog } from './test-mode-watchdog'
 import { installMainErrorLog } from './main-error-log'
+import { bootControlReady, bootStage, bootWindowLoaded, DIAGNOSTICS_DIRECTORY, startBootDiagnostics } from './boot-diagnostics'
 import { SystemMetricsSampler } from './system-metrics.ts'
 import type { SystemMetricsSnapshot } from '../shared/system-metrics.ts'
 import { CloseConfirmation, hasRunningWork, hasSessionWork } from './close-confirmation'
@@ -371,6 +372,16 @@ const revealWindow = (window: BrowserWindow, activate = true): void => {
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 if (!hasSingleInstanceLock) app.quit()
+/* Startup diagnostics (docs/startup-diagnostics.md): every boot stage is on disk the moment it
+ * begins, so a launch that dies (2026-10-22: every one ran out of heap four seconds in) has said
+ * where, and the recovery watchdog and the meta-wizard can say why in one line. Only the launch
+ * that holds the lock writes it; a second instance that hands over never does. */
+/** A checkout launch (electron out/main/index.js) reports Electron's version from app.getVersion(). */
+function bootVersion(): string {
+  if (app.isPackaged) return app.getVersion()
+  try { return `${(JSON.parse(readFileSync(join(__dirname, '../../package.json'), 'utf8')) as { version?: string }).version ?? app.getVersion()}-dev` } catch { return app.getVersion() }
+}
+if (hasSingleInstanceLock) startBootDiagnostics({ directory: join(app.getPath('userData'), DIAGNOSTICS_DIRECTORY), pid: process.pid, version: bootVersion(), packaged: app.isPackaged, exe: process.execPath, startedAtMs: performance.timeOrigin, sampler: true, processHooks: process })
 
 /* Recovery mode (docs/recovery-mode.md): a watchdog outside the app brings Conductor back when a
  * restart, an update install or a crash leaves it down. Read here, before this launch arms its own,
@@ -529,6 +540,8 @@ const createWindow = (
   })
   window.webContents.on('did-finish-load', () => {
     window.webContents.setZoomFactor(getAppSettings().zoomFactor)
+    // The first window that loads after app control answers makes this launch ready.
+    bootWindowLoaded()
   })
   window.webContents.on('render-process-gone', (_event, details) => {
     if (isQuitting || window.isDestroyed() || details.reason === 'clean-exit') return
@@ -2808,10 +2821,12 @@ const loginShellPath = importLoginShellPath()
 
 app.whenReady().then(async () => {
   if (!hasSingleInstanceLock) return
+  bootStage('app-ready')
   await loginShellPath
   app.setAppUserModelId('io.conductor.desktop')
   const databasePath = join(app.getPath('userData'), 'conductor.db')
   database = new ConductorDatabase(databasePath)
+  bootStage('settings')
   // The owner's auto-approve policy, live before any runtime asks it (approval-policy.ts).
   {
     const store = database
@@ -2858,6 +2873,7 @@ app.whenReady().then(async () => {
   if (conductorProject) schedules.ensureBuiltin(conductorProject.id, latestModelsBuiltin())
   // A project that already had the old fixed check (added from its Schedules panel) keeps it, now with its scripts.
   for (const schedule of schedules.all()) if (schedule.kind === 'latest-models-methods' && schedule.projectId !== conductorProject?.id) schedules.ensureBuiltin(schedule.projectId, latestModelsBuiltin())
+  bootStage('services')
   sourceControl = new SourceControl(database)
   projectBacklogs = new ProjectBacklogs(database, sourceControl)
   for (const project of database.listDeskProjects()) void projectBacklogs.ensure(project.id).catch(error => console.warn('Project task file unavailable', error))
@@ -3283,7 +3299,9 @@ app.whenReady().then(async () => {
   // one after every restart.
   agentControlServer = new AgentControlServer(control, undefined, spec => remoteControl?.machineNote(spec) ?? '', { path: join(app.getPath('userData'), 'control-owner.json'), appVersion: app.getVersion(), packaged: app.isPackaged },
     { path: join(app.getPath('userData'), 'control-endpoint.json'), reclaim: reclaimControlPort })
+  bootStage('control-api')
   await agentControlServer.start()
+  bootControlReady()
   void recovery?.start({ fromVersion: app.getVersion(), checkout: findCheckout(database.listProjects().map(project => project.path)) })
   await browserMcp.start()
   // conductor-local MCP tools (src/main/local-assist): every Claude and Codex launch from here on.
@@ -3407,6 +3425,7 @@ app.whenReady().then(async () => {
   const restartPlan = resumePlan(previousStop, initiator, recoveryReport)
   if (restartPlan) console.log(`Restart plan: ${restartPlan.reason}; ${restartPlan.wizards.length} wizard(s), ${restartPlan.coworkers.length} coworker(s) to bring back`)
   // Turns the previous process kept running are rebound before any window asks for their tabs.
+  bootStage('runtime-reattach')
   try { await reattachKeptRuntimes() } catch (error) { console.error('Kept runtimes could not be reattached', error) }
   launchRecoveryNote = recoveryNote(recoveryReport)
   briefReattachedRuntimes(restartLine(restartPlan?.reason ?? restartReason(previousStop, initiator), previousStop?.fromVersion, updates.getState().currentVersion) + launchRecoveryNote)
@@ -3414,7 +3433,9 @@ app.whenReady().then(async () => {
   // right after reattaching, the way it did for 71 s on 2026-09-25.
   const stallMs = Number(process.env.CONDUCTOR_TEST_STARTUP_BLOCK_MS)
   if (process.env.CONDUCTOR_TEST_USER_DATA && stallMs > 0 && reattachedRuntimes.size) { console.log(`[test] stalling main for ${stallMs} ms`); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, stallMs) }
+  bootStage('runtime-host')
   runtimeHostStarted = startRuntimeHost()
+  bootStage('windows')
   const restoreAfterUpdate = database.getSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY) === 'true'
   const savedWindowLayout = restoreAfterUpdate
     ? parseSavedWindowLayout(database.getSetting(UPDATE_WINDOW_LAYOUT_KEY))

@@ -77,11 +77,17 @@ A restart nobody was watching still comes back without taking the screen.
      (`attemptWaitMs`) to answer, and no second attempt is started next to it, since it holds the
      lock. Each records its pid, its exit code, and its stdout/stderr (`recovery/launch-*.log`;
      the newest 10 are kept). An attempt that exits at once against the lock of a Conductor someone
-     else started waits for that one instead of trying again.
+     else started waits for that one instead of trying again. A failed attempt also carries its
+     **boot verdict** (`attempt.boot`), the one line its boot record gives
+     (docs/startup-diagnostics.md): *died in stage structured-store 4.1 s after start: V8 heap out
+     of memory (heap 3.9 GB of a 4.0 GB limit, …)*. When the newest launch is not the watched one
+     and never became ready (an update's new build that died starting), its verdict is added to
+     the error and to the report (`boot`).
   5. Still down: call the **recovery agent** with the exact error (below), then wait 60 s more.
   - Crash loop guard: after 3 recovery launches in 15 min it stops relaunching and goes to the agent.
 - **Owner notice.** A Windows toast (`io.conductor.desktop`) when a relaunch brought Conductor back,
-  when the agent is called, when the agent brought it back, and when it is still down. A test
+  when the agent is called, when the agent brought it back, and when it is still down; the last two
+  say where and why the start died (the boot verdict). A test
   profile writes `recovery/toasts.jsonl` instead and never shows one. Phone push is not sent: its
   VAPID private key lives in the OS credential vault that only the running app reads.
 - **Report.** `recovery/recovery-<time>.json` and `.md` (the agent's diagnosis followed by the
@@ -131,8 +137,10 @@ waits.
 `claude -p` (Claude Code, found on PATH or `%USERPROFILE%\.local\bin\claude.exe`), in the Conductor
 checkout among the owner's projects (else userData), prompt on stdin (`recovery/agent.ts`):
 
-- The prompt holds the exact error, the stop record, every relaunch attempt with its exit code and
-  output tail, the tails of `runtime-host/host.log` and `recovery/watchdog.log`, and the paths. It
+- The prompt holds the exact error, the stop record, every relaunch attempt with its exit code,
+  boot verdict and output tail, the tails of `runtime-host/host.log`, `recovery/watchdog.log` and
+  the boot records (`diagnostics/boot.json`, `boot-last-failure.json`, `boot-sample.json`), and
+  the paths. It
   also has rules: bring Conductor back by starting the installed exe, never commit, push, reset or
   clean, never delete or edit userData, never `npm run dev`.
 - Tools: `Read, Grep, Glob, Bash, PowerShell` allowed. Denied: `Edit, Write, NotebookEdit, WebFetch,

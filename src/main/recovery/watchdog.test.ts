@@ -260,3 +260,31 @@ describe('recovery watchdog', () => {
     expect(await runWatchdog(m.deps, m.config)).toEqual({ result: 'stopped', reason: 'parent gone' })
   })
 })
+
+describe('recovery watchdog: boot diagnostics say where a start died (docs/startup-diagnostics.md)', () => {
+  it('names the stage of every failed attempt and of the update that never answered, in the error, the report and the toasts', async () => {
+    const m = machine({ armed: arm('update-install'), appDiesAtMs: 0, exes: { 'C:\\Programs\\Conductor.exe': { exitCode: 3758096392, output: 'JavaScript heap out of memory' } } })
+    const asked: Array<[number | undefined, number | null, string]> = []
+    m.deps.bootVerdict = (pid, exitCode, output) => { asked.push([pid, exitCode, output]); return 'died in stage structured-store 4.1 s after start: V8 heap out of memory (heap 3.9 GB of a 4.0 GB limit, RSS 4.2 GB); Conductor 0.1.54, pid 4242' }
+    m.deps.latestBoot = watched => watched === OLD ? 'died in stage structured-store 4.0 s after start: V8 heap out of memory; Conductor 0.1.54, pid 4100' : null
+    const result = await runWatchdog(m.deps, m.config)
+    expect(result.result).toBe('down')
+    expect(asked).toEqual([[4242, 3758096392, 'JavaScript heap out of memory'], [4242, 3758096392, 'JavaScript heap out of memory']])
+    const report = m.reports[0]!
+    expect(report.boot).toContain('pid 4100')
+    expect(report.error).toContain('; the newest launch died in stage structured-store 4.0 s after start')
+    expect(report.attempts.map(attempt => attempt.boot)).toEqual([expect.stringContaining('died in stage structured-store'), expect.stringContaining('died in stage structured-store')])
+    expect(m.agentCalls[0]!.error).toContain('#1 C:\\Programs\\Conductor.exe: died in stage structured-store 4.1 s after start: V8 heap out of memory')
+    expect(m.notifications.find(note => note.startsWith('Conductor is down'))).toContain('died in stage structured-store')
+    expect(m.notifications.find(note => note.startsWith('Conductor is still down'))).toContain('died in stage structured-store')
+  })
+
+  it('works as before when no boot record exists', async () => {
+    const m = machine({ armed: arm('restart'), appDiesAtMs: 0, exes: { 'C:\\Programs\\Conductor.exe': { exitCode: 1 } } })
+    m.deps.bootVerdict = () => null
+    m.deps.latestBoot = () => null
+    await runWatchdog(m.deps, m.config)
+    expect(m.reports[0]!.boot).toBeUndefined()
+    expect(m.agentCalls[0]!.error).toContain('exited with code 1')
+  })
+})

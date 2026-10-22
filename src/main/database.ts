@@ -1,4 +1,5 @@
 import { mkdirSync } from 'node:fs'
+import { bootStage } from './boot-diagnostics'
 import { readStoredIdentity } from '../shared/remote-control'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -374,11 +375,15 @@ export class ConductorDatabase {
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true })
+    // Boot stages (docs/startup-diagnostics.md): no-ops outside a launch.
+    bootStage('db-open')
     this.db = new DatabaseSync(path)
     // journal_size_limit: a write-ahead log that once grew (3.5 GB on the owner's machine,
     // 2026-09-25) is cut back once it has been checkpointed, instead of staying that size (FX33).
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 3000; PRAGMA journal_size_limit = 67108864;')
+    bootStage('db-migrations')
     this.migrate()
+    bootStage('structured-store')
     this.structured = new StructuredAgentStore(this.db, dirname(path))
     this.tabArchive = new TabArchiveStore(this.db)
   }

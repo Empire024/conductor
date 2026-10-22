@@ -26,6 +26,7 @@ export function recoveryPrompt(request: AgentRequest, context: { userData: strin
     ? request.attempts.map((attempt, index) => [
       `### Attempt ${index + 1}: ${attempt.exe} ${attempt.args.join(' ')}`,
       `started ${attempt.startedAt}${attempt.pid ? `, pid ${attempt.pid}` : ''}; ${attempt.error ? `spawn failed: ${attempt.error}` : attempt.exitCode === null || attempt.exitCode === undefined ? 'kept running but never answered app control' : `exited with code ${attempt.exitCode}`}`,
+      attempt.boot ? `boot diagnostics: ${attempt.boot}` : '',
       attempt.outputPath ? `full output: ${attempt.outputPath}` : '',
       attempt.output ? block(attempt.output, 1500) : ''
     ].filter(Boolean).join('\n')).join('\n\n')
@@ -43,6 +44,7 @@ export function recoveryPrompt(request: AgentRequest, context: { userData: strin
     `- old app pid: ${arm?.appPid ?? 'unknown'}`,
     `- how to start Conductor: ${launch ? `\`${launch.exe}\`${launch.args.length ? ` with arguments ${JSON.stringify(launch.args)}` : ''}` : 'unknown'}`,
     `- userData: ${context.userData} (control-owner.json there holds the running app's pid and control endpoint; runtime-host/host.log; recovery/watchdog.log)`,
+    `- boot diagnostics: ${context.userData}\\diagnostics (boot.json: the newest launch's stages with heap and RSS; boot-last-failure.json; boot-history.jsonl; docs/startup-diagnostics.md)`,
     '- update installer cache: %LOCALAPPDATA%\\conductor-desktop-updater (pending\\ holds a downloaded installer)',
     '',
     '## Relaunch attempts already made',

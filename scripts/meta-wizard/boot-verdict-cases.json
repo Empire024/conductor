@@ -1,0 +1,118 @@
+{
+  "note": "Shared by src/main/recovery/boot-verdict.test.ts and scripts/meta-wizard.test.mjs: both verdict readers must give these exact answers (docs/startup-diagnostics.md).",
+  "records": {
+    "oomStore": {
+      "schema": 1, "pid": 68968, "version": "0.1.58-local.1792659912858", "packaged": true, "exe": "C:\\Conductor.exe",
+      "startedAt": "2026-10-22T09:26:00.000Z", "heapLimitMb": 4096, "stage": "structured-store", "stageAt": "2026-10-22T09:26:00.700Z",
+      "outcome": "booting", "readyMs": null,
+      "stages": [
+        { "name": "process-start", "at": "2026-10-22T09:26:00.000Z", "ms": 0, "heapMb": 12, "rssMb": 80 },
+        { "name": "single-instance", "at": "2026-10-22T09:26:00.300Z", "ms": 300, "heapMb": 14, "rssMb": 90 },
+        { "name": "structured-store", "at": "2026-10-22T09:26:00.700Z", "ms": 700, "heapMb": 40, "rssMb": 150 }
+      ],
+      "peak": { "heapMb": 40, "rssMb": 150 }, "errors": [], "fatal": null
+    },
+    "exitSettings": {
+      "schema": 1, "pid": 500, "version": "0.1.59-local.1", "packaged": false, "exe": "electron.exe",
+      "startedAt": "2026-10-22T10:00:00.000Z", "heapLimitMb": 4096, "stage": "settings", "stageAt": "2026-10-22T10:00:01.000Z",
+      "outcome": "failed", "readyMs": null,
+      "stages": [{ "name": "settings", "at": "2026-10-22T10:00:01.000Z", "ms": 1000, "heapMb": 60, "rssMb": 200 }],
+      "peak": { "heapMb": 60, "rssMb": 200 }, "errors": [],
+      "fatal": { "at": "2026-10-22T10:00:01.200Z", "stage": "settings", "kind": "exit", "message": "exit code 70", "heapMb": 60, "rssMb": 200 }
+    },
+    "erroredServices": {
+      "schema": 1, "pid": 600, "version": "0.1.59-local.2", "packaged": true, "exe": "C:\\Conductor.exe",
+      "startedAt": "2026-10-22T10:00:00.000Z", "heapLimitMb": 4096, "stage": "services", "stageAt": "2026-10-22T10:00:02.000Z",
+      "outcome": "booting", "readyMs": null,
+      "stages": [{ "name": "services", "at": "2026-10-22T10:00:02.000Z", "ms": 2000, "heapMb": 300, "rssMb": 500 }],
+      "peak": { "heapMb": 300, "rssMb": 500 },
+      "errors": [{ "at": "2026-10-22T10:00:02.500Z", "stage": "services", "kind": "unhandledRejection", "message": "TypeError: cannot read properties of undefined (reading 'id')" }],
+      "fatal": null
+    },
+    "slowControl": {
+      "schema": 1, "pid": 700, "version": "0.1.59-local.3", "packaged": true, "exe": "C:\\Conductor.exe",
+      "startedAt": "2026-10-22T10:00:00.000Z", "heapLimitMb": 4096, "stage": "control-api", "stageAt": "2026-10-22T10:00:05.000Z",
+      "outcome": "booting", "readyMs": null,
+      "stages": [{ "name": "control-api", "at": "2026-10-22T10:00:05.000Z", "ms": 5000, "heapMb": 500, "rssMb": 900 }],
+      "peak": { "heapMb": 500, "rssMb": 900 }, "errors": [], "fatal": null
+    },
+    "ready": {
+      "schema": 1, "pid": 800, "version": "0.1.59-local.4", "packaged": true, "exe": "C:\\Conductor.exe",
+      "startedAt": "2026-10-22T10:00:00.000Z", "heapLimitMb": 4096, "stage": "ready", "stageAt": "2026-10-22T10:00:06.200Z",
+      "outcome": "ready", "readyMs": 6200,
+      "stages": [{ "name": "ready", "at": "2026-10-22T10:00:06.200Z", "ms": 6200, "heapMb": 410, "rssMb": 700 }],
+      "peak": { "heapMb": 410, "rssMb": 700 }, "errors": [], "fatal": null
+    }
+  },
+  "cases": [
+    {
+      "name": "the 2026-10-22 outage: died in the store, OOM read from the launch log",
+      "input": { "record": "oomStore", "alive": false, "exitCode": 3758096392, "log": "OOM error in V8: MarkCompactCollector: young object promotion failed Allocation failed - JavaScript heap out of memory", "now": 1792660000000 },
+      "expect": { "state": "died", "stage": "structured-store", "cause": "oom", "signature": "died:structured-store:oom",
+        "line": "died in stage structured-store 0.7 s after start: V8 heap out of memory (heap 40 MB of a 4.0 GB limit, RSS 150 MB); Conductor 0.1.58-local.1792659912858, pid 68968" }
+    },
+    {
+      "name": "OOM from the sampler alone: the heap was at its limit when the samples stopped",
+      "input": { "record": "oomStore", "sample": { "schema": 1, "pid": 68968, "at": "2026-10-22T09:26:04.100Z", "ms": 4100, "rssMb": 4300, "heapMb": 3905, "mainBeatAgoMs": 3400, "stage": "structured-store" }, "alive": false, "exitCode": null, "log": "", "now": 1792660000000 },
+      "expect": { "state": "died", "stage": "structured-store", "cause": "oom", "signature": "died:structured-store:oom",
+        "line": "died in stage structured-store 4.1 s after start: V8 heap out of memory (heap 3.8 GB of a 4.0 GB limit, RSS 4.2 GB); Conductor 0.1.58-local.1792659912858, pid 68968" }
+    },
+    {
+      "name": "a sample of another launch is ignored",
+      "input": { "record": "oomStore", "sample": { "schema": 1, "pid": 1, "at": "2026-10-22T09:26:04.100Z", "ms": 4100, "rssMb": 4300, "heapMb": 3905, "mainBeatAgoMs": 0, "stage": "ready" }, "alive": false, "exitCode": 1, "log": "", "now": 1792660000000 },
+      "expect": { "state": "died", "stage": "structured-store", "cause": "crash", "signature": "died:structured-store:crash",
+        "line": "died in stage structured-store 0.7 s after start: the process ended without a JavaScript error (exit code 1) (heap 40 MB of a 4.0 GB limit, RSS 150 MB); Conductor 0.1.58-local.1792659912858, pid 68968" }
+    },
+    {
+      "name": "an exit the app saw",
+      "input": { "record": "exitSettings", "alive": false, "exitCode": 70, "log": "", "now": 1792660000000 },
+      "expect": { "state": "died", "stage": "settings", "cause": "exit", "signature": "died:settings:exit",
+        "line": "died in stage settings 1.0 s after start: exited (exit code 70); Conductor 0.1.59-local.1, pid 500" }
+    },
+    {
+      "name": "an unhandled rejection left the launch stalled",
+      "input": { "record": "erroredServices", "alive": true, "now": 1792663260000 },
+      "nowIso": "2026-10-22T10:01:00.000Z",
+      "expect": { "state": "stalled", "stage": "services", "cause": "exception", "signature": "stalled:services:exception",
+        "line": "stalled in stage services for 58.0 s after unhandledRejection TypeError: cannot read properties of undefined (reading 'id'); Conductor 0.1.59-local.2, pid 600" }
+    },
+    {
+      "name": "the same launch dying after its error",
+      "input": { "record": "erroredServices", "alive": false, "exitCode": 1, "now": 1792663260000 },
+      "expect": { "state": "died", "stage": "services", "cause": "exception", "signature": "died:services:exception",
+        "line": "died in stage services 2.0 s after start: crashed after unhandledRejection TypeError: cannot read properties of undefined (reading 'id') (exit code 1); Conductor 0.1.59-local.2, pid 600" }
+    },
+    {
+      "name": "still booting",
+      "input": { "record": "slowControl", "alive": true, "now": 1792663235000 },
+      "nowIso": "2026-10-22T10:00:35.000Z",
+      "expect": { "state": "booting", "stage": "control-api", "cause": null, "signature": "booting:control-api:none",
+        "line": "booting: in stage control-api for 30.0 s, 35.0 s after start (heap 500 MB of a 4.0 GB limit, RSS 900 MB); Conductor 0.1.59-local.3, pid 700" }
+    },
+    {
+      "name": "hung with a blocked main thread",
+      "input": { "record": "slowControl", "sample": { "schema": 1, "pid": 700, "at": "2026-10-22T10:05:00.000Z", "ms": 300000, "rssMb": 950, "heapMb": 520, "mainBeatAgoMs": 290000, "stage": "control-api" }, "alive": true, "now": 1792663505000 },
+      "nowIso": "2026-10-22T10:05:05.000Z",
+      "expect": { "state": "stalled", "stage": "control-api", "cause": "hang", "signature": "stalled:control-api:hang",
+        "line": "stalled in stage control-api for 5.0 min (main thread blocked for 4.8 min; heap 520 MB of a 4.0 GB limit, RSS 950 MB); Conductor 0.1.59-local.3, pid 700" }
+    },
+    {
+      "name": "ready",
+      "input": { "record": "ready", "alive": true, "now": 1792663300000 },
+      "expect": { "state": "ready", "stage": "ready", "cause": null, "signature": "ready:ready:none",
+        "line": "ready in 6.2 s (peak heap 410 MB); Conductor 0.1.59-local.4, pid 800" }
+    },
+    {
+      "name": "no record, OOM in the log",
+      "input": { "record": null, "pid": 900, "alive": false, "exitCode": 4294930435, "log": "", "now": 1792663300000 },
+      "expect": { "state": "unknown", "stage": null, "cause": "oom", "signature": "unknown:none:oom",
+        "line": "died before writing boot diagnostics (before the single-instance lock, or a build without them): V8 heap out of memory (exit code 4294930435)" }
+    },
+    {
+      "name": "no record, alive",
+      "input": { "record": null, "pid": 901, "alive": true, "now": 1792663300000 },
+      "expect": { "state": "unknown", "stage": null, "cause": null, "signature": "unknown:none:none",
+        "line": "pid 901 runs but has written no boot diagnostics (a build without them, or it has not reached the single-instance lock)" }
+    }
+  ]
+}

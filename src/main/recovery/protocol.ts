@@ -54,6 +54,8 @@ export interface RelaunchAttempt {
   /** Tail of what it wrote to stdout/stderr. */
   output?: string
   outputPath?: string
+  /** Where and why this attempt's launch failed, from its boot record (docs/startup-diagnostics.md). */
+  boot?: string
   ready: boolean
 }
 
@@ -79,6 +81,8 @@ export interface RecoveryReport {
   outcome: RecoveryOutcome
   /** Why it was needed: what the watchdog saw when it gave up waiting. */
   error: string
+  /** The newest launch's boot verdict when it never became ready (docs/startup-diagnostics.md). */
+  boot?: string
   attempts: RelaunchAttempt[]
   agent?: AgentRun
   readyPid?: number

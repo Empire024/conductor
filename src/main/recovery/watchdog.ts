@@ -48,6 +48,11 @@ export interface WatchdogDeps {
    *  launched app reads it at startup, before it answers app control. */
   announce(report: RecoveryReport): void
   log(message: string): void
+  /** Where and why the launch `pid` failed, in one line, from its boot record (docs/startup-diagnostics.md). */
+  bootVerdict?(pid: number | undefined, exitCode: number | null, output: string): string | null
+  /** The newest launch other than `appPid`, when it never became ready: an update's new build that
+   *  died starting (2026-10-22) is told apart from one that never ran. */
+  latestBoot?(appPid: number): string | null
   /** Test profiles: the smoke that launched the app is gone, so nothing is left to watch for. */
   parentGone(): boolean
 }
@@ -144,17 +149,19 @@ export async function runWatchdog(deps: WatchdogDeps, config: WatchdogConfig): P
   if (back) { deps.log(`Conductor is back as pid ${back.pid} after ${deps.now() - exitedAt} ms`); return { result: 'returned', pid: back.pid, waitedMs: deps.now() - exitedAt } }
   const waited = Math.round((deps.now() - exitedAt) / 1000)
   const stuck = successor(deps, appPid)
+  const newest = deps.latestBoot?.(appPid) ?? null
   const reason = (kind === 'running'
     ? `Conductor pid ${appPid} ended without quitting (crash or kill) and no Conductor answered app control within ${waited} s`
     : `after ${kind === 'update-install' ? `the update install${arm?.toVersion ? ` of ${arm.toVersion}` : ''}` : 'app.restart'} no new Conductor answered app control within ${waited} s of pid ${appPid} exiting`) +
-    (stuck ? `; Conductor pid ${stuck.pid} is running and holds the single-instance lock but never answered` : '')
+    (stuck ? `; Conductor pid ${stuck.pid} is running and holds the single-instance lock but never answered` : '') +
+    (newest ? `; the newest launch ${newest}` : '')
   deps.log(reason)
 
   const paths = deps.reportPaths()
   const attempts: RelaunchAttempt[] = []
   const build = (outcome: RecoveryOutcome, readyPid: number | undefined, agent: AgentRun | undefined): RecoveryReport => ({
     id: paths.id, at: new Date(deps.now()).toISOString(), appPid, kind, fromVersion: arm?.fromVersion ?? '',
-    ...(arm?.toVersion ? { toVersion: arm.toVersion } : {}), outcome, error: reason, attempts,
+    ...(arm?.toVersion ? { toVersion: arm.toVersion } : {}), outcome, error: reason, ...(newest ? { boot: newest } : {}), attempts,
     ...(agent ? { agent } : {}), ...(readyPid ? { readyPid } : {}), reportPath: paths.markdown
   })
   const finish = async (outcome: RecoveryOutcome, readyPid: number | undefined, agent: AgentRun | undefined): Promise<WatchdogResult> => {
@@ -229,7 +236,9 @@ export async function runWatchdog(deps: WatchdogDeps, config: WatchdogConfig): P
         await deps.notify('Conductor was brought back', `It did not come back by itself; recovery mode relaunched it (attempt ${index + 1}).`)
         return finish('relaunched', readyPid, undefined)
       }
-      deps.log(`attempt ${index + 1} did not answer: ${attempt.exitCode === null ? 'still running, not answering' : `exited with ${attempt.exitCode}`}`)
+      const boot = deps.bootVerdict?.(child.pid, attempt.exitCode, attempt.output) ?? null
+      if (boot) attempt.boot = boot
+      deps.log(`attempt ${index + 1} did not answer: ${attempt.exitCode === null ? 'still running, not answering' : `exited with ${attempt.exitCode}`}${boot ? `; ${boot}` : ''}`)
       // A live attempt keeps the single-instance lock: another would only exit against it.
       if (attempt.exitCode === null) break
     }
@@ -237,9 +246,10 @@ export async function runWatchdog(deps: WatchdogDeps, config: WatchdogConfig): P
 
   // 5. The agent, with the exact error.
   const error = attempts.length
-    ? `${reason}. Relaunch attempts: ${attempts.map((attempt, index) => `#${index + 1} ${attempt.exe}: ${attempt.error ?? (attempt.exitCode === null || attempt.exitCode === undefined ? 'running but never answered app control' : `exited with code ${attempt.exitCode}`)}`).join('; ')}`
+    ? `${reason}. Relaunch attempts: ${attempts.map((attempt, index) => `#${index + 1} ${attempt.exe}: ${attempt.error ?? attempt.boot ?? (attempt.exitCode === null || attempt.exitCode === undefined ? 'running but never answered app control' : `exited with code ${attempt.exitCode}`)}`).join('; ')}`
     : looping ? `${reason}. Crash loop: ${config.maxRecoveries} recoveries in ${Math.round(config.recoveryWindowMs / 60_000)} min, so no relaunch was tried` : `${reason}. No relaunch could be tried: the app left no launch record`
-  await deps.notify('Conductor is down', 'Recovery mode could not relaunch it; a recovery agent is looking into it.')
+  const where = [...attempts].reverse().find(attempt => attempt.boot)?.boot ?? newest
+  await deps.notify('Conductor is down', `Recovery mode could not relaunch it${where ? `: ${where}` : ''}. A recovery agent is looking into it.`)
   let agent: AgentRun | undefined
   deps.announce(build('agent-recovered', undefined, undefined))
   try {
@@ -253,7 +263,7 @@ export async function runWatchdog(deps: WatchdogDeps, config: WatchdogConfig): P
     await deps.notify('Conductor was brought back', 'The recovery agent brought it back. Its diagnosis is in the recovery report.')
     return finish('agent-recovered', after.pid, agent)
   }
-  await deps.notify('Conductor is still down', `Start it by hand. Diagnosis: ${paths.markdown}`)
+  await deps.notify('Conductor is still down', `${where ? `${where}. ` : ''}Diagnosis: ${paths.markdown}`)
   return finish('down', undefined, agent)
 }
 

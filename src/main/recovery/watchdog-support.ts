@@ -43,6 +43,7 @@ export function recoveryMarkdown(report: RecoveryReport): string {
     '',
     `- **Outcome:** ${report.outcome === 'relaunched' ? 'relaunched by the watchdog' : report.outcome === 'agent-recovered' ? 'brought back by the recovery agent' : 'still down: start Conductor by hand'}${report.readyPid ? ` (pid ${report.readyPid})` : ''}`,
     `- **Error:** ${report.error}`,
+    ...(report.boot ? [`- **Newest launch:** ${report.boot}`] : []),
     `- **Stop:** ${report.kind} of pid ${report.appPid}${report.fromVersion ? `, version ${report.fromVersion}` : ''}${report.toVersion ? ` -> ${report.toVersion}` : ''}`,
     `- **When:** ${report.at}`,
     ''
@@ -50,7 +51,7 @@ export function recoveryMarkdown(report: RecoveryReport): string {
   if (report.attempts.length) {
     lines.push('## Relaunch attempts', '')
     report.attempts.forEach((attempt, index) => {
-      lines.push(`${index + 1}. \`${attempt.exe}\` at ${attempt.startedAt}: ${attempt.ready ? 'answered app control' : attempt.error ? `could not start (${attempt.error})` : attempt.exitCode === null || attempt.exitCode === undefined ? 'ran but never answered' : `exited with code ${attempt.exitCode}`}${attempt.outputPath ? ` — output: ${attempt.outputPath}` : ''}`)
+      lines.push(`${index + 1}. \`${attempt.exe}\` at ${attempt.startedAt}: ${attempt.ready ? 'answered app control' : attempt.error ? `could not start (${attempt.error})` : attempt.exitCode === null || attempt.exitCode === undefined ? 'ran but never answered' : `exited with code ${attempt.exitCode}`}${attempt.boot ? `; ${attempt.boot}` : ''}${attempt.outputPath ? ` — output: ${attempt.outputPath}` : ''}`)
     })
     lines.push('')
   }

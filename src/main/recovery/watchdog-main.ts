@@ -5,6 +5,7 @@ import { execFileSync, spawn } from 'node:child_process'
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync, fstatSync } from 'node:fs'
 import { join } from 'node:path'
 import { recoveryAgentArgs, recoveryAgentCommand, recoveryPrompt, RECOVERY_AGENT_TIMEOUT_MS } from './agent'
+import { readBootRecord, readBootVerdict } from './boot-verdict'
 import { HISTORY_FILE, PENDING_REPORT_FILE, TEST_TOAST_FILE, WATCHDOG_LOCK_FILE, WATCHDOG_LOG_FILE, ARM_FILE, parseArmRecord, recoveryDirectory, type AgentRun, type RecoveryReport, type WatchdogLock } from './protocol'
 import { recoveryMarkdown, toastScript, watchdogTimings } from './watchdog-support'
 import { DEFAULT_WATCHDOG_CONFIG, runWatchdog, type LaunchedProcess, type WatchdogDeps } from './watchdog'
@@ -153,7 +154,8 @@ const deps: WatchdogDeps = {
   },
   async logTails() {
     const tails: Record<string, string> = {}
-    for (const path of [join(userData, 'runtime-host', 'host.log'), logPath]) {
+    const diagnostics = join(userData, 'diagnostics')
+    for (const path of [join(userData, 'runtime-host', 'host.log'), logPath, join(diagnostics, 'boot.json'), join(diagnostics, 'boot-last-failure.json'), join(diagnostics, 'boot-sample.json')]) {
       const text = tailFile(path, 5000)
       if (text) tails[path] = text.split('\n').slice(-50).join('\n')
     }
@@ -177,6 +179,15 @@ const deps: WatchdogDeps = {
   },
   announce(report: RecoveryReport) { writeAtomic(join(directory, PENDING_REPORT_FILE), `${JSON.stringify(report, null, 2)}\n`) },
   log,
+  bootVerdict(pid, exitCode, output) {
+    if (!pid) return null
+    return readBootVerdict(userData, { pid, alive: alive(pid), exitCode, log: output }).line
+  },
+  latestBoot(watchedPid) {
+    const { record } = readBootRecord(userData, null)
+    if (!record || record.pid === watchedPid || record.outcome === 'ready') return null
+    return readBootVerdict(userData, { pid: record.pid, alive: alive(record.pid) }).line
+  },
   parentGone: () => Number.isInteger(parentPid) && parentPid > 0 && !alive(parentPid)
 }
 
