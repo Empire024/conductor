@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { followsBottomAfterScroll, hasTimelineSelection, isAtConversationBottom, latestOwnerPrompt, truncatePromptPreview, type ScrollGeometry } from './conversation-scroll'
+import { followsBottomAfterScroll, hasTimelineSelection, isAtConversationBottom, latestOwnerPrompt, pickStickyMessage, stickyCandidates, truncatePromptPreview, type ScrollGeometry } from './conversation-scroll'
 import type { PromptOrigin, TimelineItem } from '../../../shared/structured-agent'
 
 const geometry = (distanceFromBottom: number, scrollHeight = 1000, clientHeight = 500): ScrollGeometry =>
@@ -133,5 +133,35 @@ describe('hasTimelineSelection', () => {
     expect(hasTimelineSelection(timeline, selection(inside, false, 'selected words').value)).toBe(true)
     expect(hasTimelineSelection(timeline, selection(inside, false, '').value)).toBe(false)
     expect(hasTimelineSelection(null, selection(inside, false, 'selected words').value)).toBe(false)
+  })
+})
+
+describe('sticky message selection', () => {
+  const view = { top: 0, bottom: 500 }
+  const rects = (entries: Record<string, [number, number]>) => new Map(Object.entries(entries).map(([id, [top, bottom]]) => [id, { top, bottom }]))
+
+  it('lists the prompt and the text messages after it, skipping tools', () => {
+    const items = [userText('u0', 'old'), userText('u1', 'ask'), toolItem('t1'), assistantText('a1', 'one'), assistantText('a2', 'two')]
+    const prompt = latestOwnerPrompt(items)
+    expect(stickyCandidates(items, prompt).map(c => c.id)).toEqual(['u1', 'a1', 'a2'])
+    expect(stickyCandidates(items, null)).toEqual([])
+  })
+
+  it('keeps the prompt when it is scrolled out of view', () => {
+    const c = [{ id: 'u1', text: 'ask' }, { id: 'a1', text: 'one' }]
+    expect(pickStickyMessage(c, rects({ u1: [-300, -100], a1: [-90, 50] }), view)?.id).toBe('u1')
+  })
+
+  it('sticks the next message when the prompt is fully visible', () => {
+    const c = [{ id: 'u1', text: 'ask' }, { id: 'a1', text: 'one' }, { id: 'a2', text: 'two' }]
+    expect(pickStickyMessage(c, rects({ u1: [10, 60], a1: [80, 400], a2: [420, 700] }), view)?.id).toBe('a2')
+    expect(pickStickyMessage(c, rects({ u1: [10, 60], a1: [80, 600] }), view)?.id).toBe('a1')
+    expect(pickStickyMessage(c, rects({ u1: [10, 60] }), view)?.id).toBe('a1')
+  })
+
+  it('falls back to the prompt when everything is visible', () => {
+    const c = [{ id: 'u1', text: 'ask' }, { id: 'a1', text: 'one' }]
+    expect(pickStickyMessage(c, rects({ u1: [10, 60], a1: [80, 200] }), view)?.id).toBe('u1')
+    expect(pickStickyMessage([], rects({}), view)).toBeNull()
   })
 })

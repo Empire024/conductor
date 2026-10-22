@@ -1964,7 +1964,7 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
   
   ![image.png](.conductor/prompt-images/86e7a5dd-062e-432b-b111-10256519ea40.png)
 
-- [ ] when stickied message is in veiw already stick the next message (and make a simple animatiomn for it so we know t just happened) <!-- conductor-task:01b78446-de80-4344-8d57-01bfc67f4184 -->
+- [x] when stickied message is in veiw already stick the next message (and make a simple animatiomn for it so we know t just happened) <!-- conductor-task:01b78446-de80-4344-8d57-01bfc67f4184 agent=agent_mvjj40wg_x60q7d6 --> Done: the pinned bar sticks the next text message when the last prompt is fully in view (pickStickyMessage in conversation-scroll.ts) and plays a 250 ms slide-in on change; reduced-motion already disables it; scripts/smoke-sticky-next-message.mjs passes parked.
 
 - [x] usage graph should change color gradient to red as it get closer to 100% with a caling towards 100% so biger part of bottom is bluer and then gets red suddely Done: usage graphs (sidebar sparkline, usage dialog charts) now fill and stroke through a vertical gradient that is blue up to 75% and eases (squared) to red at 100% (usage-color.ts, UsageGradient.tsx); smoke-usage-gradient.mjs. <!-- conductor-task:f02f8d08-5538-4e94-a29b-4fccd004ba1e agent=agent_mvifslig_1l1rozz -->
 

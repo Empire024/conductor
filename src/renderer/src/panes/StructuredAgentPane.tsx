@@ -23,7 +23,7 @@ import { StructuredSendButton, sendButtonIntent } from './StructuredSendButton'
 import { IncomingMessageList, incomingQueued, ownQueued, QueuedMessageList } from './QueuedMessageList'
 import { StructuredAgentTelemetry, StructuredLiveTokens, StructuredUsageSummary } from './StructuredAgentTelemetry'
 import { distinguishSubagentLabels, subagentColorIndex, subagentIdentityId, summarizeSubagents } from './usage-summary'
-import { followsBottomAfterScroll, hasTimelineSelection, latestOwnerPrompt, truncatePromptPreview } from './conversation-scroll'
+import { followsBottomAfterScroll, hasTimelineSelection, latestOwnerPrompt, pickStickyMessage, stickyCandidates, truncatePromptPreview } from './conversation-scroll'
 import { ConversationFindBar } from './ConversationFindBar'
 import { CLOSED_FIND, clearFindRanges, collectQueryRanges, conversationMatches, findReducer, paintFindRanges, type ConversationMatch, type FindAction } from './conversation-find'
 import { useOlderHistory, withStoredMatches } from './conversation-paging'
@@ -868,7 +868,32 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     })
     setPendingPromptScroll(id)
   }
-  const scrollToPinnedPrompt = (): void => { if (pinnedPrompt) scrollToItem(pinnedPrompt.id) }
+  // The bar sticks the owner's last prompt, unless that prompt is fully in view already; then it
+  // sticks the next message after it, and a change of message plays a short slide-in.
+  const [sticky, setSticky] = useState<{ id: string; text: string; animate: boolean } | null>(null)
+  useEffect(() => {
+    const element = timeline.current
+    const candidates = stickyCandidates(conversationItems, pinnedPrompt)
+    if (!element || !candidates.length) { setSticky(null); return }
+    let frame = 0
+    const update = (): void => {
+      frame = 0
+      const view = element.getBoundingClientRect()
+      const rects = new Map<string, { top: number; bottom: number }>()
+      for (const candidate of candidates) {
+        const card = element.querySelector<HTMLElement>('[data-item-id="' + CSS.escape(candidate.id) + '"]')
+        if (card) { const box = card.getBoundingClientRect(); rects.set(candidate.id, { top: box.top, bottom: box.bottom }) }
+      }
+      const pick = pickStickyMessage(candidates, rects, { top: view.top, bottom: view.bottom })
+      setSticky(current => !pick ? null : current?.id === pick.id && current.text === pick.text ? current : { id: pick.id, text: pick.text, animate: Boolean(current) && current!.id !== pick.id })
+    }
+    const schedule = (): void => { if (!frame) frame = requestAnimationFrame(update) }
+    update()
+    element.addEventListener('scroll', schedule, { passive: true })
+    return () => { element.removeEventListener('scroll', schedule); if (frame) cancelAnimationFrame(frame) }
+  }, [conversationItems, pinnedPrompt, ready, readingWindow])
+  const stickyShown = sticky && pinnedPrompt ? sticky : pinnedPrompt ? { id: pinnedPrompt.id, text: pinnedPrompt.text, animate: false } : null
+  const scrollToSticky = (): void => { if (stickyShown) scrollToItem(stickyShown.id) }
   useLayoutEffect(() => {
     if (!pendingPromptScroll) return
     const element = timeline.current
@@ -1220,7 +1245,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   // an external store), so the timeline is memoized on what it actually shows; a keystroke
   // reconciles only the composer. Handlers in here read refs and stable setters, and every value
   // the closures below read (pinned prompt, reading window, visible count) is a dependency.
-  const timelineView = useMemo(() => <div className="sa-timeline-wrap">{pinnedPrompt && <button type="button" className="sa-pinned-prompt" title={pinnedPrompt.text} aria-label={'Scroll to ' + (pinnedPrompt.origin ? pinnedPrompt.origin.label + '\'s initiating message' : 'your last message') + ': ' + pinnedPrompt.text} onClick={scrollToPinnedPrompt}><Pin size={11} aria-hidden="true" /><span>{truncatePromptPreview(pinnedPrompt.text)}</span></button>}<div className="sa-timeline" ref={timeline} role="region" aria-label={name + ' conversation'} tabIndex={0} onWheel={event => { userScrollUntil.current = Date.now() + 800; if (event.deltaY < 0) { nearBottom.current = false; setReadingWindow(current => current ?? lastVisibleItems.current) } }} onTouchMove={() => { userScrollUntil.current = Date.now() + 800 }} onPointerDown={event => { if (event.target === timeline.current) userScrollUntil.current = Date.now() + 2000 }} onKeyDown={event => { if (event.target === timeline.current && ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) { userScrollUntil.current = Date.now() + 800; if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) nearBottom.current = false } }} onScroll={() => {
+  const timelineView = useMemo(() => <div className="sa-timeline-wrap">{pinnedPrompt && stickyShown && <button type="button" key={stickyShown.id} className={'sa-pinned-prompt' + (stickyShown.animate ? ' sa-pinned-changed' : '')} title={stickyShown.text} aria-label={'Scroll to ' + (stickyShown.id !== pinnedPrompt.id ? 'the message after your last one' : pinnedPrompt.origin ? pinnedPrompt.origin.label + '\'s initiating message' : 'your last message') + ': ' + stickyShown.text} onClick={scrollToSticky}><Pin size={11} aria-hidden="true" /><span>{truncatePromptPreview(stickyShown.text)}</span></button>}<div className="sa-timeline" ref={timeline} role="region" aria-label={name + ' conversation'} tabIndex={0} onWheel={event => { userScrollUntil.current = Date.now() + 800; if (event.deltaY < 0) { nearBottom.current = false; setReadingWindow(current => current ?? lastVisibleItems.current) } }} onTouchMove={() => { userScrollUntil.current = Date.now() + 800 }} onPointerDown={event => { if (event.target === timeline.current) userScrollUntil.current = Date.now() + 2000 }} onKeyDown={event => { if (event.target === timeline.current && ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) { userScrollUntil.current = Date.now() + 800; if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) nearBottom.current = false } }} onScroll={() => {
       const el = timeline.current
       // Layout and content growth can emit scroll events too. Only user input
       // should release automatic following while the view is pinned to the end.
@@ -1246,7 +1271,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
         return <details className="sa-completed-group" key={group[0]!.id}><summary><span>{coalesced ? coalescedEditLabel(coalesced) : `${group.length} completed actions`}</span>{latestTask && <span className="sa-completed-latest" title={latestTask}><b>Latest</b> {latestTask}{latestOutput && <code>OUT {latestOutput}</code>}</span>}</summary><div>{activities}</div></details>
       })}
       {(projection.phase === 'running' || projection.phase === 'starting') && <div className="sa-working" role="status"><i />{projection.phase === 'starting' ? 'Connecting…' : ['Thinking…', 'Spelunking…', 'Working…', 'Considering…'][workingWord]}<StructuredLiveTokens items={projection.items} /></div>}
-    </div></div>{newOutput && <button className="sa-jump" onClick={jumpToLatest}><ArrowDown size={13} /> New output · Jump to latest</button>}</div>, [pinnedPrompt, conversationItems, name, ready, earlierCount, older.status, observeEarlier, readingWindow, projection.items, projection.runtimeId, projection.phase, activityGroups, activeId, props.project.id, fileCwd, expansion, historical, dockedQuestions, labelAnchors, parentLabels, onExpand, onOpenFile, onRespond, focusOrigin, setQuestionDocked, revealDock, provider, switchPermission, recallByItem, loadTurnRecalls, workingWord, newOutput, props.resourceId])
+    </div></div>{newOutput && <button className="sa-jump" onClick={jumpToLatest}><ArrowDown size={13} /> New output · Jump to latest</button>}</div>, [pinnedPrompt, stickyShown?.id, stickyShown?.text, stickyShown?.animate, conversationItems, name, ready, earlierCount, older.status, observeEarlier, readingWindow, projection.items, projection.runtimeId, projection.phase, activityGroups, activeId, props.project.id, fileCwd, expansion, historical, dockedQuestions, labelAnchors, parentLabels, onExpand, onOpenFile, onRespond, focusOrigin, setQuestionDocked, revealDock, provider, switchPermission, recallByItem, loadTurnRecalls, workingWord, newOutput, props.resourceId])
 
   return <AgentFileMachineContext.Provider value={fileMachineId}><section ref={pane} className="structured-agent-pane" data-provider={provider} data-structured-session={activeId} data-file-machine={fileMachineId} onFocusCapture={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id, historical } }} onPointerDown={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id, historical } }}>
     <header className="sa-session-bar">

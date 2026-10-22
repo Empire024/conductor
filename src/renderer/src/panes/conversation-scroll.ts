@@ -55,3 +55,30 @@ export function isAtConversationBottom(element: ScrollGeometry, threshold = FOLL
 export function followsBottomAfterScroll(wasFollowing: boolean, geometry: ScrollGeometry): boolean {
   return isAtConversationBottom(geometry, wasFollowing ? FOLLOW_THRESHOLD_PX : RETURN_THRESHOLD_PX)
 }
+
+export interface StickyCandidate { id: string; text: string }
+const STICKY_LOOKAHEAD = 6
+
+/** The pinned prompt followed by the next few text messages after it, in order. */
+export function stickyCandidates(items: TimelineItem[], prompt: OwnerPrompt | null): StickyCandidate[] {
+  if (!prompt) return []
+  const out: StickyCandidate[] = [{ id: prompt.id, text: prompt.text }]
+  const start = items.findIndex(item => item.id === prompt.id)
+  if (start < 0) return out
+  for (let index = start + 1; index < items.length && out.length <= STICKY_LOOKAHEAD; index++) {
+    const data = items[index]!.data
+    if (data.type === 'text' && data.role !== 'status' && data.text.trim()) out.push({ id: items[index]!.id, text: data.text })
+  }
+  return out
+}
+
+/** Which message the top bar sticks: the first candidate not already fully inside the viewport
+ *  (sticking one the owner can see adds nothing). A candidate with no rect is not rendered, so it
+ *  is not visible. When every candidate is in view the prompt itself stays stuck. */
+export function pickStickyMessage(candidates: StickyCandidate[], rects: ReadonlyMap<string, { top: number; bottom: number }>, viewport: { top: number; bottom: number }): StickyCandidate | null {
+  const hidden = candidates.find(candidate => {
+    const rect = rects.get(candidate.id)
+    return !rect || rect.top < viewport.top || rect.bottom > viewport.bottom
+  })
+  return hidden ?? candidates[0] ?? null
+}

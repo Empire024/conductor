@@ -431,6 +431,8 @@
 
 /* The pin occupies a non-scrolling row, so no transcript text can paint above or behind it. */
 .structured-agent-pane .sa-pinned-prompt { position: relative; z-index: 3; display: flex; flex: 0 0 auto; width: 100%; align-items: center; justify-content: flex-start; gap: 6px; margin: 0; padding: 5px 9px; border: 1px solid var(--border-soft); border-radius: 0 0 6px 6px; background: var(--surface-1); box-shadow: 0 6px 16px -10px #000a; text-align: left; font-size: 11px; }
+.sa-pinned-prompt.sa-pinned-changed { animation: sa-pinned-in 250ms ease-out; }
+@keyframes sa-pinned-in { from { opacity: 0; transform: translateY(-6px); background: color-mix(in srgb, var(--accent) 22%, var(--surface-1)); } to { opacity: 1; transform: none; } }
 .sa-pinned-prompt > svg { flex: 0 0 auto; color: var(--accent-muted); }
 .sa-pinned-prompt > span { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--text-2); }
 /* A brief ring around the target activity after jumping to it from the pin, so the click has a
