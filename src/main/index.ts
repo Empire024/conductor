@@ -1769,7 +1769,8 @@ const registerIpc = (): void => {
     // A tab placed on another machine has no local runtime; the prompt belongs to that machine.
     const sessionId = structuredId(id)
     if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.submit(sessionId, String(text), 'agents.submit', settings, attachments)
-    return agents.structured.submit(sessionId, text, settings, attachments)
+    // The owner's Send is never refused because another sender's message is being delivered.
+    return agents.structured.submitFromOwner(sessionId, text, settings, attachments)
   })
   ipcMain.handle('structured:respond', (event, response) => {
     trustedStructured(event)

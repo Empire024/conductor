@@ -1297,6 +1297,36 @@ describe('mid-turn steering and input retention', () => {
 describe('messages queued together are delivered together', () => {
   const controller: PromptOrigin = { agentSessionId: 'controller-tab', label: 'Controller' }
   const userTexts = (f: ReturnType<typeof fixture>) => f.database.structured.snapshot(f.spec.id)!.items.flatMap(item => item.data.type === 'text' && item.data.role === 'user' ? [item.data] : [])
+  it('never refuses the owner because an agent steer is still unacknowledged: the owner message waits and is delivered on its own', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Original', settings)
+    f.current.capabilities.steering = true
+    let release = () => {}
+    f.current.onSteer = () => new Promise<void>(resolve => { release = resolve })
+    const agent = f.manager.steerOrStart(f.spec.id, 'Controller note', settings, [], controller)
+    await vi.waitFor(() => expect(f.current.steers).toHaveLength(1))
+    // The turn ends while the controller's steer is unacknowledged; the composer now sees an idle
+    // conversation and sends. A plain submit still refuses, which is what the owner used to get.
+    f.current.finish()
+    await expect(f.manager.submit(f.spec.id, 'Owner words', settings)).rejects.toThrow('already active')
+    const owner = f.manager.submitFromOwner(f.spec.id, 'Owner words', settings)
+    f.current.onSteer = undefined
+    release()
+    await agent
+    expect(['steered', 'queued']).toContain(await owner)
+    await vi.waitFor(() => expect(userTexts(f).map(item => [item.text, item.origin])).toContainEqual(['Owner words', undefined]))
+    expect(userTexts(f).find(item => item.text.includes('Owner words'))?.text).toBe('Owner words')
+    const notices = f.database.structured.snapshot(f.spec.id)!.items.flatMap(item => item.data.type === 'notice' ? [item.data.message] : [])
+    expect(notices.some(message => /^Your message (went into the running turn|is queued and goes after this turn) \(a message from Controller was still being delivered/.test(message))).toBe(true)
+  })
+
+  it('sends the owner message as a new turn when nothing else is being delivered', async () => {
+    const f = fixture()
+    expect(await f.manager.submitFromOwner(f.spec.id, 'Hello', settings)).toBe('started')
+    expect(f.current.submissions.map(submission => submission.text)).toEqual(['Hello'])
+    expect(f.database.structured.snapshot(f.spec.id)!.items.some(item => item.data.type === 'notice' && item.data.message.startsWith('Your message'))).toBe(false)
+  })
+
   /** The running turn cannot take a steer yet, so each message is held as a queued steer. */
   const heldBehindRunningTurn = async (f: ReturnType<typeof fixture>, ...messages: Array<[string, PromptOrigin?]>) => {
     await f.manager.submit(f.spec.id, 'Original', settings)

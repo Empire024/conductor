@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentActivityPhase, AgentSpec, LayoutNode, RuntimeEnsureResult } from '../shared/models'
 import { ANSWERED_IN_CONVERSATION, isAsyncQuestion, isFrontierModel, MAX_PROMPT_CHARS, PROVIDER_AUTH_EXPIRED, PROVIDER_OVERLOADED, PROVIDER_SAFEGUARD_REFUSAL, PROVIDER_USAGE_LIMIT, settingsForRuntime, WIZARD_MODEL_HINT, wizardActive } from '../shared/structured-agent'
-import { CONDUCTOR_ORIGIN } from '../shared/message-sender'
+import { CONDUCTOR_ORIGIN, messageSenderOf } from '../shared/message-sender'
 import type { ActivityStatus, AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, InteractionResponseResult, Json, PendingSteering, SessionProjection, PromptDispatchAuthority, PromptOrigin, QueuedPrompt, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import type { AgentChangeHistory, RevertOutcome, RevertScope } from '../shared/agent-change-history'
 import type { ConductorDatabase } from './database'
@@ -923,6 +923,24 @@ export class StructuredSessions {
     if (live.submitting || live.steering || live.queueing || active.has(phase)) return this.steer(id, text, settings, attachments, origin)
     await this.submit(id, text, settings, attachments, origin)
     return 'started'
+  }
+  /** The owner's Send from the composer. The composer chooses Send or Steer from the phase it last
+   *  saw, so a message from another sender being delivered at that moment (an agent's steer still
+   *  unacknowledged, a turn Conductor is starting for a report) used to refuse the owner with "A turn
+   *  or request is already active". The owner is never blocked by someone else's delivery: their
+   *  message is steered into, or queued behind, that turn, and the conversation says so. */
+  async submitFromOwner(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = []): Promise<SteerDelivery> {
+    const live = this.get(id), state = this.database.structured.snapshot(id)!
+    if (!(live.submitting || live.steering || live.queueing || active.has(state.phase))) {
+      await this.submit(id, text, settings, attachments)
+      return 'started'
+    }
+    if (state.phase === 'interrupting') throw new Error('The conversation is still stopping its last turn; send the message again once it has stopped')
+    const other = [...state.pendingSteering ?? []].reverse().find(input => input.status === 'sending' && messageSenderOf(input).kind !== 'owner')
+    const delivery = await this.steer(id, text, settings, attachments)
+    const why = other ? `a message from ${messageSenderOf(other).label} was still being delivered` : 'another delivery was under way'
+    this.emit(live, { data: { type: 'notice', message: delivery === 'steered' ? `Your message went into the running turn (${why} when you sent it).` : `Your message is queued and goes after this turn (${why} when you sent it).` } })
+    return delivery
   }
   /** Project-task ownership is transferred only after the native runtime acknowledges custody.
    * Unlike an ordinary composer steer, this never degrades into an unbounded host-side queue. */
