@@ -1972,7 +1972,7 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 
 - [~] messsages coming in from agents must be diffeerentiated completely in the ui from my own messages. absolutely completely not liek a queued message. <!-- conductor-task:85c79cbc-7f9c-48f1-a052-95f1d083d939 agent=agent_mvifslig_1l1rozz -->
 
-- [~] currently - approvals can get stsuck in chat - and then when the agent is continuing, i gotta scroll up to even find em.. evne if i click the bottom left one. <!-- conductor-task:4d8dba7b-20fc-4914-8dac-744a66933885 agent=agent_mvifslig_1l1rozz -->
+- [x] currently - approvals can get stsuck in chat - and then when the agent is continuing, i gotta scroll up to even find em.. evne if i click the bottom left one. <!-- conductor-task:4d8dba7b-20fc-4914-8dac-744a66933885 agent=agent_mvj3sjbc_3rzuiih --> Done: 788ec5e - pending approvals and questions dock above the composer with live buttons until answered; Needs attention, links and the header badge reveal the dock; Claude tabs stay waiting_approval while the agent keeps streaming (smoke-approval-dock).
 
 ## Phone WebApp: ultimate, snappy control suite (2026-10-03)
 
