@@ -16,6 +16,8 @@
   const TOKEN_KEY = 'conductor.phone.token'
   const FILTER_KEY = 'conductor.phone.filter'
   const LAST_AGENT_KEY = 'conductor.phone.lastAgent'
+  /* { id, at, sentAt? }: the conversation last opened on this phone, for landing on it. */
+  const LAST_USED_KEY = 'conductor.phone.lastUsed'
   const THEME_KEY = 'conductor.phone.theme'
   const STATE_CACHE_KEY = 'conductor.phone.lastState'
   const STATE_CACHE_MAX_AGE = 24 * 60 * 60 * 1000
@@ -133,6 +135,10 @@
     expanded: {},
     /* Coworker groups are compact by default; expansion is a local viewing choice. */
     expandedCoworkers: {},
+    /* Finished coworkers fold again inside an expanded group, by controller id. */
+    expandedFinished: {},
+    /* When this phone last sent in each conversation (ms), until the computer's lastOwnerMessageAt shows it. */
+    sentAt: {},
     /* In-progress answers per pending interaction id, same reason as drafts. */
     answers: {},
     /* Questions that closed while their answer was being typed, per conversation id: their cards
@@ -1605,7 +1611,6 @@
   // ------------------------------------------------------------------ sessions screen
 
   const activityTime = session => Date.parse(session.updatedAt || session.lastActivityAt || session.createdAt || '') || 0
-  const recentSessions = sessions => sessions.slice().sort((a, b) => activityTime(b) - activityTime(a) || String(a.id).localeCompare(String(b.id)))
   const sessionPhase = session => {
     if (session.state === 'attention' || session.state === 'failed' || session.phase === 'waiting_approval' || session.phase === 'waiting_input') return { id: 'attention', label: 'Needs you' }
     if (sessionViewing(session) || ['limited', 'disconnected', 'idle'].indexOf(session.state) >= 0 || session.activity === 'waiting') return { id: 'waiting', label: 'Waiting' }
@@ -1674,21 +1679,23 @@
       view.body.appendChild(hero)
       if (!phone) { view.body.appendChild(safeSkeleton('Reading projects…', 'Your project overview appears when the computer connects.')); return }
       if (state.offerInstall && state.installPrompt) view.body.appendChild(installCard())
-      view.body.appendChild(sectionHead('Projects'))
       const projects = el('div', 'home-projects')
       for (const project of phone.projects || []) {
-        const rows = sessions.filter(row => row.projectId === project.id)
+        const status = projectStatus(sessions.filter(row => row.projectId === project.id))
         const card = button('card project-card', null, () => go('#/tabs?project=' + encodeURIComponent(project.id)))
+        card.dataset.projectId = project.id
         card.appendChild(projectBadge(project.id, project.name))
-        card.appendChild(el('span', 'card-note', dotRow([rows.length + ' tabs', rows.filter(row => sessionPhase(row).id === 'running').length + ' running', rows.filter(row => sessionPhase(row).id === 'attention').length + ' need you'])))
+        card.appendChild(el('span', 'card-note project-status', dotRow([status.open + (status.open === 1 ? ' tab' : ' tabs'), status.text])))
         projects.appendChild(card)
       }
       if (!(phone.projects || []).length) projects.appendChild(emptyNote('No projects yet.', 'Add a project on the computer.'))
-      view.body.appendChild(projects)
-      view.body.appendChild(sectionHead('Recent tabs', 'All tabs', '#/tabs'))
-      const recent = el('div', 'list')
-      for (const session of recentSessions(sessions).slice(0, 5)) recent.appendChild(sessionRow(session))
+      /* Now first: the tab last written in, what needs the owner, what runs; then the latest of the rest. */
+      view.body.appendChild(sectionHead('Now', 'All tabs', '#/tabs'))
+      const recent = el('div', 'list home-now')
+      for (const row of rankedSessions(sessions).slice(0, 5)) recent.appendChild(sessionRow(row.session, false, { last: row.reason === 'sent', coworkersWorking: row.coworkersWorking, lead: row.coworkersWorking && !row.session.wizard ? 'Coordinator' : '' }))
       view.body.appendChild(recent)
+      view.body.appendChild(sectionHead('Projects'))
+      view.body.appendChild(projects)
       view.body.appendChild(sectionHead('Recent activity', 'View all', '#/activity'))
       if (activityError) view.body.appendChild(el('p', 'card-note', activityError))
       else if (!activity) view.body.appendChild(el('p', 'card-note', 'Reading activity…'))
@@ -2006,10 +2013,13 @@
     return session.state === state.filter
   }
 
-  const sessionRow = (session, compact) => {
+  /* extra (optional): { lead: 'Coordinator', last: true, coworkersWorking: n } from the Now rank or a group. */
+  const sessionRow = (session, compact, extra) => {
+    extra = extra || {}
     const node = button('session' + (compact ? ' coworker-session' : ''), null, () => go('#/session/' + encodeURIComponent(session.id)))
     const phase = sessionPhase(session)
     if (session.state === 'done' && Date.now() - activityTime(session) < 86400000) node.classList.add('recent-done')
+    if (extra.last) node.classList.add('last-sent')
     node.appendChild(badge(session.state))
 
     const main = el('div', 'session-main')
@@ -2021,6 +2031,8 @@
     main.appendChild(head)
 
     const meta = el('div', 'session-meta')
+    if (session.wizard) meta.appendChild(el('span', 'lead-flag wizard-flag', '✦ Wizard'))
+    else if (extra.lead) meta.appendChild(el('span', 'lead-flag', extra.lead))
     meta.appendChild(projectBadge(session.projectId, session.projectName))
     const parts = [providerWord(session.provider), session.model]
     if (session.machineId && session.machineId !== 'local') parts.push('on ' + session.machineName)
@@ -2039,6 +2051,8 @@
     if (session.incoming) meta.appendChild(el('span', 'session-flag incoming-flag', session.incoming + ' from agents'))
     if (session.backgroundTasks) meta.appendChild(el('span', 'session-flag', session.backgroundTasks + ' in background'))
     if (session.archived) meta.appendChild(el('span', 'session-flag', 'archived'))
+    if (extra.coworkersWorking) meta.appendChild(el('span', 'session-flag', extra.coworkersWorking + (extra.coworkersWorking === 1 ? ' coworker working' : ' coworkers working')))
+    if (extra.last) meta.appendChild(el('span', 'session-flag last-sent-flag', 'Last sent'))
     main.appendChild(meta)
 
     const preview = session.state === 'attention' && session.pendingTitle ? session.pendingTitle : session.lastText
@@ -2100,9 +2114,81 @@
           session: root,
           coworkers: workspace.sessions.filter(session => session.id !== root.id && rootId(session) === root.id)
         }))
+        /* The wizard leads its workspace; everything else keeps the computer's order. */
+        workspace.entries = workspace.entries.filter(entry => entry.session.wizard).concat(workspace.entries.filter(entry => !entry.session.wizard))
       }
     }
     return groups
+  }
+
+  /* What the owner is doing across projects (docs/phone-navigation.md). Open tabs fall in bands:
+     'sent' the one tab with the owner's newest message, 'attention' needs the owner, 'running'
+     working (a working coworker is represented by the tab that controls it), then 'recent', the
+     rest by last activity. Inside the first bands the order is by the owner's last message, then
+     the computer's order, never by activity: running tabs tick several times a second. */
+  const NOW_LIMIT = 8
+  const ownerTime = session => Math.max(Date.parse(session.lastOwnerMessageAt || '') || 0, state.sentAt[session.id] || 0)
+  const rankedSessions = sessions => {
+    const open = (sessions || []).filter(session => session.tabId !== null && !session.archived)
+    const byId = {}, position = {}
+    open.forEach((session, index) => { byId[session.id] = session; position[session.id] = index })
+    const rootOf = session => {
+      let current = session
+      const seen = {}
+      while (current.controllerId && byId[current.controllerId] && !seen[current.controllerId]) { seen[current.id] = true; current = byId[current.controllerId] }
+      return current
+    }
+    const working = {}
+    for (const session of open) {
+      const root = rootOf(session)
+      if (root !== session && sessionPhase(session).id === 'running') working[root.id] = (working[root.id] || 0) + 1
+    }
+    let last = null
+    for (const session of open) if (ownerTime(session) && (!last || ownerTime(session) > ownerTime(last))) last = session
+    const byOwner = (a, b) => ownerTime(b) - ownerTime(a) || position[a.id] - position[b.id]
+    const taken = {}
+    const rows = []
+    const take = (session, reason) => {
+      if (taken[session.id]) return
+      taken[session.id] = true
+      rows.push({ session: session, reason: reason, coworkersWorking: working[session.id] || 0 })
+    }
+    if (last) take(last, 'sent')
+    for (const session of open.filter(row => sessionPhase(row).id === 'attention').sort(byOwner)) take(session, 'attention')
+    for (const session of open.filter(row => rootOf(row) === row && (sessionPhase(row).id === 'running' || working[row.id])).sort(byOwner)) take(session, 'running')
+    for (const session of open.filter(row => rootOf(row) === row).sort((a, b) => activityTime(b) - activityTime(a) || position[a.id] - position[b.id])) take(session, 'recent')
+    return rows
+  }
+  const nowSessions = (sessions, limit) => rankedSessions(sessions).filter(row => row.reason !== 'recent').slice(0, limit || NOW_LIMIT)
+
+  /* One line per project: its wizard's (else its coordinator's) state, then what runs and waits. */
+  const projectStatus = sessions => {
+    const open = (sessions || []).filter(session => session.tabId !== null && !session.archived)
+    const controllers = {}
+    for (const session of open) if (session.controllerId) controllers[session.controllerId] = true
+    const wizard = open.find(session => session.wizard)
+    const lead = wizard || open.find(session => controllers[session.id]) || null
+    const running = open.filter(session => sessionPhase(session).id === 'running').length
+    const attention = open.filter(session => sessionPhase(session).id === 'attention').length
+    const leadText = lead ? (wizard ? 'Wizard ' : 'Coordinator ') + sessionPhase(lead).label.toLowerCase() : ''
+    return { lead: lead, running: running, attention: attention, open: open.length, text: dotRow([leadText, running ? running + ' running' : '', attention ? attention + ' need you' : '']) || (open.length ? 'idle' : 'nothing open') }
+  }
+
+  /* A cold launch lands on the tab the owner last used, if recent and still open in the last state
+     this phone saw: the newer of the one opened here and the computer's newest owner message. */
+  const LANDING_MAX_AGE = 12 * 60 * 60 * 1000
+  const landingSession = (sessions, stored, now) => {
+    const open = (sessions || []).filter(session => session.tabId !== null && !session.archived)
+    let best = null, bestAt = 0
+    if (stored && stored.id) {
+      const used = open.find(session => session.id === stored.id)
+      if (used) { best = used; bestAt = Math.max(Number(stored.at) || 0, Number(stored.sentAt) || 0) }
+    }
+    for (const session of open) {
+      const at = Date.parse(session.lastOwnerMessageAt || '') || 0
+      if (at > bestAt) { best = session; bestAt = at }
+    }
+    return best && now - bestAt <= LANDING_MAX_AGE ? best.id : null
   }
 
   /* The Tabs list keeps its nodes across updates. keep(key, signature, build) hands back the node
@@ -2143,17 +2229,31 @@
     return { keep: keep, sync: sync, done: done }
   }
 
-  const keptSessionRow = (nodes, session, compact) => nodes.keep('row:' + (compact ? 'c:' : '') + session.id, JSON.stringify(session), () => {
-    const node = sessionRow(session, compact)
+  /* prefix keeps a tab's Now card apart from its card in the project group. */
+  const keptSessionRow = (nodes, session, compact, extra, prefix) => nodes.keep((prefix || 'row:') + (compact ? 'c:' : '') + session.id, JSON.stringify([session, extra || null, state.sentAt[session.id] || 0]), () => {
+    const node = sessionRow(session, compact, extra)
     node.dataset.sessionId = session.id
     return node
   }, true)
+
+  /* A project's head: its colour, name and one-line status, with Files for a project on this computer. */
+  const projectHead = (project, status, files) => {
+    const node = el('div', 'section-head project-head')
+    node.style.setProperty('--project-color', projectColour(project.id))
+    const text = el('div', 'project-head-text')
+    text.appendChild(el('h2', 'group-title', project.name || 'Project'))
+    text.appendChild(el('span', 'project-status', status.text))
+    node.appendChild(text)
+    if (files) node.appendChild(button('ghost', 'Files', () => go(filesHash(project.id, ''))))
+    return node
+  }
 
   const renderGroups = (nodes, sessions, projects) => groupSessions(sessions, projects).map(project => {
     /* A project on this computer offers its files next to its name (#/files). */
     const local = projectById(project.id)
     const files = Boolean(local && local.machineId === 'local')
-    const head = nodes.keep('head:' + project.id, JSON.stringify([project.name, files]), () => files ? sectionHead(project.name || 'Project', 'Files', filesHash(project.id, '')) : el('h2', 'group-title', project.name || 'Project'))
+    const status = projectStatus(sessions.filter(session => session.projectId === project.id))
+    const head = nodes.keep('head:' + project.id, JSON.stringify([project.name, files, status.text]), () => projectHead(project, status, files))
     const children = [head]
     for (const workspace of project.workspaces) {
       const single = project.workspaces.length === 1 && workspace.name === project.name
@@ -2161,7 +2261,7 @@
       const rows = []
       for (const entry of workspace.entries) {
         const root = entry.session, coworkers = entry.coworkers
-        rows.push(keptSessionRow(nodes, root, false))
+        rows.push(keptSessionRow(nodes, root, false, coworkers.length && !root.wizard ? { lead: 'Coordinator' } : null))
         if (!coworkers.length) continue
         const expanded = state.expandedCoworkers[root.id] === true
         const working = coworkers.filter(session => session.state === 'working').length
@@ -2174,7 +2274,24 @@
           toggle.appendChild(el('span', 'chev' + (expanded ? ' down' : ''), '›'))
           return toggle
         }))
-        if (expanded) rows.push(nodes.sync(nodes.keep('coworkers:' + root.id, '', () => el('div', 'coworker-list')), coworkers.map(coworker => keptSessionRow(nodes, coworker, true))))
+        if (expanded) {
+          /* Live coworkers are listed; finished ones fold again behind "N finished". */
+          const live = coworkers.filter(session => sessionPhase(session).id !== 'done')
+          const finished = coworkers.filter(session => sessionPhase(session).id === 'done')
+          const showFinished = state.expandedFinished[root.id] === true
+          const list = live.map(coworker => keptSessionRow(nodes, coworker, true))
+          if (finished.length) {
+            list.push(nodes.keep('finished:' + root.id, JSON.stringify([showFinished, finished.length]), () => {
+              const toggle = button('coworker-toggle finished-toggle', null, () => { state.expandedFinished[root.id] = !showFinished; render() })
+              toggle.setAttribute('aria-expanded', showFinished ? 'true' : 'false')
+              toggle.appendChild(el('span', 'coworker-toggle-label', finished.length + ' finished'))
+              toggle.appendChild(el('span', 'chev' + (showFinished ? ' down' : ''), '›'))
+              return toggle
+            }))
+            if (showFinished) for (const coworker of finished) list.push(keptSessionRow(nodes, coworker, true))
+          }
+          rows.push(nodes.sync(nodes.keep('coworkers:' + root.id, '', () => el('div', 'coworker-list')), list))
+        }
       }
       children.push(nodes.sync(nodes.keep('list:' + workspace.id, '', () => el('div', 'list')), rows))
     }
@@ -2299,6 +2416,16 @@
         const title = state.filter === 'all' ? 'No conversations yet.' : 'Nothing here.'
         children.push(nodes.keep('empty', title + hint, () => emptyNote(title, hint)))
       } else {
+        /* Now: what the owner is doing across every project, above the stable groups. Only on the
+           whole list; a filter or a project chip already says what to look at. */
+        const now = route.name === 'tabs' && !route.projectId && state.filter === 'all' ? nowSessions(all) : []
+        if (now.length) {
+          const nowRows = now.map(row => keptSessionRow(nodes, row.session, false, { last: row.reason === 'sent', coworkersWorking: row.coworkersWorking, lead: row.coworkersWorking && !row.session.wizard ? 'Coordinator' : '' }, 'now:'))
+          children.push(nodes.sync(nodes.keep('now', '', () => el('section', 'group now-group')), [
+            nodes.keep('now-head', '', () => el('h2', 'group-title now-title', 'Now')),
+            nodes.sync(nodes.keep('now-list', '', () => el('div', 'list')), nowRows)
+          ]))
+        }
         for (const group of renderGroups(nodes, open, phone.projects)) children.push(group)
       }
 
@@ -2981,7 +3108,8 @@
       }
       // A submit/queued turn reaches the runtime when a new user timeline item appears. Steering
       // requires its input-delivery receipt; an accepted steer alone is never labelled Delivered.
-      if (row.mode !== 'steer' && !row.itemId) {
+      // A delivered steer is then tied to its user item too, or it stays drawn as the last bubble.
+      if ((row.mode !== 'steer' || row.status === 'delivered') && !row.itemId) {
         const matches = userItems.filter(item => item.sequence > row.baseline && !usedItems.has(item.id) && receiptText(item.data.text) === row.text)
         if (matches.length === 1) {
           row.itemId = matches[0].id
@@ -3040,9 +3168,19 @@
     }
   }
 
+  const rememberUsed = (id, sent) => {
+    let stored = null
+    try { stored = JSON.parse(readStored(LAST_USED_KEY) || 'null') } catch (error) { stored = null }
+    const entry = { id: id, at: Date.now() }
+    if (sent) entry.sentAt = Date.now()
+    else if (stored && stored.id === id && stored.sentAt) entry.sentAt = stored.sentAt
+    writeStored(LAST_USED_KEY, JSON.stringify(entry))
+  }
+
   const conversationScreen = id => {
     state.conversationId = id
     state.conversationError = ''
+    rememberUsed(id, false)
     const root = el('div', 'screen')
     const header = topbar()
     header.classList.add('conversation-bar')
@@ -3174,7 +3312,9 @@
           if (!state.authReady || state.locked) throw abortedRequest()
           if (state.stops[id] !== stopAtSend) throw ApiError('Sending was cancelled by Stop. Your draft and attachments are kept.', 409)
           mutationStarted = true
-          const result = await api(base + '/message', { method: 'POST', body: attachments.length ? { text: text, mode: 'auto', attachments: attachments } : { text: text, mode: 'auto' } })
+          state.sentAt[id] = Date.now()
+          rememberUsed(id, true)
+          const result = await api(base + '/message',{ method: 'POST', body: attachments.length ? { text: text, mode: 'auto', attachments: attachments } : { text: text, mode: 'auto' } })
           row.mode = result && result.mode
           if (!row.acknowledged) row.status = row.mode === 'queue' ? 'queued' : row.mode === 'steer' ? 'steered' : 'sent'
         }
@@ -6330,6 +6470,24 @@
     setTimeout(() => field.scrollIntoView({ block: 'end', inline: 'nearest' }), 60)
   }
 
+  /* A cold launch on Home (the app icon; a notification or link names its own page, a reload keeps
+     its history) opens the tab last used; seedNavigation puts Home behind it, one Back away. The
+     open tabs come from the last state cached here; with none (a locked phone caches nothing) the
+     tab last opened on this phone is trusted alone. */
+  const landOnLastUsed = () => {
+    const history = window.history
+    if (!state.token || !history || !history.replaceState || (window.location.hash || '#/') !== '#/') return
+    if (history.state && history.state.conductorPhone) return
+    let stored = null, cached = null
+    try { stored = JSON.parse(readStored(LAST_USED_KEY) || 'null') } catch (error) { stored = null }
+    try { cached = JSON.parse(readStored(STATE_CACHE_KEY) || 'null') } catch (error) { cached = null }
+    const sessions = cached && cached.token === state.token && cached.phone && Array.isArray(cached.phone.sessions) ? cached.phone.sessions : null
+    const id = sessions
+      ? landingSession(sessions, stored, Date.now())
+      : stored && stored.id && Date.now() - Math.max(Number(stored.at) || 0, Number(stored.sentAt) || 0) <= LANDING_MAX_AGE ? stored.id : null
+    if (id) history.replaceState(null, '', navigationUrl('#/session/' + encodeURIComponent(id)))
+  }
+
   const boot = () => {
     appRoot = document.getElementById('app')
     overlayPill = document.getElementById('pill')
@@ -6339,6 +6497,7 @@
     const savedFilter = readStored(FILTER_KEY)
     if (savedFilter && FILTERS.some(entry => entry.id === savedFilter)) state.filter = savedFilter
     takePairHash()
+    landOnLastUsed()
     seedNavigation()
     applyTheme(readStored(THEME_KEY) || 'system')
     applyViewport()

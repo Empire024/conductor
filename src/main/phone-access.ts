@@ -7,7 +7,7 @@ import { LOCAL_MACHINE_ID } from '../shared/remote-control'
 import { PROJECT_TASK_MAX_LENGTH, projectTaskKinds, projectTaskPriorities, projectTaskWeights, type ProjectTaskKind, type ProjectTaskPriority, type ProjectTaskWeight } from '../shared/project-backlog'
 import type { ContextAttachment, ConversationHistoryEntry, InteractionResponse, InteractionResponseResult, PendingInteraction, PromptOrigin, SessionProjection, SessionSettings, StructuredProvider, TimelineItem } from '../shared/structured-agent'
 import { emptyProjection } from '../shared/structured-agent-reducer'
-import { isAsyncQuestion, settingsForRuntime } from '../shared/structured-agent'
+import { isAsyncQuestion, settingsForRuntime, wizardActive } from '../shared/structured-agent'
 import type { SystemMetricsSnapshot } from '../shared/system-metrics'
 import { normalizeUsageWindows, summarizeUsage, updatedSequence, usageWindowAppliesToModel, type UsageWindow } from '../shared/usage-accounting'
 import {
@@ -96,6 +96,11 @@ export function phoneInputDeliveries(projection: SessionProjection | null): NonN
     } else if (data.type === 'input_delivery') {
       const prior = receipts.get(data.inputId)
       receipts.set(data.inputId, { id: data.inputId, text: prior?.text || '', status: data.status, sequence })
+    } else if (data.type === 'text' && data.role === 'user' && item.nativeItemId) {
+      // Steering and receipt events are projection state, never timeline items: a steer the runtime
+      // took leaves pendingSteering and becomes this user message, keyed by its input id. That
+      // message is its delivered receipt; without it the phone kept the row at "Steered" for good.
+      receipts.set(item.nativeItemId, { id: item.nativeItemId, text: previewText(data.text, 4000), status: 'delivered', sequence })
     }
   }
   for (const prompt of projection?.queuedPrompts ?? (projection?.queued ? [projection.queued] : [])) receipts.set(prompt.id, { id: prompt.id, text: previewText(prompt.text, 4000), status: 'queued', sequence: projection?.sequence || 0 })
@@ -883,6 +888,7 @@ export class PhoneAccessService {
     const pending = projection ? answerableInteractions(projection).at(-1) : undefined
     const denials = autoModeDenials(items)
     const last = lastMessage(items)
+    const ownerAt = lastOwnerMessageAt(items)
     const machineId = tab ? tabMachineId(tab) : spec?.machineId ?? project.remote?.machineId ?? LOCAL_MACHINE_ID
     const provider = (typeof tab?.state?.provider === 'string' ? tab.state.provider : spec?.provider ?? process?.provider ?? 'claude') as PhoneSessionSummary['provider']
     const latest = items.reduce<string | undefined>((best, item) => !best || item.timestamp > best ? item.timestamp : best, undefined)
@@ -907,6 +913,8 @@ export class PhoneAccessService {
       updatedAt: latest ?? process?.updatedAt ?? new Date(this.now()).toISOString(),
       ...(turnStartedAt ? { turnStartedAt } : {}),
       ...(last ? { lastText: previewText(last.text, PHONE_STATE_LIMITS.previewChars), lastRole: last.role, ...(last.role === 'user' && phoneSender(last) ? { lastFrom: phoneSender(last)!.label } : {}) } : {}),
+      ...(ownerAt ? { lastOwnerMessageAt: ownerAt } : {}),
+      ...(projection && wizardActive(projection.settings, provider) ? { wizard: true as const } : {}),
       ...(extra.limitResumeAt ?? process?.resumeAt ? { limitResumeAt: extra.limitResumeAt ?? process?.resumeAt } : {}),
       ...(extra.backgroundTasks ? { backgroundTasks: extra.backgroundTasks } : {}),
       ...queuedCounts(projection),
@@ -1430,6 +1438,18 @@ export function trimItem(item: TimelineItem): PhoneTimelineItem {
   else if (data.type === 'notice' && data.payload !== undefined) data = { ...data, payload: undefined }
   const sender = data.type === 'text' && data.role === 'user' ? phoneSender(data) : null
   return { id: item.id, sequence: item.sequence, timestamp: item.timestamp, ...(item.parentId ? { parentId: item.parentId } : {}), data, ...(sender ? { sender } : {}) }
+}
+
+/** When the owner last wrote in this conversation: the newest top-level user message whose sender is
+ *  the owner (messageSenderOf), so agents' messages, Conductor notices and activity never move it.
+ *  Scans back from the end and stops at the first one (docs/phone-navigation.md). */
+export function lastOwnerMessageAt(items: readonly TimelineItem[]): string | undefined {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index]!
+    if (item.parentId || item.data.type !== 'text' || item.data.role !== 'user' || !item.timestamp) continue
+    if (messageSenderOf(item.data).kind === 'owner') return item.timestamp
+  }
+  return undefined
 }
 
 /** Who sent a message that is not the owner's own, or null for the owner's (messageSenderOf). */

@@ -175,6 +175,15 @@ describe('phone authoritative delivery reconciliation', () => {
     app.reconcileMessages('s1', conversation({ inputDeliveries: [{ id: 'new-input', text: '', status: 'delivered', sequence: 12 }] }))
     expect(message.status).toBe('delivered')
   })
+  it('a delivered steer becomes its timeline message, not a lingering last bubble (owner-steer-stays-steered)', () => {
+    const app = runtime(); const message: any = row({ mode: 'steer' }); app.state.messages.s1 = [message]
+    app.reconcileMessages('s1', conversation({ inputDeliveries: [{ id: 'new-input', text: 'Same words', status: 'accepted', sequence: 11 }] }))
+    expect(message.status).toBe('steered'); expect(message.itemId).toBeUndefined()
+    // What phoneInputDeliveries reports once the runtime took it: the steer left pendingSteering and
+    // is now a user message whose native item id is the input id.
+    app.reconcileMessages('s1', conversation({ items: [{ id: 'user-steer', sequence: 13, data: { type: 'text', role: 'user', text: 'Same words' } }], inputDeliveries: [{ id: 'new-input', text: 'Same words', status: 'delivered', sequence: 13 }] }))
+    expect(message.status).toBe('delivered'); expect(message.itemId).toBe('user-steer')
+  })
   it('does not associate two ambiguous same-text acknowledgements', () => {
     const app = runtime(); const message = row({ ambiguous: true, mode: 'steer', status: 'uncertain' }); app.state.messages.s1 = [message]
     app.reconcileMessages('s1', conversation({ inputDeliveries: ['one', 'two'].map(id => ({ id, text: 'Same words', status: 'accepted', sequence: 11 })) }))

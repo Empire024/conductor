@@ -350,6 +350,25 @@ describe('what the phone sees', () => {
     expect(phoneQueued(steering)).toEqual([{ id: 's', text: 'steered in', sender: { kind: 'agent', label: 'Fixer', agentSessionId: 'agent_x1y2' } }, { id: 'a', text: 'mine' }, { id: 'b', text: 'theirs', sender: { kind: 'agent', label: 'Fixer', agentSessionId: 'agent_x1y2' } }])
   })
 
+  it('says when the owner last wrote, which agents and Conductor never move, and marks a wizard', () => {
+    const fix = fixture()
+    openConversation(fix, 'agent-1', { phase: 'running', settings: { permission: 'auto', plan: false, model: 'claude-fable-5-1', wizard: true }, items: [
+      item(1, { type: 'text', role: 'user', text: 'Ship the phone list', mode: 'snapshot' }),
+      item(2, { type: 'text', role: 'assistant', text: 'On it.', mode: 'snapshot' }),
+      item(3, { type: 'text', role: 'user', text: 'Done', mode: 'snapshot', origin: { agentSessionId: 'agent_fixer1', label: 'Fixer' } }),
+      item(4, { type: 'text', role: 'user', text: '[Conductor] approved: npm test', mode: 'snapshot' }),
+      item(5, { type: 'text', role: 'user', text: 'a nested prompt', mode: 'snapshot' }, { parentId: 'item-2' })
+    ] })
+    openConversation(fix, 'agent-2', { items: [item(6, { type: 'text', role: 'user', text: 'Report', mode: 'snapshot', origin: { agentSessionId: 'agent-1', label: 'Wizard' } })] })
+    const byId = new Map(fix.service.phoneState().sessions.map(session => [session.id, session]))
+    expect(byId.get('agent-1')).toMatchObject({ lastOwnerMessageAt: item(1, { type: 'notice', message: '' }).timestamp, wizard: true, lastFrom: 'Conductor' })
+    expect(byId.get('agent-2')!.lastOwnerMessageAt).toBeUndefined()
+    expect(byId.get('agent-2')!.wizard).toBeUndefined()
+    // The toggle on a model that cannot be a wizard is not a wizard.
+    fix.projections.set('agent-2', { ...fix.projections.get('agent-2')!, settings: { permission: 'auto', plan: false, model: 'claude-haiku-5-5', wizard: true } })
+    expect(fix.service.phoneState().sessions.find(session => session.id === 'agent-2')!.wizard).toBeUndefined()
+  })
+
   it('reports host load with the runtimes named by project and workspace', async () => {
     const fix = fixture()
     openConversation(fix, 'agent-1')

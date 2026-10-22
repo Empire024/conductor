@@ -1927,3 +1927,16 @@ a.login-link { display: block; text-align: center; text-decoration: none; paddin
 .files-actions { display: flex; gap: 8px; }
 a.files-action { flex: 1; display: inline-flex; align-items: center; justify-content: center; text-decoration: none; }
 .files-open { margin-top: -6px; }
+
+/* Phone navigation across projects (docs/phone-navigation.md): Now, project heads, wizard marks. */
+.now-group { margin-bottom: 8px; }
+.now-title { margin-top: 6px; color: var(--text); }
+.session.last-sent { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); background: color-mix(in srgb, var(--accent) 6%, var(--surface-1)); }
+.session-flag.last-sent-flag { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.lead-flag { flex: 0 0 auto; color: var(--text); background: var(--surface-3); border-radius: 999px; padding: 1px 7px; font-size: 11px; font-weight: 650; }
+.lead-flag.wizard-flag { color: #c792ea; background: color-mix(in srgb, #c792ea 14%, transparent); }
+.project-head { --project-color: var(--accent); margin: 22px 0 10px; padding-left: 10px; border-left: 4px solid var(--project-color); }
+.project-head-text { display: flex; flex-direction: column; min-width: 0; gap: 2px; }
+.project-head .group-title { margin: 0; color: var(--text); font-size: 15px; }
+.project-status { color: var(--text-2); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.finished-toggle { margin-top: 6px; }

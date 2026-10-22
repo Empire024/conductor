@@ -392,6 +392,10 @@ export interface PhoneSessionSummary {
   lastRole?: 'user' | 'assistant'
   /** Set when the last user-role message came from an agent or Conductor, not the owner. */
   lastFrom?: string
+  /** When the owner last wrote here (phone or desktop); agents' and Conductor's messages never move it. */
+  lastOwnerMessageAt?: string
+  /** A wizard tab (`wizardActive`): pinned first in its project on the phone. */
+  wizard?: true
   limitResumeAt?: string
   backgroundTasks?: number
   /** The owner's own queued messages. */

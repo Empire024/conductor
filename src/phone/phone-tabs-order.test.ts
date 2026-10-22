@@ -46,7 +46,7 @@ const harness = () => {
   const window: any = { location, history, navigator: {}, localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value), removeItem: (key: string) => storage.delete(key) }, ConductorBoot: {}, document }
   let instrumented = source.replace('const render = () => {', 'const render = () => { if (window.__listOnly) { if (screen && screen.update) screen.update(currentRoute()); return }')
   instrumented = instrumented.replace(/  if \(document.readyState === 'loading'\)[\s\S]*?\n\}\)\(\)\s*$/, `
-    window.test = { state, groupSessions, stalePhoneState, onStreamEvent, refreshPhoneState, open: () => { screen = sessionsScreen(currentRoute()); return screen } };
+    window.test = { state, groupSessions, rankedSessions, nowSessions, projectStatus, landingSession, stalePhoneState, onStreamEvent, refreshPhoneState, open: () => { screen = sessionsScreen(currentRoute()); return screen } };
   })()`)
   window.__listOnly = true
   runInNewContext(instrumented, { window, document, navigator: window.navigator, fetch, setTimeout: () => 0, clearTimeout: () => undefined, AbortController, Intl, Date })
@@ -84,7 +84,8 @@ const tick = (revision: number) => snapshot(revision, sessions().map((row, index
   : row))
 
 const cards = (root: Node) => root.querySelectorAll('.session')
-const order = (root: Node) => cards(root).map(card => card.dataset.sessionId)
+const order = (root: Node) => root.querySelectorAll('.group').filter(node => node.dataset.projectId).flatMap(group => group.querySelectorAll('.session')).map(card => card.dataset.sessionId)
+const nowOrder = (root: Node) => (root.querySelector('.now-group')?.querySelectorAll('.session') ?? []).map(card => card.dataset.sessionId)
 
 describe('phone Tabs list order', () => {
   it('groups in the computer project, workspace and tab order, never by activity', () => {
@@ -161,5 +162,85 @@ describe('phone Tabs list order', () => {
     // A restarted computer counts again from 1, under a new instance.
     api.onStreamEvent('state', snapshot(1, sessions(), 'run-2'))
     expect(api.state.phone.instance).toBe('run-2')
+  })
+})
+
+// docs/phone-navigation.md: Now across projects, the wizard first in its project, one status line
+// per project, and landing on the tab last used.
+describe('phone Now across projects', () => {
+  const at = (minutes: number) => new Date(Date.parse('2026-10-18T09:00:00.000Z') + minutes * 60000).toISOString()
+  const ids = (rows: Array<{ session: { id: string }; reason: string }>) => rows.map(row => [row.session.id, row.reason])
+
+  it('puts the tab last written in first, then needs-you, then running, then the rest by activity', () => {
+    const api = harness()
+    const rows = sessions()
+    rows[0] = { ...rows[0]!, lastOwnerMessageAt: at(5) }                          // wizard, running
+    rows[5] = { ...rows[5]!, lastOwnerMessageAt: at(30), state: 'done', phase: 'idle' } // miron-a: the owner just wrote here
+    rows[6] = { ...rows[6]!, state: 'attention', phase: 'waiting_approval' }         // miron-b needs the owner
+    rows[4] = { ...rows[4]!, updatedAt: at(50) }                                     // notes: done, latest activity
+    expect(ids(api.rankedSessions(rows))).toEqual([
+      ['miron-a', 'sent'], ['miron-b', 'attention'], ['wizard', 'running'], ['notes', 'recent'], ['old-wizard', 'recent']
+    ])
+    // The wizard carries its two working coworkers instead of listing them.
+    expect(api.rankedSessions(rows)[2].coworkersWorking).toBe(2)
+    expect(ids(api.nowSessions(rows))).toEqual([['miron-a', 'sent'], ['miron-b', 'attention'], ['wizard', 'running']])
+    expect(api.nowSessions(rows, 2)).toHaveLength(2)
+    // Closed history never takes part.
+    expect(api.rankedSessions(rows).some((row: any) => row.session.id === 'history')).toBe(false)
+  })
+
+  it('a message sent from this phone counts at once, and activity alone never reorders Now', () => {
+    const api = harness()
+    const rows = sessions().map(row => ({ ...row, lastOwnerMessageAt: row.id === 'wizard' ? at(5) : undefined }))
+    expect(api.nowSessions(rows)[0].session.id).toBe('wizard')
+    const before = ids(api.nowSessions(rows))
+    for (let minute = 0; minute < 10; minute++) {
+      const ticked = rows.map((row, index) => index % 3 === minute % 3 ? { ...row, updatedAt: at(100 + minute) } : row)
+      expect(ids(api.nowSessions(ticked))).toEqual(before)
+    }
+    api.state.sentAt['miron-b'] = Date.parse(at(60))
+    expect(api.nowSessions(rows)[0].session.id).toBe('miron-b')
+    expect(api.nowSessions(rows)[0].reason).toBe('sent')
+  })
+
+  it('pins the wizard first in its workspace and gives each project one status line', () => {
+    const api = harness()
+    const rows = sessions()
+    rows[3] = { ...rows[3]!, wizard: true, state: 'working', phase: 'running' }
+    const groups = api.groupSessions(rows.filter(row => row.tabId), projects)
+    expect(groups[0].workspaces[0].entries.map((entry: any) => entry.session.id)).toEqual(['old-wizard', 'wizard'])
+    expect(api.projectStatus(rows.filter(row => row.projectId === 'p-conductor')).text).toBe('Wizard running · 4 running')
+    const miron = sessions().filter(row => row.projectId === 'p-miron').map(row => row.id === 'miron-b' ? { ...row, state: 'attention', phase: 'waiting_input' } : row)
+    expect(api.projectStatus(miron).text).toBe('1 running · 1 need you')
+    // A tab that controls coworkers leads a project that has no wizard.
+    expect(api.projectStatus(sessions().filter(row => row.projectId === 'p-conductor')).text).toBe('Coordinator running · 3 running')
+    expect(api.projectStatus([]).text).toBe('nothing open')
+  })
+
+  it('draws Now above the project groups only on the whole list', () => {
+    const api = harness()
+    const rows = sessions().map(row => row.id === 'miron-b' ? { ...row, lastOwnerMessageAt: new Date().toISOString() } : row)
+    api.onStreamEvent('state', snapshot(1, rows))
+    const view = api.open()
+    expect(nowOrder(view.root)).toEqual(['miron-b', 'wizard', 'miron-a'])
+    expect(view.root.querySelector('.now-group')!.querySelector('.last-sent')!.dataset.sessionId).toBe('miron-b')
+    expect(view.root.querySelector('.project-head')!.textContent).toContain('Coordinator running')
+    api.state.filter = 'working'
+    view.update()
+    expect(view.root.querySelector('.now-group')).toBeNull()
+  })
+
+  it('lands on the tab last used when it is recent and still open', () => {
+    const api = harness()
+    const now = Date.parse(at(60))
+    const rows = sessions()
+    expect(api.landingSession(rows, { id: 'miron-a', at: Date.parse(at(50)) }, now)).toBe('miron-a')
+    // A newer message from the desktop wins over an older open on the phone.
+    rows[0] = { ...rows[0]!, lastOwnerMessageAt: at(55) }
+    expect(api.landingSession(rows, { id: 'miron-a', at: Date.parse(at(50)) }, now)).toBe('wizard')
+    // A closed tab, or one used more than 12 hours ago, is not landed on.
+    expect(api.landingSession(sessions(), { id: 'history', at: now }, now)).toBeNull()
+    expect(api.landingSession(sessions(), { id: 'miron-a', at: now - 13 * 3600000 }, now)).toBeNull()
+    expect(api.landingSession(sessions(), null, now)).toBeNull()
   })
 })

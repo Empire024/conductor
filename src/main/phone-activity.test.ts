@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { DatabaseSync } from 'node:sqlite'
 import { PhoneActivityStore, activityReceipt, ACTIVITY_WINDOW_MS } from './phone-activity'
 import { phoneInputDeliveries } from './phone-access'
-import type { SessionProjection, TimelineItem } from '../shared/structured-agent'
+import { projectAgentEvent, replayAgentEvents } from '../shared/structured-agent-reducer'
+import type { AgentEvent, SessionProjection, TimelineItem } from '../shared/structured-agent'
 
 const databases: DatabaseSync[] = []
 afterEach(() => { for (const db of databases.splice(0)) db.close() })
@@ -53,4 +54,21 @@ it('keeps queued and accepted input distinct from authoritative delivered acknow
   expect(phoneInputDeliveries(state)).toEqual([{ id: prompt.id, text: prompt.text, status: 'accepted', sequence: 11 }])
   items.push({ sequence: 12, data: { type: 'input_delivery', inputId: prompt.id, status: 'delivered' } } as TimelineItem)
   expect(phoneInputDeliveries(state)[0]?.status).toBe('delivered')
+})
+
+it('reports a steer the runtime took as delivered once it is a user message (owner-steer-stays-steered)', () => {
+  // The events a Claude steer produces in main (structured-sessions reconcileInput), folded by the
+  // real reducer: steering and receipts are projection state, so the timeline only gains the message.
+  let sequence = 0
+  const event = (data: AgentEvent['data'], itemId?: string): AgentEvent => ({ schemaVersion: 1, id: 'e' + ++sequence, sequence, sessionId: 's', runtimeId: 'r', provider: 'claude', projectId: 'p', workspaceId: 'w', cwd: '/', timestamp: new Date(sequence * 1000).toISOString(), turnId: 't', ...(itemId ? { itemId } : {}), data } as AgentEvent)
+  const input = { id: 'input-1', text: 'Not laptop sorry state of pc', settings: {} as never, attachments: [], runtimeId: 'r', turnId: 't' }
+  let state = replayAgentEvents('s', [event({ type: 'session', phase: 'running' }), event({ type: 'steering', prompts: [{ ...input, status: 'sending' }] })])
+  expect(phoneInputDeliveries(state)).toEqual([{ id: input.id, text: input.text, status: 'sending', sequence: 2 }])
+  state = projectAgentEvent(state, event({ type: 'steering', prompts: [{ ...input, status: 'accepted' }] }))
+  expect(phoneInputDeliveries(state)[0]?.status).toBe('accepted')
+  state = projectAgentEvent(state, event({ type: 'steering', prompts: [] }))
+  state = projectAgentEvent(state, event({ type: 'text', role: 'user', text: input.text, mode: 'snapshot' }, input.id))
+  state = projectAgentEvent(state, event({ type: 'session', phase: 'completed' }))
+  expect(state.pendingSteering).toEqual([])
+  expect(phoneInputDeliveries(state)).toEqual([{ id: input.id, text: input.text, status: 'delivered', sequence: 5 }])
 })
