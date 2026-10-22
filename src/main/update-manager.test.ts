@@ -94,6 +94,16 @@ describe('installed updater source ownership — mocked transport, no installati
     await m.check()
     expect(m.getState()).toMatchObject({ source: 'release', promptAllowed: true })
   })
+  it('survives an install-blocker probe that throws because the database is closed', async () => {
+    vi.useFakeTimers()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const m = new UpdateManager({ currentVersion: '0.1.4', isPackaged: true, localBuildDirectory: updateDir(), beforeInstall: vi.fn(),
+      installBlockers: () => { throw new Error('database is not open') } })
+    managers.push(m); m.configure(''); await m.check(); await m.download()
+    expect(m.getState().installBlockers).toEqual([])
+    await expect(vi.advanceTimersByTimeAsync(3000)).resolves.not.toThrow()
+    warn.mockRestore()
+  })
   it('rechecks at click time and installs a queued version once idle', async () => {
     vi.useFakeTimers()
     let blockers = [{ id: 'fake', title: 'Fake busy tab' }]

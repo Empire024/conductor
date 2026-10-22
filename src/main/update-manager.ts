@@ -117,7 +117,9 @@ export class UpdateManager {
   getState(): AppUpdateState {
     const request = this.restartRequest
     const current = request && Date.now() - Date.parse(request.at) <= RESTART_REQUEST_MAX_AGE_MS
-    const installBlockers = this.options.installBlockers?.() ?? []
+    // The probe reads the database; during a quit it may already be closed, and the idle timer must not throw into the main process then.
+    let installBlockers: Array<{ id: string; title: string }> = []
+    try { installBlockers = this.options.installBlockers?.() ?? [] } catch (error) { console.warn('Install blockers could not be read', error) }
     const gate = this.state.source === 'local' ? localUpdateGate(
       this.options.localBuildDirectory && this.state.availableVersion ? readLocalUpdateOffer(this.options.localBuildDirectory, this.state.availableVersion) : null,
       installBlockers.length) : { promptAllowed: true }
