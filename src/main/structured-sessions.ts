@@ -26,6 +26,7 @@ import { carriesAccountLimits, describeAccountLimits, describeUsageCap, evaluate
 import { recordAllowanceHistory, summarizeProviderAllowance, type AllowanceHistory, type ProviderAllowanceRow } from '../shared/provider-allowance'
 import { LiveRuntimeBudget } from './live-runtime-budget'
 import { sanitizeDiagnostic } from './structured-store'
+import { mergeStreamedDelta, streamedDeltaKey, withoutRestatedCapabilities } from './journal-coalescing'
 import { rememberedBrowserTools, rememberBrowserTools, rememberedPermission, rememberPermission } from './app-settings'
 import { assertLocalControlAllowed } from './local-models/tools.ts'
 import { anonymousConversations } from './local-models/anonymous'
@@ -77,6 +78,9 @@ interface LiveSession {
   /** The background-task count this conversation last reported, so a change in the provider's
    *  inventory between turns can be noticed and restated. */
   backgroundTasks?: number
+  /** The sequence of the last event this runtime journaled with its full capabilities, so an
+   *  unchanged restatement soon after is dropped (journal-coalescing.ts). */
+  capabilitiesStatedAt?: number
   /** Handed on to a successor (agents.handoff): the background work it owns is stopped once its
    *  turn settles, and `stoppingBackground` is set while that stop is in flight. */
   retiring?: boolean
@@ -355,6 +359,8 @@ export class StructuredSessions {
   isArchiving(id: string): boolean { return this.archiving.has(id) }
   private live = new Map<string, LiveSession>()
   private pending: AgentEvent[] = []
+  /** One streamed delta per conversation still growing from the deltas after it (emit). */
+  private heldDeltas = new Map<LiveSession, { key: string; source: AdapterEvent; reviewProjection: boolean }>()
   /** The latest status per session since the last flush - `recordActivityPhase` can fire many
    *  times per session within one synchronous burst of events; only the final one is worth a
    *  write and a broadcast. */
@@ -1930,7 +1936,23 @@ export class StructuredSessions {
     this.pendingStatus.set(live.spec.id, { id: live.spec.id, status, phase })
     this.scheduleFlush()
   }
+  /** Holds a streamed delta (journal-coalescing.ts) and merges the deltas that follow it into one
+   *  event, journaled when anything else arrives from the conversation or at the burst's flush. */
   private emit(live: LiveSession, source: AdapterEvent, reviewProjection = false): void {
+    const key = live.closed ? null : streamedDeltaKey(source)
+    const held = this.heldDeltas.get(live)
+    if (held) {
+      if (key && held.key === key && held.reviewProjection === reviewProjection) { held.source = mergeStreamedDelta(held.source, source); return }
+      this.heldDeltas.delete(live)
+      this.emitNow(live, held.source, held.reviewProjection)
+    }
+    if (key) { this.heldDeltas.set(live, { key, source, reviewProjection }); this.scheduleFlush(); return }
+    this.emitNow(live, source, reviewProjection)
+  }
+  private releaseHeldDeltas(): void {
+    for (const [live, held] of this.heldDeltas) { this.heldDeltas.delete(live); this.emitNow(live, held.source, held.reviewProjection) }
+  }
+  private emitNow(live: LiveSession, source: AdapterEvent, reviewProjection = false): void {
     const store = this.database.structured, state = store.snapshot(live.spec.id)
     if (!state || live.closed) return
     if (!reviewProjection) source = this.approvalGate.intercept(live.spec, live.runtimeId, source)
@@ -1973,6 +1995,8 @@ export class StructuredSessions {
       try { data = { ...data, outputArtifactId: store.putOutput(live.spec.id, output), output: output.slice(-32_000) } }
       catch { data = { ...data, output: '[Output artifact unavailable: storage allowance reached. Bounded tail follows.]\n' + output.slice(-32_000) } }
     }
+    data = withoutRestatedCapabilities(data, state.capabilities, live.capabilitiesStatedAt, state.sequence + 1)
+    if (data.type === 'session' && data.capabilities) live.capabilitiesStatedAt = state.sequence + 1
     const event = store.stage({ ...source, data, schemaVersion: 1, id: randomUUID(), sequence: state.sequence + 1, sessionId: live.spec.id, runtimeId: live.runtimeId, provider: live.spec.provider as StructuredProvider, projectId: live.spec.projectId, workspaceId: live.spec.sessionId, cwd: live.spec.cwd, timestamp: new Date().toISOString(), nativeSessionId: source.nativeSessionId ?? state.nativeSessionId })
     this.pending.push(event)
     this.observe?.(live.spec, event)
@@ -2103,6 +2127,8 @@ export class StructuredSessions {
    *  event the renderer receives is always durable, and a crash before this call loses at most
    *  the batch that was still pending. */
   flush(): void {
+    // Before clearing the flag, so the events these release do not schedule a second flush.
+    this.releaseHeldDeltas()
     this.flushScheduled = false
     const events = this.pending.splice(0)
     if (events.length) this.database.structured.persist(events)

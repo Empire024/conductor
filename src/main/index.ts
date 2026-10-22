@@ -77,6 +77,7 @@ import { wizardActive, type SessionSettings } from '../shared/structured-agent'
 import type { AgentConfirmResponse } from '../shared/agent-confirm'
 import { AgentConfirmBroker } from './agent-confirm-broker'
 import { ConductorDatabase } from './database'
+import { startJournalCompaction } from './journal-compaction'
 import { TerminalManager } from './terminal-manager'
 import { AgentManager, onAgentStatusChange, onBroadcast } from './agent-manager'
 import { aggregateProjectActivity } from './project-activity'
@@ -243,6 +244,7 @@ let modelIntelligence: ModelIntelligence | undefined
 let modelUpgrades: ModelUpgradeService | undefined
 let disposeModelObserver: (() => void) | undefined
 let disposeMemoryGuard: (() => void) | undefined
+let stopJournalCompaction: (() => void) | undefined
 let permissionGrants: Awaited<ReturnType<typeof startPermissionGrants>> | undefined
 let claudeFullAuto: ClaudeFullAutoPolicy
 let browserViews: BrowserViews | undefined
@@ -3442,6 +3444,9 @@ app.whenReady().then(async () => {
   // Conversations are resident only while used (structured-store.ts, RESIDENT_BUDGET_BYTES); past 70% of
   // the V8 heap every idle one is dropped and the fact logged, before the allocator kills the process.
   disposeMemoryGuard = database.structured.startMemoryGuard()
+  // Superseded tool-input fragments leave the journal in a worker thread, five minutes after launch
+  // and then daily (journal-compaction.ts, conductor-task:db-growth-1022).
+  stopJournalCompaction = startJournalCompaction(databasePath)
 })
 
 // 'window-all-closed' is owned by the host lifecycle: it quits exactly as before unless this machine
@@ -3478,6 +3483,7 @@ app.on('will-quit', () => {
   }
   try { if (database) policyAnswerLog(database).flush() } catch (error) { console.warn('The auto-approve policy log could not be saved', error) }
   disposeMemoryGuard?.()
+  stopJournalCompaction?.()
   hostLifecycle?.dispose()
   // Closing each job's held stdin is what tells its node to stop it.
   void remoteJobs?.shutdown(0)
