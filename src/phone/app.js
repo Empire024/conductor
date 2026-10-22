@@ -3247,13 +3247,23 @@
     /* One line to MAX_COMPOSER_LINES, then the field scrolls. The height is border-box, so the
        border is added to the content-plus-padding scrollHeight (20px lines, 11px padding). */
     const lineHeight = 20
+    /* Measuring collapses the field to one line for a moment, which hands the timeline that room
+       and clamps its scroll; without putting the scroll back, a multi-line draft scrolled the
+       conversation by its own height on every letter. A timeline at the bottom stays at the bottom. */
     const grow = () => {
+      const top = scroll.scrollTop
+      const pinned = scroll.scrollHeight - top - scroll.clientHeight <= 2
+      const before = input.style.height
       input.style.height = 'auto'
       const border = (input.offsetHeight - input.clientHeight) || 0
       const max = lineHeight * MAX_COMPOSER_LINES + 22 + border
       const wanted = input.scrollHeight + border
-      input.style.height = Math.min(wanted, max) + 'px'
+      const height = Math.min(wanted, max) + 'px'
+      input.style.height = height
       input.style.overflowY = wanted > max ? 'auto' : 'hidden'
+      if (height === before && scroll.scrollTop === top) return
+      if (pinned) scroll.scrollTop = scroll.scrollHeight
+      else if (scroll.scrollTop !== top) scroll.scrollTop = top
     }
     input.addEventListener('input', () => {
       state.drafts[id] = input.value
@@ -6488,9 +6498,20 @@
   /* Once the keyboard has finished opening and the fixed shell has been pulled back into place,
      make sure the caret itself is not left under the keyboard, e.g. after growing a multi-line
      draft or focusing lower on the page. */
+  /* Only when the field really is out of sight: scrolling a field that is already visible still
+     moves the visual viewport on iOS, applyViewport then pulls the shell back, and the whole app
+     jumped up and down on every letter typed. */
+  const fieldHidden = field => {
+    if (typeof field.getBoundingClientRect !== 'function') return false
+    const box = field.getBoundingClientRect()
+    const viewport = window.visualViewport
+    const top = viewport ? viewport.offsetTop : 0
+    const bottom = top + (viewport ? viewport.height : window.innerHeight || 0)
+    return bottom > top && (box.bottom > bottom + 1 || box.top < top - 1)
+  }
   const scrollCaretIntoView = field => {
     if (!field || typeof field.scrollIntoView !== 'function') return
-    setTimeout(() => field.scrollIntoView({ block: 'end', inline: 'nearest' }), 60)
+    setTimeout(() => { if (fieldHidden(field)) field.scrollIntoView({ block: 'nearest', inline: 'nearest' }) }, 60)
   }
 
   /* A cold launch on Home (the app icon; a notification or link names its own page, a reload keeps

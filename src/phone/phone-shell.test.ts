@@ -1274,3 +1274,53 @@ describe('phone typing survives live updates', () => {
     expect(nameField()).not.toBe(name)
   })
 })
+
+describe('phone composer typing keeps the page still', () => {
+  const composer = (page: ReturnType<typeof bootApp>) => page.app.find(node => node.tagName === 'TEXTAREA' && node.className.includes('composer-input'))! as any
+  const timeline = (page: ReturnType<typeof bootApp>) => page.app.querySelector('timeline')! as any
+  const typed = async (box: { top: number; bottom: number }) => {
+    const page = bootApp('#/session/s1', conversationAnswer([{ role: 'assistant', text: 'Hello' }]))
+    await settleAll()
+    const field = composer(page)
+    const scrolls: unknown[] = []
+    field.scrollIntoView = (options: unknown) => { scrolls.push(options) }
+    field.getBoundingClientRect = () => box
+    field.typeText('a')
+    page.advance(100)
+    return scrolls
+  }
+
+  it('never scrolls a field that is already in view, on any key', async () => {
+    expect(await typed({ top: 700, bottom: 744 })).toEqual([])
+  })
+
+  it('still brings a field hidden below the screen into view', async () => {
+    expect(await typed({ top: 820, bottom: 864 })).toEqual([{ block: 'nearest', inline: 'nearest' }])
+  })
+
+  it('puts back a timeline scroll that measuring the composer clamped', async () => {
+    const page = bootApp('#/session/s1', conversationAnswer([{ role: 'assistant', text: 'Hello' }]))
+    await settleAll()
+    const field = composer(page)
+    const scroll = timeline(page)
+    Object.assign(scroll, { scrollHeight: 2000, clientHeight: 500, scrollTop: 900 })
+    /* Collapsing the field to one line hands the timeline its room, and the browser clamps it. */
+    let height = ''
+    field.style = { setProperty: () => undefined, get height() { return height }, set height(value: string) { height = value; if (value === 'auto') scroll.scrollTop = 850 } }
+    Object.assign(field, { scrollHeight: 84, offsetHeight: 44, clientHeight: 42 })
+    field.typeText('one\ntwo\nthree')
+    expect(height).toBe('86px')
+    expect(scroll.scrollTop).toBe(900)
+  })
+
+  it('keeps a timeline at the live end there while the composer grows', async () => {
+    const page = bootApp('#/session/s1', conversationAnswer([{ role: 'assistant', text: 'Hello' }]))
+    await settleAll()
+    const field = composer(page)
+    const scroll = timeline(page)
+    Object.assign(scroll, { scrollHeight: 2000, clientHeight: 500, scrollTop: 1500 })
+    Object.assign(field, { scrollHeight: 64, offsetHeight: 44, clientHeight: 42 })
+    field.typeText('one\ntwo')
+    expect(scroll.scrollTop).toBe(2000)
+  })
+})

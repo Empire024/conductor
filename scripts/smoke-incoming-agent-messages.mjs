@@ -65,6 +65,22 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
 })
 `
 
+// A calm card, not an alert (owner, 2026-10-22, conductor-task:incoming-cards-calm-1022): every colour
+// of an incoming card is a grey or blue-grey, never the old amber/orange.
+const calm = colour => {
+  // color-mix() computes to color(srgb r g b) with channels from 0 to 1.
+  const scale = colour.startsWith('color(') ? 255 : 1
+  const [r, g, b] = (colour.match(/[\d.]+/g) ?? []).map(value => Number(value) * scale)
+  return Number.isFinite(b) && !(r > b + 24 && r > g)
+}
+const cardColours = selector => {
+  const node = document.querySelector(selector)
+  const style = getComputedStyle(node)
+  const badge = node.querySelector('.sa-sender-badge, .sender-badge')
+  return { border: style.borderLeftColor, background: style.backgroundColor, badge: badge ? getComputedStyle(badge).backgroundColor : null }
+}
+const assertCalm = (colours, where) => { for (const [part, colour] of Object.entries(colours)) if (colour) assert.ok(calm(colour), `${where} ${part} is a warning colour: ${colour}`) }
+
 const tabCall = async (auth, method, args = {}) => {
   const response = await fetch(auth.endpoint, { method: 'POST', headers: { Authorization: 'Bearer ' + auth.token, 'Content-Type': 'application/json' }, body: JSON.stringify({ method, args }) })
   const body = await response.json()
@@ -149,6 +165,7 @@ try {
   assert.match(ownText, /owner follow-up/)
   assert.doesNotMatch(ownText, /REPORT|Queued 2/)
   const colours = await view.evaluate(() => ({ incoming: getComputedStyle(document.querySelector('.sa-incoming-pending')).borderLeftColor, own: getComputedStyle(document.querySelector('.sa-queue')).backgroundColor }))
+  assertCalm(await view.evaluate(cardColours, '.sa-incoming-pending'), 'incoming list card')
   record('L1', 'PASS', colours, `incoming card "${incomingText.replace(/\s+/g, ' ').slice(0, 160)}" apart from the owner queue "${ownText.replace(/\s+/g, ' ')}"; ${await shot('l1-incoming-mid-turn')}`)
 
   // ------------------------------------------------------------------ L2
@@ -171,6 +188,7 @@ try {
   await own.first().waitFor({ timeout: 10_000 })
   assert.match(await own.first().innerText(), /You/)
   assert.equal(await pane.locator('article.sa-user').filter({ hasText: 'REPORT from worker' }).count(), 0, 'no report drawn as the owner')
+  assertCalm(await view.evaluate(cardColours, 'article.sa-incoming .sa-incoming-card'), 'timeline incoming card')
   await card.first().scrollIntoViewIfNeeded()
   record('L2', 'PASS', { userTurns: users.length }, `report card "${cardText.replace(/\s+/g, ' ').slice(0, 160)}"; ${await shot('l2-timeline')}`)
 
@@ -215,6 +233,7 @@ try {
       await phone.locator('.bubble.user').filter({ hasText: 'owner follow-up' }).first().waitFor()
       const sides = await phone.evaluate(() => ({ incoming: getComputedStyle(document.querySelector('.bubble.incoming')).alignSelf, own: getComputedStyle(document.querySelector('.bubble.user')).alignSelf }))
       assert.deepEqual(sides, { incoming: 'flex-start', own: 'flex-end' })
+      assertCalm(await phone.evaluate(cardColours, '.bubble.incoming'), engine + ' incoming bubble')
       const waiting = phone.locator('.incoming-queue .incoming-queued').filter({ hasText: `SECOND REPORT ${engine}` })
       await waiting.first().waitFor({ timeout: 15_000 })
       assert.match(await phone.locator('.incoming-queue').innerText(), /Incoming/)
