@@ -29,6 +29,7 @@ interface Harness {
   quits: number
   shown: number
   asked: string[]
+  machines: string[][]
 }
 
 /** The tray click and the before-quit hook both run an async question; let it settle. */
@@ -40,7 +41,7 @@ describe('installHostLifecycle', () => {
   let harness: Harness
 
   const install = (platform: NodeJS.Platform = 'win32', options: { withTray?: boolean; installBeforeQuit?: boolean } = {}) => {
-    harness = { listeners: new Map(), trays: [], quits: 0, shown: 0, asked: [] }
+    harness = { listeners: new Map(), trays: [], quits: 0, shown: 0, asked: [], machines: [] }
     const app = {
       on(event: string, listener: (event: LifecycleEvent) => void) {
         harness.listeners.set(event, [...(harness.listeners.get(event) ?? []), listener])
@@ -58,7 +59,7 @@ describe('installHostLifecycle', () => {
     return installHostLifecycle(app, {
       hosting: () => state,
       showWindow: () => { harness.shown++ },
-      confirm: async message => { harness.asked.push(message); return answer },
+      confirm: async (message, machines) => { harness.asked.push(message); harness.machines.push(machines); return answer },
       quit: () => { harness.quits++ },
       platform,
       ...(options.withTray === false ? {} : { createTray }),
@@ -134,6 +135,7 @@ describe('installHostLifecycle', () => {
     harness.trays[0]!.items[1]!.click()
     await settle()
     expect(harness.asked).toEqual(['Stop hosting for LAPTOP? Their attached tabs will disconnect; work already running here continues until you close it.'])
+    expect(harness.machines).toEqual([['LAPTOP']])
     expect(harness.quits).toBe(1)
   })
 
@@ -158,6 +160,7 @@ describe('installHostLifecycle', () => {
     const lifecycle = install()
     expect(await lifecycle.confirmStopHosting()).toBe(true)
     expect(harness.asked).toEqual(['Stop hosting for LAPTOP, TABLET and PHONE? Their attached tabs will disconnect; work already running here continues until you close it.'])
+    expect(harness.machines).toEqual([['LAPTOP', 'TABLET', 'PHONE']])
   })
 
   it('takes the tray away when hosting stops', () => {

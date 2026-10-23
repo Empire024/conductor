@@ -6,7 +6,10 @@
  *  'background' keeps the running turns alive in the runtime host while the app goes
  *  (docs/runtime-host.md); it is offered only when the host can take them. */
 export type StopDecision = 'stop' | 'background' | 'cancel'
-export type PendingStopConfirmation = { action: 'quit' | 'restart'; running: Array<{ id: string; title: string }>; openedAt: string; choices?: StopDecision[] }
+/** `hosting` names the machines and phones a quit would disconnect: the "Stop hosting for …?"
+ *  question that comes before the running-work one, answered the same way (stop = stop hosting
+ *  and quit, cancel = keep running). */
+export type PendingStopConfirmation = { action: 'quit' | 'restart'; running: Array<{ id: string; title: string }>; openedAt: string; choices?: StopDecision[]; hosting?: string[] }
 
 export class StopConfirmations {
   private open: { info: PendingStopConfirmation; answer(decision: StopDecision): void } | null = null

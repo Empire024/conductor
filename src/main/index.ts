@@ -3003,7 +3003,10 @@ app.whenReady().then(async () => {
       if (!backgroundWindows && window.isMinimized()) window.restore()
       revealWindow(window)
     },
-    confirm: async message => (await showDecision(liveWindow(mainWindow), { type: 'question', buttons: ['Stop hosting and quit', 'Keep running'], defaultId: 1, cancelId: 1, message })) === 0,
+    // Answerable like the running-work question: app.state pendingQuitConfirmation names the
+    // machines, and app.quit.confirm from a wizard or the owner credential closes the dialog.
+    confirm: async (message, machines) => (await stopConfirmations.ask({ action: 'quit', running: [], hosting: machines, choices: ['stop', 'cancel'] },
+      async signal => (await showDecision(liveWindow(mainWindow), { type: 'question', buttons: ['Stop hosting and quit', 'Keep running'], defaultId: 1, cancelId: 1, message, signal })) === 0 ? 'stop' : 'cancel')) === 'stop',
     quit: () => { isQuitting = true; app.quit() },
     createTray: () => electronTray(ensureTrayIconFile(app.getPath('userData')))
   })

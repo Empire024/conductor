@@ -27,6 +27,15 @@ describe('stop confirmations', () => {
     expect(confirmations.answer(true)).toBeNull()
   })
 
+  it('shows the stop-hosting question with its machines and closes it with an agent answer', async () => {
+    const confirmations = new StopConfirmations(), box = dialog()
+    const decision = confirmations.ask({ action: 'quit', running: [], hosting: ['LAPTOP', 'iPhone'] }, box.show)
+    expect(confirmations.pending()).toMatchObject({ action: 'quit', running: [], hosting: ['LAPTOP', 'iPhone'], choices: ['stop', 'cancel'] })
+    expect(confirmations.answer(true)).toMatchObject({ hosting: ['LAPTOP', 'iPhone'] })
+    expect(await decision).toBe('stop')
+    expect(box.closed).toBe(true)
+  })
+
   it('keeps work running when the agent answers stopWork:false', async () => {
     const confirmations = new StopConfirmations(), box = dialog()
     const decision = confirmations.ask(info, box.show)

@@ -45,7 +45,9 @@ export interface HostLifecycleApp {
 export interface HostLifecycleDependencies {
   hosting(): HostLifecycleState
   showWindow(): void
-  confirm(message: string): Promise<boolean>
+  /** `machines` are the attached peers the message names, so the question can be answered by an
+   *  agent too (app.quit.confirm). */
+  confirm(message: string, machines: string[]): Promise<boolean>
   quit(): void
   /** Omitted in tests and wherever no tray is wanted; the keep-alive rule does not depend on it. */
   createTray?(): HostTray
@@ -104,7 +106,7 @@ export function installHostLifecycle(app: HostLifecycleApp, deps: HostLifecycleD
   const confirmStopHosting = async (): Promise<boolean> => {
     const current = state()
     if (!current.enabled || !current.listening || !current.attachedPeers.length) return true
-    return deps.confirm(`Stop hosting for ${nameList(current.attachedPeers)}? Their attached tabs will disconnect; work already running here continues until you close it.`)
+    return deps.confirm(`Stop hosting for ${nameList(current.attachedPeers)}? Their attached tabs will disconnect; work already running here continues until you close it.`, current.attachedPeers)
   }
 
   const syncTray = (): void => {
