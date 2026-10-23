@@ -598,7 +598,7 @@ export class PhoneAccessServer {
     } catch (error) {
       request.resume()
       const status = error instanceof PhoneAccessError || error instanceof PhoneLockError || error instanceof PhoneTerminalError ? error.status : 400
-      const detail = error instanceof PhoneLockError ? error.detail : {}
+      const detail = error instanceof PhoneLockError ? error.detail : error instanceof PhoneAccessError ? error.detail ?? {} : {}
       reply(status, { error: error instanceof Error ? error.message : 'Request failed', ...detail })
     }
   }

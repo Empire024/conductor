@@ -378,6 +378,39 @@ describe('what the phone sees', () => {
   })
 })
 
+describe('a succeeded conversation (conductor-task:phone-succeeded-tab-1023)', () => {
+  const succession = (sequence: number, agentSessionId: string, title: string) => item(sequence, { type: 'notice', message: `Continued in “${title}”.`, payload: { succession: { agentSessionId, tabId: 'tab-' + agentSessionId, title, uri: 'conductor://tab' } } } as AgentEventData)
+
+  it('names the newest open successor and refuses messages, resume and images without touching the old tab', async () => {
+    const fix = fixture()
+    openConversation(fix, 'old', { title: 'Wizard: haf-stuff', items: [item(1, { type: 'text', role: 'user', text: 'Go', mode: 'snapshot' }), succession(2, 'middle', 'Wizard (continued)')] })
+    openConversation(fix, 'middle', { title: 'Wizard (continued)', items: [succession(3, 'newest', 'stale title')] })
+    openConversation(fix, 'newest', { title: 'Wizard (continued 2)' })
+    expect(fix.service.conversation('old').succession).toEqual({ id: 'newest', title: 'Wizard (continued 2)', open: true })
+    expect(fix.service.conversation('middle').succession).toEqual({ id: 'newest', title: 'Wizard (continued 2)', open: true })
+    expect(fix.service.conversation('newest').succession).toBeUndefined()
+
+    const refused = await fix.service.sendMessage('old', { text: 'still typing here' }).catch(error => error)
+    expect(refused).toMatchObject({ status: 409, detail: { successor: { id: 'newest', title: 'Wizard (continued 2)', open: true } } })
+    expect(refused.message).toMatch(/continued in “Wizard \(continued 2\)”.*Nothing was sent here/)
+    await expect(fix.service.resume('old')).rejects.toMatchObject({ status: 409 })
+    await expect(fix.service.importSessionImage('old', 'shot.png', new Uint8Array([1]))).rejects.toMatchObject({ status: 409 })
+    for (const method of [fix.sessions.submit, fix.sessions.steer, fix.sessions.queue, fix.sessions.resume]) expect(method).not.toHaveBeenCalled()
+
+    await expect(fix.service.sendMessage('newest', { text: 'Here instead' })).resolves.toMatchObject({ mode: 'submit' })
+    expect(fix.sessions.submit).toHaveBeenCalledWith('newest', 'Here instead', expect.anything(), [])
+  })
+
+  it('says so when the successor was closed, and stops on a loop', () => {
+    const fix = fixture()
+    openConversation(fix, 'old', { items: [succession(1, 'gone', 'Wizard (continued)')] })
+    expect(fix.service.conversation('old').succession).toEqual({ id: 'gone', title: 'Wizard (continued)', open: false })
+    openConversation(fix, 'a', { items: [succession(2, 'b', 'B')] })
+    openConversation(fix, 'b', { title: 'B', items: [succession(3, 'a', 'A')] })
+    expect(fix.service.conversation('a').succession).toMatchObject({ id: 'b', open: true })
+  })
+})
+
 describe('driving a conversation', () => {
   it('submits when idle, steers a running turn when the provider allows it, queues otherwise', async () => {
     const fix = fixture()

@@ -489,6 +489,9 @@ export interface PhoneConversation {
   canAttachImages: boolean
   /** The conversation must be resumed before it takes a message. */
   needsResume: boolean
+  /** It handed itself on (agents.handoff successor:true): read-only, messages go to `id`, the
+   *  newest successor in the chain (`open: false` when that tab is closed). */
+  succession?: { id: string; title: string; open: boolean }
 }
 
 export type PhoneMessageMode = 'auto' | 'submit' | 'steer' | 'queue'

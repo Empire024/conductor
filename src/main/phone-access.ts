@@ -109,7 +109,39 @@ export function phoneInputDeliveries(projection: SessionProjection | null): NonN
 }
 
 export class PhoneAccessError extends Error {
-  constructor(message: string, readonly status = 400) { super(message) }
+  constructor(message: string, readonly status = 400, readonly detail?: Record<string, unknown>) { super(message) }
+}
+
+/** The successor named by the newest succession notice in a timeline (agents.handoff
+ *  successor:true, a relay roll): the notice the desktop's SuccessionBanner reads. */
+export function successionNotice(items: readonly TimelineItem[]): { agentSessionId: string; title: string } | null {
+  for (let index = items.length - 1; index >= 0; index--) {
+    const data = items[index]!.data
+    if (data.type !== 'notice' || !data.payload || typeof data.payload !== 'object' || Array.isArray(data.payload)) continue
+    const value = (data.payload as Record<string, unknown>).succession
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue
+    const { agentSessionId, title } = value as Record<string, unknown>
+    if (typeof agentSessionId === 'string' && agentSessionId && typeof title === 'string') return { agentSessionId, title }
+  }
+  return null
+}
+
+/** Where a succeeded conversation's work went, followed through every later succession to the
+ *  newest successor that is still open (else the last one named). Null if it never handed on. */
+export function phoneSuccession(id: string, snapshot: (id: string) => Pick<SessionProjection, 'items' | 'title'> | null | undefined): NonNullable<PhoneConversation['succession']> | null {
+  let found: NonNullable<PhoneConversation['succession']> | null = null
+  const seen = new Set([id])
+  let projection = snapshot(id)
+  for (let hops = 0; hops < 64 && projection; hops++) {
+    const next = successionNotice(projection.items)
+    if (!next || seen.has(next.agentSessionId)) break
+    seen.add(next.agentSessionId)
+    const target = snapshot(next.agentSessionId)
+    if (!target) { found ??= { id: next.agentSessionId, title: next.title || 'its successor', open: false }; break }
+    found = { id: next.agentSessionId, title: target.title || next.title || 'its successor', open: true }
+    projection = target
+  }
+  return found
 }
 
 interface StoredDevice {
@@ -957,6 +989,7 @@ export class PhoneAccessService {
     const items = projection?.items ?? []
     const roots = items.filter(isConversationActivity).filter(item => !item.parentId && !['steering', 'queue', 'input_delivery'].includes(item.data.type))
     const kept = roots.slice(-PHONE_STATE_LIMITS.items)
+    const succession = this.successionOf(id)
     return {
       summary,
       sequence: projection?.sequence ?? 0,
@@ -967,8 +1000,21 @@ export class PhoneAccessService {
       truncated: Boolean(projection?.truncated) || kept.length < roots.length,
       canSteer: projection?.capabilities?.steering === true,
       canAttachImages: projection?.capabilities?.imageAttachments === true && !this.deps.remote?.isRemote(id) && Boolean(this.deps.importImage),
-      needsResume: Boolean(projection?.nativeSessionId) && (projection?.phase === 'interrupted' || projection?.phase === 'disconnected')
+      needsResume: Boolean(projection?.nativeSessionId) && (projection?.phase === 'interrupted' || projection?.phase === 'disconnected'),
+      ...succession ? { succession } : {}
     }
+  }
+
+  private successionOf(id: string) {
+    return phoneSuccession(id, candidate => this.deps.database.structured.snapshot(candidate))
+  }
+
+  /** A succeeded conversation is read-only, as on the desktop: a message from the phone is
+   *  refused with the successor named (and its id in the body), never landed in the old tab. */
+  private refuseSucceeded(id: string): void {
+    const succession = this.successionOf(id)
+    if (!succession) return
+    throw new PhoneAccessError(`This conversation continued in “${succession.title}”${succession.open ? '' : ', which is closed now'}; send your message there. Nothing was sent here.`, 409, { successor: succession })
   }
 
   async metrics(): Promise<PhoneMetrics> {
@@ -1005,6 +1051,7 @@ export class PhoneAccessService {
   /** Uploaded bytes become a prompt image in the conversation's own folder, as the desktop composer saves them. */
   async importSessionImage(id: string, name: unknown, bytes: Uint8Array): Promise<PhoneImage> {
     const { projection, remote } = this.structuredOnly(id)
+    this.refuseSucceeded(id)
     if (remote) throw new PhoneAccessError('Images can only be sent to conversations running on this computer.', 409)
     if (projection.capabilities?.imageAttachments !== true) throw new PhoneAccessError('This conversation’s provider does not take images.', 409)
     const cwd = this.deps.database.structured.spec<AgentSpec>(id)?.cwd
@@ -1153,6 +1200,7 @@ export class PhoneAccessService {
     if (text.length > 100_000) throw new PhoneAccessError('That message is too long to send from a phone.')
     const requested = (['auto', 'submit', 'steer', 'queue'] as const).includes(input.mode as PhoneMessageMode) ? input.mode as PhoneMessageMode : 'auto'
     const { projection, remote } = this.structuredOnly(id)
+    this.refuseSucceeded(id)
     if (images.length && remote) throw new PhoneAccessError('Images can only be sent to conversations running on this computer.', 409)
     if (images.length && projection.capabilities?.imageAttachments !== true) throw new PhoneAccessError('This conversation’s provider does not take images.', 409)
     // structured-sessions resolves each path inside the conversation's folder and checks the
@@ -1202,6 +1250,7 @@ export class PhoneAccessService {
 
   async resume(id: string): Promise<{ phase: SessionProjection['phase'] }> {
     const { projection, remote } = this.structuredOnly(id)
+    this.refuseSucceeded(id)
     await (remote ? this.deps.remote!.resume(id, projection.settings) : this.deps.sessions.resume(id, projection.settings))
     return { phase: this.deps.database.structured.snapshot(id)?.phase ?? projection.phase }
   }

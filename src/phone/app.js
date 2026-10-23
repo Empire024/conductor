@@ -747,8 +747,66 @@
     if (text) window.location.assign(text)
   }
 
-  const showToast = notification => {
+  /* Typing on a phone leaves a small window; a toast over it is in the way (owner, 2026-10-23,
+     conductor-task:phone-notifications-typing-1023). While a text field has focus or the keyboard
+     is up, notifications wait behind one small count chip at the end of the header row; they are
+     shown once the field lets go, at most three, the rest summed up in one more. */
+  const HELD_TOAST_LIMIT = 30
+  const heldToasts = []
+  let heldChip = null
+  let heldChipObserver = null
+  let heldFlushTimer = null
+  const typingNow = () => {
+    const root = document.documentElement
+    if (isTextField(document.activeElement) || (root && root.classList.contains('keyboard-open'))) return true
+    return Boolean(window.visualViewport && Math.max(window.innerHeight || 0, (root && root.clientHeight) || 0) - window.visualViewport.height > KEYBOARD_MIN_HEIGHT)
+  }
+  const paintHeldChip = () => {
+    if (!heldChip) return
+    heldChip.hidden = !heldToasts.length
+    /* A flex item at the end of the screen's own header row: it takes room there, never covers.
+       Headers are redrawn on every update, so while anything is held the chip is put back. */
+    const place = () => {
+      const row = appRoot ? appRoot.querySelector('.topbar-main') || appRoot.querySelector('.topbar') : null
+      if (row && heldChip.parentNode !== row) row.appendChild(heldChip)
+    }
+    if (heldToasts.length) {
+      place()
+      if (!heldChipObserver && appRoot && window.MutationObserver) {
+        heldChipObserver = new window.MutationObserver(() => { if (!heldChip.isConnected) place() })
+        heldChipObserver.observe(appRoot, { childList: true, subtree: true })
+      }
+    } else if (heldChipObserver) { heldChipObserver.disconnect(); heldChipObserver = null }
+    heldChip.textContent = heldToasts.length > 9 ? '9+' : String(heldToasts.length)
+    heldChip.setAttribute('aria-label', heldToasts.length + ' notification' + (heldToasts.length === 1 ? '' : 's') + ' held while you type; tap to show')
+  }
+  const flushHeldToasts = force => {
+    if (heldFlushTimer !== null) { clearTimeout(heldFlushTimer); heldFlushTimer = null }
+    if (!heldToasts.length || (!force && typingNow())) return
+    const waiting = heldToasts.splice(0, heldToasts.length)
+    paintHeldChip()
+    const shown = waiting.slice(-3)
+    if (waiting.length > shown.length) {
+      const more = waiting.length - shown.length
+      shown.shift()
+      shown.unshift({ kind: 'attention', title: (more + 1) + ' more notifications', body: 'Arrived while you were typing; Attention lists what needs you.', url: '#/attention' })
+    }
+    for (const notification of shown) showToast(notification, true)
+  }
+  /* Focus moving between fields is not the end of typing: look again once it settles. */
+  const scheduleHeldFlush = () => {
+    if (!heldToasts.length || heldFlushTimer !== null) return
+    heldFlushTimer = setTimeout(() => { heldFlushTimer = null; flushHeldToasts(false) }, 400)
+  }
+
+  const showToast = (notification, held) => {
     if (!toastHost) return
+    if (!held && typingNow()) {
+      heldToasts.push(notification)
+      if (heldToasts.length > HELD_TOAST_LIMIT) heldToasts.splice(0, heldToasts.length - HELD_TOAST_LIMIT)
+      paintHeldChip()
+      return
+    }
     const node = el('div', 'toast tone-' + (notification.kind || 'attention'))
     node.appendChild(el('strong', 'toast-title', notification.title || 'Conductor'))
     if (notification.body) node.appendChild(el('span', 'toast-body', oneLine(notification.body, 140)))
@@ -904,6 +962,7 @@
     appRoot.appendChild(tabBar)
     updateTabBar(route)
     paintConnection()
+    paintHeldChip()
     if (overlayPill) overlayPill.hidden = state.connected || !state.token || state.locked
     /* A field can only take focus once it is in the page. */
     if (screen.onShown) screen.onShown()
@@ -3209,6 +3268,36 @@
     const pendingHost = el('div', 'pending-host')
     const queuedHost = el('div', 'queued-host')
     const errorHost = el('div', 'error-host')
+    /* A conversation that handed itself on (agents.handoff successor:true) is read-only, as on the
+       desktop (SuccessionBanner): the composer gives way to the way to its successor, the newest in
+       the chain, and an unsent draft goes along. Stop stays while it finishes its last step. */
+    const successionHost = el('div', 'succession-host')
+    successionHost.setAttribute('role', 'status')
+    let shownSuccession = ''
+    const succeeded = () => {
+      const conversation = state.conversation
+      return conversation && conversation.summary && conversation.summary.id === id && conversation.succession ? conversation.succession : null
+    }
+    const openSuccessor = target => {
+      if (input.value.trim() && !(state.drafts[target] || '').trim()) { state.drafts[target] = input.value; state.drafts[id] = ''; input.value = '' }
+      go('#/session/' + encodeURIComponent(target))
+    }
+    const paintSuccession = () => {
+      const succession = succeeded()
+      footer.classList.toggle('succeeded', Boolean(succession))
+      input.disabled = Boolean(succession)
+      const key = succession ? [succession.id, succession.title, succession.open].join('\n') : ''
+      if (key === shownSuccession) return
+      shownSuccession = key
+      clear(successionHost)
+      if (!succession) return
+      if (document.activeElement === input) input.blur()
+      successionHost.appendChild(el('p', 'succession-title', 'Continued in ' + succession.title))
+      successionHost.appendChild(el('p', 'succession-note', succession.open
+        ? 'This conversation is read-only: its coworkers, wizard mode and remaining work moved to the successor. Send messages there.'
+        : 'This conversation is read-only. Its successor is closed now; reopen it on the computer.'))
+      if (succession.open) successionHost.appendChild(button('primary wide succession-open', 'Open ' + succession.title, () => openSuccessor(succession.id)))
+    }
     const composer = el('div', 'composer')
     const input = el('textarea', 'composer-input')
     input.rows = 1
@@ -3240,6 +3329,7 @@
     footer.appendChild(pendingHost)
     footer.appendChild(queuedHost)
     footer.appendChild(errorHost)
+    footer.appendChild(successionHost)
     footer.appendChild(chatTray.node)
     footer.appendChild(composer)
     footer.appendChild(dictation.status)
@@ -3285,7 +3375,7 @@
       }
     }
     const sendPrimary = async () => {
-      if (busy) return
+      if (busy || succeeded()) return
       if (ambiguousMessage()) { await checkMessageStatus(); return }
       const text = input.value.trim()
       const conversation = state.conversation
@@ -3601,6 +3691,7 @@
 
     const paintComposer = () => {
       busy = messageRows(id).some(row => row.inflight)
+      paintSuccession()
       const conversation = state.conversation
       const summary = conversation ? conversation.summary : null
       const phase = summary ? summary.phase : 'idle'
@@ -3611,7 +3702,7 @@
       const ambiguous = ambiguousMessage()
       primary.textContent = busy ? 'Sending…' : ambiguous ? 'Check status' : label
       const empty = !input.value.trim() && !chatImages.length
-      primary.disabled = busy || !state.authReady || !conversation || (empty && label !== 'Resume' && !ambiguous)
+      primary.disabled = busy || !state.authReady || !conversation || Boolean(succeeded()) || (empty && label !== 'Resume' && !ambiguous)
       const takesImages = Boolean(conversation && conversation.canAttachImages)
       attach.hidden = !takesImages && !chatImages.length
       attach.disabled = busy || !takesImages || chatImages.length >= IMAGE_LIMIT
@@ -6485,14 +6576,21 @@
     const root = document.documentElement
     const layout = Math.max(window.innerHeight || 0, root.clientHeight || 0)
     const shrunk = Boolean(viewport && layout - viewport.height > KEYBOARD_MIN_HEIGHT)
+    /* In a Safari tab the toolbar can sit over the bottom of the CSS viewport (owner, 2026-10-23,
+       conductor-task:phone-bottom-cutoff-1023: "bottom of the phone app is cut off"): what Safari
+       reports as visible is the shell's height, so the tab bar and composer stay above it. Not on
+       the Home Screen (above) and not while pinch-zoomed. */
+    const standalone = Boolean((window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || window.navigator.standalone === true)
+    const covered = Boolean(viewport && !standalone && Math.abs((viewport.scale || 1) - 1) < 0.01 && layout - viewport.height > 1)
     const offset = viewport ? viewport.offsetTop : 0
-    if (shrunk) root.style.setProperty('--app-height', Math.round(viewport.height) + 'px')
+    if (shrunk || covered) root.style.setProperty('--app-height', Math.round(viewport.height) + 'px')
     else root.style.removeProperty('--app-height')
     root.style.setProperty('--app-offset', Math.round(offset) + 'px')
     /* While typing the tab bar steps aside and its home-indicator inset sits under the keyboard. */
     const typing = isTextField(document.activeElement)
     root.classList.toggle('keyboard-open', shrunk && typing)
     if (window.scrollTo) window.scrollTo(0, 0)
+    if (!shrunk) scheduleHeldFlush()
   }
 
   /* Once the keyboard has finished opening and the fixed shell has been pulled back into place,
@@ -6536,6 +6634,11 @@
     appRoot = document.getElementById('app')
     overlayPill = document.getElementById('pill')
     toastHost = document.getElementById('toasts')
+    heldChip = button('held-chip', null, null)
+    heldChip.id = 'held-toasts'
+    heldChip.hidden = true
+    heldChip.addEventListener('click', () => { if (isTextField(document.activeElement)) document.activeElement.blur(); flushHeldToasts(true) })
+    document.addEventListener('focusout', scheduleHeldFlush)
     tabBar = buildTabBar()
     state.token = readStored(TOKEN_KEY)
     const savedFilter = readStored(FILTER_KEY)

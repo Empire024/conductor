@@ -199,6 +199,8 @@ button { cursor: pointer; min-height: 44px; min-width: 44px; }
   align-items: center;
   gap: 8px;
   padding: calc(env(safe-area-inset-top) + 8px) 10px 0;
+  /* Follows the shell when Safari scrolls the layout viewport under the keyboard. */
+  transform: translateY(var(--app-offset, 0px));
 }
 
 .pill {
@@ -216,6 +218,9 @@ button { cursor: pointer; min-height: 44px; min-width: 44px; }
 .toasts {
   width: 100%;
   max-width: 520px;
+  /* The upper part of the screen only: a stack never reaches the composer. */
+  max-height: 45%;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -241,6 +246,24 @@ button { cursor: pointer; min-height: 44px; min-width: 44px; }
 .toast.tone-limited { border-left-color: var(--amber); }
 .toast-title { font-size: 14px; font-weight: 600; }
 .toast-body { font-size: 12.5px; color: var(--text-2); }
+
+/* Notifications held while typing: one small count at the end of the header row, never over the
+   composer or the conversation; tapping it shows them. */
+.held-chip {
+  flex: 0 0 auto;
+  align-self: center;
+  min-width: 26px;
+  min-height: 26px;
+  padding: 0 7px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--amber) 45%, var(--border));
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 24px;
+}
+.held-chip[hidden] { display: none; }
 
 @keyframes toast-in { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: none; } }
 
@@ -890,6 +913,15 @@ button.md-file { display: inline; padding: 0; border: 0; background: none; font:
 .queued-item { margin: 0; font-size: 12.5px; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .error-host:empty { display: none; }
+
+/* A succeeded conversation: the way to its successor replaces the composer (Stop stays). */
+.succession-host { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-radius: 12px; background: var(--surface-1); border: 1px solid var(--border-soft); }
+.succession-host:empty { display: none; }
+.succession-title { margin: 0; font-size: 14px; font-weight: 600; color: var(--text); overflow-wrap: anywhere; }
+.succession-note { margin: 0; font-size: 12.5px; color: var(--text-2); }
+.footer.succeeded .composer-images, .footer.succeeded .composer > :not(.composer-stop) { display: none; }
+.footer.succeeded .composer { justify-content: flex-end; }
+.footer.succeeded .composer:not(:has(.composer-stop:not([hidden]))) { display: none; }
 
 .composer { display: flex; align-items: flex-end; gap: 8px; }
 .composer-input {

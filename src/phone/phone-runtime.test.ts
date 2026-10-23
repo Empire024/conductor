@@ -51,6 +51,7 @@ const runtime = (options: { recognition?: unknown; secure?: boolean; fetch?: typ
   const exposed = `window.runtime = { state, api, dictationButton, stopDictation, markLocked, handleUnauthorized, checkLock, onStreamEvent, applyLockStatus, cachePhoneState, restorePhoneState, refreshPhoneState, refreshRuntime, loadConversation, reconcileMessages, applyTheme,
     startConversation: id => { screen = conversationScreen(id); return screen; },
     setToasts: host => { toastHost = host; },
+    showToast, flushHeldToasts, setHeldChip: chip => { heldChip = chip; },
   };`
   let source = readFileSync(new URL('./app.js', import.meta.url), 'utf8')
   source = source.replace('const render = () => {', 'const render = () => { if (window.__runtimeOnly) { if (screen && screen.update) screen.update(); return }')
@@ -246,5 +247,72 @@ describe('phone service worker bounded shell fallback', () => {
     const intercepted = vi.fn()
     handlers.fetch!({ request: { url: 'https://phone.test/api/sessions/s1/message', method: 'POST' }, respondWith: intercepted })
     expect(intercepted).not.toHaveBeenCalled()
+  })
+})
+
+describe('a succeeded conversation on the phone (conductor-task:phone-succeeded-tab-1023)', () => {
+  it('replaces the composer with the way to the newest successor, sends nothing and takes the draft along', async () => {
+    const calls: string[] = []
+    const app = runtime({ fetch: (async (path: string) => { calls.push(path); return new Response(JSON.stringify(conversation({ summary: { ...summary, phase: 'idle', state: 'idle' }, succession: { id: 's3', title: 'Wizard (continued 2)', open: true } }))) }) as typeof fetch })
+    app.state.drafts.s1 = 'half-typed'
+    const view = app.startConversation('s1'); await settle()
+    const footer = view.root.querySelector('.footer')!
+    expect(footer.classList.contains('succeeded')).toBe(true)
+    expect(view.root.querySelector('.succession-host')!.textContent).toContain('Continued in Wizard (continued 2)')
+    expect(view.root.querySelector('.composer-input')!.disabled).toBe(true)
+    expect(view.root.querySelector('.composer-send')!.disabled).toBe(true)
+    view.root.querySelector('.composer-send')!.click(); await settle()
+    expect(calls.filter(path => path.endsWith('/message'))).toEqual([])
+    view.root.querySelector('.succession-open')!.click()
+    expect(app.window.location.hash).toBe('#/session/s3')
+    expect(app.state.drafts.s3).toBe('half-typed')
+    expect(app.state.drafts.s1).toBe('')
+  })
+  it('says the successor is closed without a button to it', async () => {
+    const app = runtime({ fetch: (async () => new Response(JSON.stringify(conversation({ succession: { id: 's3', title: 'Wizard (continued)', open: false } })))) as typeof fetch })
+    const view = app.startConversation('s1'); await settle()
+    expect(view.root.querySelector('.succession-host')!.textContent).toMatch(/closed now/)
+    expect(view.root.querySelector('.succession-open')).toBeNull()
+  })
+  it('keeps an ordinary conversation open to typing', async () => {
+    const app = runtime()
+    const view = app.startConversation('s1'); await settle()
+    expect(view.root.querySelector('.footer')!.classList.contains('succeeded')).toBe(false)
+    expect(view.root.querySelector('.composer-input')!.disabled).toBe(false)
+    expect(view.root.querySelector('.succession-host')!.textContent).toBe('')
+  })
+})
+
+describe('notifications while typing (conductor-task:phone-notifications-typing-1023)', () => {
+  it('holds toasts behind a count chip while a field has focus and shows them when it lets go', () => {
+    const app = runtime(); const chip = new Node('BUTTON'); app.setHeldChip(chip)
+    const field = new Node('TEXTAREA'); (app.window.document as any).activeElement = field
+    for (const title of ['One', 'Two', 'Three', 'Four', 'Five']) app.showToast({ kind: 'done', title, body: '' })
+    expect(app.toast.children).toHaveLength(0)
+    expect(chip.hidden).toBe(false)
+    expect(chip.textContent).toBe('5')
+    app.flushHeldToasts(false)
+    expect(app.toast.children).toHaveLength(0)
+    ;(app.window.document as any).activeElement = null
+    app.flushHeldToasts(false)
+    expect(chip.hidden).toBe(true)
+    expect(app.toast.children).toHaveLength(3)
+    expect(app.toast.textContent).toContain('3 more notifications')
+    expect(app.toast.textContent).toContain('Four')
+    expect(app.toast.textContent).toContain('Five')
+  })
+  it('holds them while the keyboard is up even without a focused field', () => {
+    const app = runtime(); app.setHeldChip(new Node('BUTTON'))
+    app.window.innerHeight = 852; app.window.visualViewport = { height: 500 }
+    app.showToast({ title: 'Later' })
+    expect(app.toast.children).toHaveLength(0)
+    app.window.visualViewport = { height: 852 }
+    app.flushHeldToasts(false)
+    expect(app.toast.textContent).toContain('Later')
+  })
+  it('shows a toast at once when nobody is typing', () => {
+    const app = runtime()
+    app.showToast({ title: 'Now' })
+    expect(app.toast.textContent).toContain('Now')
   })
 })
