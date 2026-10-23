@@ -61,7 +61,7 @@ No single looping writer was behind it.
 - Long term the journal still grows with the number of conversations (up to 20,000 events each).
   See the owner decision below.
 
-## One-off: shrinking the file (not run; the owner decides)
+## One-off: shrinking the file (run 2026-10-23)
 
 `VACUUM` rewrites the database without the free pages. Run it only with Conductor closed (it
 takes an exclusive lock, and the app holds the database open), after the first compaction pass
@@ -76,7 +76,11 @@ Estimate: it reads ~16 GB and writes ~9–11 GB, plus a temporary copy of the sa
 `PRAGMA auto_vacuum = INCREMENTAL` could be set in the same session before the `VACUUM`. After
 that, a background `PRAGMA incremental_vacuum(N)` could return free pages a little at a time.
 
-## Owner decision still open: retention for old conversations
+Run on 2026-10-23 with the owner's approval (.conductor-scratch/vacuum/vacuum-run.mjs, through node:sqlite since sqlite3 is not installed): 15.85 GB -> 11.54 GB in 239 s, quick_check ok. The script disabled the meta-wizard task for the duration, quit Conductor cleanly (answering the stop-hosting and running-work questions through app.quit.confirm, possible since 38b723d) and started it again.
+
+## Owner decision: no retention trimming for old conversations (2026-10-23)
+
+The owner declined trimming on 2026-10-23. The analysis stays here for reference.
 
 Bounding the file for good means trimming the journals of conversations nobody has touched for a
 while (say 30 days) down to their snapshot. The rendered timeline already lives in
