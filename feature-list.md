@@ -1977,12 +1977,12 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 
 - [x] should be obvious in tab view who's the current wizard. <!-- conductor-task:a5306cf2-9151-4e2f-af7e-6c707d724811 agent=agent_mvr5ubyp_tnk1p0g --> Done: the live wizard's strip tab wears a wand (clarity.liveWizardTabIds) and a handed-off tab is dimmed and italic; scripts/smoke-wizard-tab-mark.mjs.
 
-- [~] multiple errors on lap machine <!-- conductor-task:48d23b2b-fa09-449d-b3f8-2932078ba415 agent=agent_mvr5udkv_ey2x5xc -->
+- [x] multiple errors on lap machine <!-- conductor-task:48d23b2b-fa09-449d-b3f8-2932078ba415 agent=agent_mvr5udkv_ey2x5xc --> Done: 3f2754b (1: an image attached on the laptop is saved in the MAIN project and sent by its MAIN path), 2dbdf79 (2: a MAIN agent id such as a successor wizard opens the laptop mirror of it; 3: missed push subscriptions no longer silence a tab, unsubscribed workspaces keep the 1 s poll, no duplicate pulls). smoke-laptop-full-mirror 12/12 on a parked pair; real-laptop check pending (needs app.update on MAIN and Lap).
   1) images are saved into the project folder which is on main attach them from conductor on main - when teyna get a screen of error here
   2) could not open wizard : conductor + ; your message is still here: Error invoking remote method 'agent-control:focus-origin'
   3. when sent message to project, it started 'working' but never showed whats was actually going on - had to go check via teamviewer to see if it was actually working
 
-- [~] when tryna quit - getting 'remote sessions' running and i cant. i mean if theyre remove, obv we can quit this lap's sesh without interrupting them <!-- conductor-task:8ae9ecbc-d49b-4be2-8052-f2b9f5e78cda agent=agent_mvr5udkv_ey2x5xc -->
+- [x] when tryna quit - getting 'remote sessions' running and i cant. i mean if theyre remove, obv we can quit this lap's sesh without interrupting them <!-- conductor-task:8ae9ecbc-d49b-4be2-8052-f2b9f5e78cda agent=agent_mvr5udkv_ey2x5xc --> Done: f0103d5 - quitting or restarting asks only about work this machine runs; conversations mirrored from MAIN are only detached and keep running there. Real-laptop check pending (needs app.update on Lap).
   
   i think the real fix will be having an agent use the app h imself and try to build something, fixing each issue in the process, because currently there is more missing than implemented
 
