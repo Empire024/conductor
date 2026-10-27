@@ -19,6 +19,14 @@ export function hasRunningWork(process: RuntimeProcessSummary, state?: SessionPr
   return ['working', 'waiting_input', 'waiting_background'].includes(process.activityPhase ?? '') || Boolean(process.resumeAt)
 }
 
+/** The work quitting or restarting this app would cut: a conversation that runs on another
+ *  machine (a tab placed on or mirrored from a paired host) is only watched from here, and closing
+ *  this app detaches from it without touching the host, so it never blocks the quit
+ *  (conductor-task:8ae9ecbc-d49b-4be2-8052-f2b9f5e78cda). */
+export function localWork<T extends Pick<RuntimeProcessSummary, 'id'>>(running: T[], runsElsewhere: (id: string) => boolean): T[] {
+  return running.filter(process => !runsElsewhere(process.id))
+}
+
 /** Deduplicate close/menu/quit requests while the owner makes one decision. A yes/no dialog and
  *  the quit dialog's three-way decision share one pending answer: 'cancel' is no, anything else yes. */
 export class CloseConfirmation {

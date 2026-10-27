@@ -54,7 +54,7 @@ import { installMainErrorLog } from './main-error-log'
 import { bootControlReady, bootStage, bootWindowLoaded, DIAGNOSTICS_DIRECTORY, startBootDiagnostics } from './boot-diagnostics'
 import { SystemMetricsSampler } from './system-metrics.ts'
 import type { SystemMetricsSnapshot } from '../shared/system-metrics.ts'
-import { CloseConfirmation, hasRunningWork, hasSessionWork } from './close-confirmation'
+import { CloseConfirmation, hasRunningWork, hasSessionWork, localWork } from './close-confirmation'
 import { readSessionArchive, writeSessionArchive } from './session-archive'
 import type {
   AgentSpec,
@@ -1288,14 +1288,17 @@ const runningWork = (): ReturnType<ConductorDatabase['listProcesses']> => databa
   hasRunningWork(process, process.kind === 'agent' ? database.structured.resident(process.id) : null, process.kind === 'agent' ? agents.structured.hasRuntime(process.id) : undefined)
 )
 
+/** Running work on this machine only: quitting just detaches from conversations a paired host runs. */
+const quitBlockingWork = (): ReturnType<typeof runningWork> => localWork(runningWork(), id => Boolean(remoteControl?.mirror.isRemote(id)))
+
 /** The work a quit or restart would ask the owner about now, or null when it would go ahead. */
 const stopQuestion = (): Array<{ id: string; title: string }> | null => {
-  const active = runningWork()
+  const active = quitBlockingWork()
   return active.length || agents.nativeCli.hasSubmittedInput() ? active.slice(0, 8).map(process => ({ id: process.id, title: process.title })) : null
 }
 
 const confirmApplicationStop = async (owner: BrowserWindow | null, action: 'quit' | 'restart'): Promise<StopDecision> => {
-  const active = runningWork()
+  const active = quitBlockingWork()
   if (!active.length && !agents.nativeCli.hasSubmittedInput()) return 'stop'
   const running = active.slice(0, 8).map(process => ({ id: process.id, title: process.title }))
   // Conversation turns can outlive the app in the runtime host (docs/runtime-host.md); terminal
@@ -3498,7 +3501,7 @@ app.on('will-quit', () => {
   if (!restartIntentRecorded && database) {
     try {
       const updateReady = updates?.getState().phase === 'ready'
-      if (!mayInstallOnQuit({ updateReady, unkeptWork: runningWork().length > 0, ownerAnswered: false })) {
+      if (!mayInstallOnQuit({ updateReady, unkeptWork: quitBlockingWork().length > 0, ownerAnswered: false })) {
         updates.deferInstallOnQuit()
         console.log('A downloaded update waits for the next quit: this one cuts running work nobody was asked about')
       }

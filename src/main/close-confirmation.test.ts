@@ -1,10 +1,17 @@
 import { describe, expect, it } from 'vitest'
-import { CloseConfirmation, hasRunningWork, hasSessionWork } from './close-confirmation'
+import { CloseConfirmation, hasRunningWork, hasSessionWork, localWork } from './close-confirmation'
 import { emptyProjection } from '../shared/structured-agent-reducer'
 import type { RuntimeProcessSummary } from '../shared/models'
 
 const process: RuntimeProcessSummary = { id: 'agent', projectId: 'other-project', sessionId: 'other-workspace', kind: 'agent', title: 'Worker', status: 'running', activityPhase: 'idle', needsInput: false, progress: null, updatedAt: '' }
 describe('close confirmation', () => {
+  /* 8ae9ecbc: quitting the laptop is blocked only by work running on the laptop; a conversation it
+     watches on MAIN keeps running there and must not stop the quit. */
+  it('leaves conversations another machine runs out of the quit question', () => {
+    const remote = { ...process, id: 'remote', title: 'Mirrored from MAIN' }
+    expect(localWork([process, remote], id => id === 'remote')).toEqual([process])
+    expect(localWork([remote], id => id === 'remote')).toEqual([])
+  })
   it('ignores idle process instances and metadata connections', () => {
     expect(hasRunningWork(process)).toBe(false)
     expect(hasRunningWork(process, { ...emptyProjection('agent'), phase: 'starting' })).toBe(false)
