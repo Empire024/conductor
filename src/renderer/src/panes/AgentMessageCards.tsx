@@ -62,8 +62,8 @@ export function ConversationLink({ peer, projectId, onFocusOrigin }: { peer: Mes
   // A tab closed since the message still has a durable id, which can restore it.
   const origin = peer.agentSessionId
   const focus = entry ? () => void focusDirectoryEntry(entry).catch(reportFocusError) : origin ? () => onFocusOrigin ? onFocusOrigin({ agentSessionId: origin, label: peer.title }) : void window.conductor.agentControl.focusOrigin(origin).catch(reportFocusError) : null
-  if (!focus) return <span className="sa-conversation-name">{label}</span>
-  return <button type="button" className="sa-role-coordinated sa-conversation-link" title={'Show ' + label + ' tab'} aria-label={'Show ' + (entry?.title ?? peer.title) + ' tab'} data-agent-session={peer.agentSessionId} onClick={event => { event.preventDefault(); event.stopPropagation(); focus() }}><Link2 size={11} />{label}</button>
+  if (!focus) return <span className="sa-conversation-name" title={label}>{label}</span>
+  return <button type="button" className="sa-role-coordinated sa-conversation-link" title={'Show ' + label + ' tab'} aria-label={'Show ' + (entry?.title ?? peer.title) + ' tab'} data-agent-session={peer.agentSessionId} onClick={event => { event.preventDefault(); event.stopPropagation(); focus() }}><Link2 size={11} /><span className="sa-conversation-link-label">{label}</span></button>
 }
 
 const firstLine = (text: string): string => {

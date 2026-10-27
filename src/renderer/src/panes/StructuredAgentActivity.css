@@ -22,6 +22,11 @@
 .sa-agent-message > summary { display: flex; align-items: baseline; gap: 10px; padding: 5px 9px; cursor: pointer; list-style: none; min-width: 0; font-size: 11px; }
 .sa-agent-message > summary::-webkit-details-marker { display: none; }
 .sa-agent-message-head { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; color: var(--text-2); white-space: nowrap; }
+/* A long sender title shrinks to an ellipsis on the header line; it never wraps into the body. */
+.sa-agent-message-head { flex: 0 1 auto; min-width: 0; max-width: 100%; }
+.sa-agent-message-head .sa-conversation-link, .sa-agent-message-head .sa-conversation-name { display: inline-flex; align-items: center; gap: 4px; min-width: 0; max-width: 100%; white-space: nowrap; }
+.sa-agent-message-head .sa-conversation-link > svg { flex: 0 0 auto; }
+.sa-conversation-link-label, .sa-agent-message-head .sa-conversation-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .sa-agent-message-head small { color: var(--text-3, var(--text-2)); opacity: 0.8; font-size: 10px; }
 .sa-agent-message-head .sa-role-coordinated { padding: 0 !important; }
 .sa-agent-message-preview { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
