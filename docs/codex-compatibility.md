@@ -1,6 +1,6 @@
 # Codex adapter compatibility baseline
 
-Recorded 2026-09-07 against `codex-cli 0.153.4`; rebaselined 2026-09-21 to `codex-cli 0.155.1` (see "Rebaseline 0.153.4 → 0.155.1" below) and 2026-09-30 to `codex-cli 0.159.1`, keeping 0.155.1 accepted (see "Rebaseline 0.155.1 → 0.159.1"), and 2026-10-22 to `codex-cli 0.163.0`, keeping 0.159.1 and 0.155.1 accepted (see "Rebaseline 0.159.1 → 0.163.0"). This document separates implementation from verification. It is not a claim of complete VS Code extension parity or a successful live turn.
+Recorded 2026-09-07 against `codex-cli 0.153.4`; rebaselined 2026-09-21 to `codex-cli 0.155.1` (see "Rebaseline 0.153.4 → 0.155.1" below) and 2026-09-30 to `codex-cli 0.159.1`, keeping 0.155.1 accepted (see "Rebaseline 0.155.1 → 0.159.1"), and 2026-10-22 to `codex-cli 0.163.0`, keeping 0.159.1 and 0.155.1 accepted (see "Rebaseline 0.159.1 → 0.163.0"), and 2026-10-27 to `codex-cli 0.164.0`, keeping 0.163.0, 0.159.1 and 0.155.1 accepted (see "Rebaseline 0.163.0 → 0.164.0"). This document separates implementation from verification. It is not a claim of complete VS Code extension parity or a successful live turn.
 
 The inspected local runtime reports `codex-cli 0.155.1`. The executable is a native Windows `codex.exe` under the owner's installed OpenAI Codex program directory. `codex login status` reported **Logged in using ChatGPT**. No token, credential file, inherited environment, or account secret was inspected. The adapter uses this user-managed CLI connection, not an Agent SDK/API connection. It does not change account or billing configuration. No OpenAI/Codex VS Code extension directory was present under the inspected `C:/Users/stilj/.vscode/extensions`; its local extension version is therefore **unavailable**, not inferred from the CLI version.
 
@@ -16,7 +16,7 @@ codex app-server generate-json-schema --experimental --out src/main/providers/ge
 npx.cmd vitest run src/main/providers/codex.test.ts
 ```
 
-`node scripts/generate-codex-protocol.mjs` empties the bundle, performs the two generation steps after requiring version 0.163.0 (`CODEX_PROTOCOL_BASELINE` in `src/main/providers/codex.ts`) and prints the SHA-256 values recorded below. `CONDUCTOR_CODEX_PATH` may point it at a scratch CLI. Generated files must not be edited manually. The generated bundle includes experimental types for compile-time checking; that does **not** enable experimental protocol behavior. `initialize.capabilities.experimentalApi` defaults to false. Plan controls require `CONDUCTOR_CODEX_EXPERIMENTAL=1` and an exact runtime in `CODEX_VERIFIED_RUNTIMES` (0.163.0, 0.159.1 or 0.155.1). Other 0.155.x, 0.159.x and 0.163.x patch versions receive a visible unverified-version limitation and experimental features remain disabled. Other minor versions fail connection with a recoverable compatibility error.
+`node scripts/generate-codex-protocol.mjs` empties the bundle, performs the two generation steps after requiring version 0.164.0 (`CODEX_PROTOCOL_BASELINE` in `src/main/providers/codex.ts`) and prints the SHA-256 values recorded below. `CONDUCTOR_CODEX_PATH` may point it at a scratch CLI. Generated files must not be edited manually. The generated bundle includes experimental types for compile-time checking; that does **not** enable experimental protocol behavior. `initialize.capabilities.experimentalApi` defaults to false. Plan controls require `CONDUCTOR_CODEX_EXPERIMENTAL=1` and an exact runtime in `CODEX_VERIFIED_RUNTIMES` (0.164.0, 0.163.0, 0.159.1 or 0.155.1). Other 0.155.x, 0.159.x, 0.163.x and 0.164.x patch versions receive a visible unverified-version limitation and experimental features remain disabled. Other minor versions fail connection with a recoverable compatibility error.
 
 To move the baseline to a new CLI minor (every step is a script, so the model-upgrade pipeline can run them unattended; none touches the global CLI or `~/.codex`):
 
@@ -30,12 +30,26 @@ SHA-256 of the generated baseline (before Git line-ending normalization):
 
 | File under `src/main/providers/generated/codex` | SHA-256 |
 | --- | --- |
-| `ClientRequest.ts` | `9FF8DCC6E37782A0D95CDDF329E0B29A6F5E834F005CFA4F21C77A564E10E40B` |
-| `ServerNotification.ts` | `DF9B5AB2F11010AC336FB7C5B6BB386A7C389CD5DBE742AC5C804FCC69BD40D9` |
+| `ClientRequest.ts` | `2E3313E6213863410CFD8B7437F79CA9C5FDA2F214DE37E2A9FCBE1ABC3B4C4E` |
+| `ServerNotification.ts` | `DF9B5AB2F11010AC336FB7C5B6BB386A7C389CD5DBE742AC5C804FCC69BD40D9` (unchanged since 0.163.0) |
 | `ServerRequest.ts` | `1C5837ADBFBDD005F387478BA87840808D1353B47B82DCF63739A78BB1C8D3BE` (unchanged since 0.153.4) |
-| `schema/codex_app_server_protocol.v2.schemas.json` | `A000C50CEB59E6A9B668F9B638BFCE1DF6FCD59A383AAA38291ED72C96FA92E0` |
+| `schema/codex_app_server_protocol.v2.schemas.json` | `72B1AFCDB14B4880CFF9FACCDFCA1F73F7288FF3A0CB80B7A4BD400A5C4E574C` |
 
-The 0.159.1 hashes were `F21E6307…860436`, `459D76DE…C38C4AD`, `1C5837AD…C8D3BE` (unchanged) and `E77B7D14…168827C`. The 0.155.1 hashes were `38C6718F…828416`, `711F5014…7228F4B`, `1C5837AD…C8D3BE` (unchanged) and `F82D3752…22263C`. The 0.153.4 hashes were `83418E6F…B910F2`, `DFD31C72…556D54`, `1C5837AF…C8D3BE` (unchanged) and `E5F798FD…4F7D0A` respectively; the full values remain in this file's Git history.
+The 0.163.0 hashes were `9FF8DCC6…E10E40B`, `DF9B5AB2…BD40D9` (unchanged), `1C5837AD…C8D3BE` (unchanged) and `A000C50C…FA92E0`. The 0.159.1 hashes were `F21E6307…860436`, `459D76DE…C38C4AD`, `1C5837AD…C8D3BE` (unchanged) and `E77B7D14…168827C`. The 0.155.1 hashes were `38C6718F…828416`, `711F5014…7228F4B`, `1C5837AD…C8D3BE` (unchanged) and `F82D3752…22263C`. The 0.153.4 hashes were `83418E6F…B910F2`, `DFD31C72…556D54`, `1C5837AF…C8D3BE` (unchanged) and `E5F798FD…4F7D0A` respectively; the full values remain in this file's Git history.
+
+## Rebaseline 0.163.0 → 0.164.0 (2026-10-27)
+
+Why: the owner's global Codex CLI auto-updated to `codex-cli 0.164.0`, and every Codex tab failed to open with "Codex 0.164.0 is outside the tested 0.155.x/0.159.x/0.163.x protocol baseline". Regenerated from the installed 0.164.0 itself (`node scripts/generate-codex-protocol.mjs`); `scripts/diff-codex-protocol.mjs` delta, all of it read:
+
+| Change in 0.164.0 | Adapter consequence |
+| --- | --- |
+| New client methods `thread/sample`, `thread/sample/cancel`, `feedback/save` | Not called. No new notifications (`ServerNotification.ts` byte-identical). |
+| `ImageGenerationItem.result` moves into a `{ fileId } \| { result }` union; new optional `inputImages` | The adapter does not map `imageGeneration` items. |
+| `HookEventName` gains `preModelRequest`/`postModelRequest`; `ManagedHooksRequirements` gains required `PreModelRequest`/`PostModelRequest` | The live-isolation check only tests `requirements.hooks` for presence. |
+| `ApplicationRequirements.storage` (required); `McpServerStatus.toolListMeta` (required) | Not read; the fixtures return no applications and an empty `mcpServerStatus/list`. |
+| `TurnStartParams`/`TurnSteerParams.responsesapiClientMetadataPatch`; `ThreadForkParams.experimentalDisablePredictionMcp`; `ThreadRealtimeStartParams.voiceSessionId`; `PlanType` gains `sci`/`sci_plus` | Optional and not sent; the plan type is not read. |
+
+`ServerRequest.ts` (every approval request/response) is byte-identical; `turn/start`, `turn/interrupt`, `model/list`, `thread/start/resume`, `AskForApproval`, `SandboxMode` and `collaborationMode` are unchanged on the wire. Nothing the adapter sends or reads moved, so **0.164.0, 0.163.0, 0.159.1 and 0.155.1 are accepted** (gate `/^0\.(?:155|159|163|164)\./`). Verification: `npm run test:agent-contracts` (fixture now reports 0.164.0 by default; 0.163.0, 0.159.1 and 0.155.1 connect unlimited, 0.164.2 is flagged unverified, 0.161.0 refused), `node scripts/inspect-codex-baseline.mjs` against the installed 0.164.0, and one live `CodexAdapter` turn on 0.164.0 (gpt-6.1-sol, low: one shell command plus answer).
 
 ## Rebaseline 0.159.1 → 0.163.0 (2026-10-22)
 

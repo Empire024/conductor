@@ -452,6 +452,54 @@
             },
             "method": {
               "enum": [
+                "thread/sample"
+              ],
+              "title": "Thread/sampleRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadSampleParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/sampleRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "thread/sample/cancel"
+              ],
+              "title": "Thread/sample/cancelRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadSampleCancelParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/sample/cancelRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
                 "thread/archive"
               ],
               "title": "Thread/archiveRequestMethod",
@@ -3850,6 +3898,30 @@
             "params"
           ],
           "title": "Feedback/uploadRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "feedback/save"
+              ],
+              "title": "Feedback/saveRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/FeedbackSaveParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Feedback/saveRequest",
           "type": "object"
         },
         {
@@ -9553,6 +9625,42 @@
                 "type": "null"
               }
             ]
+          },
+          "storage": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ApplicationStorageRequirements"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ApplicationStorageRequirements": {
+        "description": "Managed storage settings for new Desktop workspaces, not filesystem access restrictions.",
+        "properties": {
+          "defaultProjectParent": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/LegacyAppPathString"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "projectlessWorkspaceRoot": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/LegacyAppPathString"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object"
@@ -14017,6 +14125,85 @@
         },
         "type": "object"
       },
+      "FeedbackSaveParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "classification": {
+            "type": "string"
+          },
+          "extraLogFiles": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "includeLogs": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "savePath": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/LegacyAppPathString"
+              }
+            ],
+            "description": "Absolute, previously unused ZIP path on the app-server host. The caller owns this file, including after a disconnected RPC."
+          },
+          "tags": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "threadId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "classification",
+          "savePath"
+        ],
+        "title": "FeedbackSaveParams",
+        "type": "object"
+      },
+      "FeedbackSaveResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "promptHash": {
+            "description": "Same prompt hash as feedback/upload; null when prompt metadata is absent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "savedPath": {
+            "$ref": "#/definitions/v2/LegacyAppPathString"
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "savedPath",
+          "threadId"
+        ],
+        "title": "FeedbackSaveResponse",
+        "type": "object"
+      },
       "FeedbackUploadParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
@@ -15545,6 +15732,8 @@
       },
       "HookEventName": {
         "enum": [
+          "preModelRequest",
+          "postModelRequest",
           "preToolUse",
           "permissionRequest",
           "postToolUse",
@@ -16026,6 +16215,23 @@
             "type": "object"
           }
         ]
+      },
+      "ImageGenerationInputImage": {
+        "description": "A local image file successfully read for this exact image-generation request.",
+        "properties": {
+          "path": {
+            "$ref": "#/definitions/v2/AbsolutePathBuf"
+          },
+          "sha256": {
+            "description": "Lowercase SHA-256 of the file bytes read before image normalization.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "sha256"
+        ],
+        "type": "object"
       },
       "InAppBrowserRequirements": {
         "properties": {
@@ -16705,6 +16911,13 @@
             },
             "type": "array"
           },
+          "PostModelRequest": {
+            "default": [],
+            "items": {
+              "$ref": "#/definitions/v2/ConfiguredHookMatcherGroup"
+            },
+            "type": "array"
+          },
           "PostToolUse": {
             "items": {
               "$ref": "#/definitions/v2/ConfiguredHookMatcherGroup"
@@ -16712,6 +16925,13 @@
             "type": "array"
           },
           "PreCompact": {
+            "items": {
+              "$ref": "#/definitions/v2/ConfiguredHookMatcherGroup"
+            },
+            "type": "array"
+          },
+          "PreModelRequest": {
+            "default": [],
             "items": {
               "$ref": "#/definitions/v2/ConfiguredHookMatcherGroup"
             },
@@ -17410,6 +17630,9 @@
                 "type": "null"
               }
             ]
+          },
+          "toolListMeta": {
+            "description": "Opaque `_meta` from the first page of the corresponding MCP tool catalog. Null when unavailable."
           },
           "tools": {
             "additionalProperties": {
@@ -18774,6 +18997,8 @@
           "edu",
           "edu_plus",
           "edu_pro",
+          "sci",
+          "sci_plus",
           "unknown"
         ],
         "type": "string"
@@ -25140,8 +25365,12 @@
             "description": "When true, return only thread metadata and live fork state without populating `thread.turns`. This is useful when the client plans to call `thread/turns/list` immediately after forking. Full-history hydration is deprecated for paginated threads; use this with `thread/turns/list` and `thread/items/list` instead.",
             "type": "boolean"
           },
+          "experimentalDisablePredictionMcp": {
+            "description": "Disable MCP servers in prediction mode when the inherited window uses incremental tools on Responses Lite. Requires `experimentalPredictionMode: true`.",
+            "type": "boolean"
+          },
           "experimentalPredictionMode": {
-            "description": "Start from the loaded parent's effective config, tools, environments, and persisted history to maximize prompt-cache reuse. Requires a loaded, persisted parent and `ephemeral: true`. Enables `features.reasoning_effort_override` on the fork. Cannot be combined with configuration overrides, `path`, `lastTurnId`, or `beforeTurnId`.",
+            "description": "Start from the loaded parent's effective config, tools, environments, and persisted history to maximize prompt-cache reuse. Requires a loaded, persisted parent and `ephemeral: true`. Enables `features.reasoning_effort_override` on the fork. Only `config.thread_unload_delay_secs` may override the inherited config. Cannot be combined with `path`, `lastTurnId`, or `beforeTurnId`.",
             "type": "boolean"
           },
           "lastTurnId": {
@@ -26376,6 +26605,33 @@
             "type": "object"
           },
           {
+            "anyOf": [
+              {
+                "properties": {
+                  "fileId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "fileId"
+                ],
+                "title": "FileIdThreadItem",
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "result": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "result"
+                ],
+                "title": "ResultThreadItem",
+                "type": "object"
+              }
+            ],
+            "description": "Either inline generated-image data or its durable attachment-store identity.\n\n`File` must remain first so rollouts written during the migration, which contain both an empty `result` and a `fileId`, retain the file reference when deserialized.",
             "properties": {
               "failure": {
                 "anyOf": [
@@ -26391,8 +26647,12 @@
               "id": {
                 "type": "string"
               },
-              "result": {
-                "type": "string"
+              "inputImages": {
+                "description": "Observed local inputs for a completed generation, absent on older items.",
+                "items": {
+                  "$ref": "#/definitions/v2/ImageGenerationInputImage"
+                },
+                "type": "array"
               },
               "revisedPrompt": {
                 "type": [
@@ -26430,7 +26690,6 @@
             },
             "required": [
               "id",
-              "result",
               "status",
               "type"
             ],
@@ -28180,6 +28439,13 @@
                 "type": "null"
               }
             ]
+          },
+          "voiceSessionId": {
+            "description": "Client-generated identifier for the product voice session. This is distinct from `realtimeSessionId`.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -28750,6 +29016,123 @@
           "threadId"
         ],
         "title": "ThreadRevertedNotification",
+        "type": "object"
+      },
+      "ThreadSampleCancelParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "requestId": {
+            "$ref": "#/definitions/v2/RequestId"
+          }
+        },
+        "required": [
+          "requestId"
+        ],
+        "title": "ThreadSampleCancelParams",
+        "type": "object"
+      },
+      "ThreadSampleCancelResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "ThreadSampleCancelResponse",
+        "type": "object"
+      },
+      "ThreadSampleParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "disableMcp": {
+            "description": "Disable MCP servers when the inherited window uses incremental tools on Responses Lite.",
+            "type": "boolean"
+          },
+          "effort": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ReasoningEffort"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Applied only when the provider and model support cache-preserving reasoning-effort updates."
+          },
+          "expectedTurnId": {
+            "description": "The loaded source's latest completed, failed, or interrupted turn. Stale or active sources are rejected.",
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "responsesapiClientMetadata": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Optional metadata to enrich Codex's ResponsesAPI turn metadata.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "turnTrigger": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "expectedTurnId",
+          "prompt",
+          "threadId"
+        ],
+        "title": "ThreadSampleParams",
+        "type": "object"
+      },
+      "ThreadSampleResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "cachedInputTokens": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "inputTokens": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "outputTokens": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "responseId": {
+            "type": "string"
+          },
+          "sourceTurnId": {
+            "type": "string"
+          },
+          "text": {
+            "description": "Assistant text from the response, or null if it attempted a tool call or completed without text.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "responseId",
+          "sourceTurnId"
+        ],
+        "title": "ThreadSampleResponse",
         "type": "object"
       },
       "ThreadSearchOccurrence": {
@@ -31221,7 +31604,17 @@
             "additionalProperties": {
               "type": "string"
             },
-            "description": "Optional metadata to enrich Codex's ResponsesAPI turn metadata.\n\nEntries are flattened into the JSON string sent as `client_metadata[\"x-codex-turn-metadata\"]` on ResponsesAPI HTTP and websocket requests.\n\nThey are not sent as top-level ResponsesAPI `client_metadata` keys, and reserved keys such as `session_id`, `thread_id`, `turn_id`, and `window_id` cannot be overridden.",
+            "description": "Optional metadata to enrich Codex's ResponsesAPI turn metadata. Replaces unprotected client-provided entries when supplied; an empty map clears them.\n\nEntries are flattened into the JSON string sent as `client_metadata[\"x-codex-turn-metadata\"]` on ResponsesAPI HTTP and websocket requests.\n\nThey are not sent as top-level ResponsesAPI `client_metadata` keys, and reserved keys such as `session_id`, `thread_id`, `turn_id`, and `window_id` cannot be overridden.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "responsesapiClientMetadataPatch": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Merge entries into the ResponsesAPI turn metadata without removing existing entries. Applied after `responsesapiClientMetadata` if both are provided; reserved keys remain protected.",
             "type": [
               "object",
               "null"
@@ -31380,7 +31773,17 @@
             "additionalProperties": {
               "type": "string"
             },
-            "description": "Optional metadata to enrich Codex's ResponsesAPI turn metadata.\n\nEntries are flattened into the JSON string sent as `client_metadata[\"x-codex-turn-metadata\"]` on ResponsesAPI HTTP and websocket requests.\n\nThey are not sent as top-level ResponsesAPI `client_metadata` keys, and reserved keys such as `session_id`, `thread_id`, `turn_id`, and `window_id` cannot be overridden.",
+            "description": "Optional metadata to enrich Codex's ResponsesAPI turn metadata. Replaces unprotected client-provided entries when supplied; an empty map clears them.\n\nEntries are flattened into the JSON string sent as `client_metadata[\"x-codex-turn-metadata\"]` on ResponsesAPI HTTP and websocket requests.\n\nThey are not sent as top-level ResponsesAPI `client_metadata` keys, and reserved keys such as `session_id`, `thread_id`, `turn_id`, and `window_id` cannot be overridden.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "responsesapiClientMetadataPatch": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Merge entries into the ResponsesAPI turn metadata without removing existing entries. Applied after `responsesapiClientMetadata` if both are provided; reserved keys remain protected.",
             "type": [
               "object",
               "null"

@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 
 if (process.env.CONDUCTOR_TEST_PROVIDER_START_CAPTURE) writeFileSync(process.env.CONDUCTOR_TEST_PROVIDER_START_CAPTURE, `${process.pid}\n`)
-const codexVersion = process.env.CONDUCTOR_FAKE_CODEX_VERSION || '0.163.0'
+const codexVersion = process.env.CONDUCTOR_FAKE_CODEX_VERSION || '0.164.0'
 if (process.argv.includes('--version')) { console.log(`codex-cli ${codexVersion}`); process.exit(0) }
 
 let initialized = false
