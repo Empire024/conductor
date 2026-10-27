@@ -11,7 +11,7 @@ import type {
   StructuredProvider
 } from '../shared/structured-agent'
 import type { AgentSpec, RuntimeEnsureResult } from '../shared/models'
-import type { RemotePromptAttachment, RemotePromptFileAttachment } from '../shared/remote-files'
+import { REMOTE_PROMPT_IMAGE_PATH, type RemotePromptAttachment, type RemotePromptFileAttachment } from '../shared/remote-files'
 import { isPastedText, PASTED_TEXT_MAX_CHARS } from '../shared/pasted-text'
 import { STREAM_RESYNC_POLL_MS } from '../shared/remote-stream'
 import type { ConductorDatabase } from './database'
@@ -355,6 +355,17 @@ export class RemoteSessionMirror {
       const attachment = item as ContextAttachment & Partial<RemotePromptFileAttachment>
       const file = attachment.remoteFile
       const path = typeof file?.path === 'string' ? file.path.replaceAll('\\', '/') : ''
+      // An image pasted here was saved into the host project first (files.importImage); only its
+      // host path travels with the prompt.
+      if ((item as ContextAttachment).kind === 'image') {
+        if (typeof attachment.id !== 'string' || !attachment.id || attachment.id.length > 160
+          || typeof attachment.name !== 'string' || !attachment.name || attachment.name.length > 512
+          || Object.hasOwn(attachment, 'content') || Object.hasOwn(attachment, 'path') || !file
+          || file.machineId !== binding.machineId || file.projectId !== binding.projectId || !REMOTE_PROMPT_IMAGE_PATH.test(path)) {
+          throw new Error(`Images for a conversation on another machine must be attached here so they are saved there first; an image saved on this computer cannot be sent.`)
+        }
+        return { id: attachment.id, kind: 'image', name: attachment.name, remoteFile: { machineId: binding.machineId, projectId: binding.remoteProjectId, path } }
+      }
       if (attachment.kind !== 'file' || typeof attachment.id !== 'string' || !attachment.id || attachment.id.length > 160
         || typeof attachment.name !== 'string' || !attachment.name || attachment.name.length > 512
         || Object.hasOwn(attachment, 'content') || Object.hasOwn(attachment, 'path') || !file

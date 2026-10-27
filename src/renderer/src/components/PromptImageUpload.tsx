@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { ImagePlus, LoaderCircle } from 'lucide-react'
 import type { ContextAttachment } from '../../../shared/structured-agent'
+import type { RemoteFileIdentity } from '../../../shared/remote-files'
+import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
 
 export function PromptImageUpload({ projectId, disabled, unavailable, onAttach, onError }: {projectId:string; disabled:boolean; /** Why images cannot be attached here at all, said when someone tries. */ unavailable?:string; onAttach(images:ContextAttachment[]):void; onError(message:string):void}): React.JSX.Element {
   const host=useRef<HTMLSpanElement>(null), input=useRef<HTMLInputElement>(null)
@@ -44,8 +46,23 @@ export function PromptImageUpload({ projectId, disabled, unavailable, onAttach, 
   </span>
 }
 
-export function PromptImageThumbnail({ projectId, attachment }: {projectId:string;attachment:ContextAttachment}):React.JSX.Element|null {
+/** The host file an image lives in when it was saved on another machine: one pasted here into a
+ *  project of that machine's (`remoteFile`), or one in a conversation that machine runs (`machineId`). */
+function remoteImage(projectId:string, attachment:ContextAttachment, machineId?:string):RemoteFileIdentity|null {
+  const named=(attachment as ContextAttachment & {remoteFile?:RemoteFileIdentity}).remoteFile
+  if(named) return named
+  return machineId && machineId!==LOCAL_MACHINE_ID && attachment.path ? {machineId,projectId,path:attachment.path} : null
+}
+
+export function PromptImageThumbnail({ projectId, attachment, machineId }: {projectId:string;attachment:ContextAttachment;/** The machine running the conversation, when it is not this one. */ machineId?:string}):React.JSX.Element|null {
   const [url,setUrl]=useState('')
-  useEffect(()=>{let live=true; if(attachment.path)void window.conductor.files.readDataUrl(projectId,attachment.path).then(value=>{if(live)setUrl(value.dataUrl)}).catch(()=>{});return()=>{live=false}},[projectId,attachment.path])
+  const remote=remoteImage(projectId,attachment,machineId)
+  const remoteKey=remote ? remote.machineId+'\0'+remote.projectId+'\0'+remote.path : ''
+  useEffect(()=>{
+    let live=true, preview=''
+    if(remote) void window.conductor.remote.files.preview(remote).then(resource=>{preview=resource.url; if(live)setUrl(resource.url); else void window.conductor.remote.files.revokePreview(resource.url)}).catch(()=>{})
+    else if(attachment.path) void window.conductor.files.readDataUrl(projectId,attachment.path).then(value=>{if(live)setUrl(value.dataUrl)}).catch(()=>{})
+    return()=>{live=false; if(preview) void window.conductor.remote.files.revokePreview(preview)}
+  },[projectId,attachment.path,remoteKey])
   return url ? <img className="sa-image-thumbnail" src={url} alt={attachment.name}/> : null
 }

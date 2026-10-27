@@ -405,6 +405,42 @@ describe('remote structured conversation operations', () => {
     expect(fix.sessions.archive).toHaveBeenCalledWith('agent-remote', true)
   })
 
+  /* 48d23b2b item 1: a screenshot pasted on the laptop into one of MAIN's projects is saved on MAIN
+     and reaches the agent there as an image read from MAIN's project. */
+  it('saves an image a paired machine sends into the shared project and attaches it by that path', async () => {
+    const id = '0f8fa3a4-6b39-4d0e-9d55-3f3c6d0a1b2c'
+    const saved: Array<{ cwd: string; name: string; size: number }> = []
+    const images = fixture({
+      importImage: async (cwd, name, bytes) => {
+        saved.push({ cwd, name, size: bytes.byteLength })
+        mkdirSync(join(cwd, '.conductor', 'prompt-images'), { recursive: true })
+        writeFileSync(join(cwd, '.conductor', 'prompt-images', id + '.png'), Buffer.from(bytes))
+        return { id: 'local', kind: 'image', name, path: '.conductor/prompt-images/' + id + '.png' }
+      }
+    })
+    const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3])
+    expect(await images.call('files.importImage', { projectId: 'shared-project', name: 'error.png', data: png.toString('base64') }))
+      .toEqual({ path: '.conductor/prompt-images/' + id + '.png', name: 'error.png' })
+    expect(saved).toEqual([{ cwd: shared, name: 'error.png', size: png.length }])
+    expect(await images.refusal('files.importImage', { projectId: 'shared-project', name: 'big.png', data: Buffer.alloc(1536 * 1024 + 1).toString('base64') })).toMatch(/at most 1.5 MiB/)
+    expect(await images.refusal('files.importImage', { projectId: 'private-project', name: 'x.png', data: png.toString('base64') })).toMatch(/not shared/)
+    // A host without the saver says so instead of half-serving the call.
+    expect(await fix.refusal('files.importImage', { projectId: 'shared-project', name: 'x.png', data: png.toString('base64') })).toMatch(/cannot take images/)
+
+    const image = { id: 'img-1', kind: 'image', name: 'error.png', remoteFile: { machineId: 'host-machine', projectId: 'shared-project', path: '.conductor/prompt-images/' + id + '.png' } }
+    await images.call('agents.submit', { ...base, prompt: 'what is this error?', settings, attachments: [image] })
+    expect(images.sessions.submit).toHaveBeenLastCalledWith('agent-remote', 'what is this error?', settings, [{
+      id: 'img-1', kind: 'image', name: 'error.png', path: '.conductor/prompt-images/' + id + '.png'
+    }], expect.any(Object))
+    // Only a prompt image of that project, by its own path; never another file, another path or bytes.
+    for (const bad of [
+      { ...image, remoteFile: { ...image.remoteFile, path: 'notes.md' } },
+      { ...image, remoteFile: { ...image.remoteFile, path: '../private/secrets.env' } },
+      { ...image, path: '.conductor/prompt-images/' + id + '.png' },
+      { ...image, remoteFile: { ...image.remoteFile, path: '.conductor/prompt-images/00000000-0000-0000-0000-000000000000.png' } }
+    ]) await expect(images.call('agents.submit', { ...base, prompt: 'bad', settings, attachments: [bad] })).rejects.toThrow()
+  })
+
   it('never lets a paired machine hand a tab the wizard wand, or take it away', async () => {
     await fix.call('agents.settings', { ...base, settings: { ...settings, wizard: true } })
     expect(fix.sessions.saveSettings).toHaveBeenLastCalledWith('agent-remote', settings)

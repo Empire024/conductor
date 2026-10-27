@@ -133,7 +133,17 @@ export type RemotePromptTextAttachment = Pick<ContextAttachment, 'id' | 'name'> 
   kind: 'selection'
   content: string
 }
-export type RemotePromptAttachment = RemotePromptFileAttachment | RemotePromptTextAttachment
+/** An image pasted on the controlling machine, already saved into the host project by
+ *  `files.importImage` (a `.conductor/prompt-images/` file): named by its host path, never sent again. */
+export type RemotePromptImageAttachment = Pick<ContextAttachment, 'id' | 'name'> & {
+  kind: 'image'
+  remoteFile: RemoteFileIdentity
+}
+export type RemotePromptAttachment = RemotePromptFileAttachment | RemotePromptTextAttachment | RemotePromptImageAttachment
+/** The largest prepared image `files.importImage` takes: base64 of it still fits a 3 MiB request. */
+export const REMOTE_PROMPT_IMAGE_MAX_BYTES = 1536 * 1024
+/** The only host paths an image attachment may name: what `files.importImage` (or a phone upload) wrote. */
+export const REMOTE_PROMPT_IMAGE_PATH = /^\.conductor\/prompt-images\/[0-9a-f-]{36}\.(?:png|jpg)$/
 
 /** Host/controller transport; never expose raw chunk iteration directly to untrusted web content. */
 export interface RemoteFileResourceTransport {

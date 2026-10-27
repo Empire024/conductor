@@ -152,6 +152,14 @@ joined, each project keeps the machine it lives on, and work opened in it runs o
 - A PDF, archive or office file such a conversation links opens here with this computer's default
   app, as a read-only copy fetched through the grant into `userData/remote-open` (kept 7 days, at
   most 500 MB). Text files open in the editor against MAIN's copy, as before.
+- An image pasted, dropped or chosen in the composer of one of MAIN's conversations is shrunk here
+  to at most 1.5 MiB, saved into that project's `.conductor/prompt-images` on MAIN
+  (`files.importImage`), and sent by its MAIN path, so the agent on MAIN reads it like an image
+  pasted at MAIN's own keyboard. A MAIN too old to answer `files.importImage` is named as needing
+  an update.
+- Quitting the laptop never asks about conversations running on MAIN: closing it only stops
+  watching them, and MAIN carries on. A link in a mirrored transcript to one of MAIN's
+  conversations (a wizard's successor, a coworker's message) opens this computer's mirror of it.
 - Renaming a shared project on MAIN keeps it shared: the grant follows the folder, and a rename made
   before this existed is healed when MAIN starts (and on every probe), unless the old folder still
   holds the same working copy (a copy, not a move). A new project that took the old folder name

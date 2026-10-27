@@ -37,9 +37,10 @@ export function fitImageForMessage(bytes: Buffer, maxBytes: number): Buffer | nu
   return encoded
 }
 
-/** Uploaded bytes become immutable workspace images, so providers and restored drafts share them. */
-export async function importPromptImage(cwd: string, name: unknown, input: unknown): Promise<ContextAttachment> {
-  if (typeof name !== 'string' || !(input instanceof Uint8Array) || !input.byteLength || input.byteLength > 20 * 1024 * 1024) throw new Error('Choose an image no larger than 20 MB')
+/** Checks and shrinks pasted image bytes to a PNG or JPEG of at most `maxBytes`. Used on its own
+ *  by a controlling machine before it sends an image to the machine whose project it belongs to. */
+export function encodePromptImage(input: unknown, maxBytes = 2 * 1024 * 1024): { bytes: Buffer; extension: 'png' | 'jpg' } {
+  if (!(input instanceof Uint8Array) || !input.byteLength || input.byteLength > 20 * 1024 * 1024) throw new Error('Choose an image no larger than 20 MB')
   const bytes = Buffer.from(input)
   const png = bytes.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]))
   const jpeg = bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255
@@ -52,14 +53,21 @@ export async function importPromptImage(cwd: string, name: unknown, input: unkno
   if (!width || !height || width * height > 80_000_000) throw new Error('Image dimensions are too large')
   if (Math.max(width,height) > 4096) image = image.resize(width >= height ? {width:4096} : {height:4096})
   let encoded = image.toPNG()
-  let extension = 'png'
-  if (encoded.length > 2 * 1024 * 1024) { encoded = image.toJPEG(90); extension = 'jpg' }
-  while (encoded.length > 2 * 1024 * 1024) {
+  let extension: 'png' | 'jpg' = 'png'
+  if (encoded.length > maxBytes) { encoded = image.toJPEG(90); extension = 'jpg' }
+  while (encoded.length > maxBytes) {
     ;({width,height} = image.getSize())
     if (Math.max(width,height) < 512) throw new Error('Image could not be prepared within the attachment limit')
     image = image.resize({width:Math.round(width*.75)})
     encoded = image.toJPEG(85)
   }
+  return { bytes: encoded, extension }
+}
+
+/** Uploaded bytes become immutable workspace images, so providers and restored drafts share them. */
+export async function importPromptImage(cwd: string, name: unknown, input: unknown): Promise<ContextAttachment> {
+  if (typeof name !== 'string') throw new Error('Name the image')
+  const { bytes: encoded, extension } = encodePromptImage(input)
   // Validate each ancestor separately; never follow a user-created junction out of the project.
   for (const part of ['.conductor', '.conductor/prompt-images']) {
     const directory = await workspacePath(cwd,part,true)

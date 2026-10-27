@@ -432,6 +432,25 @@ describe('mirroring a conversation that runs on another machine', () => {
     expect(() => f.mirror.unsupported('local-session', 'Native CLI handoff')).toThrow(/not supported.*another machine/)
   })
 
+  /* 48d23b2b item 1: an image pasted on the laptop was saved in MAIN's project first; only its host
+     path goes with the prompt, and an image saved on this computer is refused rather than lost. */
+  it('forwards an image saved in the host project by its host path, and refuses one saved here', async () => {
+    const f = fixture(() => [])
+    f.mirror.bind(binding())
+    const path = '.conductor/prompt-images/0f8fa3a4-6b39-4d0e-9d55-3f3c6d0a1b2c.png'
+    await f.mirror.submit('local-session', 'what is this', 'agents.submit', remoteSnapshot().settings, [{
+      id: 'img-1', kind: 'image', name: 'error.png', remoteFile: { machineId: 'desktop', projectId: 'project', path }
+    } as ContextAttachment])
+    expect(f.asked.find(call => call.method === 'agents.submit')?.args).toMatchObject({ attachments: [{
+      id: 'img-1', kind: 'image', name: 'error.png', remoteFile: { machineId: 'desktop', projectId: 'their-project', path }
+    }] })
+    for (const bad of [
+      { id: 'img-2', kind: 'image', name: 'error.png', path },
+      { id: 'img-3', kind: 'image', name: 'error.png', remoteFile: { machineId: 'desktop', projectId: 'project', path: 'notes.md' } },
+      { id: 'img-4', kind: 'image', name: 'error.png', remoteFile: { machineId: 'controller', projectId: 'project', path } }
+    ]) await expect(f.mirror.submit('local-session', 'bad', 'agents.submit', remoteSnapshot().settings, [bad as ContextAttachment])).rejects.toThrow(/saved there first/)
+  })
+
   it('forwards composer-pasted text with its content, but never a path on it', async () => {
     const f = fixture(() => [])
     f.mirror.bind(binding())

@@ -20,6 +20,10 @@ import { launcherTile } from './lib/launcher-tile.mjs'
  *  - the laptop's own tabs run beside them, unlabelled (this computer);
  *  - MAIN's machines list names the laptop as controlling it and MAIN's real GitHub login;
  *  - with "Mirror everything" switched off on MAIN, the laptop launcher says why and what to click.
+ *  - (conductor-task:48d23b2b) the reply to a prompt typed on the laptop streams back into the
+ *    laptop's tab; an image attached on the laptop is saved in MAIN's project and reaches the turn
+ *    on MAIN as an image; and a MAIN conversation named by MAIN's own id (a wizard's successor)
+ *    opens from the laptop instead of failing in agent-control:focus-origin.
  *
  * Run after a build, one smoke at a time:
  *   node scripts/smoke-lock.mjs -- node scripts/smoke-laptop-full-mirror.mjs
@@ -175,6 +179,41 @@ try {
   await settle(host.page, hostSessions[1])
   check('a prompt typed in a mirrored tab on the laptop ran in the conversation on MAIN')
 
+  // ---- what MAIN did comes back to the laptop (48d23b2b item 3) --------------------------------
+  const laptopVideos = await videosPane.getAttribute('data-structured-session')
+  const hostReply = (await snapshot(host.page, hostSessions[1])).items.slice(before)
+    .filter(item => item.data.type === 'text' && item.data.role === 'assistant').map(item => item.data.text).join('\n')
+  assert.ok(hostReply.trim(), 'MAIN answered the laptop prompt with no assistant text')
+  await expect.poll(async () => {
+    const mirrored = await snapshot(controller.page, laptopVideos)
+    return mirrored?.items.filter(item => item.data.type === 'text' && item.data.role === 'assistant').map(item => item.data.text).join('\n') ?? ''
+  }, { timeout: 30000 }).toContain(hostReply.trim().split('\n').at(-1))
+  await expect.poll(async () => (await snapshot(controller.page, laptopVideos))?.phase, { timeout: 30000 }).toBe('completed')
+  check('the reply to the laptop prompt streamed back into the laptop tab and it settled as completed')
+
+  // ---- an image attached on the laptop is saved on MAIN (48d23b2b item 1) -----------------------
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64')
+  await videosPane.locator('input[aria-label="Choose prompt images"]').setInputFiles({ name: 'error.png', mimeType: 'image/png', buffer: png })
+  await expect(videosPane.locator('.sa-context-chips')).toContainText('error.png', { timeout: 20000 })
+  await expect(videosPane.locator('.sa-context-chips img.sa-image-thumbnail')).toHaveCount(1, { timeout: 20000 })
+  const beforeImage = (await snapshot(host.page, hostSessions[1])).items.length
+  await composer.fill('SYNTHETIC LINKS what is this error')
+  await videosPane.getByRole('button', { name: 'Send message', exact: true }).click()
+  await expect.poll(async () => {
+    const sent = (await snapshot(host.page, hostSessions[1])).items.slice(beforeImage)
+      .find(item => item.data.type === 'text' && item.data.role === 'user' && /what is this error/.test(item.data.text))
+    return JSON.stringify(sent?.data.attachments ?? [])
+  }, { timeout: 30000 }).toMatch(/"kind":"image".*"path":"[^"]*prompt-images(?:\/|\\\\)[0-9a-f-]{36}\.png"/)
+  const sentImage = (await snapshot(host.page, hostSessions[1])).items.slice(beforeImage)
+    .find(item => item.data.type === 'text' && item.data.role === 'user' && /what is this error/.test(item.data.text)).data.attachments[0]
+  const hostVideos = (await host.page.evaluate(() => window.conductor.projects.list())).find(project => project.name === 'videos')
+  // MAIN's session keeps it by its absolute path in MAIN's project folder.
+  assert.ok(sentImage.path.replaceAll('\\', '/').startsWith(hostVideos.path.replaceAll('\\', '/') + '/.conductor/prompt-images/'), `the image is not in MAIN's project: ${sentImage.path}`)
+  const onMain = await host.page.evaluate(({ projectId, path }) => window.conductor.files.readDataUrl(projectId, path).then(value => value.dataUrl.slice(0, 22)), { projectId: hostVideos.id, path: '.conductor/prompt-images/' + sentImage.path.replaceAll('\\', '/').split('/').at(-1) })
+  assert.equal(onMain, 'data:image/png;base64,', 'the image is not readable in MAIN\'s project')
+  await settle(host.page, hostSessions[1])
+  check('an image attached on the laptop was saved in MAIN\'s project and reached the turn on MAIN as an image')
+
   // ---- a conversation MAIN opens later appears by itself ----------------------------------------
   await host.page.locator('.project-row').filter({ hasText: 'haf-stuff' }).click()
   hostSessions.push(await conversation(host.page, 'SYNTHETIC LINKS second from MAIN', true))
@@ -186,6 +225,13 @@ try {
   await controller.page.locator('.pane-add-tab').first().click()
   await expect(controller.page.locator('.launcher-remote-conversations:visible .launcher-attach-list button').filter({ hasText: /second from MAIN/i }).last()).toContainText('open here', { timeout: 20000 })
   check('a conversation MAIN opened later appeared on the laptop by itself')
+
+  // ---- a MAIN conversation named by MAIN's id opens from the laptop (48d23b2b item 2) -----------
+  await controller.page.locator('.project-row').filter({ hasText: 'videos' }).click()
+  await controller.page.evaluate(id => window.conductor.agentControl.focusOrigin(id), hostSessions[2])
+  await expect(controller.page.locator('.pane-tab.active')).toContainText(/second from MAIN/i, { timeout: 20000 })
+  await controller.page.locator('.project-row').filter({ hasText: 'haf-stuff' }).click()
+  check('a MAIN conversation named by MAIN\'s own id (as a successor is) opened on the laptop')
 
   // ---- the laptop's own tabs beside them --------------------------------------------------------
   await controller.page.evaluate(() => window.conductor.projects.create('laptop notes'))

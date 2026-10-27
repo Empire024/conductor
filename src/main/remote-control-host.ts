@@ -19,7 +19,7 @@ import type { RemoteServiceRegistry } from './remote-services'
 import { RemoteTerminalHost, type RemoteTerminalStream, type TerminalRuntime } from './remote-terminals'
 import type { StructuredSessions } from './structured-sessions'
 import { readTextFile } from './text-files'
-import { REMOTE_FILE_CHUNK_BYTES, REMOTE_FILE_MAX_ASSET_BYTES, REMOTE_OPENABLE_DOCUMENTS } from '../shared/remote-files'
+import { REMOTE_FILE_CHUNK_BYTES, REMOTE_FILE_MAX_ASSET_BYTES, REMOTE_OPENABLE_DOCUMENTS, REMOTE_PROMPT_IMAGE_MAX_BYTES, REMOTE_PROMPT_IMAGE_PATH } from '../shared/remote-files'
 import { MAX_PROMPT_CHARS, type ContextAttachment } from '../shared/structured-agent'
 import { isPastedText, PASTED_TEXT_MAX_CHARS } from '../shared/pasted-text'
 import { isAnonymousTab } from './local-models/anonymous'
@@ -101,6 +101,7 @@ export const remoteToolSignatures = {
   'files.describe': '({projectId,path}) — safe image/video metadata and immutable version token',
   'files.readChunk': '({projectId,path,offset,length,version}) — at most 256 KiB from that exact version',
   'files.open': '({projectId,sessionId,path})',
+  'files.importImage': '({projectId,name,data}) — an image pasted on the controlling machine (data base64, at most 1.5 MiB), saved as a prompt image in the shared project; returns {path,name} for an image attachment',
   'tasks.list': '({projectId})',
   'tasks.create': '({projectId,revision,title,kind,priority?,weight?})',
   'tasks.update': '({projectId,revision,id,status?,title?,priority?})',
@@ -146,6 +147,9 @@ export interface RemoteControlHostDependencies {
   renameProject?(projectId: string, name: string): Promise<unknown>
   /** The repository link behind the task list, for `tasks.sourceControl`. */
   sourceControl?: { setEnabled(projectId: string, enabled: boolean): void; describe(projectId: string): Promise<SourceControlStatus> }
+  /** Saves image bytes as a prompt image under `cwd` (src/main/prompt-images.ts). Without it
+   *  `files.importImage` is refused. */
+  importImage?(cwd: string, name: string, bytes: Uint8Array): Promise<ContextAttachment>
 }
 
 /** A task-list page request, from only the fields a page is made of. */
@@ -297,6 +301,23 @@ export class RemoteControlHost {
       }
       const remoteFile = item.remoteFile && typeof item.remoteFile === 'object' && !Array.isArray(item.remoteFile)
         ? item.remoteFile as Record<string, unknown> : {}
+      // An image the peer pasted, already saved here by files.importImage: the provider reads it
+      // from this project, exactly like an image pasted at this machine's own composer.
+      if (item.kind === 'image') {
+        if (typeof item.id !== 'string' || !item.id || item.id.length > 160 || typeof item.name !== 'string' || !item.name || item.name.length > 512
+          || Object.hasOwn(item, 'content') || Object.hasOwn(item, 'path')
+          || remoteFile.machineId !== this.deps.peers.machineId || remoteFile.projectId !== projectId
+          || typeof remoteFile.path !== 'string' || !REMOTE_PROMPT_IMAGE_PATH.test(remoteFile.path)) {
+          throw new RemoteAccessError('A remote image attachment must name a prompt image saved in the host project.', 400)
+        }
+        const path = await workspacePath(authority.project.path, remoteFile.path, false)
+        current()
+        const info = await stat(path).catch(() => null)
+        current()
+        if (!info?.isFile()) throw new RemoteAccessError('That image is no longer in the project on this machine; attach it again.', 404)
+        attachments.push({ id: item.id, kind: 'image', name: item.name, path: remoteFile.path })
+        continue
+      }
       if (item.kind !== 'file' || typeof item.id !== 'string' || !item.id || item.id.length > 160
         || typeof item.name !== 'string' || !item.name || item.name.length > 512
         || Object.hasOwn(item, 'content') || Object.hasOwn(item, 'path')
@@ -530,6 +551,16 @@ export class RemoteControlHost {
       const saved = writeEditorFile(path, args.content, args.expectedContent)
       if (saved.status === 'saved') { invalidateProjectFiles(project.path); this.deps.fileChanged({ projectId: project.id, path: relativePath }) }
       return saved
+    }
+    if (method === 'files.importImage') {
+      if (!this.deps.importImage) throw new RemoteAccessError('This machine cannot take images from another machine yet.', 501)
+      const authority = this.deps.peers.captureProjectAuthority(peer, args.projectId)
+      const data = typeof args.data === 'string' && args.data.length <= Math.ceil(REMOTE_PROMPT_IMAGE_MAX_BYTES / 3) * 4 ? Buffer.from(args.data, 'base64') : null
+      if (!data?.length || data.length > REMOTE_PROMPT_IMAGE_MAX_BYTES) throw new RemoteAccessError('Send one image of at most 1.5 MiB.', 400)
+      const saved = await this.deps.importImage(authority.project.path, text(args, 'name', 160), new Uint8Array(data))
+      this.deps.peers.requireCurrentProject(peer, args.projectId, authority.revision)
+      if (!saved.path || !REMOTE_PROMPT_IMAGE_PATH.test(saved.path)) throw new RemoteAccessError('The image was not saved as a prompt image.', 500)
+      return { path: saved.path, name: saved.name }
     }
     if (method === 'services.list') {
       if (!this.deps.services) throw new RemoteAccessError('This machine is not sharing any services.', 503)

@@ -19,7 +19,7 @@ import type {
   RemoteWorkspaceTab,
   RemoteWorkspaceTabs
 } from '../shared/remote-control'
-import type { RemoteFileDescription, RemoteFileIdentity, RemoteFileWriteRequest } from '../shared/remote-files'
+import { REMOTE_PROMPT_IMAGE_MAX_BYTES, REMOTE_PROMPT_IMAGE_PATH, type RemoteFileDescription, type RemoteFileIdentity, type RemoteFileWriteRequest } from '../shared/remote-files'
 import { decodeTicket, encodeTicket, LOCAL_MACHINE_ID, readRemoteProjectSummaries, type TailscaleState } from '../shared/remote-control'
 import { checkRemoteProjectPlacement } from '../shared/project-identity'
 import { adoptRemoteProject, adoptRemoteProjects, type RemoteProjectAdoptionDependencies } from './remote-project-adoption'
@@ -61,7 +61,7 @@ import type { TerminalManager } from './terminal-manager'
 import type { StreamHostFrame } from '../shared/remote-stream'
 import type { MachineDiagnostics } from '../shared/remote-control'
 import type { ProjectRecord } from '../shared/models'
-import type { PromptDispatchAuthority } from '../shared/structured-agent'
+import type { ContextAttachment, PromptDispatchAuthority } from '../shared/structured-agent'
 
 export interface RemoteControlServiceDependencies {
   database: ConductorDatabase
@@ -90,6 +90,12 @@ export interface RemoteControlServiceDependencies {
   renameProject?(projectId: string, name: string): Promise<unknown>
   /** This machine's repository links behind the task list, served as `tasks.sourceControl`. */
   sourceControl?: { setEnabled(projectId: string, enabled: boolean): void; describe(projectId: string): Promise<SourceControlStatus> }
+  /** This machine's prompt images: saving one a paired machine sent (host), and shrinking one
+   *  pasted here before it is sent to the machine whose project it is for (controller). */
+  promptImages?: {
+    save(cwd: string, name: string, bytes: Uint8Array): Promise<ContextAttachment>
+    encode(bytes: Uint8Array, maxBytes: number): { bytes: Uint8Array }
+  }
 }
 
 const MACHINE_NAME_SETTING = 'remote-control.machineName'
@@ -344,7 +350,8 @@ export class RemoteControlService {
       ui: deps.ui, fileChanged: deps.fileChanged, machineName: () => this.machineName(),
       ...(deps.createProject ? { createProject: (name: string) => deps.createProject!(name) } : {}),
       ...(deps.renameProject ? { renameProject: (projectId: string, name: string) => deps.renameProject!(projectId, name) } : {}),
-      ...(deps.sourceControl ? { sourceControl: deps.sourceControl } : {})
+      ...(deps.sourceControl ? { sourceControl: deps.sourceControl } : {}),
+      ...(deps.promptImages ? { importImage: (cwd: string, name: string, bytes: Uint8Array) => deps.promptImages!.save(cwd, name, bytes) } : {})
     })
     this.server = new RemoteControlServer({
       peers: this.peers, host: this.host, store, vault,
@@ -1373,6 +1380,34 @@ export class RemoteControlService {
     void this.mirror.pull(localSessionId).catch(error => console.warn('Remote session did not load', error))
     void this.refreshSubscriptions(target.machineId)
     return { localSessionId, machineId: target.machineId, machineName: target.machineName, title, provider }
+  }
+
+  /**
+   * An image pasted or dropped into the composer of a project that lives on another machine
+   * (conductor-task:48d23b2b-fa09-449d-b3f8-2932078ba415, item 1). It is shrunk here to what one
+   * request carries, saved into that project's `.conductor/prompt-images` there, and attached by
+   * its host path - the agent that reads it runs there, so that is where the file has to be.
+   */
+  async importImage(projectId: string, name: unknown, bytes: unknown): Promise<ContextAttachment & { remoteFile: RemoteFileIdentity }> {
+    if (!this.deps.promptImages) throw new RemoteAccessError('This computer cannot send images to another machine.', 501)
+    if (typeof name !== 'string') throw new RemoteAccessError('Name the image.', 400)
+    const target = this.remoteProjectTarget(String(projectId ?? ''))
+    const prepared = this.deps.promptImages.encode(bytes as Uint8Array, REMOTE_PROMPT_IMAGE_MAX_BYTES)
+    let saved: unknown
+    try {
+      saved = await this.client.call(target.machineId, 'files.importImage', { projectId: target.remoteProjectId, name: name.slice(0, 160) || 'Pasted image', data: Buffer.from(prepared.bytes).toString('base64') })
+    } catch (error) {
+      if (/Unknown remote method/i.test(error instanceof Error ? error.message : String(error))) {
+        throw new RemoteAccessError(`${target.machineName} runs an older Conductor that cannot take images from here. Update Conductor on ${target.machineName}.`, 501)
+      }
+      throw error
+    }
+    const result = (saved && typeof saved === 'object' ? saved : {}) as { path?: unknown; name?: unknown }
+    if (typeof result.path !== 'string' || !REMOTE_PROMPT_IMAGE_PATH.test(result.path)) throw new RemoteAccessError(`${target.machineName} did not save the image.`, 502)
+    return {
+      id: randomUUID(), kind: 'image', name: typeof result.name === 'string' && result.name ? result.name : name.slice(0, 160) || 'Pasted image',
+      remoteFile: { machineId: target.machineId, projectId: target.localProjectId, path: result.path }
+    }
   }
 
   /**

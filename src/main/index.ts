@@ -21,7 +21,7 @@ import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } 
 import { promises as fs, readFileSync, appendFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { homedir } from 'node:os'
-import { importPromptImage } from './prompt-images'
+import { encodePromptImage, importPromptImage } from './prompt-images'
 import { importPromptAttachmentPath, projectPromptAttachment } from './prompt-context'
 import { moveExternalDropIntoProject, moveProjectDropWithinProject } from './file-drop-move'
 import { ProjectBacklogs } from './project-backlog'
@@ -1707,6 +1707,9 @@ const registerIpc = (): void => {
   ipcMain.handle('structured:events', (event, id, after = 0) => { trustedStructured(event); if (!Number.isSafeInteger(after) || after < 0) throw new Error('Invalid sequence'); return database.structured.events(structuredId(id), after) })
   ipcMain.handle('files:import-image', async (event, projectId: string, name: unknown, bytes: unknown) => {
     trustedStructured(event)
+    // A project that lives on another machine gets the image there, where its agents run.
+    const record = findProjectRecord(database, projectId)
+    if (record && isRemoteProject(record) && remoteControl) return remoteControl.importImage(record.id, name, bytes)
     const project = localProject(database, projectId, 'Importing an image into the project')
     const attachment = await importPromptImage(project.path, name, bytes)
     invalidateProjectFiles(project.path)
@@ -2966,6 +2969,10 @@ app.whenReady().then(async () => {
     // And its own rename and repository links, for a paired machine's task list and rename.
     renameProject: (projectId, name) => renameLocalProject(projectId, name),
     sourceControl,
+    promptImages: {
+      save: async (cwd, name, bytes) => { const attachment = await importPromptImage(cwd, name, bytes); invalidateProjectFiles(cwd); return attachment },
+      encode: (bytes, maxBytes) => encodePromptImage(bytes, maxBytes)
+    },
     chooseRemoteDownloadPath: async description => {
       const options: Electron.SaveDialogOptions = {
         title: `Save ${basename(description.file.path)}`,
