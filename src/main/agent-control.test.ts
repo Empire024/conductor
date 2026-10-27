@@ -516,6 +516,21 @@ locked: [budget]
     await expect(f.control.focusOrigin('guessed-origin')).rejects.toThrow('no longer available')
   })
 
+  /* 48d23b2b item 2: a transcript mirrored from MAIN names MAIN's conversations by MAIN's ids (a wizard's
+     successor), so the laptop focuses its own mirror of that conversation instead of failing. */
+  it('focuses the local mirror of a conversation a paired machine names by its own id', async () => {
+    const f = fixture()
+    const peer = agentIn(f, f.project.id, f.workspace.id, 'peer')
+    const asked: string[] = []
+    const control = new AgentControl({ ...f.deps, localSessionForRemote: async id => { asked.push(id); return id === 'main-successor' ? peer.agentSessionId : null } })
+    await control.focusOrigin('main-successor')
+    expect(asked).toEqual(['main-successor'])
+    expect(f.requests.at(-1)).toMatchObject({ action: 'tabs.focus', params: { tabId: 'tab-peer' } })
+    await control.focusOrigin(peer.agentSessionId)
+    expect(asked).toEqual(['main-successor'])
+    await expect(control.focusOrigin('unknown-on-main')).rejects.toThrow('no longer available')
+  })
+
   it('requires owner confirmation before closing an active tab and never closes the caller', async () => {
     const f = fixture(), target = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab
     f.database.structured.append({ schemaVersion: 1, id: 'close-running', sequence: f.database.structured.snapshot(target.resourceId!)!.sequence + 1, sessionId: target.resourceId!, runtimeId: 'close-runtime', provider: 'codex', projectId: f.project.id, workspaceId: f.workspace.id, cwd: f.project.path, timestamp: new Date().toISOString(), data: { type: 'session', phase: 'running' } })

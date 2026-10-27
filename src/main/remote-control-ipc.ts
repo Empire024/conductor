@@ -479,7 +479,8 @@ export class RemoteControlService {
     this.mirror = new RemoteSessionMirror({
       database: store,
       call: (machineId, method, args) => this.client.call(machineId, method, args),
-      publish: deps.publish
+      publish: deps.publish,
+      hears: binding => this.subscribed.get(binding.machineId)?.has(`${binding.remoteProjectId} ${binding.remoteSessionId}`) === true
     })
     const ui = (scope: { projectId: string; sessionId: string }, action: AgentControlUiRequest['action'], params: Record<string, unknown>): Promise<unknown> =>
       deps.ui({ ...scope, agentSessionId: '', id: randomUUID(), action, params })
@@ -635,8 +636,11 @@ export class RemoteControlService {
    * keeps the set across reconnects, so asking twice costs nothing.
    */
   private refreshing = new Set<string>()
+  private refreshAgain = new Set<string>()
   private async refreshSubscriptions(machineId: string): Promise<void> {
-    if (this.refreshing.has(machineId)) return
+    // A refresh asked for while one is reading the host (a tab opened or mirrored meanwhile) runs
+    // again after it; dropping it left that workspace unsubscribed and its tab silent.
+    if (this.refreshing.has(machineId)) { this.refreshAgain.add(machineId); return }
     const connection = this.client.get(machineId)
     if (!connection || connection.detached || connection.status === 'revoked' || !this.transport.streaming(machineId)) return
     this.refreshing.add(machineId)
@@ -661,6 +665,7 @@ export class RemoteControlService {
       this.subscribed.set(machineId, new Set(wanted.keys()))
     } finally {
       this.refreshing.delete(machineId)
+      if (this.refreshAgain.delete(machineId)) void this.refreshSubscriptions(machineId)
     }
   }
 
@@ -1368,6 +1373,49 @@ export class RemoteControlService {
     void this.mirror.pull(localSessionId).catch(error => console.warn('Remote session did not load', error))
     void this.refreshSubscriptions(target.machineId)
     return { localSessionId, machineId: target.machineId, machineName: target.machineName, title, provider }
+  }
+
+  /**
+   * The conversation here that shows one another machine names by its own id. A mirrored
+   * transcript keeps the host's agent ids - a wizard's successor, a coworker message's sender - so
+   * the owner clicking one on this computer has to land on this computer's mirror of it
+   * (conductor-task:48d23b2b-fa09-449d-b3f8-2932078ba415, item 2). One not mirrored here yet is
+   * brought in: a host that mirrors everything is synced, and otherwise the conversation is looked
+   * up in the host workspaces this computer already watches and attached into the matching
+   * workspace here. Null when no paired host knows it.
+   */
+  async localSessionForRemote(remoteAgentSessionId: string): Promise<string | null> {
+    if (!remoteAgentSessionId) return null
+    const bound = (): string | null => this.mirror.list().find(binding => binding.remoteAgentSessionId === remoteAgentSessionId)?.localSessionId ?? null
+    const known = bound()
+    if (known) return known
+    const connected = this.client.list().filter(connection => connection.status === 'connected' && !connection.detached)
+    for (const connection of connected) {
+      if (this.hostMirrors.get(connection.machineId)?.mirror !== true) continue
+      this.fullMirror.undismiss(connection.machineId, remoteAgentSessionId)
+      await this.fullMirror.sync(connection.machineId, { confirmed: true }).catch(error => console.warn('Remote mirror sync failed', error))
+      const synced = bound()
+      if (synced) return synced
+    }
+    const machines = new Set(connected.map(connection => connection.machineId))
+    const searched = new Set<string>()
+    for (const binding of this.mirror.list()) {
+      const key = [binding.machineId, binding.remoteSessionId, binding.workspaceId].join('\0')
+      if (!machines.has(binding.machineId) || searched.has(key)) continue
+      searched.add(key)
+      const agents = await this.client.call(binding.machineId, 'agents.list', { projectId: binding.remoteProjectId, sessionId: binding.remoteSessionId }).catch(() => null)
+      if (!Array.isArray(agents) || !agents.some(agent => (agent as Record<string, unknown> | null)?.agentSessionId === remoteAgentSessionId)) continue
+      const attached = await this.attachRemoteTab({ projectId: binding.projectId, sessionId: binding.workspaceId, remoteSessionId: binding.remoteSessionId, remoteAgentSessionId })
+      if (!attached.existingWorkspaceId) {
+        const tab: PaneTab = {
+          id: makeId('pane'), kind: 'agent', title: `${attached.title} · ${attached.machineName}`, resourceId: attached.localSessionId,
+          state: { provider: attached.provider, resume: false, model: 'default', effort: 'auto', machineId: attached.machineId, machineName: attached.machineName }
+        }
+        await this.deps.ui({ projectId: binding.projectId, sessionId: binding.workspaceId, agentSessionId: '', id: randomUUID(), action: 'tabs.open', params: { tab, focus: false } })
+      }
+      return attached.localSessionId
+    }
+    return null
   }
 
   /**

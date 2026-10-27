@@ -511,6 +511,9 @@ export interface AgentControlDependencies {
   providers(): AgentProviderInfo[]
   /** This machine plus any paired machines a tab may be placed on. */
   machines?(): MachineDescriptor[]
+  /** The local conversation mirroring one a paired machine names by its own id, brought in when it
+   *  is not shown here yet; null when no paired machine knows it. */
+  localSessionForRemote?(remoteAgentSessionId: string): Promise<string | null>
   /** Opens the tab on a paired machine and returns what it created there. */
   openRemote?(machineId: string, request: { projectId: string; sessionId: string; provider?: string; model?: string; effort?: string; title?: string }): Promise<{ tabId: string; agentSessionId?: string; machineName: string }>
   ui(request: AgentControlUiRequest): Promise<unknown>
@@ -1162,16 +1165,25 @@ export class AgentControl {
    */
   async focusOrigin(agentSessionId: string): Promise<void> {
     if (!agentSessionId || agentSessionId.length > 160) throw new Error('Invalid originating agent')
+    if (await this.focusLocalOrigin(agentSessionId)) return
+    // A mirrored transcript names the host's conversations by the host's ids (a wizard's
+    // successor on MAIN, seen from the laptop): focus this machine's mirror of it.
+    const mirrored = await this.deps.localSessionForRemote?.(agentSessionId)
+    if (mirrored && mirrored !== agentSessionId && await this.focusLocalOrigin(mirrored)) return
+    throw new Error('The originating agent tab is no longer available.')
+  }
+
+  private async focusLocalOrigin(agentSessionId: string): Promise<boolean> {
     for (const project of this.deps.database.listProjects()) for (const workspace of this.deps.database.listSessions(project.id)) {
       const scope: AgentControlScope = { projectId: project.id, sessionId: workspace.id, agentSessionId: '' }
       const open = this.tabs(scope).find(tab => tab.kind === 'agent' && tab.resourceId === agentSessionId)
-      if (open) { await this.ui(scope, 'tabs.focus', { tabId: open.id }); return }
+      if (open) { await this.ui(scope, 'tabs.focus', { tabId: open.id }); return true }
       if (workspace.closedTabs.some(tab => tab.kind === 'agent' && tab.resourceId === agentSessionId)) {
         await this.ui(scope, 'tabs.focus-origin', { agentSessionId })
-        return
+        return true
       }
     }
-    throw new Error('The originating agent tab is no longer available.')
+    return false
   }
 
   /** The owner moved these conversations' tabs from workspace `from` to `to` of one project

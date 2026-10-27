@@ -152,6 +152,13 @@ export interface RemoteSessionMirrorDependencies {
   /** Injected so tests drive the poll loop instead of waiting on a timer. */
   schedule?(run: () => void, ms: number): { cancel(): void }
   now?(): number
+  /**
+   * Whether the push channel is subscribed to the host workspace this conversation is in. A stream
+   * that is up but not listening there carries no notices for it, so such a tab keeps the
+   * one-second poll (conductor-task:48d23b2b-fa09-449d-b3f8-2932078ba415, item 3: a turn sent from
+   * the laptop showed "working" and nothing else). Absent: the machine's stream is taken as covering it.
+   */
+  hears?(binding: RemoteSessionBinding): boolean
 }
 
 /**
@@ -178,6 +185,9 @@ export class RemoteSessionMirror {
   private readonly pulledAt = new Map<string, number>()
   /** Auto mirrors whose tab has been opened (connect) since this launch; only these poll every second. */
   private readonly viewed = new Set<string>()
+  /** One fetch per conversation at a time, and at most one queued behind it: two overlapping
+   *  fetches would both copy the same events from the same cursor and duplicate the transcript. */
+  private readonly pulls = new Map<string, { running: Promise<AgentEvent[]>; next?: Promise<AgentEvent[]> }>()
 
   constructor(private readonly deps: RemoteSessionMirrorDependencies) {
     this.owners = readOwners(this.deps.database.getSetting(OWNERS_SETTING) || undefined)
@@ -458,7 +468,30 @@ export class RemoteSessionMirror {
    * poll rather than unbinding the tab: a laptop closing its lid should not destroy the owner's
    * view of a render that is still running on the other computer.
    */
-  async pull(localSessionId: string): Promise<AgentEvent[]> {
+  pull(localSessionId: string): Promise<AgentEvent[]> {
+    const current = this.pulls.get(localSessionId)
+    if (current?.next) return current.next
+    const settle = (run: Promise<AgentEvent[]>): void => {
+      void run.catch(() => undefined).then(() => {
+        const entry = this.pulls.get(localSessionId)
+        if (entry?.running !== run) return
+        if (entry.next) this.pulls.set(localSessionId, { running: entry.next })
+        else this.pulls.delete(localSessionId)
+      })
+    }
+    if (current) {
+      const next = current.running.catch(() => undefined).then(() => this.pullOnce(localSessionId))
+      current.next = next
+      settle(next)
+      return next
+    }
+    const running = this.pullOnce(localSessionId)
+    this.pulls.set(localSessionId, { running })
+    settle(running)
+    return running
+  }
+
+  private async pullOnce(localSessionId: string): Promise<AgentEvent[]> {
     const active = this.bindings.get(localSessionId)
     if (!active) return []
     this.pulledAt.set(localSessionId, this.now())
@@ -562,7 +595,8 @@ export class RemoteSessionMirror {
       for (const id of [...this.bindings.keys()]) {
         const binding = this.bindings.get(id)
         if (!binding) continue
-        const slow = this.streaming.has(binding.machineId) || (binding.auto === true && !this.viewed.has(id))
+        const pushed = this.streaming.has(binding.machineId) && (this.deps.hears?.(binding) ?? true)
+        const slow = pushed || (binding.auto === true && !this.viewed.has(id))
         if (slow && now - (this.pulledAt.get(id) ?? 0) < STREAM_RESYNC_POLL_MS) continue
         try { await this.pull(id) }
         catch (error) { console.warn('Remote session poll failed', error) }

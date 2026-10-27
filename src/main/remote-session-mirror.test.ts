@@ -37,7 +37,7 @@ const remoteSnapshot = (): SessionProjection => ({
   }
 })
 
-function fixture(calls: (method: string, args?: Record<string, unknown>) => unknown, now?: () => number) {
+function fixture(calls: (method: string, args?: Record<string, unknown>) => unknown, now?: () => number, hears?: (binding: RemoteSessionBinding) => boolean) {
   const root = mkdtempSync(join(tmpdir(), 'conductor-mirror-')); roots.push(root)
   const db = new DatabaseSync(':memory:'); databases.push(db)
   db.exec('CREATE TABLE agent_sessions(id TEXT PRIMARY KEY)')
@@ -55,7 +55,8 @@ function fixture(calls: (method: string, args?: Record<string, unknown>) => unkn
     database,
     call: async (machineId, method, args) => { asked.push({ machineId, method, args }); return calls(method, args) },
     publish: (channel, payload) => { published.push({ channel, payload }) },
-    ...(now ? { now } : {})
+    ...(now ? { now } : {}),
+    ...(hears ? { hears } : {})
   })
   return { mirror, store, settings, published, asked, database }
 }
@@ -532,6 +533,45 @@ describe('the push channel driving the mirror', () => {
     clock.now += 1_000
     await f.mirror.poll()
     expect(f.asked.map(entry => entry.machineId)).toEqual(['desktop', 'laptop', 'laptop'])
+  })
+
+  /* 48d23b2b item 3: a turn sent from the laptop showed "working" and nothing else. A stream that is
+     up but not subscribed to the conversation's workspace brings no notices for it, so it is polled. */
+  it('keeps the fast poll for a conversation whose workspace the stream is not listening to', async () => {
+    const clock = { now: Date.parse('2026-09-16T10:00:00.000Z') }
+    const f = fixture(() => [], () => clock.now, entry => entry.remoteSessionId === 'their-workspace')
+    f.mirror.bind(binding())
+    f.mirror.bind(binding({ localSessionId: 'unheard', remoteSessionId: 'new-workspace', remoteAgentSessionId: 'new-session' }))
+    f.mirror.streamConnected('desktop', true)
+    await f.mirror.poll()
+    clock.now += 1_000
+    await f.mirror.poll()
+    expect(f.asked.map(entry => entry.args?.agentSessionId)).toEqual(['their-session', 'new-session', 'new-session'])
+  })
+
+  it('never copies the same events twice when a notice, the poll and a submit fetch at once', async () => {
+    const replies: Array<ReturnType<typeof deferred<AgentEvent[]>>> = []
+    const f = fixture(method => {
+      if (method !== 'agents.history') return []
+      const reply = deferred<AgentEvent[]>()
+      replies.push(reply)
+      return reply.promise
+    })
+    f.mirror.bind(binding())
+    const first = f.mirror.pull('local-session')
+    const second = f.mirror.pull('local-session')
+    const third = f.mirror.pull('local-session')
+    // The second and third share the one fetch queued behind the first.
+    expect(second).toBe(third)
+    await Promise.resolve()
+    expect(replies).toHaveLength(1)
+    replies[0]!.resolve([remoteEvent(1, 'one'), remoteEvent(2, 'two')])
+    expect(await first).toHaveLength(2)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(f.asked.at(-1)!.args).toMatchObject({ afterSequence: 2 })
+    replies[1]!.resolve([remoteEvent(1, 'one'), remoteEvent(2, 'two'), remoteEvent(3, 'three')])
+    expect(await second).toHaveLength(1)
+    expect(f.store.snapshot('local-session')!.sequence).toBe(3)
   })
 })
 

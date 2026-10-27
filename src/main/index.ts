@@ -3063,6 +3063,7 @@ app.whenReady().then(async () => {
     providers: () => agents.listProviders(), ui: request => { recordTabOpener(database, request); const reopened = reopenedConversation(request); if (reopened) agents.structured.endArchive(reopened); return agentControlUi!.request(request) },
     machines: () => remoteControl!.machines(),
     openRemote: (machineId, request) => remoteControl!.openRemote(machineId, request),
+    localSessionForRemote: remoteAgentSessionId => remoteControl ? remoteControl.localSessionForRemote(remoteAgentSessionId) : Promise.resolve(null),
     confirm: (scope, message) => agentConfirms.request(scope.agentSessionId, message),
     fileChanged: change => projectFileChanges?.changed(change),
     linksChanged: scope => publish('agent-control:links-changed', { projectId: scope.projectId, sessionId: scope.sessionId })
