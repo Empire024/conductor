@@ -458,9 +458,20 @@ describe('llama.cpp server lifecycle', () => {
     const large = { ...defaultModelConfig(QWEN_35B), port: await findFreePort(small) }
     // A record as a launch writes it: generation plus the OS identity read while the pid is pinned
     // (here by this test's own child handle). Only that identity makes the process stoppable.
-    const identity = await processControl.inspect(sleeper.pid!, 15_000)
-    expect(identity.state).toBe('running')
-    if (identity.state !== 'running') return
+    // The OS side (a powershell.exe per query, inside a 15 s budget) has its own test in
+    // llama-stop.test.ts; here it answers for the sleeper through Node's handle, so a starved runner
+    // cannot turn a slow PowerShell start into 'unknown'. The kill is real and its exit observed.
+    const identity = { creationTime: 'sleeper-launch', executable: process.execPath }
+    const alive = (): boolean => sleeper.exitCode === null && sleeper.signalCode === null
+    vi.spyOn(processControl, 'inspect').mockImplementation(async pid => pid === sleeper.pid && alive() ? { state: 'running', ...identity } : { state: 'absent' })
+    vi.spyOn(processControl, 'terminate').mockImplementation(async (pid, recorded) => {
+      if (pid !== sleeper.pid || !alive()) return { state: 'absent' }
+      if (recorded.creationTime !== identity.creationTime || recorded.executable !== identity.executable) return { state: 'mismatch', ...identity }
+      const exited = new Promise<void>(done => sleeper.once('exit', () => done()))
+      sleeper.kill()
+      await exited
+      return { state: 'exited' }
+    })
     writeFileSync(runFile(small), JSON.stringify({ pid: sleeper.pid, port: orphan.port, model: small.id, file: small.file, startedAt: '2026-09-21', generation: 'test-generation', identity: { creationTime: identity.creationTime, executable: identity.executable } }))
     const asked: string[] = []
     const release = async (running: resources.BlockingServer): Promise<'idle'> => {

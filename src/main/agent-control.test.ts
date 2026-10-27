@@ -2494,6 +2494,9 @@ describe('control catalog and dispatch repairs', () => {
     const codex = await f.control.call(f.scope, 'tabs.open', { provider: 'codex', model: 'codex-synthetic', effort: 'low' }) as AgentControlTab
     await f.control.call(f.scope, 'agents.submit', { agentSessionId: claude.resourceId, prompt: 'One turn' })
     await f.control.call(f.scope, 'agents.submit', { agentSessionId: codex.resourceId, prompt: 'One turn' })
+    // The windows signal is throttled on a timer; a fake one keeps a starved CI worker from spanning
+    // the reports across two real seconds (two signals) or waiting a real second for the one signal.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
     const emit = (provider: StructuredProvider) => f.submissions.find(submission => submission.provider === provider)!.options.emit
     emit('claude')({ itemId: 'usage:account-rate-limits', data: { type: 'usage', source: 'provider', limits: { rateLimits: { five_hour: { usedPercent: 42, windowDurationMins: 300, resetsAt: inFiveHours }, seven_day: { usedPercent: 61.5, windowDurationMins: 10080, resetsAt: inAWeek }, seven_day_overage_included: { usedPercent: 12, windowDurationMins: 10080, resetsAt: anHourAgo } } } } })
     emit('codex')({ itemId: 'account-rate-limits', data: { type: 'usage', source: 'provider', limits: { rateLimits: { limitId: 'codex', primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: inFiveHours } }, rateLimitsByLimitId: { codex: { limitId: 'codex', limitName: null, primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: inFiveHours }, secondary: { usedPercent: 96, windowDurationMins: 10080, resetsAt: inAWeek }, credits: { hasCredits: true, unlimited: false, balance: '12.50' }, planType: 'pro' } } } } })
@@ -2538,8 +2541,10 @@ describe('control catalog and dispatch repairs', () => {
     expect(rows[1]!.short!.points.map(([, percent]) => percent)).toEqual([10, 12])
     expect(rows[1]!.planType).toBe('pro')
     // Every report tells the windows once a second at most, so the strip re-reads without polling.
-    await new Promise(resolve => setTimeout(resolve, 1100))
-    expect(f.broadcast.mock.calls.filter(([channel]) => channel === 'usage:limits-changed')).toHaveLength(1)
+    const told = () => f.broadcast.mock.calls.filter(([channel]) => channel === 'usage:limits-changed')
+    expect(told()).toHaveLength(0)
+    vi.advanceTimersByTime(1000)
+    expect(told()).toHaveLength(1)
   })
 
   it('usage.weekly reports each provider weekly window from the readings live turns record, zero-turn, and validates its arguments', async () => {
