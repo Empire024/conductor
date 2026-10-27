@@ -34,6 +34,7 @@ import {
   TimerReset,
   EyeOff,
   Undo2,
+  WandSparkles,
   X
 } from 'lucide-react'
 import { fileTypeIcon } from '../file-types'
@@ -821,6 +822,7 @@ function PaneGroup({
         data-control-agent-id={tab.resourceId}
         {...(dropSlot ? { 'data-drop-slot-id': tab.id, ...(hiddenBefore.get(tab.id) ? { 'data-drop-span': 1 + hiddenBefore.get(tab.id)! } : {}) } : {})}
         data-clarity-status={clarity?.statusByTab.get(tab.id)}
+        data-live-wizard={clarity?.liveWizardTabIds?.has(tab.id) ? 'true' : undefined}
         aria-selected={bulk ? selection.ids.has(tab.id) : undefined}
         className={`pane-tab ${bulk && selection.ids.has(tab.id) ? 'multi-selected' : ''} ${tab.id === mainTabId ? 'clarity-main' : ''} ${tab.id === activeTab.id ? 'active' : ''} ${tabPhase === 'waiting_input' ? 'needs-attention' : ''} ${openingTabIds.has(tab.id) ? 'opening' : ''} ${spotlight?.tabId === tab.id ? 'spotlight' : ''} ${closingTabIds.has(tab.id) ? 'closing' : ''} ${newTabs.has(tab.id) && tab.id !== activeTab.id ? 'is-new' : ''} ${isSourceGroup && dragging!.tab.id === tab.id ? 'drag-lifted' : ''}`}
         style={{ marginLeft: gapHere ? dragging!.width : undefined }}
@@ -846,7 +848,8 @@ function PaneGroup({
       >
         {tab.kind === 'agent' ? <ProviderIcon provider={String(tab.state?.provider ?? 'codex')} model={tab.state?.model as string | undefined} size={14} /> : <Icon size={13} strokeWidth={1.8} />}
         {(() => { const machine = tabMachineLabel(tab, workspace.project); return machine ? <span className="pane-tab-machine" title={`Runs on ${machine}`}>{machine}</span> : null })()}
-        <span className="pane-tab-title" title={tab.title}>{stripLabels.get(tab.id) ?? tab.title}</span>
+        <span className="pane-tab-title" title={clarity?.statusByTab.get(tab.id) === 'handed-off' ? `${tab.title} (handed on to a successor)` : tab.title}>{stripLabels.get(tab.id) ?? tab.title}</span>
+        {clarity?.liveWizardTabIds?.has(tab.id) && <span className="pane-tab-wizard" title="The live wizard of this workspace" aria-label="live wizard"><WandSparkles size={11} /></span>}
         {tab.state?.anonymous === true && <span className="pane-tab-anonymous" title="Anonymous: kept only in memory. Closing this tab deletes the conversation for good; files it wrote stay." aria-label="anonymous"><EyeOff size={12} /></span>}
         {newTabs.has(tab.id) && tab.id !== activeTab.id && <span className="pane-tab-new-mark" title="Opened by an agent; not viewed yet" aria-label="new" />}
         {controller && <ControlledByBadge compact controllerTitle={controller.controllerTitle ?? group.tabs.find(candidate => candidate.id === controller.controllerTabId)?.title ?? 'another tab'} />}

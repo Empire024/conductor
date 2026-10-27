@@ -10,6 +10,10 @@
 .pane-tabs .pane-tab:not(.active) > svg:first-child { width: 12px; height: 12px; }
 .pane-tabs .pane-tab.clarity-main { font-weight: 600; }
 .pane-tabs .pane-tab.clarity-main::before { content: ''; position: absolute; left: 0; top: 6px; bottom: 6px; width: 2px; border-radius: 2px; background: var(--accent); }
+/* The live wizard wears a wand; a wizard that handed on is dimmed (its title may still say Wizard). */
+.pane-tabs .pane-tab .pane-tab-wizard { flex: 0 0 auto; display: inline-flex; align-items: center; color: var(--accent); }
+.pane-tabs .pane-tab[data-clarity-status="handed-off"]:not(.active) { opacity: 0.55; }
+.pane-tabs .pane-tab[data-clarity-status="handed-off"] .pane-tab-title { font-style: italic; }
 
 .pane-overflow-button { flex: 0 0 auto; align-self: center; height: 22px; min-width: 30px; margin: 0 2px 0 4px; padding: 0 7px; display: inline-flex; align-items: center; gap: 3px; border: 1px solid var(--border-soft); border-radius: 7px; background: var(--surface-1); color: var(--text-2); font-size: 10px; font-weight: 600; cursor: pointer; }
 .pane-overflow-button:hover, .pane-overflow-button[aria-expanded="true"] { color: var(--text); background: var(--surface-hover); }

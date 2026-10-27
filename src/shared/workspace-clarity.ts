@@ -94,6 +94,8 @@ export interface WorkspaceClarity {
   /** Tabs the strip leaves out: finished, unpinned, not on screen, not looked at since they finished. */
   hiddenFromStrip: ReadonlySet<string>
   statusByTab: ReadonlyMap<string, ClarityStatus>
+  /** Tabs that are a wizard and still live: the strip marks them with a wand. */
+  liveWizardTabIds?: ReadonlySet<string>
 }
 
 export interface ClarityInput {
@@ -192,7 +194,8 @@ export function buildWorkspaceClarity(input: ClarityInput): WorkspaceClarity {
     if (seen !== undefined && settled !== undefined && seen >= settled) continue
     hiddenFromStrip.add(id)
   }
-  return { mainTabId, live, done, hiddenFromStrip, statusByTab: new Map([...byTab].map(([id, entry]) => [id, entry.status])) }
+  const liveWizardTabIds = new Set([...byTab.keys()].filter(liveWizard))
+  return { mainTabId, live, done, hiddenFromStrip, statusByTab: new Map([...byTab].map(([id, entry]) => [id, entry.status])), liveWizardTabIds }
 }
 
 /** The tab strip's order of rank: the MAIN first, then live coworkers (waiting, then running),
