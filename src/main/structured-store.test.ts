@@ -4,7 +4,8 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'n
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { CHECKPOINT_INTERVAL_MS, REDACTION_TARGETS, StructuredAgentStore, maskSecrets, redactSecretsChunk, registerSecretCheck, sanitizeDiagnostic } from './structured-store'
+import { CHECKPOINT_INTERVAL_MS, JOURNAL_PAGE_DEFAULT, JOURNAL_PAGE_MAX, REDACTION_TARGETS, StructuredAgentStore, journalPageSize, maskSecrets, redactSecretsChunk, registerSecretCheck, sanitizeDiagnostic } from './structured-store'
+import { anonymousConversations } from './local-models/anonymous'
 import type { AgentEvent, AgentEventData } from '../shared/structured-agent'
 import { emptyProjection } from '../shared/structured-agent-reducer'
 
@@ -543,5 +544,151 @@ describe('conversations are resident only while used', () => {
     const reads = source.split('\n').filter(line => /SELECT\b/.test(line) && /projection_json/.test(line) && /structured_sessions/.test(line))
     expect(reads.length).toBeGreaterThan(0)
     for (const read of reads) expect(read).toMatch(/WHERE id=\?/)
+  })
+})
+
+describe('caller-sized journal and archive pages, bounded in SQL', () => {
+  const text = (sequence: number, sessionId = 'one'): AgentEvent => event(sequence, { type: 'text', role: sequence % 2 ? 'assistant' : 'user', text: `Message ${sequence}`, mode: 'snapshot' }, { sessionId, itemId: `item-${sequence}` })
+  const seed = (store: StructuredAgentStore, db: DatabaseSync, count: number, sessionId = 'one'): void => {
+    db.exec('BEGIN')
+    for (let sequence = 1; sequence <= count; sequence++) store.append(text(sequence, sessionId))
+    db.exec('COMMIT')
+  }
+  /** Rows each prepared statement handed to JavaScript, so a test can see the bound was SQL's. */
+  const countRows = (db: DatabaseSync): Array<{ sql: string; rows: number }> => {
+    const reads: Array<{ sql: string; rows: number }> = []
+    const prepare = db.prepare.bind(db)
+    db.prepare = ((sql: string) => {
+      const statement = prepare(sql), all = statement.all.bind(statement)
+      statement.all = ((...args: Parameters<typeof all>) => { const rows = all(...args); reads.push({ sql, rows: rows.length }); return rows }) as typeof statement.all
+      return statement
+    }) as typeof db.prepare
+    return reads
+  }
+  /** A durable archive as `trimJournal` leaves it: rendered items plus its coverage row. */
+  const archiveRows = (db: DatabaseSync, sequences: number[], through: number, from = 1, body = (sequence: number) => `Archived ${sequence}`): void => {
+    db.exec('BEGIN')
+    const insert = db.prepare('INSERT INTO structured_transcript_archive(session_id,sequence,item_json) VALUES(?,?,?)')
+    for (const sequence of sequences) insert.run('one', sequence, JSON.stringify({ id: `archived-${sequence}`, sequence, data: { type: 'text', role: 'assistant', text: body(sequence), mode: 'snapshot' } }))
+    db.prepare(`INSERT INTO structured_transcript_archive_state(session_id,archived_through,archived_from) VALUES('one',?,?)
+      ON CONFLICT(session_id) DO UPDATE SET archived_through=excluded.archived_through`).run(through, from)
+    db.exec('COMMIT')
+  }
+
+  it('pages a journal larger than a page in exact sequence order, with a durable cursor and no gap or repeat', () => {
+    const f = fixture()
+    seed(f.store, f.db, 1_234)
+    const reads = countRows(f.db)
+    const seen: number[] = []
+    let cursor = 0, pages = 0
+    for (;;) {
+      const page = f.store.eventsPage('one', cursor, 100)
+      pages++
+      expect(page.events.length).toBeLessThanOrEqual(100)
+      seen.push(...page.events.map(entry => entry.sequence))
+      expect(page.nextAfter).toBe(page.events.at(-1)?.sequence ?? cursor)
+      cursor = page.nextAfter
+      if (!page.hasMore) break
+    }
+    expect(pages).toBe(13)
+    expect(seen).toEqual(Array.from({ length: 1_234 }, (_, index) => index + 1))
+    // Each page asked SQLite for at most limit+1 rows, never the 20,001 `events` reads.
+    expect(reads.filter(read => read.sql.includes('structured_events')).every(read => read.rows <= 101)).toBe(true)
+    // The cursor survives what happens between pages: new events continue after it, a trim below it is invisible.
+    f.store.append(text(1_235))
+    expect(f.store.eventsPage('one', cursor, 100)).toMatchObject({ events: [{ sequence: 1_235 }], nextAfter: 1_235, hasMore: false })
+    f.db.prepare('DELETE FROM structured_events WHERE session_id=? AND sequence<?').run('one', 1_000)
+    expect(f.store.eventsPage('one', 1_100, 3).events.map(entry => entry.sequence)).toEqual([1_101, 1_102, 1_103])
+    // Past the end: nothing, and the cursor stays where it was.
+    expect(f.store.eventsPage('one', 5_000, 10)).toEqual({ events: [], nextAfter: 5_000, hasMore: false })
+    // Another conversation's rows never leak into the page.
+    expect(f.store.eventsPage('two', 0, 10).events).toEqual([])
+  })
+
+  it('defaults a missing page size, caps an oversized one, and refuses an invalid size or cursor', () => {
+    const f = fixture()
+    seed(f.store, f.db, JOURNAL_PAGE_MAX + 2)
+    const fallback = f.store.eventsPage('one')
+    expect(fallback.events).toHaveLength(JOURNAL_PAGE_DEFAULT)
+    expect(fallback).toMatchObject({ nextAfter: JOURNAL_PAGE_DEFAULT, hasMore: true })
+    const capped = f.store.eventsPage('one', 0, 1_000_000)
+    expect(capped.events).toHaveLength(JOURNAL_PAGE_MAX)
+    expect(capped.hasMore).toBe(true)
+    expect(f.store.eventsPage('one', capped.nextAfter, 1_000_000)).toMatchObject({ events: [{ sequence: JOURNAL_PAGE_MAX + 1 }, { sequence: JOURNAL_PAGE_MAX + 2 }], hasMore: false })
+    for (const limit of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '10', null]) {
+      expect(() => f.store.eventsPage('one', 0, limit as number)).toThrow(RangeError)
+      expect(() => f.store.archivePage('one', 0, limit as number)).toThrow(RangeError)
+      expect(() => journalPageSize(limit)).toThrow(RangeError)
+    }
+    for (const after of [-1, 0.5, Number.NaN, '3']) {
+      expect(() => f.store.eventsPage('one', after as number, 10)).toThrow(RangeError)
+      expect(() => f.store.archivePage('one', after as number, 10)).toThrow(RangeError)
+    }
+    // journalRange keeps its callers' sizes uncapped but never lets a negative LIMIT read everything.
+    expect(f.store.journalRange('one', 1, Number.MAX_SAFE_INTEGER, JOURNAL_PAGE_MAX + 2)).toHaveLength(JOURNAL_PAGE_MAX + 2)
+    expect(() => f.store.journalRange('one', 1, 10, -1)).toThrow(RangeError)
+    expect(() => f.store.journalRange('one', 1, 10, 0)).toThrow(RangeError)
+    // The restore replay keeps its own default, untouched by the page reader's.
+    expect(f.store.events('one')).toHaveLength(JOURNAL_PAGE_MAX + 2)
+  })
+
+  it('pages the durable archive in order, reads it bounded in SQL, and keeps one consistent archive across a checkpoint', () => {
+    const f = fixture()
+    const sequences = Array.from({ length: 2_500 }, (_, index) => (index + 1) * 3)
+    archiveRows(f.db, sequences, 7_500, 1)
+    const reads = countRows(f.db)
+    const items: number[] = []
+    let page = f.store.archivePage('one', 0, 1_000)!
+    const through = page.through
+    expect(page).toMatchObject({ from: 1, through: 7_500, hasMore: true })
+    items.push(...page.items.map(item => item.sequence))
+    // A checkpoint archives more between pages: a reader that passes `through` back never sees it.
+    archiveRows(f.db, [7_503, 7_506], 7_510, 1)
+    while (page.hasMore) {
+      page = f.store.archivePage('one', page.nextAfter, 1_000, through)!
+      items.push(...page.items.map(item => item.sequence))
+    }
+    expect(items).toEqual(sequences)
+    expect(reads.filter(read => read.sql.includes('structured_transcript_archive ')).every(read => read.rows <= 1_001)).toBe(true)
+    // A fresh read sees the new coverage, and `archive` is the concatenation of every page.
+    const whole = f.store.archive('one')!
+    expect(whole.from).toBe(1)
+    expect(whole.items.map(item => item.sequence)).toEqual([...sequences, 7_503, 7_506])
+    const direct = (f.db.prepare('SELECT item_json FROM structured_transcript_archive WHERE session_id=? ORDER BY sequence').all('one') as Array<{ item_json: string }>).map(row => JSON.parse(row.item_json))
+    expect(whole.items).toEqual(direct)
+    // No archive yet is null, the same as before.
+    expect(f.store.archivePage('two')).toBeNull()
+    expect(f.store.archive('two')).toBeNull()
+  })
+
+  it('masks journal and archive rows the one-off redaction has not reached yet, on every page', () => {
+    const token = 'c0ffee'.repeat(10) + 'beef'
+    const f = fixture()
+    seed(f.store, f.db, 30)
+    archiveRows(f.db, [1, 2, 3], 3, 1, sequence => `ran CONDUCTOR_CONTROL_TOKEN=${token} step ${sequence}`)
+    f.db.prepare('UPDATE structured_events SET event_json=replace(event_json,?,?)').run('Message 2', `CONDUCTOR_CONTROL_TOKEN=${token} Message 2`)
+    f.db.close()
+    const db = new DatabaseSync(f.path); databases.push(db)
+    const store = new StructuredAgentStore(db, f.root)
+    let cursor = 0, journal = ''
+    for (let page = store.eventsPage('one', 0, 7); ; page = store.eventsPage('one', cursor, 7)) { journal += JSON.stringify(page.events); cursor = page.nextAfter; if (!page.hasMore) break }
+    expect(journal).not.toContain(token)
+    expect(journal).toContain('CONDUCTOR_CONTROL_TOKEN=[REDACTED] Message 2')
+    const archive = store.archivePage('one', 0, 2)!
+    expect(JSON.stringify([archive.items, store.archivePage('one', archive.nextAfter, 2, archive.through)!.items])).not.toContain(token)
+    expect(JSON.stringify(store.archive('one'))).toContain('CONDUCTOR_CONTROL_TOKEN=[REDACTED]')
+  })
+
+  it('reads nothing of an anonymous conversation', () => {
+    const f = fixture()
+    anonymousConversations.mark('ghost')
+    try {
+      f.store.register('ghost', 'project', 'local', {})
+      f.store.append(text(1, 'ghost'))
+      expect(f.store.eventsPage('ghost', 0, 10)).toEqual({ events: [], nextAfter: 0, hasMore: false })
+      expect(f.store.archivePage('ghost', 0, 10)).toBeNull()
+      expect(f.store.archive('ghost')).toBeNull()
+      expect(f.store.journalRange('ghost', 0, 100, 10)).toEqual([])
+    } finally { anonymousConversations.forget('ghost') }
   })
 })

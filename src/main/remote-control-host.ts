@@ -43,6 +43,8 @@ const text = (args: Args, key: string, maximum = 20000): string => {
   return value
 }
 
+/** Native events per agents.history pull: the page a mirror has always been handed. */
+const REMOTE_HISTORY_PAGE = 100
 const remoteMediaTypes: Record<string, { kind: 'image' | 'video'; mimeType: string }> = {
   '.png': { kind: 'image', mimeType: 'image/png' },
   '.jpg': { kind: 'image', mimeType: 'image/jpeg' },
@@ -82,7 +84,7 @@ export const remoteToolSignatures = {
   'tabs.close': '({projectId,sessionId,tabId})',
   'agents.list': '({projectId,sessionId})',
   'agents.snapshot': '({projectId,sessionId,agentSessionId})',
-  'agents.history': '({projectId,sessionId,agentSessionId,afterSequence?}) — incremental events, for mirroring the tab remotely',
+  'agents.history': '({projectId,sessionId,agentSessionId,afterSequence?,limit?}) — incremental events after afterSequence, oldest first, up to limit (default and maximum 100), for mirroring the tab remotely',
   'agents.submit': '({projectId,sessionId,agentSessionId,prompt,settings?})',
   'agents.steer': '({projectId,sessionId,agentSessionId,prompt,settings?})',
   'agents.queue': '({projectId,sessionId,agentSessionId,prompt,settings})',
@@ -654,7 +656,9 @@ export class RemoteControlHost {
       }
       if (method === 'agents.history') {
         const after = typeof args.afterSequence === 'number' && Number.isSafeInteger(args.afterSequence) && args.afterSequence >= 0 ? args.afterSequence : 0
-        return database.structured.events(agentSessionId, after).slice(0, 100)
+        if (args.limit !== undefined && (typeof args.limit !== 'number' || !Number.isSafeInteger(args.limit) || args.limit < 1)) throw new RemoteAccessError(`limit must be a whole number from 1 to ${REMOTE_HISTORY_PAGE}`, 400)
+        // Bounded in SQL: a mirror pull used to read up to 20,001 journal rows to keep 100.
+        return database.structured.eventsPage(agentSessionId, after, Math.min((args.limit as number | undefined) ?? REMOTE_HISTORY_PAGE, REMOTE_HISTORY_PAGE)).events
       }
       const requestedSettings = args.settings === undefined ? state.settings : keepHostWizard(args.settings as SessionSettings, state.settings)
       if (method === 'agents.interrupt') {

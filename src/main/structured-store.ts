@@ -24,6 +24,30 @@ const JOURNAL_WINDOW = 20_000
  *  (typing-lag-long-conversation). The journal still gets every event at once, and a restore
  *  replays what came after the snapshot, so nothing is lost by a snapshot a second old. */
 export const CHECKPOINT_INTERVAL_MS = 1000
+/** Page sizes a caller may ask the journal and archive page readers for. Each page is one
+ *  primary-key keyset scan bounded in SQL (`sequence > cursor ORDER BY sequence LIMIT n+1`), the
+ *  pattern t3code pages its event replay with (OrchestrationEventStore, dd14848: READ_PAGE_SIZE
+ *  500, cursor = last sequence read), instead of reading up to 20,001 rows and slicing them. */
+export const JOURNAL_PAGE_DEFAULT = 500, JOURNAL_PAGE_MAX = 5000
+/** A caller's page size: missing means `fallback`, anything above the maximum is capped, and a
+ *  value that is not a whole number of at least 1 is refused rather than guessed at (SQLite would
+ *  read a negative LIMIT as no limit at all). */
+export function journalPageSize(limit: unknown, fallback = JOURNAL_PAGE_DEFAULT): number {
+  if (limit === undefined) return Math.min(fallback, JOURNAL_PAGE_MAX)
+  if (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1) throw new RangeError(`A page size must be a whole number from 1 to ${JOURNAL_PAGE_MAX}`)
+  return Math.min(limit, JOURNAL_PAGE_MAX)
+}
+const pageCursor = (after: unknown): number => {
+  if (typeof after !== 'number' || !Number.isSafeInteger(after) || after < 0) throw new RangeError('A page cursor must be a sequence number of 0 or more')
+  return after
+}
+/** One page of the journal, oldest first. `nextAfter` is the last sequence returned (`after` when
+ *  none was): sequences never move, so it stays a valid cursor across appends and trims. */
+export interface JournalPage { events: AgentEvent[]; nextAfter: number; hasMore: boolean }
+/** One page of the durable transcript archive, oldest first. `through` is the archive's coverage
+ *  (`archived_through`) when the page was read: pass it back to read later pages of the same
+ *  archive even if a checkpoint archives more in between. */
+export interface ArchivePage { items: TimelineItem[]; from: number; through: number; nextAfter: number; hasMore: boolean }
 /**
  * Conversations are resident in memory only while something uses them. Until 2026-10-22 the
  * store parsed every stored projection at construction and kept all of them forever; the owner's
@@ -656,11 +680,32 @@ export class StructuredAgentStore {
    *  anything before it was already gone from the journal before this conversation's archive
    *  started covering it. */
   archive(id: string): { items: TimelineItem[]; from: number } | null {
+    // The whole archive in one synchronous piece, for callers that need exactly that; it is read
+    // in bounded pages so no single statement scans it whole. Copy transcript reads
+    // `archivePage` itself and yields between pages.
+    let page = this.archivePage(id, 0, JOURNAL_PAGE_MAX)
+    if (!page) return null
+    const items = page.items, { from, through } = page
+    while (page?.hasMore) {
+      page = this.archivePage(id, page.nextAfter, JOURNAL_PAGE_MAX, through)
+      for (const item of page?.items ?? []) items.push(item)
+    }
+    return { items, from }
+  }
+  /** One page of {@link archive} after the item sequence `after`, at most `limit` items, bounded in
+   *  SQL by the archive's primary key. `through` caps the read at an earlier page's coverage, so a
+   *  reader paging across a checkpoint sees one consistent archive: a later flush only adds items
+   *  above the coverage it extends (`settleArchiveTail` keeps nothing below the cut). Rows the
+   *  one-off redaction has not reached yet are masked on the way out, as the journal's are. */
+  archivePage(id: string, after = 0, limit?: number, through?: number): ArchivePage | null {
+    const size = journalPageSize(limit, JOURNAL_PAGE_MAX), cursor = pageCursor(after)
     if (this.volatileSpecs.has(id)) return null
-    const state = this.db.prepare('SELECT archived_from FROM structured_transcript_archive_state WHERE session_id=?').get(id) as { archived_from: number } | undefined
+    const state = this.db.prepare('SELECT archived_from, archived_through FROM structured_transcript_archive_state WHERE session_id=?').get(id) as { archived_from: number; archived_through: number } | undefined
     if (!state) return null
-    const rows = this.db.prepare('SELECT item_json FROM structured_transcript_archive WHERE session_id=? ORDER BY sequence').all(id) as Array<{ item_json: string }>
-    return { items: rows.map(row => JSON.parse(row.item_json) as TimelineItem), from: state.archived_from }
+    const cap = through === undefined ? state.archived_through : Math.min(pageCursor(through), state.archived_through)
+    const rows = this.db.prepare('SELECT sequence, item_json FROM structured_transcript_archive WHERE session_id=? AND sequence>? AND sequence<=? ORDER BY sequence LIMIT ?').all(id, cursor, cap, size + 1) as Array<{ sequence: number; item_json: string }>
+    const page = rows.slice(0, size), items = page.map(row => JSON.parse(row.item_json) as TimelineItem)
+    return { items: this.redactionPending ? maskStrings(items) : items, from: state.archived_from, through: cap, nextAfter: page.at(-1)?.sequence ?? cursor, hasMore: rows.length > size }
   }
   update(id: string, values: Partial<Pick<SessionProjection, 'title' | 'archived' | 'settings'>>): void {
     const state = this.snapshot(id)
@@ -686,12 +731,25 @@ export class StructuredAgentStore {
     if (this.volatileSpecs.has(id)) return []
     return this.readBack((this.db.prepare('SELECT event_json FROM structured_events WHERE session_id=? AND sequence>? ORDER BY sequence LIMIT 20001').all(id, after) as Array<{ event_json: string }>).map(row => JSON.parse(row.event_json) as AgentEvent))
   }
+  /** One caller-sized page of the journal after `after`, oldest first. Unlike {@link events} (the
+   *  restore and archive-tail replay, which keep their own cap) the page is bounded in SQL, and
+   *  one extra row tells `hasMore` without a second query. */
+  eventsPage(id: string, after = 0, limit?: number): JournalPage {
+    const size = journalPageSize(limit), cursor = pageCursor(after)
+    if (this.volatileSpecs.has(id)) return { events: [], nextAfter: cursor, hasMore: false }
+    const rows = this.db.prepare('SELECT sequence, event_json FROM structured_events WHERE session_id=? AND sequence>? ORDER BY sequence LIMIT ?').all(id, cursor, size + 1) as Array<{ sequence: number; event_json: string }>
+    const page = rows.slice(0, size)
+    return { events: this.readBack(page.map(row => JSON.parse(row.event_json) as AgentEvent)), nextAfter: page.at(-1)?.sequence ?? cursor, hasMore: rows.length > size }
+  }
   /** The oldest sequence the journal still holds for a conversation; a primary-key seek. */
   journalFloor(id: string): number | null {
     return (this.db.prepare('SELECT sequence FROM structured_events WHERE session_id=? ORDER BY sequence LIMIT 1').get(id) as { sequence: number } | undefined)?.sequence ?? null
   }
   /** One primary-key-bounded slice of the journal, `from` <= sequence < `to`, at most `limit` rows. */
   journalRange(id: string, from: number, to: number, limit: number): AgentEvent[] {
+    // Not capped (its callers detect the end by a short page), but never unbounded: SQLite reads a
+    // negative LIMIT as no limit at all.
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new RangeError('A journal range needs a limit of at least 1')
     return this.readBack((this.db.prepare('SELECT event_json FROM structured_events WHERE session_id=? AND sequence>=? AND sequence<? ORDER BY sequence LIMIT ?').all(id, from, to, limit) as Array<{ event_json: string }>).map(row => JSON.parse(row.event_json) as AgentEvent))
   }
   /** Journal rows handed out (agents.history, raw included) before the one-off redaction has

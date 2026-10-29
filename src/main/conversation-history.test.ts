@@ -134,6 +134,57 @@ describe('conversation history beyond the resident projection', () => {
     expect(transcript.markdown.trimEnd().endsWith(`Message ${total}`)).toBe(true)
   })
 
+  it('reads the archive for Copy transcript in bounded pages with a yield between them, and the Markdown is byte-identical to a one-piece read', async () => {
+    const total = 24_000
+    const { store } = seedWithCheckpoints(total, 2_000)
+    const pages: Array<{ after: number; limit: number | undefined; through: number | undefined; coverage: number | undefined; items: number }> = []
+    const archivePage = store.archivePage.bind(store)
+    store.archivePage = (id, after, limit, through) => { const page = archivePage(id, after, limit, through); pages.push({ after: after ?? 0, limit, through, coverage: page?.through, items: page?.items.length ?? 0 }); return page }
+    let pauses = 0
+    const paged = await new ConversationHistory(store, async () => { pauses++ }).transcript('chat')
+    const read = pages.splice(0)
+    // The archive holds thousands of items (sequences up to 4000): several pages, each at most 1,000.
+    const archived = store.archive('chat')!.items.length
+    expect(archived).toBeGreaterThan(3_000)
+    expect(read.length).toBe(Math.ceil(archived / 1_000))
+    expect(read.reduce((sum, page) => sum + page.items, 0)).toBe(archived)
+    expect(read.every(page => page.limit === 1_000 && page.items <= 1_000)).toBe(true)
+    // Every later page is capped at the coverage the first one saw.
+    expect(read[0]!.through).toBeUndefined()
+    expect(read[0]!.coverage).toBe(3_999)
+    expect(read.slice(1).map(page => page.through)).toEqual(read.slice(1).map(() => 3_999))
+    // Each page starts right after the last item of the one before it.
+    expect(read.slice(1).every(page => page.after > 0)).toBe(true)
+    expect(pauses).toBeGreaterThanOrEqual(read.length - 1)
+    // The reference: the same export with the whole archive handed over in one piece (the old read).
+    const whole = { ...store, snapshot: store.snapshot.bind(store), spec: store.spec.bind(store), journalFloor: store.journalFloor.bind(store), journalRange: store.journalRange.bind(store),
+      archivePage: (id: string) => { const all = store.archive(id); return all && { items: all.items, from: all.from, through: Number.MAX_SAFE_INTEGER, nextAfter: Number.MAX_SAFE_INTEGER, hasMore: false } } }
+    const reference = await new ConversationHistory(whole, async () => {}).transcript('chat')
+    expect(paged).toEqual(reference)
+    expect(paged.messages).toBe(total)
+  })
+
+  it('a checkpoint that archives more while Copy transcript is between archive pages neither duplicates nor drops a message', async () => {
+    const total = 24_000
+    const { db, store, event } = seedWithCheckpoints(total, 2_000)
+    let armed = false, fired = false
+    const archivePage = store.archivePage.bind(store)
+    store.archivePage = (id, after, limit, through) => { armed = true; return archivePage(id, after, limit, through) }
+    const history = new ConversationHistory(store, async () => {
+      if (!armed || fired) return
+      fired = true
+      // Production's checkpoint timer, landing in the yield: 2,000 more events trim 4001..6000 out
+      // of the journal the history above was rebuilt from and into the archive being paged.
+      db.exec('BEGIN'); for (let index = total + 1; index <= total + 2_000; index++) store.append(event(index)); db.exec('COMMIT')
+      store.checkpoint('chat')
+    })
+    const transcript = await history.transcript('chat')
+    expect(fired).toBe(true)
+    expect(store.archive('chat')!.items.length).toBeGreaterThan(4_000)
+    const found = [...transcript.markdown.slice(transcript.markdown.indexOf('\n')).matchAll(/Message (\d+)/g)].map(match => Number(match[1]))
+    expect(found).toEqual(Array.from({ length: total }, (_, index) => index + 1))
+  })
+
   it('keeps archiving correctly across a restart, and only reports a real gap for history that predates the archive', async () => {
     const root = mkdtempSync(join(tmpdir(), 'conductor-history-archive-restart-')); roots.push(root)
     const dbPath = join(root, 'events.sqlite')

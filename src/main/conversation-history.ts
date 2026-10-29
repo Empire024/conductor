@@ -8,7 +8,7 @@ import type { AgentEvent, SessionProjection, TimelineItem } from '../shared/stru
 import { emptyProjection, projectAgentEvent } from '../shared/structured-agent-reducer'
 import type { StructuredAgentStore } from './structured-store'
 
-type HistoryStore = Pick<StructuredAgentStore, 'snapshot' | 'spec' | 'journalFloor' | 'journalRange' | 'archive'>
+type HistoryStore = Pick<StructuredAgentStore, 'snapshot' | 'spec' | 'journalFloor' | 'journalRange' | 'archivePage'>
 
 /** Journal rows read per step. Each step is one primary-key range scan, and the loop yields to the
  *  event loop between steps, so rebuilding a long history never blocks the main process for long. */
@@ -20,6 +20,8 @@ const STRADDLE = 400
  *  older ones out of the running state at this size means it never truncates what we rebuild. */
 const SETTLE_AT = 800, KEEP_LIVE = 300
 const PAGE_LIMIT = 250, MAX_HITS = 1000
+/** Archive items read per step of Copy transcript, yielding between steps like the journal rebuild. */
+const ARCHIVE_PAGE = 1000
 
 /** Everything older than a conversation's resident projection, rebuilt from its journal.
  *  `boundary` is the resident projection's first item sequence when this was built; the running
@@ -134,7 +136,7 @@ export class ConversationHistory {
     const resident = this.store.snapshot(id)
     if (!resident) throw new Error('This conversation is no longer stored.')
     const region = await this.region(id)
-    const archive = this.store.archive(id)
+    const archive = await this.archived(id)
     const items = [...(archive?.items ?? []), ...(region?.items ?? []), ...resident.items.filter(isConversationActivity)]
     const spec = this.store.spec<{ provider?: string }>(id)
     const provider = resident.capabilities?.provider ?? spec?.provider
@@ -146,6 +148,21 @@ export class ConversationHistory {
     const olderUnavailable = resident.truncated && missingEvents > 0
     const { markdown, messages } = conversationMarkdown(items, { title: resident.title, assistant: assistantName(provider, resident.settings.model), olderUnavailable: missingEvents })
     return { markdown, messages, olderUnavailable }
+  }
+
+  /** The durable archive, every item in sequence order, read in bounded keyset pages with a yield
+   *  between them. Later pages are capped at the first page's coverage, so a checkpoint that
+   *  archives more while this reads cannot add items the journal rebuild above already holds. */
+  private async archived(id: string): Promise<{ items: TimelineItem[]; from: number } | null> {
+    let page = this.store.archivePage(id, 0, ARCHIVE_PAGE)
+    if (!page) return null
+    const items = page.items, { from, through } = page
+    while (page?.hasMore) {
+      await this.pause()
+      page = this.store.archivePage(id, page.nextAfter, ARCHIVE_PAGE, through)
+      for (const item of page?.items ?? []) items.push(item)
+    }
+    return { items, from }
   }
 
   /** Null when the resident projection is the whole conversation. */

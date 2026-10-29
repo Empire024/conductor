@@ -12,6 +12,8 @@ import type { TerminalRuntime } from './remote-terminals'
 import { RemoteAccessError, type RemotePeers } from './remote-peers'
 import type { StructuredSessions } from './structured-sessions'
 import { MAX_PROMPT_CHARS } from '../shared/structured-agent'
+import { DatabaseSync } from 'node:sqlite'
+import { StructuredAgentStore } from './structured-store'
 
 /**
  * The host is where an authenticated peer's calls meet this machine's disk and its tabs, so these
@@ -715,5 +717,42 @@ describe('mirroring everything to the asking machine', () => {
     peers.syncMirror = () => { throw new Error('disk') }
     const listed = await local.call('projects.list', {}) as Array<{ id: string }>
     expect(listed.map(project => project.id)).toContain('shared-project')
+  })
+})
+
+describe('agents.history for a mirror', () => {
+  it('hands over native events after the cursor, oldest first, read bounded in SQL at the requested page', async () => {
+    const dir = mkdtempSync(join(root, 'history-'))
+    const db = new DatabaseSync(join(dir, 'events.sqlite'))
+    try {
+      db.exec("CREATE TABLE agent_sessions(id TEXT PRIMARY KEY); INSERT INTO agent_sessions(id) VALUES('agent-remote')")
+      const store = new StructuredAgentStore(db, dir)
+      store.register('agent-remote', 'shared-project', 'codex', {})
+      db.exec('BEGIN')
+      for (let sequence = 1; sequence <= 250; sequence++) store.append({ schemaVersion: 1, id: `event-${sequence}`, sequence, sessionId: 'agent-remote', runtimeId: 'runtime', provider: 'codex', projectId: 'shared-project', workspaceId: 'workspace-1', cwd: shared, timestamp: '2026-10-29T00:00:00.000Z', itemId: `item-${sequence}`, data: { type: 'text', role: 'assistant', text: `Message ${sequence}`, mode: 'snapshot' } })
+      db.exec('COMMIT')
+      const unbounded = vi.spyOn(store, 'events')
+      const page = vi.spyOn(store, 'eventsPage')
+      const host = fixture({
+        database: {
+          getProject: (id: string) => PROJECTS.find(entry => entry.id === id) ?? null,
+          getSession: (id: string) => id === 'workspace-1' ? { id, projectId: 'shared-project', layout: { version: 1, root: { type: 'group', id: 'group-1', activeTabId: 'agent-tab', tabs: [{ id: 'agent-tab', kind: 'agent', title: 'Remote agent', resourceId: 'agent-remote', state: { provider: 'codex' } }] } } } : null,
+          listSessions: () => [{ id: 'workspace-1', projectId: 'shared-project', name: 'Main' }],
+          listDetachedWindows: () => [],
+          structured: store
+        } as unknown as ConductorDatabase
+      })
+      const scope = { projectId: 'shared-project', sessionId: 'workspace-1', agentSessionId: 'agent-remote' }
+      const sequences = async (args: Record<string, unknown>): Promise<number[]> => (await host.call('agents.history', { ...scope, ...args }) as Array<{ sequence: number }>).map(entry => entry.sequence)
+      // An older mirror sends no limit and gets the 100 it always got.
+      expect(await sequences({})).toEqual(Array.from({ length: 100 }, (_, index) => index + 1))
+      expect(await sequences({ afterSequence: 200 })).toEqual(Array.from({ length: 50 }, (_, index) => index + 201))
+      expect(await sequences({ afterSequence: 10, limit: 5 })).toEqual([11, 12, 13, 14, 15])
+      expect(await sequences({ afterSequence: 0, limit: 1_000 })).toHaveLength(100)
+      expect(await sequences({ afterSequence: 250 })).toEqual([])
+      expect(page.mock.calls.map(call => call[2])).toEqual([100, 100, 5, 100, 100])
+      expect(unbounded).not.toHaveBeenCalled()
+      for (const limit of [0, -3, 2.5, '10']) expect(await host.refusal('agents.history', { ...scope, limit })).toMatch(/limit must be a whole number from 1 to 100/)
+    } finally { db.close() }
   })
 })
