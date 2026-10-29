@@ -147,7 +147,9 @@ describe('GeneralThreads', () => {
     const fresh = await general.ensure()
     expect(fresh.project.id).not.toBe(project.id)
     expect(fresh.project.path).toBe(project.path + ' 2')
-    expect(() => setup().general.promote('x')).toThrow(/no General project/)
+    // A second fixture opens its own database; close it too, or Windows cannot remove its temp folder (EPERM).
+    const empty = setup()
+    try { expect(() => empty.general.promote('x')).toThrow(/no General project/) } finally { empty.database.close() }
     database.close()
   })
 })

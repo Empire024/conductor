@@ -169,6 +169,14 @@ is exactly `git diff 3f95349 cc6879d -- src scripts docs/perf-evidence/t3code-cl
 `phoneState()`/`snapshot()` calls in `src/main/index.ts` (threads wiring) are expected to be adapted
 to the already delivered `phoneStateAsync({history:false})` / `peekAsync`.
 
+**Windows fixture fix (from the local integration run):** in `src/main/general-threads.test.ts`, the
+promote test's `setup().general.promote('x')` opened a second real SQLite fixture and never closed it,
+so Windows could not `rmSync` its temp folder (EPERM at cleanup). The second fixture is now closed in
+`finally`, and the first fixture's `database.close()` is kept. This is test-only: product behaviour is
+unchanged. The integrator reported `general-threads.test.ts` 7/7 and `threads-ipc.test.ts` 3/3 passing
+on Windows; both also pass here (10/10). The integration patch was regenerated from `3f95349` to the
+commit carrying this fix.
+
 ## Limitations (truthful)
 
 - No run on Windows or against the installed app. The parked smoke is unrun, and no `app.update` was
