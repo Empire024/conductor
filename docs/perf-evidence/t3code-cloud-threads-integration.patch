@@ -1,9 +1,9 @@
 diff --git a/docs/perf-evidence/t3code-cloud-threads.md b/docs/perf-evidence/t3code-cloud-threads.md
 new file mode 100644
-index 0000000..e5e2d06
+index 0000000..181214c
 --- /dev/null
 +++ b/docs/perf-evidence/t3code-cloud-threads.md
-@@ -0,0 +1,246 @@
+@@ -0,0 +1,273 @@
 +# Threads without a project — t3code adoption, first slice (CLOUD)
 +
 +Cloud-only implementation commissioned by the owner; Sol integrates it locally. Branch
@@ -154,7 +154,34 @@ index 0000000..e5e2d06
 +
 +### Full suite
 +
-+FULL_SUITE_PLACEHOLDER
++One Linux run of `CI=1 npx vitest run` on this branch finished with 12 failing files (26 tests) out
++of 565 files (6,322 tests passed):
++
++- **10 files are pre-existing:** they fail identically on the clean base `3f95349` in this container.
++  They are `agent-control`, `approval-policy`, `conductor-relay`, `path-lookup`, `phone-access`,
++  `production/profile`, `wizard-approvals`, `local-assist/tools`, `providers/codex-approval-spam` and
++  `providers/codex-sandbox-acl`.
++- **2 files failed under load:** `providers/local` (10 tests) and `production/browser` (1 test). That run
++  shared the CPU with an Electron build and the real-app run. **Rerun alone on this branch, both pass,
++  46/46.** Neither imports anything this change touches.
++
++There was no single full run with only the pre-existing failures, and the owner's Windows full suite
++has not been run. The local `git.ship` (full suite, because `models.ts`, `ipc.ts` and `index.ts` are
++shared) is the authoritative check.
++
++**Integration patch:** [`t3code-cloud-threads-integration.patch`](t3code-cloud-threads-integration.patch)
++is exactly `git diff 3f95349 cc6879d -- src scripts docs/perf-evidence/t3code-cloud-threads.md`
++(21 files, no binaries). `git apply --check` passes against `3f95349`. Locally, the
++`phoneState()`/`snapshot()` calls in `src/main/index.ts` (threads wiring) are expected to be adapted
++to the already delivered `phoneStateAsync({history:false})` / `peekAsync`.
++
++**Windows fixture fix (from the local integration run):** in `src/main/general-threads.test.ts`, the
++promote test's `setup().general.promote('x')` opened a second real SQLite fixture and never closed it,
++so Windows could not `rmSync` its temp folder (EPERM at cleanup). The second fixture is now closed in
++`finally`, and the first fixture's `database.close()` is kept. This is test-only: product behaviour is
++unchanged. The integrator reported `general-threads.test.ts` 7/7 and `threads-ipc.test.ts` 3/3 passing
++on Windows; both also pass here (10/10). The integration patch was regenerated from `3f95349` to the
++commit carrying this fix.
 +
 +## Limitations (truthful)
 +
@@ -363,10 +390,10 @@ index 0000000..bf29d2c
 +await finish()
 diff --git a/src/main/general-threads.test.ts b/src/main/general-threads.test.ts
 new file mode 100644
-index 0000000..0852871
+index 0000000..531edff
 --- /dev/null
 +++ b/src/main/general-threads.test.ts
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,155 @@
 +import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 +import { mkdir, stat } from 'node:fs/promises'
 +import { tmpdir } from 'node:os'
@@ -516,7 +543,9 @@ index 0000000..0852871
 +    const fresh = await general.ensure()
 +    expect(fresh.project.id).not.toBe(project.id)
 +    expect(fresh.project.path).toBe(project.path + ' 2')
-+    expect(() => setup().general.promote('x')).toThrow(/no General project/)
++    // A second fixture opens its own database; close it too, or Windows cannot remove its temp folder (EPERM).
++    const empty = setup()
++    try { expect(() => empty.general.promote('x')).toThrow(/no General project/) } finally { empty.database.close() }
 +    database.close()
 +  })
 +})
