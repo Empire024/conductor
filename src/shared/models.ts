@@ -174,6 +174,9 @@ export interface ProjectRecord {
   updatedAt: string
   /** Absent for every project that lives on this computer, which is all of them in standalone use. */
   remote?: RemoteProjectOrigin
+  /** The General project, where threads started without a project live (src/shared/threads.ts).
+   *  Set by the main process on the lists it sends the window; never stored. */
+  general?: true
 }
 
 export interface AppSettings {

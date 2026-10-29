@@ -1,0 +1,91 @@
+{
+  "root": "/tmp/conductor-cloud-threads-l9UsFZ",
+  "results": [
+    {
+      "id": "first-launch-empty-state",
+      "verdict": "PASS",
+      "detail": {
+        "projects": 0,
+        "offer": "Start without a project"
+      }
+    },
+    {
+      "id": "new-thread-general",
+      "verdict": "PASS",
+      "detail": {
+        "projects": [
+          {
+            "name": "General",
+            "path": "/tmp/conductor-cloud-threads-l9UsFZ/projects/General",
+            "general": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "new-thread-launcher",
+      "verdict": "PASS",
+      "detail": {
+        "launchers": 2
+      }
+    },
+    {
+      "id": "general-thread-listed",
+      "verdict": "PASS",
+      "detail": {
+        "state": "done",
+        "title": "Logo ideas",
+        "projectName": "General",
+        "phase": "completed"
+      }
+    },
+    {
+      "id": "agent-cwd-is-general-folder",
+      "verdict": "PASS",
+      "detail": {
+        "reply": "Three directions, working in /tmp/conductor-cloud-threads-l9UsFZ/projects/General: Sketch three logo directions"
+      }
+    },
+    {
+      "id": "new-thread-reuses-general",
+      "verdict": "PASS",
+      "detail": {
+        "projects": 1
+      }
+    },
+    {
+      "id": "restart-keeps-general-thread",
+      "verdict": "PASS",
+      "detail": {
+        "general": "project_mvu6itt5_ayxunqt",
+        "kept": true,
+        "textItems": 2
+      }
+    },
+    {
+      "id": "continue-in-project-handoff",
+      "verdict": "PASS",
+      "detail": {
+        "chars": 412,
+        "provider": "claude"
+      }
+    },
+    {
+      "id": "continue-in-project-draft",
+      "verdict": "PASS",
+      "detail": {}
+    },
+    {
+      "id": "promote-in-place",
+      "verdict": "PASS",
+      "detail": {
+        "promoted": {
+          "name": "Logo work",
+          "path": "/tmp/conductor-cloud-threads-l9UsFZ/projects/General"
+        },
+        "nextGeneral": "/tmp/conductor-cloud-threads-l9UsFZ/projects/General 2",
+        "status": "completed"
+      }
+    }
+  ]
+}

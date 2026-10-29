@@ -173,6 +173,8 @@ import { LOCAL_MACHINE_ID } from '../shared/remote-control'
 import type { EditorDraft } from '../shared/models'
 import type { BrowserPresentation, BrowserSurfaceCommand, BrowserSurfaceRequest } from '../shared/browser-surface'
 import type { SessionArchive, SessionArchiveResult } from '../shared/session-archive'
+import { GeneralThreads } from './general-threads'
+import { registerThreadsIpc } from './threads-ipc'
 
 const projectPreview = new ProjectPreviewServer()
 /** Host telemetry for the performance chip. Nothing is sampled until a renderer asks, and
@@ -216,6 +218,8 @@ let disposeIdeaRunsIpc: (() => void) | undefined
 let productionApp: ProductionApp | undefined
 let disposeProductionIpc: (() => void) | undefined
 let disposeLogicLoopsIpc: (() => void) | undefined
+let disposeThreadsIpc: (() => void) | undefined
+let generalThreads: GeneralThreads | undefined
 let collaboration: AgentCollaborationStore
 let disposeCollaborationIpc: (() => void) | undefined
 let disposeProjectActivity: (() => void) | undefined
@@ -780,6 +784,7 @@ const disposeRuntimeServices = (): void => {
     ['schedule IPC', () => disposeScheduleIpc?.()],
     ['delivery IPC', () => disposeDeliveryIpc?.()],
     ['logic loops IPC', () => disposeLogicLoopsIpc?.()],
+    ['threads IPC', () => disposeThreadsIpc?.()],
     ['orchestration IPC', () => disposeOrchestrationIpc?.()],
     ['collaboration IPC', () => disposeCollaborationIpc?.()],
     ['project activity', () => { disposeProjectActivity?.(); if (projectActivityTimer) clearTimeout(projectActivityTimer); projectActivityTimer = null }],
@@ -1900,7 +1905,36 @@ const registerIpc = (): void => {
     authorize: (event, projectId) => { trustedStructured(event); requireLocalProject(database, projectId, 'Logic loops') },
     projectPath: projectId => localProject(database, projectId, 'Logic loops').path,
     changed: projectId => { for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed()) window.webContents.send('logic-loops:changed', projectId) } })
-  ipcMain.handle('projects:list', () => database.listDeskProjects())
+  // The General project (threads started without a project) is marked so the window names it
+  // as such; it is otherwise an ordinary local project (src/main/general-threads.ts).
+  generalThreads = new GeneralThreads({
+    getSetting: key => database.getSetting(key),
+    setSetting: (key, value) => database.setSetting(key, value),
+    getProject: id => database.getProject(id),
+    listSessions: projectId => database.listSessions(projectId),
+    createSession: (projectId, name) => database.createSession(projectId, name),
+    projectsRoot: () => getAppSettings().projectsRoot,
+    folderExists,
+    makeFolder: async path => { await fs.mkdir(path, { recursive: true }) },
+    createProject: name => addLocalProject(name),
+    registerFolder: (path, name) => registerProjectFolder(path, name),
+    renameRow: (projectId, name) => { const project = localProject(database, projectId, 'Turning General into a project'); return database.updateProjectLocation(project.id, project.path, name) }
+  })
+  disposeThreadsIpc = registerThreadsIpc({
+    ipcMain, trusted: trustedStructured, general: generalThreads,
+    sessions: () => phoneAccess?.phoneState().sessions ?? [],
+    spec: id => database.structured.spec<AgentSpec>(id),
+    items: id => database.structured.snapshot(id)?.items ?? [],
+    // The name the owner sees on the tab and in the Threads list, before the conversation's own.
+    title: id => phoneAccess?.phoneState().sessions.find(session => session.id === id)?.title ?? database.structured.snapshot(id)?.title ?? null,
+    getProject: id => database.getProject(id),
+    projectsChanged: () => {
+      const projects = generalThreads!.mark(database.listDeskProjects())
+      for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('projects:changed', projects)
+      phoneAccess?.refresh()
+    }
+  })
+  ipcMain.handle('projects:list', () => generalThreads?.mark(database.listDeskProjects()) ?? database.listDeskProjects())
   ipcMain.handle('projects:open-folder', async () => {
     const result = await testDialogs.showOpenDialog(null, {
       title: 'Open a project folder',

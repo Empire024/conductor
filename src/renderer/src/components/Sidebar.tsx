@@ -6,6 +6,8 @@ import type { WorkspaceTabDrag } from '../layout/workspace-tab-move'
 import { RemoveProjectDialog } from './RemoveProjectDialog'
 import { ProcessStatusSummary } from './ProcessStatusSummary'
 import { NeedsAttention } from './NeedsAttention'
+import { ThreadList } from './ThreadList'
+import type { ThreadSummary } from '../../../shared/threads'
 import { ProviderAllowance } from './ProviderAllowance'
 import { UsageOverview } from './UsageOverview'
 import type { TabGroupAction } from '../layout/tab-groups'
@@ -31,6 +33,7 @@ import {
   LayoutGrid,
   ListTodo,
   MemoryStick,
+  MessageSquareDashed,
   MonitorSmartphone,
   ShieldCheck,
   MoreHorizontal,
@@ -102,6 +105,15 @@ interface SidebarProps {
   sessionActivity: ReadonlyMap<string, SessionActivityStatus>
   activityPhases: ReadonlyMap<string, AgentActivityPhase>
   projectActivity: ReadonlyMap<string, ProjectActivityStatus>
+  /** Threads across every project (ThreadList.tsx); absent hides the section. */
+  threads?: {
+    activeAgentSessionId?: string | null
+    refreshKey: string
+    onNewThread(): void
+    onOpenThread(thread: ThreadSummary): void
+    onContinueInProject(thread: ThreadSummary, projectId: string): void
+    onPromoteGeneral(name: string): Promise<void>
+  }
 }
 
 export type WorkspacePanel = 'backlog' | 'agents' | 'tasks' | 'routines' | 'memory' | 'processes'
@@ -369,6 +381,8 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
           <kbd>Ctrl K</kbd>
         </button>
 
+        {props.threads && <ThreadList projects={props.projects} {...props.threads} />}
+
         <section className="sidebar-section projects-section">
           <div className="sidebar-heading">
             <span>Projects</span>
@@ -449,9 +463,10 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
                         onDoubleClick={(event) => { event.preventDefault(); beginProjectRename(project) }}
                         onKeyDown={(event) => { if (event.key === 'F2') { event.preventDefault(); beginProjectRename(project) } }}
                         title={badge ? `${badge.title}
-${project.path} (on ${project.remote!.machineName})` : project.path}
+${project.path} (on ${project.remote!.machineName})` : project.general ? `Threads started without a project\n${project.path}` : project.path}
+                        data-general-project={project.general || undefined}
                       >
-                        <span className="project-glyph">{badge ? <MonitorSmartphone size={14} /> : <FolderGit2 size={14} />}</span>
+                        <span className="project-glyph">{badge ? <MonitorSmartphone size={14} /> : project.general ? <MessageSquareDashed size={14} /> : <FolderGit2 size={14} />}</span>
                         <span className="ellipsis">{project.name}</span>
                         {badge && <span className={`project-remote-badge ${badge.unavailable ? 'unavailable' : ''}`} title={badge.title}>{badge.label}</span>}
                         {projectStatus === 'attention' && <span className="session-attention-badge" title="An agent in this project needs your attention"><Bell size={11} strokeWidth={1.7} /></span>}

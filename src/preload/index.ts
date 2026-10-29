@@ -20,6 +20,7 @@ import { providerLoginBridge } from './provider-login'
 import { durableJobsBridge } from './durable-jobs'
 import { tokenBurnBridge } from './token-burn'
 import { needsAttentionBridge } from './needs-attention'
+import { threadsBridge } from './threads'
 import { productionBridge } from './production'
 import { cloudBridge } from './cloud'
 import { logicLoopsBridge } from './logic-loops'
@@ -216,6 +217,7 @@ const bridge: ConductorBridge = {
   durableJobs: durableJobsBridge,
   tokenBurn: tokenBurnBridge,
   needsAttention: needsAttentionBridge,
+  threads: threadsBridge,
   production: productionBridge,
   cloud: cloudBridge,
   ideas: ideasBridge,

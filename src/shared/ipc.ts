@@ -92,6 +92,7 @@ export interface ConductorBridge {
   durableJobs: import('./durable-jobs-bridge').DurableJobsBridge
   tokenBurn: import('./token-burn').TokenBurnBridge
   needsAttention: import('./needs-attention').NeedsAttentionBridge
+  threads: import('./threads').ThreadsBridge
   production: import('./production').ProductionBridge
   cloud: import('./cloud').CloudBridge
   ideas: import('./ideas').IdeasBridge

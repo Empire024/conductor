@@ -1,0 +1,3 @@
+/* The empty state's second offer (EmptyState.tsx) sits under "Start without a project". */
+.empty-content .secondary-action { height: 30px; margin-top: 8px; padding: 0 10px; display: flex; align-items: center; gap: 8px; border: 1px solid var(--border-soft); border-radius: 6px; background: transparent; color: var(--text-2); font-size: 9px; font-weight: 600; cursor: pointer; }
+.empty-content .secondary-action:hover { background: var(--surface-hover); color: var(--text); }

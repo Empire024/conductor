@@ -25,6 +25,12 @@ export function attachToDraft(projectId: string, sessionId: string, attachment: 
   }))
 }
 
+/** Puts an unsent first message into a conversation that has no pane yet ("Continue in project",
+ *  src/shared/threads.ts); words the owner already typed there are never replaced. */
+export function seedDraft(projectId: string, sessionId: string, message: string): void {
+  drafts.update(composerDraftKey(projectId, sessionId), draft => draft.message.trim() ? draft : { ...draft, message })
+}
+
 /** Moves a predecessor's unsent draft onto its successor's, once per follow, and tells a mounted
  *  successor pane it arrived. */
 export function deliverSuccessionDraft(follow: SuccessionFollow): { caret: number; moved: boolean } {

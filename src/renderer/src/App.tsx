@@ -111,6 +111,9 @@ import { spinPhaseStyle } from './spin-sync'
 import { CONDUCTOR_FILE_DRAG, decodeConductorFileDrag } from './components/composer-file-drop'
 import type { MachineDescriptor } from '../../shared/remote-control'
 import { LOCAL_MACHINE_ID } from '../../shared/remote-control'
+import type { ThreadSummary } from '../../shared/threads'
+import { seedDraft } from './panes/use-composer-draft'
+import { revealConversation } from './components/permission-grants/PendingGrantDock'
 
 const workspaceDocumentsSnapshot = workspaceDocumentsReader(() => localStorage, (workspaceId): WorkspaceDocumentState => {
   // Load through the same migration the file tabs use, so a record left by an older
@@ -174,6 +177,9 @@ export function App(): React.JSX.Element {
   const [appSettings, setAppSettings] = useState<AppSettings>(() => window.conductor.settings.getStartup())
   const [resolvedThemeVariant, setResolvedThemeVariant] = useState<ThemeVariant>(() => resolveThemeVariant(appSettings))
   const [toast, setToast] = useState('')
+  /** A thread asked for before its workspace was showing: a launcher (New thread) or an agent tab with
+   *  an unsent first message (Continue in project), opened once that workspace is active. */
+  const [pendingThread, setPendingThread] = useState<{ projectId: string; sessionId?: string; provider?: AgentProviderId; draft?: string } | null>(null)
   const [loading, setLoading] = useState(true)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem('conductor.sidebarCollapsed') === 'true')
   const [phaseAttentionResourceIds, setPhaseAttentionResourceIds] = useState<Set<string>>(() => new Set())
@@ -1118,6 +1124,85 @@ export function App(): React.JSX.Element {
     setFocusedGroupId(group.id)
   }, [activeSession, focusedGroupId, setLayout])
 
+  /**
+   * New thread without a project (t3code's "Start without a project"; src/shared/threads.ts): the
+   * General project is made on first use and its workspace shows a launcher, so the owner picks an
+   * agent and types - no project to choose or create first.
+   */
+  const newThread = useCallback(async (): Promise<void> => {
+    try {
+      const { project, workspace } = await window.conductor.threads.newGeneral()
+      setProjects(current => current.some(item => item.id === project.id) ? current.map(item => item.id === project.id ? project : item) : [project, ...current])
+      const known = activeProjectIdRef.current === project.id ? sessionsRef.current.find(session => session.id === workspace.id) : undefined
+      if (known) selectSession(known)
+      else await loadProject(project.id, workspace.id)
+      setPendingThread({ projectId: project.id, sessionId: workspace.id })
+    } catch (reason) { setToast(cleanIpcError(reason)) }
+  }, [loadProject, selectSession])
+
+  const openThread = useCallback((thread: ThreadSummary): void => {
+    if (!thread.tabId) return
+    window.conductor.agentControl.focusTab(thread.projectId, thread.workspaceId, thread.tabId)
+      .then(() => revealConversation(thread.id), (reason: unknown) => setToast(cleanIpcError(reason)))
+  }, [])
+
+  /** "Continue in project": a new thread in that project, its first message drafted from the General
+   *  thread and left unsent. The General thread is not moved - its working directory is where it resumes. */
+  const continueInProject = useCallback(async (thread: ThreadSummary, projectId: string): Promise<void> => {
+    try {
+      const handoff = await window.conductor.threads.handoff(thread.id, projectId)
+      if (!handoff) { setToast('That thread is no longer open'); return }
+      if (activeProjectIdRef.current !== projectId) await loadProject(projectId)
+      setPendingThread({ projectId, provider: handoff.provider, draft: handoff.text })
+      setToast(`Continuing “${thread.title}” in ${projects.find(project => project.id === projectId)?.name ?? 'that project'}; review the drafted message and send it. The General thread stays as it is.`)
+    } catch (reason) { setToast(cleanIpcError(reason)) }
+  }, [loadProject, projects])
+
+  const promoteGeneral = useCallback(async (name: string): Promise<void> => {
+    const project = await window.conductor.threads.promote(name)
+    setProjects(current => current.map(item => item.id === project.id ? project : item))
+    setToast(`General is now the project ${project.name}; its threads keep working in ${project.path}`)
+  }, [])
+
+  useEffect(() => {
+    if (!pendingThread || !activeSession || activeSession.projectId !== pendingThread.projectId) return
+    if (pendingThread.sessionId && activeSession.id !== pendingThread.sessionId) return
+    setPendingThread(null)
+    const group = findGroup(activeSession.layout.root, focusedGroupId) ?? listGroups(activeSession.layout.root)[0]
+    if (!group) return
+    const current = group.tabs.find(tab => tab.id === group.activeTabId)
+    if (!pendingThread.provider) {
+      if (current?.kind !== 'launcher') openInFocused('launcher')
+      return
+    }
+    const tab = createPaneTab('agent', { provider: pendingThread.provider })
+    if (pendingThread.draft && tab.resourceId) seedDraft(pendingThread.projectId, tab.resourceId, pendingThread.draft)
+    setLayout(current?.kind === 'launcher' ? replaceTab(activeSession.layout, group.id, current.id, tab) : addTab(activeSession.layout, group.id, tab))
+    setFocusedGroupId(group.id)
+  }, [activeSession, focusedGroupId, openInFocused, pendingThread, setLayout])
+
+  useEffect(() => {
+    const shortcut = (event: KeyboardEvent): void => {
+      // AltGr arrives as Ctrl+Alt on Windows and types a character on many layouts (Slovak AltGr+N is
+      // '}'), so it never counts; matching the produced key rather than the physical one keeps it so.
+      if (!(event.ctrlKey || event.metaKey) || !event.altKey || event.shiftKey || event.getModifierState?.('AltGraph') || event.key.toLowerCase() !== 'n') return
+      event.preventDefault(); event.stopPropagation(); void newThread()
+    }
+    window.addEventListener('keydown', shortcut, true)
+    return () => window.removeEventListener('keydown', shortcut, true)
+  }, [newThread])
+
+  const threadsRefreshKey = useMemo(() => [...correctedActivityPhases].map(([id, phase]) => id + ':' + phase).join('|'), [correctedActivityPhases])
+  const focusedAgentSessionId = useMemo(() => {
+    const group = activeSession ? findGroup(activeSession.layout.root, focusedGroupId) ?? listGroups(activeSession.layout.root)[0] : undefined
+    const tab = group?.tabs.find(item => item.id === group.activeTabId)
+    return tab?.kind === 'agent' ? tab.resourceId ?? null : null
+  }, [activeSession, focusedGroupId])
+  const threadsSidebar = useMemo(() => ({
+    activeAgentSessionId: focusedAgentSessionId, refreshKey: threadsRefreshKey, onNewThread: () => void newThread(), onOpenThread: openThread,
+    onContinueInProject: (thread: ThreadSummary, projectId: string) => void continueInProject(thread, projectId), onPromoteGeneral: promoteGeneral
+  }), [continueInProject, focusedAgentSessionId, newThread, openThread, promoteGeneral, threadsRefreshKey])
+
   /** One view per job and workspace: an open job tab is focused, otherwise one is added to the
    *  focused group. The tab's resourceId is the job id, which is all that identifies the job. */
   const openJobTab = useCallback((job: { id: string; title: string }): void => {
@@ -1407,6 +1492,7 @@ export function App(): React.JSX.Element {
   useEffect(() => { setLiveWorkspaces(activeProjectId, sessions.filter(session => session.projectId === activeProjectId), projects) }, [activeProjectId, sessions, projects])
 
   const commands = useMemo<PaletteCommand[]>(() => [
+    { id: 'new-thread', label: 'New thread without a project', detail: 'Starts in General; turn it into a project or continue it in one later', category: 'Agents', icon: 'agent', shortcut: 'Ctrl+Alt+N', run: () => void newThread() },
     { id: 'open-claude', label: 'Open Claude Code', detail: 'Open in the focused tab group', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then C', run: () => openInFocused('agent', 'claude') },
     { id: 'open-codex', label: 'Open Codex', detail: 'Open in the focused tab group', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then X', run: () => openInFocused('agent', 'codex') },
     { id: 'open-grok', label: 'Open Grok', detail: 'Open in the focused tab group', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then R', run: () => openInFocused('agent', 'grok') },
@@ -1437,7 +1523,7 @@ export function App(): React.JSX.Element {
     { id: 'snap-tab', label: 'Snap tab area to the next stop', detail: 'Preset widths instead of a 5% nudge', category: 'Layout', icon: 'layout', run: () => nudgeFocusedGroup('right', true) },
     { id: 'move-tab-right', label: 'Move tab right', detail: 'Relocate the tab itself, not the divider', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift Alt →', run: () => moveFocusedTabTo('right') },
     { id: 'move-tab-left', label: 'Move tab left', detail: 'Relocate the tab itself, not the divider', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift Alt ←', run: () => moveFocusedTabTo('left') }
-  ], [cycleFocusedTab, moveFocusedTabTo, nudgeFocusedGroup, openInFocused, openProductionQueue, reopenClosed, splitFocused])
+  ], [cycleFocusedTab, moveFocusedTabTo, newThread, nudgeFocusedGroup, openInFocused, openProductionQueue, reopenClosed, splitFocused])
 
   // The subagent roster links a background task back to the runtime it is driving.
   useEffect(() => {
@@ -1693,6 +1779,7 @@ export function App(): React.JSX.Element {
           activityPhases={correctedActivityPhases}
           projectActivity={projectActivityStatuses}
           machines={machines}
+          threads={threadsSidebar}
         />
         <div className="main-stage">
           {activeProject ? (
@@ -1849,7 +1936,7 @@ export function App(): React.JSX.Element {
               </div>
             </>
           ) : !loading ? (
-            <EmptyState onOpen={() => void createManagedProject()} />
+            <EmptyState onOpen={() => void createManagedProject()} onNewThread={() => void newThread()} />
           ) : (
             <div className="app-loading"><i style={spinPhaseStyle(Date.now())} /><span>Restoring your workspace</span></div>
           )}

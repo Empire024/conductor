@@ -1,0 +1,26 @@
+/* Threads above the projects list (ThreadList.tsx): compact rows, state first, then recency. */
+.threads-section { display: flex; flex-direction: column; min-height: 0; }
+.sidebar-heading .threads-toggle { display: inline-flex; white-space: nowrap; margin-left: -3px; align-items: center; gap: 4px; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; text-transform: inherit; letter-spacing: inherit; cursor: pointer; }
+.sidebar-heading .threads-toggle small { color: var(--text-3); font-size: 9px; font-variant-numeric: tabular-nums; }
+.threads-body { display: flex; flex-direction: column; gap: 4px; max-height: 38vh; overflow-y: auto; padding: 0 6px 6px 8px; }
+.threads-search, .threads-promote-input { width: 100%; height: 22px; padding: 0 6px; border: 1px solid var(--border-soft); border-radius: 4px; background: var(--surface-hover); color: var(--text); font-size: 10px; }
+.thread-group { display: flex; flex-direction: column; gap: 1px; }
+.thread-group-label { padding: 2px 4px 1px; color: var(--text-3); font-size: 9px; text-transform: uppercase; letter-spacing: .05em; }
+.thread-group-needs-you .thread-group-label { color: #e2b872; }
+.thread-row { width: 100%; min-width: 0; padding: 3px 4px; display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; grid-template-rows: auto auto; column-gap: 6px; align-items: center; border: 0; border-radius: 4px; background: transparent; color: var(--text-2); font-size: 11px; text-align: left; cursor: pointer; }
+.thread-row:hover, .thread-row:focus-visible { background: var(--surface-hover); color: var(--text); }
+.thread-row.active { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--text); }
+.thread-dot { grid-row: 1 / span 2; width: 6px; height: 6px; border-radius: 50%; background: var(--text-3); opacity: .45; }
+.thread-dot.working { background: var(--accent); opacity: 1; animation: session-activity-pulse 1.2s ease-in-out infinite; }
+.thread-dot.attention, .thread-dot.limited { background: #ecc48d; opacity: 1; }
+.thread-dot.failed, .thread-dot.disconnected { background: var(--danger); opacity: 1; }
+.thread-dot.done { background: #22c57a; opacity: .8; }
+.thread-title { min-width: 0; }
+.thread-row time { color: var(--text-3); font-size: 9px; font-variant-numeric: tabular-nums; }
+.thread-pill { padding: 0 4px; border-radius: 4px; background: color-mix(in srgb, #e2b872 14%, transparent); color: #e2b872; font-size: 8px; font-style: normal; text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; }
+.thread-pill.working { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); }
+.thread-pill.failed, .thread-pill.disconnected { background: color-mix(in srgb, var(--danger) 14%, transparent); color: color-mix(in srgb, var(--danger) 80%, var(--text-2)); }
+.thread-meta { grid-column: 2 / span 2; display: inline-flex; align-items: center; gap: 3px; color: var(--text-3); font-size: 9px; }
+.threads-empty, .threads-note { margin: 2px 4px; color: var(--text-3); font-size: 10px; }
+.threads-empty button { padding: 0; border: 0; background: transparent; color: var(--accent); font: inherit; cursor: pointer; }
+@media (prefers-reduced-motion: reduce) { .thread-dot.working { animation: none; } }
