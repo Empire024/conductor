@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CLOUD_MODELS, isCloudModel, type CloudRunSummary } from '../../shared/cloud'
-import { CloudRuns, clientEnv, cloudArgs, findResult, parseTranscript, readCreateLog, type CloudExec, type CloudGit, type CloudPty, type CloudSpawn } from './runs'
+import { CloudRuns, clientEnv, cloudArgs, findResult, parseTranscript, readCreateLog, readSessionEvidence, type CloudExec, type CloudGit, type CloudPty, type CloudSpawn, type ResultSibling } from './runs'
 
 const fixture = join(process.cwd(), 'scripts/fixtures/cloud-cli.cjs')
 
@@ -37,7 +37,7 @@ const until = async (check: () => boolean, what: string, ms = 8000): Promise<voi
 
 /** origin as git ls-remote shows it, changed by the test as the "cloud" pushes. */
 function fakeOrigin() {
-  const state = { refs: [] as string[], calls: [] as string[][], inProject: [] as string[][], localBranches: [] as string[] }
+  const state = { refs: [] as string[], calls: [] as string[][], inProject: [] as string[][], localBranches: [] as string[], messages: {} as Record<string, string> }
   const git: CloudGit = async (cwd, args) => {
     state.calls.push(args)
     if (!cwd.includes('teleport')) state.inProject.push(args)
@@ -48,6 +48,7 @@ function fakeOrigin() {
     if (args[0] === 'branch' && args[1] === '--show-current') { state.localBranches.push('claude/fixture-note-ogcvln'); return 'claude/fixture-note-ogcvln\n' }
     if (args[0] === 'branch' && args[1] === '-D') state.localBranches = state.localBranches.filter(name => name !== args[2])
     if (args[0] === 'worktree' && args[1] === 'add') mkdirSync(args[3]!, { recursive: true })
+    if (args[0] === 'log') return state.messages[args[4]!] ?? ''
     if (args[0] === 'rev-parse') return 'abc123\n'
     if (args[0] === 'merge-base') return 'base000\n'
     if (args[0] === 'diff') return ' NOTE.md | 1 +\n'
@@ -183,7 +184,7 @@ describe('cloud runs', () => {
     const runs = make({ git: origin.git })
     const run = start(runs)
     await until(() => runs.get(run.id).status === 'running', 'the session')
-    await expect(runs.fetch(run.id)).rejects.toThrow(/not pushed a branch/)
+    await expect(runs.fetch(run.id)).rejects.toThrow(/not pushed claude\/fixture-note \(or it with a suffix\) yet/)
     origin.state.refs = ['c86d864\trefs/heads/claude/fixture-note-x']
     const result = await runs.fetch(run.id)
     expect(result).toMatchObject({ commit: 'abc123', ref: 'refs/heads/claude/fixture-note-x', branch: 'claude/fixture-note-x', diffStat: 'NOTE.md | 1 +' })
@@ -196,11 +197,176 @@ describe('cloud runs', () => {
 
   it('finds the session branch on origin: the named one, one with a suffix, or the one new head', () => {
     const lines = ['a1\trefs/heads/claude/old', 'b2\trefs/heads/claude/add-note-ogcvln', 'b2\trefs/pull/3/head', 'c3\trefs/heads/main'].join('\n')
-    expect(findResult(lines, 'claude/add-note', [])).toEqual({ branch: 'claude/add-note-ogcvln', head: 'b2', pr: 3, ambiguous: [] })
+    expect(findResult(lines, 'claude/add-note', [])).toEqual({ branch: 'claude/add-note-ogcvln', head: 'b2', pr: 3, ambiguous: [], verify: [] })
     expect(findResult(lines, 'claude/add-note-ogcvln', [])).toMatchObject({ branch: 'claude/add-note-ogcvln' })
     expect(findResult(lines, null, ['refs/heads/claude/old'])).toMatchObject({ branch: 'claude/add-note-ogcvln', pr: 3 })
     expect(findResult(lines, null, [])).toMatchObject({ branch: null, ambiguous: ['claude/old', 'claude/add-note-ogcvln'] })
     expect(findResult(lines, 'claude/add-notes', ['refs/heads/claude/old', 'refs/heads/claude/add-note-ogcvln'])).toMatchObject({ branch: null })
+  })
+
+  describe('branch correlation between concurrent runs', () => {
+    const audit = 'claude/t3code-cloud-runtime-audit', timing = 'claude/t3code-tool-timing-analysis', threads = 'claude/t3code-thread-separation'
+    const known = [{ ref: 'refs/heads/claude/older', sha: 'o1' }]
+    const sibling = (hint: string | null, extra: Partial<ResultSibling> = {}): ResultSibling => ({ hint, known, settled: false, ...extra })
+
+    it('gives the one pushed branch only to the run it was hinted for, then each run its own', () => {
+      // The owner's case: three runs started together; the audit pushed first.
+      let lines = ['o1\trefs/heads/claude/older', `a1\trefs/heads/${audit}-y4xpuw110fa4b`, 'a1\trefs/pull/41/head'].join('\n')
+      expect(findResult(lines, audit, known, { siblings: [sibling(timing), sibling(threads)] })).toMatchObject({ branch: `${audit}-y4xpuw110fa4b`, head: 'a1', pr: 41 })
+      for (const [hint, others] of [[timing, [audit, threads]], [threads, [audit, timing]]] as const) {
+        expect(findResult(lines, hint, known, { siblings: others.map(other => sibling(other)) })).toEqual({ branch: null, head: null, pr: null, ambiguous: [], verify: [] })
+        // Even with no other run in sight, a hinted run never takes an unrelated single new head.
+        expect(findResult(lines, hint, known)).toMatchObject({ branch: null, ambiguous: [] })
+      }
+      // The timing analysis pushes later and gets its own branch; the thread run still waits.
+      lines += `\nt2\trefs/heads/${timing}-3aqudf`
+      expect(findResult(lines, timing, known, { siblings: [sibling(audit), sibling(threads)] })).toMatchObject({ branch: `${timing}-3aqudf`, head: 't2', pr: null })
+      expect(findResult(lines, audit, known, { siblings: [sibling(timing), sibling(threads)] })).toMatchObject({ branch: `${audit}-y4xpuw110fa4b` })
+      expect(findResult(lines, threads, known, { siblings: [sibling(audit), sibling(timing)] })).toMatchObject({ branch: null, ambiguous: [] })
+    })
+
+    it('keeps the single-new-head fallback for a run without a hint only when no concurrent run could own it', () => {
+      const lines = ['o1\trefs/heads/claude/older', `a1\trefs/heads/${audit}-y4xpuw110fa4b`].join('\n')
+      const head = { branch: `${audit}-y4xpuw110fa4b`, sha: 'a1' }
+      // Sequential, as before: nothing else ran, so the one new head is this run's (and is checked).
+      expect(findResult(lines, null, known)).toMatchObject({ branch: head.branch, verify: [head] })
+      // A run that started after the push saw it already; it does not contest it.
+      expect(findResult(lines, null, known, { siblings: [sibling(null, { known: [...known, { ref: `refs/heads/${head.branch}`, sha: 'a1' }] })] })).toMatchObject({ branch: head.branch })
+      // A branch another run's hint names is that run's, not the fallback's.
+      expect(findResult(lines, null, known, { siblings: [sibling(audit)] })).toMatchObject({ branch: null, ambiguous: [] })
+      // Two hintless runs in flight: the head could be either's; neither claims it until its commits say.
+      const contested = findResult(lines, null, known, { siblings: [sibling(null)] })
+      expect(contested).toEqual({ branch: null, head: null, pr: null, ambiguous: [head.branch], verify: [head] })
+      expect(findResult(lines, null, known, { siblings: [sibling(null)], evidence: { [`${head.branch}@a1`]: 'ours' } })).toMatchObject({ branch: head.branch, verify: [] })
+      expect(findResult(lines, null, known, { siblings: [sibling(null)], evidence: { [`${head.branch}@a1`]: 'other' } })).toMatchObject({ branch: null, ambiguous: [] })
+      // A foreign push (another session signed it) is not taken even when sequential.
+      expect(findResult(lines, null, known, { evidence: { [`${head.branch}@a1`]: 'other' } })).toMatchObject({ branch: null })
+      // Which heads existed at the start is unknown: no head counts as new.
+      expect(findResult(lines, null, null)).toMatchObject({ branch: null, ambiguous: [], verify: [] })
+    })
+
+    it('ignores stale refs of an earlier run with the same task, and longer task names that only share the prefix', () => {
+      const lines = ['s1\trefs/heads/claude/fix-old111', 'x1\trefs/heads/claude/fix-tests-x1', 'e1\trefs/heads/claude/fix'].join('\n')
+      // fix-old111 and fix were on origin, untouched, when the run started; fix-tests-x1 is another task.
+      const before = [{ ref: 'refs/heads/claude/fix-old111', sha: 's1' }, { ref: 'refs/heads/claude/fix', sha: 'e1' }]
+      expect(findResult(lines, 'claude/fix', before)).toMatchObject({ branch: null, ambiguous: [] })
+      // The session pushed onto the existing name: its sha moved, so that is this run's.
+      expect(findResult(lines.replace('e1\t', 'e2\t'), 'claude/fix', before)).toMatchObject({ branch: 'claude/fix', head: 'e2' })
+      // A store from before shas were kept still accepts the exact name, but not a stale suffixed one.
+      expect(findResult(lines, 'claude/fix', ['refs/heads/claude/fix-old111', 'refs/heads/claude/fix'])).toMatchObject({ branch: 'claude/fix' })
+      expect(findResult(lines.replace('e1\trefs/heads/claude/fix', ''), 'claude/fix', ['refs/heads/claude/fix-old111'])).toMatchObject({ branch: null })
+    })
+
+    it('does not guess between several branches that fit the hint; session evidence or an exact hint settles it', () => {
+      const lines = ['a1\trefs/heads/claude/fix-aaa111', 'b1\trefs/heads/claude/fix-bbb222'].join('\n')
+      const both = findResult(lines, 'claude/fix', [])
+      expect(both).toMatchObject({ branch: null, ambiguous: ['claude/fix-aaa111', 'claude/fix-bbb222'] })
+      expect(both.verify).toEqual([{ branch: 'claude/fix-aaa111', sha: 'a1' }, { branch: 'claude/fix-bbb222', sha: 'b1' }])
+      expect(findResult(lines, 'claude/fix', [], { evidence: { 'claude/fix-aaa111@a1': 'none', 'claude/fix-bbb222@b1': 'ours' } })).toMatchObject({ branch: 'claude/fix-bbb222' })
+      expect(findResult(lines, 'claude/fix', [], { evidence: { 'claude/fix-aaa111@a1': 'other', 'claude/fix-bbb222@b1': 'none' } })).toMatchObject({ branch: 'claude/fix-bbb222' })
+      // Two runs told the same name: one push fits both, so neither takes it on the name alone.
+      const one = 'a1\trefs/heads/claude/fix-aaa111'
+      expect(findResult(one, 'claude/fix', [], { siblings: [sibling('claude/fix', { known: [] })] })).toMatchObject({ branch: null, ambiguous: ['claude/fix-aaa111'], verify: [{ branch: 'claude/fix-aaa111', sha: 'a1' }] })
+      // A run told the longer name exactly owns it over one whose shorter hint it only extends.
+      const exact = 'c1\trefs/heads/claude/fix-tests'
+      expect(findResult(exact, 'claude/fix', [], { siblings: [sibling('claude/fix-tests', { known: [] })] })).toMatchObject({ branch: null, ambiguous: [] })
+      expect(findResult(exact, 'claude/fix-tests', [], { siblings: [sibling('claude/fix', { known: [] })] })).toMatchObject({ branch: 'claude/fix-tests' })
+    })
+
+    it('reads which session signed the commits on a branch', () => {
+      const sign = (session: string): string => `Fix it\n\nClaude-Session: https://claude.ai/code/${session}\n`
+      expect(readSessionEvidence(`${sign('session_01AUDIT')}\x1e`, 'session_01AUDIT')).toBe('ours')
+      expect(readSessionEvidence(`${sign('session_01TIMING')}\x1e`, 'session_01AUDIT')).toBe('other')
+      // An unsigned head over another session's commit: that may be the base, so it decides nothing.
+      expect(readSessionEvidence(`Merge\x1e${sign('session_01TIMING')}\x1e`, 'session_01AUDIT')).toBe('none')
+      expect(readSessionEvidence(`Merge\x1e${sign('session_01AUDIT')}\x1e${sign('session_01TIMING')}\x1e`, 'session_01AUDIT')).toBe('ours')
+      expect(readSessionEvidence('', 'session_01AUDIT')).toBe('none')
+      // A longer id that merely starts with this one is another session.
+      expect(readSessionEvidence(`${sign('session_01AUDITX')}\x1e`, 'session_01AUDIT')).toBe('other')
+    })
+
+    /** A CLI that creates a session per prompt with the branch hint the test names, and refuses attaching. */
+    const scriptedCli = (hints: Record<string, string | null>): CloudSpawn => (_file, args) => {
+      let exit: (event: { exitCode: number }) => void = () => undefined
+      let data: (chunk: string) => void = () => undefined
+      setTimeout(() => {
+        const debugFile = args[args.indexOf('--debug-file') + 1]
+        if (args[0] === '--cloud' && args[1]! in hints && debugFile) {
+          const hint = hints[args[1]!]
+          const payload = hint ? `Creating session with payload: {"session_context":{"outcomes":[{"git_info":{"branches":["${hint}"]}}],"model":"claude-opus-5-5"}}\n` : ''
+          writeFileSync(debugFile, `${payload}Successfully created remote session: session_01${args[1]!.toUpperCase()}\n`)
+          exit({ exitCode: 0 })
+        } else if (args[0] === '--cloud') { data('Attaching to an existing cloud session is not enabled for your account\r\n'); exit({ exitCode: 1 }) }
+        else exit({ exitCode: 1 })
+      }, 20)
+      return { onData: listener => { data = listener }, onExit: listener => { exit = listener }, write: () => undefined, resize: () => undefined, kill: () => undefined }
+    }
+    const settle = (ms = 400): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
+
+    it('follows three simultaneous runs: each gets its own branch when it pushes, none takes another\'s', async () => {
+      const origin = fakeOrigin()
+      origin.state.refs = ['o1\trefs/heads/claude/older']
+      const runs = make({ git: origin.git, prefixArgs: [], spawn: scriptedCli({ audit, timing, threads }) })
+      const [a, t, h] = ['audit', 'timing', 'threads'].map(prompt => start(runs, { prompt }))
+      await until(() => [a, t, h].every(run => runs.get(run!.id).status === 'running' && runs.get(run!.id).branchHint !== null), 'three sessions')
+      origin.state.refs.push(`a1\trefs/heads/${audit}-y4xpuw110fa4b`, 'a1\trefs/pull/41/head')
+      await until(() => runs.get(a!.id).status === 'pushed', 'the audit push')
+      await settle()
+      expect(runs.get(a!.id)).toMatchObject({ branch: `${audit}-y4xpuw110fa4b`, headCommit: 'a1', prUrl: 'https://github.com/Empire024/conductor/pull/41' })
+      for (const run of [t!, h!]) expect(runs.get(run.id)).toMatchObject({ status: 'running', branch: null, headCommit: null, prUrl: null })
+      await expect(runs.fetch(t!.id)).rejects.toThrow(new RegExp(`not pushed ${timing} \\(or it with a suffix\\) yet`))
+      // The timing analysis pushes later: it gets its own branch, the audit keeps its.
+      origin.state.refs.push(`t2\trefs/heads/${timing}-3aqudf`)
+      await until(() => runs.get(t!.id).status === 'pushed', 'the timing push')
+      await settle()
+      expect(runs.get(t!.id)).toMatchObject({ branch: `${timing}-3aqudf`, headCommit: 't2', prUrl: null })
+      expect(runs.get(a!.id).branch).toBe(`${audit}-y4xpuw110fa4b`)
+      expect(runs.get(h!.id)).toMatchObject({ status: 'running', branch: null })
+    })
+
+    it('lets two hintless runs claim the one new head only by the session that signed it', async () => {
+      const origin = fakeOrigin()
+      const runs = make({ git: origin.git, prefixArgs: [], spawn: scriptedCli({ first: null, second: null }) })
+      const [one, two] = ['first', 'second'].map(prompt => start(runs, { prompt }))
+      await until(() => [one, two].every(run => runs.get(run!.id).status === 'running'), 'two sessions')
+      origin.state.refs = ['n1\trefs/heads/claude/new-work-abc123']
+      await settle()
+      for (const run of [one!, two!]) expect(runs.get(run.id)).toMatchObject({ status: 'running', branch: null })
+      await expect(runs.fetch(one!.id)).rejects.toThrow(/cannot be told apart.*claude\/new-work-abc123/)
+      // Evidence is fetched without a destination: no ref of the project moves.
+      expect(origin.state.calls).toContainEqual(['fetch', '--no-tags', '--no-write-fetch-head', 'origin', 'refs/heads/claude/new-work-abc123'])
+      // The next commit is signed by the second session: it is that run's, and only that run's.
+      origin.state.refs = ['n2\trefs/heads/claude/new-work-abc123']
+      origin.state.messages.n2 = `Work\n\nClaude-Session: https://claude.ai/code/${runs.get(two!.id).sessionId}\x1e`
+      await until(() => runs.get(two!.id).status === 'pushed', 'the signed push')
+      await settle()
+      expect(runs.get(two!.id)).toMatchObject({ branch: 'claude/new-work-abc123', headCommit: 'n2' })
+      expect(runs.get(one!.id)).toMatchObject({ status: 'running', branch: null })
+    })
+
+    it('retracts associations the old fallback cached, and keeps a correct branch that was merged and deleted', async () => {
+      const at = Date.now()
+      const base = { projectId: 'p', workspaceId: 'w', title: 't', prompt: 'p', model: 'claude-opus-5-5', effort: null, ref: null, cwd: project, attached: false, liveView: false, confirmedModel: null, transcriptAt: null, transcriptEntries: 0, usage: null, startedBy: 'owner', createdAt: at, updatedAt: at, endedAt: null, exitCode: null, error: null }
+      // What the old fallback left behind: all three runs on the audit's branch and pull request.
+      const wrong = { status: 'pushed', branch: `${audit}-y4xpuw110fa4b`, headCommit: 'a1', prUrl: 'https://github.com/Empire024/conductor/pull/41', worktreePath: join(root, 'worktrees', 'x'), fetchedCommit: 'a1' }
+      writeFileSync(join(root, 'runs.json'), JSON.stringify([
+        { ...base, ...wrong, id: 'cloud_audit', branchHint: audit, sessionId: 'session_01AUDIT', sessionUrl: 'https://claude.ai/code/session_01AUDIT' },
+        { ...base, ...wrong, id: 'cloud_timing', branchHint: timing, sessionId: 'session_01TIMING', sessionUrl: 'https://claude.ai/code/session_01TIMING' },
+        { ...base, ...wrong, id: 'cloud_threads', branchHint: threads, sessionId: 'session_01THREADS', sessionUrl: 'https://claude.ai/code/session_01THREADS' },
+        { ...base, ...wrong, id: 'cloud_merged', branchHint: 'claude/merged-work', branch: 'claude/merged-work-zz9', headCommit: 'm1', prUrl: 'https://github.com/Empire024/conductor/pull/9', sessionId: 'session_01MERGED', sessionUrl: 'https://claude.ai/code/session_01MERGED', cwd: join(project, 'elsewhere') }
+      ]))
+      const origin = fakeOrigin()
+      origin.state.refs = [`a1\trefs/heads/${audit}-y4xpuw110fa4b`, 'a1\trefs/pull/41/head', `t2\trefs/heads/${timing}-3aqudf`]
+      const runs = make({ git: origin.git })
+      await until(() => runs.get('cloud_timing').branch === `${timing}-3aqudf` && runs.get('cloud_threads').status === 'running', 'the corrections')
+      expect(runs.get('cloud_audit')).toMatchObject({ status: 'pushed', branch: `${audit}-y4xpuw110fa4b`, prUrl: 'https://github.com/Empire024/conductor/pull/41', fetchedCommit: 'a1' })
+      // The timing run moves to its own branch, without the audit's pull request or fetched worktree.
+      expect(runs.get('cloud_timing')).toMatchObject({ status: 'pushed', headCommit: 't2', prUrl: null, worktreePath: null, fetchedCommit: null })
+      // The thread run has pushed nothing: it is running again, with nothing claimed.
+      expect(runs.get('cloud_threads')).toMatchObject({ status: 'running', branch: null, headCommit: null, prUrl: null, worktreePath: null, fetchedCommit: null })
+      // A branch that fits its own hint and left origin (merged, deleted) stays the run's result.
+      expect(runs.get('cloud_merged')).toMatchObject({ status: 'pushed', branch: 'claude/merged-work-zz9', prUrl: 'https://github.com/Empire024/conductor/pull/9' })
+    })
   })
 
   it('reads the session, model and branch from the debug log the real CLI writes', () => {
