@@ -1,0 +1,31 @@
+/* Tool timings (ToolTimings.tsx): Settings → Usage breakdown of tool-call time. */
+.tool-timings-controls { display: flex; gap: 6px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
+.tool-timings-controls select, .tool-timings-controls button {
+  padding: 4px 6px;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 8.5px;
+}
+.tool-timings-controls button { display: inline-flex; align-items: center; gap: 4px; color: var(--accent-muted); }
+.tool-timings-summary { margin: 6px 0; color: var(--text-2); }
+.tool-timings-summary small, .tool-timings-stat small { color: var(--text-3); }
+.tool-timings-empty { color: var(--text-3); }
+.tool-timings-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; margin: 6px 0; color: var(--text-2); font-size: 8.5px; }
+.tool-timings-table th { color: var(--text-3); font-weight: 500; }
+.tool-timings-table th, .tool-timings-table td { text-align: left; padding: 3px 6px; border-bottom: 1px solid var(--border-soft); white-space: nowrap; }
+.tool-timings-table td:first-child { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+.tool-timings-table td.failed { color: var(--danger); }
+.tool-timings-setting h4 { margin: 12px 0 4px; color: var(--text); font-size: 9px; }
+.tool-timings-offenders, .tool-timings-slowest, .tool-timings-gaps { color: var(--text-2); font-size: 8.5px; }
+.tool-timings-offenders, .tool-timings-slowest { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.tool-timings-offenders > li { padding: 6px 9px; border: 1px solid var(--border-soft); border-left-width: 3px; border-radius: 6px; background: var(--surface-0); }
+.tool-timings-offenders > li.high { border-left-color: var(--danger); }
+.tool-timings-offenders > li.medium { border-left-color: color-mix(in srgb, var(--danger) 50%, var(--border-soft)); }
+.tool-timings-offenders p { margin: 3px 0; }
+.tool-timings-offenders code, .tool-timings-slowest code { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-3); font: 8px "Cascadia Mono", Consolas, monospace; }
+.tool-timings-provider { margin-left: 6px; color: var(--text-3); }
+.tool-timings-slowest > li { display: grid; grid-template-columns: minmax(70px, auto) minmax(0, 1fr) auto; gap: 8px; align-items: center; font-variant-numeric: tabular-nums; }
+.tool-timings-gaps { margin-top: 10px; }
+.tool-timings-gaps ul { margin: 4px 0; padding-left: 18px; }

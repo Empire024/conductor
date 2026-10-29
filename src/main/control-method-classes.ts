@@ -44,7 +44,7 @@ export const CONTROL_METHOD_CLASSES = new Set<`${ControlMethodClass}:${string}`>
     'tools.list', 'app.state', 'projects.list', 'machines.list', 'models.list', 'tabs.list',
     'agents.list', 'agents.snapshot', 'agents.history', 'agents.artifact', 'agents.status', 'agents.approvals', 'approvals.policy.get',
     'files.list', 'files.read', 'tasks.list', 'memory.recall', 'orchestration.snapshot',
-    'app.update.status', 'admin.status', 'supervisor.overview', 'git.status', 'git.ship.status', 'local.servers', 'usage.limits', 'usage.weekly',
+    'app.update.status', 'admin.status', 'supervisor.overview', 'git.status', 'git.ship.status', 'local.servers', 'usage.limits', 'usage.weekly', 'tools.timings',
     'jobs.list', 'jobs.status', 'jobs.events', 'schedules.list', 'schedules.get',
     'loops.list', 'loops.get', 'loops.history', 'loops.proposals', 'ideas.list', 'ideas.get', 'ideas.runs',
     'nodes.list', 'nodes.jobs', 'nodes.job', 'nodes.log', 'cloud.list', 'cloud.status', 'cloud.transcript', 'permissions.list',

@@ -91,6 +91,7 @@ export interface ConductorBridge {
   permissionGrants: import('./permission-grants').PermissionGrantsBridge
   durableJobs: import('./durable-jobs-bridge').DurableJobsBridge
   tokenBurn: import('./token-burn').TokenBurnBridge
+  toolTimings: import('./tool-timings').ToolTimingsBridge
   needsAttention: import('./needs-attention').NeedsAttentionBridge
   production: import('./production').ProductionBridge
   cloud: import('./cloud').CloudBridge

@@ -157,6 +157,8 @@ import { localEndpointOverride, localModelAvailability, localTurnsInFlight, onLo
 import { DeliveryService } from './delivery'
 import { COWORKER_AUTOCLOSE_SETTING, CoworkerAutoClose, coworkerAutoCloseMinutes, normalizeCoworkerAutoCloseMinutes } from './coworker-autoclose'
 import { registerTokenBurnIpc, TokenBurnMeter, TokenBurnService } from './token-burn'
+import { registerToolTimingsIpc, ToolTimingRecorder } from './tool-timings'
+import { maskSecrets } from './structured-store'
 import { materializePastedText } from './pasted-text-files'
 import { FinishedTabs, agentTabFacts, findLayoutTab } from './workspace-clarity'
 import { createNeedsAttention } from './needs-attention'
@@ -203,6 +205,7 @@ let disposeScheduleIpc: (() => void) | undefined
 let disposeDeliveryIpc: (() => void) | undefined
 let coworkerAutoClose: CoworkerAutoClose | undefined
 let tokenBurnMeter: TokenBurnMeter | undefined
+let toolTimings: ToolTimingRecorder | undefined
 let finishedTabs: FinishedTabs | undefined
 let needsAttentionService: ReturnType<typeof createNeedsAttention> | undefined
 let tabArchiver: TabArchiver | undefined
@@ -776,6 +779,8 @@ const disposeRuntimeServices = (): void => {
     ['coworker auto-close', () => { coworkerAutoClose?.dispose(); finishedTabs?.dispose(); tokenBurnMeter?.dispose() }],
     ['terminals', () => terminals?.dispose()],
     ['agents', () => agents?.dispose()],
+    // After the agents: calls still running when they let go are written as abandoned.
+    ['tool timings', () => toolTimings?.dispose()],
     ['schedule runner', () => scheduleRunner?.stop()],
     ['schedule IPC', () => disposeScheduleIpc?.()],
     ['delivery IPC', () => disposeDeliveryIpc?.()],
@@ -2036,6 +2041,7 @@ const registerIpc = (): void => {
   })
 
   registerTokenBurnIpc(ipcMain, () => tokenBurnMeter, event => trustedStructured(event))
+  registerToolTimingsIpc(ipcMain, () => toolTimings, event => trustedStructured(event))
   ipcMain.handle('settings:coworker-autoclose', (event) => { trustedStructured(event); return coworkerAutoCloseMinutes(key => database.getSetting(key)) })
   ipcMain.handle('settings:set-coworker-autoclose', (event, minutes: unknown) => {
     trustedStructured(event)
@@ -2896,7 +2902,10 @@ app.whenReady().then(async () => {
     publishState: state => { for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('browser:state', state) }
   })
   browserMcp = new BrowserMcpServer(browserViews)
-  agents = new AgentManager(database, new AgentCollaborationRuntime(collaboration), spec => agentControlServer?.briefing(spec) ?? '', browserMcp)
+  // Tool-call timing (src/main/tool-timings.ts): bounded JSONL beside the database, loaded off the boot path.
+  toolTimings = new ToolTimingRecorder({ directory: join(app.getPath('userData'), 'tool-timings'), mask: maskSecrets })
+  void toolTimings.load()
+  agents = new AgentManager(database, new AgentCollaborationRuntime(collaboration), spec => agentControlServer?.briefing(spec) ?? '', browserMcp, toolTimings)
   claudeFullAuto = new ClaudeFullAutoPolicy(database, async () => {
     const results = [...await agents.nativeCli.refreshClaudeFullAutoPolicy(), ...await agents.structured.refreshClaudeFullAutoPolicy()]
     const blocked = results.filter(result => result.status === 'blocked')
@@ -3044,7 +3053,7 @@ app.whenReady().then(async () => {
     broadcast: (channel, payload) => { for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send(channel, payload) },
     log: message => console.warn(message)
   })
-  const control: AgentControl = agentControlCore = new AgentControl({ database, sessions: agents.structured, modelUpgrades, usageWeeks, adminHelper: new AdminHelper(),
+  const control: AgentControl = agentControlCore = new AgentControl({ database, sessions: agents.structured, modelUpgrades, usageWeeks, toolTimings, adminHelper: new AdminHelper(),
     // A test launch may lower the context bound at which a relay rolls to a fresh session.
     relayContextTokens: !app.isPackaged && process.env.CONDUCTOR_TEST_USER_DATA ? Number(process.env.CONDUCTOR_TEST_RELAY_CONTEXT_TOKENS) || undefined : undefined,
     orchestration, collaboration, backlogs: projectBacklogs,

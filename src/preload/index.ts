@@ -19,6 +19,7 @@ import { claudeInChromeBridge } from './claude-in-chrome'
 import { providerLoginBridge } from './provider-login'
 import { durableJobsBridge } from './durable-jobs'
 import { tokenBurnBridge } from './token-burn'
+import { toolTimingsBridge } from './tool-timings'
 import { needsAttentionBridge } from './needs-attention'
 import { productionBridge } from './production'
 import { cloudBridge } from './cloud'
@@ -215,6 +216,7 @@ const bridge: ConductorBridge = {
   providerLogin: providerLoginBridge,
   durableJobs: durableJobsBridge,
   tokenBurn: tokenBurnBridge,
+  toolTimings: toolTimingsBridge,
   needsAttention: needsAttentionBridge,
   production: productionBridge,
   cloud: cloudBridge,

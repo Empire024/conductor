@@ -84,6 +84,8 @@ import { CONTROL_WAIT_MAX_SECONDS } from './permission-grants/control-mcp'
 import { isControlActivityNotice, type AppControlEntry, type ControlTarget } from '../shared/control-activity'
 import { advertisedModel, ArgumentError, modelError, pickModel, resolveModel, unknownMethodError, validateArgs } from './control-args'
 import { readHistory } from './agent-history'
+import { toolTimingsQuery } from './tool-timings'
+import type { ToolTimingsQuery, ToolTimingsReport } from '../shared/tool-timings'
 import type { ApprovalReviewRouting } from './approval-review-gate'
 import type { ModelKey, RegistryRecord, RouteConstraints, RouteDecision, TaskFeatures } from '../shared/model-routing'
 import { callModelMethod, modelMethods, modelSignatures, routeFeatures, type ModelControlCaller } from './model-intelligence/control'
@@ -315,6 +317,7 @@ const toolSignatures = {
   'local.stop': '({model?,pid?,force?,reason?,ownerApproval?}) — stop one running local model server this Conductor started, named by model or pid (both from local.servers), in one call. Refused while a turn is using it unless force:true, which asks the owner first (a wizard tab is the owner) and fails that turn; a server Conductor did not start is never stopped. A server another project started or protects is refused, naming that project and how to ask it (send_message({projectId})): a wizard tab of this project is not the owner there; only the owner credential, or ownerApproval:true with the owner approving the dialog, stops it. A server this project protected itself needs force:true and a reason. The next local turn starts its server again',
   'local.protect': '({model?,pid?,reason,protect?}) — mark a local model server this project started as protected (protect:true, the default, with a reason another project is shown) or lift that (protect:false). Kept in the server\'s run record, so it survives a restart of Conductor and ends with the server. A protected server is never stopped to make room for another model, and local.stop from another project is refused naming this project and the reason. Only the project that started it may protect it (a server started before Conductor recorded that: a project with a conversation on it), only the protecting project lifts it, and the owner credential may do either',
   'usage.weekly': '({provider?, weeks?}) — zero-turn weekly allowance report, so you can see before dispatching whether a provider’s weekly allowance is being used or left on the table: one row per provider window (split by the provider’s own reported reset, not calendar weeks; Claude seven_day and Fable weekly, Codex weekly), newest first, weeks (default 8, max 52) closed or current windows per bucket. Each row: status closed|current|no-data, startsAt/endsAt, peakPercent, finalPercent (last reading before the reset), usedUp and usedUpAt, unusedPercent, coverage complete|partial|none with notes (a stretch without readings is said to have none; nothing is interpolated), the current window’s projection at its pace so far, and tokens: processed/total tokens and cost Conductor recorded per model in that window (cost only where the provider reported one). Also recordedSince (earliest reading held) and unknown providers (Grok reports no allowance)',
+  'tools.timings': '({projectId?,agentSessionId?,provider?,tool?,since?,until?,limit?,recent?,includeDetached?}) — zero-turn tool-call timing across this project\'s tabs and providers (docs/perf-evidence/t3code-cloud-tool-timings.md): totals and failure rate; coverage (the share of calls with a measured elapsed, approval wait and execution time, per provider); tools (per tool: calls, failures, and p50/p95/max/total for elapsed, wait, exec and argument streaming, each with measured and unavailable counts); slowest calls; failure groups with exit codes and a masked error line; offenders (failure rate, approval wait, slow, repeated, abandoned, coverage) each with its evidence and a suggested fix; recent (up to 100 raw records); storage (bounded records, retention, deduplicated restatements); gaps (what each provider cannot report). Arguments are a masked summary, never the full input. A time nobody measured is null and counted as unavailable, never zero; exec is the provider\'s own duration or the observed running phase, never elapsed minus wait. limit 1–50 (default 10); since/until ISO; detached background work is left out of latency unless includeDetached. projectId other than this project, or "*", is for the owner or a wizard tab only',
   'usage.limits': '({provider?}) — zero-turn read of the newest account allowance each provider reported: per provider and bucket (Claude five_hour, seven_day and model windows such as Fable weekly; Codex primary/secondary per limit bucket with its credits), usedPercent, resetsAt, windowMinutes, observedAt with its age and the conversation that reported it. A window whose resetsAt has passed says state "reset" (its current use is unknown until the provider reports again); a provider that reported nothing, or does not report an allowance at all (Grok), says status "unknown" and why. Figures are the provider’s own; nothing is estimated. Also carries localSavings: the conductor-local MCP tools\' (run_and_summarize, local_ask, summarize_file) measured frontier-token savings over the last 7 days — calls, modelCalls, localInputTokens/localOutputTokens and tokensSaved — or null where local assist is not wired',
   'loops.list': '() — validated .conductor/loops/*.md definitions in this project, with version, triggers, inputs, budget and step count',
   'loops.get': '({id}) — one validated logic loop including its instructions and exact model/effort/action steps',
@@ -486,6 +489,8 @@ export interface AgentControlDependencies {
   localAssist?: { savings(days?: number): SavingsSummary }
   /** Weekly allowance report (usage-weeks.ts): one row per provider window with tokens recorded in it. */
   usageWeeks?: { report(options: { provider?: StructuredProvider; weeks?: number }): Promise<AllowanceWeekReport> }
+  /** Tool-call timing (src/main/tool-timings.ts): bounded records of every tab's tool calls. */
+  toolTimings?: { report(query: ToolTimingsQuery): ToolTimingsReport }
   /** Owner permission grants (src/main/permission-grants); plugged in with setPermissionGrants. */
   permissionGrants?: PermissionGrants
   /** Finished coworkers closing themselves (src/main/coworker-autoclose.ts); plugged in with
@@ -2118,8 +2123,9 @@ export class AgentControl {
     }
     // Naming another project is only meaningful for the methods that were opened to a sibling;
     // everywhere else it is still an attempt to act outside the authorized scope.
-    // The owner or a wizard coordinating a co-open project also acts on its production audit.
-    if (args.projectId !== undefined && args.projectId !== scope.projectId && !crossProjectMethods.includes(method) && !(productionMethods.has(method) && sovereign(scope))) throw new Error('This method only runs in the authorized project. Use projects.list to see what else is open, and hand work to a sibling project with tabs.open({projectId}).')
+    // The owner or a wizard coordinating a co-open project also acts on its production audit,
+    // and reads its tool timings.
+    if (args.projectId !== undefined && args.projectId !== scope.projectId && !crossProjectMethods.includes(method) && !((productionMethods.has(method) || method === 'tools.timings') && sovereign(scope))) throw new Error('This method only runs in the authorized project. Use projects.list to see what else is open, and hand work to a sibling project with tabs.open({projectId}).')
     if (method === 'tools.list') return filterSignatures({ ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.cloud ? cloudSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(this.deps.ideaRuns ? ideaRunSignatures : {}), ...(this.deps.production ? productionSignatures : {}), ...(this.deps.modelIntelligence ? modelSignatures : {}), ...(this.deps.modelUpgrades ? Object.fromEntries(Object.entries(upgradeSignatures).filter(([name]) => upgradeOpenMethods.has(name) || sovereign(scope))) : {}), ...(sovereign(scope) ? { ...ownerSignatures, ...WIZARD_APPROVAL_SIGNATURES } : {}), ...(scope.owner ? supervisorSignatures : {}), ...(this.deps.permissionGrants ? { ...PERMISSION_METHOD_SIGNATURES, ...(sovereign(scope) ? PERMISSION_OWNER_SIGNATURES : {}) } : {}) }, args)
     if (PERMISSION_METHODS.includes(method)) {
       if (!this.deps.permissionGrants) throw new Error('Permission grants are not available in this Conductor')
@@ -2173,6 +2179,16 @@ export class AgentControl {
       if (args.weeks !== undefined && (typeof args.weeks !== 'number' || !Number.isInteger(args.weeks) || args.weeks < 1 || args.weeks > 52)) throw new Error('weeks must be a whole number from 1 to 52')
       if (!this.deps.usageWeeks) throw new Error('usage.weekly is not wired in this Conductor build; read usage.limits for the current week')
       return this.deps.usageWeeks.report({ ...(args.provider ? { provider: args.provider as StructuredProvider } : {}), ...(typeof args.weeks === 'number' ? { weeks: args.weeks } : {}) })
+    }
+    if (method === 'tools.timings') {
+      validateArgs(method, args, ['projectId', 'agentSessionId', 'provider', 'tool', 'since', 'until', 'limit', 'recent', 'includeDetached'])
+      if (!this.deps.toolTimings) throw new Error('tools.timings is not wired in this Conductor build; run app.update to install a build that records tool timings')
+      const { projectId, ...rest } = args
+      // Other projects' calls name their commands and paths: this project only, unless the owner or a wizard asks.
+      if (projectId !== undefined && projectId !== scope.projectId && !sovereign(scope)) throw new Error('tools.timings reads this project only; the owner or a wizard tab may pass another projectId, or "*" for every project')
+      const query = toolTimingsQuery(rest)
+      const project = projectId === '*' && sovereign(scope) ? undefined : typeof projectId === 'string' && projectId ? projectId : scope.projectId || undefined
+      return this.deps.toolTimings.report({ ...query, ...(project ? { projectId: project } : {}) })
     }
     if (method === 'local.servers' || method === 'local.stop' || method === 'local.protect') return this.localServers(scope, source, method, args)
     if (scope.owner && !scope.projectId) throw new Error(`${method} needs a project: none is open in this Conductor yet. Register one with projects.open({path}) and pass its id as scope.projectId`)

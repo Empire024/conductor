@@ -28,6 +28,7 @@ import { CoworkerRecovery } from './coworker-recovery'
 import { encodeRestartInitiator, encodeRestartRequest, parseRestartRequest, RESTART_INITIATOR_KEY, RESTART_REQUEST_KEY, takeRestartInitiator } from './restart-initiator'
 import type { SupervisorOverview } from './supervisor-overview'
 import { UsageWeeksService } from './usage-weeks'
+import { ToolTimingRecorder } from './tool-timings'
 import { defaultApprovalPolicy, setCurrentApprovalPolicy } from './approval-policy'
 
 const dispose: Array<() => void> = []
@@ -2567,6 +2568,27 @@ describe('control catalog and dispatch repairs', () => {
     expect(JSON.stringify(await control.call(f.scope, 'tools.list'))).toContain('usage.weekly')
     // Not wired (an older host): the refusal says what to read instead.
     await expect(f.control.call(f.scope, 'usage.weekly')).rejects.toThrow(/usage.limits/)
+  })
+
+  it('tools.timings reads this project\'s tool calls only, unless the owner or a wizard asks, and validates its filters', async () => {
+    const f = fixture()
+    const toolTimings = new ToolTimingRecorder()
+    const call = (projectId: string, itemId: string, provider: 'codex' | 'claude') => toolTimings.observe({ id: itemId, sessionId: 'tab-' + projectId, runtimeId: 'r', provider, projectId, itemId, timestamp: '', data: { type: 'tool', name: 'Bash', status: 'completed', durationMs: 5, input: { command: 'ls ' + projectId } } })
+    call(f.project.id, 'a', 'codex'); call(f.project.id, 'b', 'claude'); call('elsewhere', 'c', 'codex')
+    const control = new AgentControl({ ...f.deps, toolTimings })
+    const report = await control.call(f.scope, 'tools.timings', { recent: 10 }) as import('../shared/tool-timings').ToolTimingsReport
+    expect(report.totals.calls).toBe(2)
+    expect(report.recent.map(record => record.args)).not.toContain('ls elsewhere')
+    expect((await control.call(f.scope, 'tools.timings', { provider: 'claude' }) as import('../shared/tool-timings').ToolTimingsReport).totals.calls).toBe(1)
+    await expect(control.call(f.scope, 'tools.timings', { projectId: 'elsewhere' })).rejects.toThrow(/authorized project|this project only/)
+    await expect(control.call(f.scope, 'tools.timings', { projectId: '*' })).rejects.toThrow(/authorized project|this project only/)
+    expect((await control.call({ ...f.scope, wizard: true }, 'tools.timings', { projectId: '*' }) as import('../shared/tool-timings').ToolTimingsReport).totals.calls).toBe(3)
+    expect((await control.call({ ...f.scope, wizard: true }, 'tools.timings', { projectId: 'elsewhere' }) as import('../shared/tool-timings').ToolTimingsReport).totals.calls).toBe(1)
+    await expect(control.call(f.scope, 'tools.timings', { limit: 500 })).rejects.toThrow(/limit/)
+    await expect(control.call(f.scope, 'tools.timings', { window: 'all' })).rejects.toThrow(/accepts only/)
+    expect(controlMethodClass('tools.timings')).toBe('read')
+    expect(JSON.stringify(await control.call(f.scope, 'tools.list'))).toContain('tools.timings')
+    await expect(f.control.call(f.scope, 'tools.timings')).rejects.toThrow(/app.update/)
   })
 
   it('dispatches a local model read-only without a sandbox mode it does not have, and keeps its writes refused', async () => {
