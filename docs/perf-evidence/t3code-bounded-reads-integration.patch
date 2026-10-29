@@ -1,0 +1,463 @@
+diff --git a/src/main/conversation-history.test.ts b/src/main/conversation-history.test.ts
+index 3058e9e..e4c6526 100644
+--- a/src/main/conversation-history.test.ts
++++ b/src/main/conversation-history.test.ts
+@@ -134,6 +134,57 @@ describe('conversation history beyond the resident projection', () => {
+     expect(transcript.markdown.trimEnd().endsWith(`Message ${total}`)).toBe(true)
+   })
+ 
++  it('reads the archive for Copy transcript in bounded pages with a yield between them, and the Markdown is byte-identical to a one-piece read', async () => {
++    const total = 24_000
++    const { store } = seedWithCheckpoints(total, 2_000)
++    const pages: Array<{ after: number; limit: number | undefined; through: number | undefined; coverage: number | undefined; items: number }> = []
++    const archivePage = store.archivePage.bind(store)
++    store.archivePage = (id, after, limit, through) => { const page = archivePage(id, after, limit, through); pages.push({ after: after ?? 0, limit, through, coverage: page?.through, items: page?.items.length ?? 0 }); return page }
++    let pauses = 0
++    const paged = await new ConversationHistory(store, async () => { pauses++ }).transcript('chat')
++    const read = pages.splice(0)
++    // The archive holds thousands of items (sequences up to 4000): several pages, each at most 1,000.
++    const archived = store.archive('chat')!.items.length
++    expect(archived).toBeGreaterThan(3_000)
++    expect(read.length).toBe(Math.ceil(archived / 1_000))
++    expect(read.reduce((sum, page) => sum + page.items, 0)).toBe(archived)
++    expect(read.every(page => page.limit === 1_000 && page.items <= 1_000)).toBe(true)
++    // Every later page is capped at the coverage the first one saw.
++    expect(read[0]!.through).toBeUndefined()
++    expect(read[0]!.coverage).toBe(3_999)
++    expect(read.slice(1).map(page => page.through)).toEqual(read.slice(1).map(() => 3_999))
++    // Each page starts right after the last item of the one before it.
++    expect(read.slice(1).every(page => page.after > 0)).toBe(true)
++    expect(pauses).toBeGreaterThanOrEqual(read.length - 1)
++    // The reference: the same export with the whole archive handed over in one piece (the old read).
++    const whole = { ...store, snapshot: store.snapshot.bind(store), spec: store.spec.bind(store), journalFloor: store.journalFloor.bind(store), journalRange: store.journalRange.bind(store),
++      archivePage: (id: string) => { const all = store.archive(id); return all && { items: all.items, from: all.from, through: Number.MAX_SAFE_INTEGER, nextAfter: Number.MAX_SAFE_INTEGER, hasMore: false } } }
++    const reference = await new ConversationHistory(whole, async () => {}).transcript('chat')
++    expect(paged).toEqual(reference)
++    expect(paged.messages).toBe(total)
++  })
++
++  it('a checkpoint that archives more while Copy transcript is between archive pages neither duplicates nor drops a message', async () => {
++    const total = 24_000
++    const { db, store, event } = seedWithCheckpoints(total, 2_000)
++    let armed = false, fired = false
++    const archivePage = store.archivePage.bind(store)
++    store.archivePage = (id, after, limit, through) => { armed = true; return archivePage(id, after, limit, through) }
++    const history = new ConversationHistory(store, async () => {
++      if (!armed || fired) return
++      fired = true
++      // Production's checkpoint timer, landing in the yield: 2,000 more events trim 4001..6000 out
++      // of the journal the history above was rebuilt from and into the archive being paged.
++      db.exec('BEGIN'); for (let index = total + 1; index <= total + 2_000; index++) store.append(event(index)); db.exec('COMMIT')
++      store.checkpoint('chat')
++    })
++    const transcript = await history.transcript('chat')
++    expect(fired).toBe(true)
++    expect(store.archive('chat')!.items.length).toBeGreaterThan(4_000)
++    const found = [...transcript.markdown.slice(transcript.markdown.indexOf('\n')).matchAll(/Message (\d+)/g)].map(match => Number(match[1]))
++    expect(found).toEqual(Array.from({ length: total }, (_, index) => index + 1))
++  })
++
+   it('keeps archiving correctly across a restart, and only reports a real gap for history that predates the archive', async () => {
+     const root = mkdtempSync(join(tmpdir(), 'conductor-history-archive-restart-')); roots.push(root)
+     const dbPath = join(root, 'events.sqlite')
+diff --git a/src/main/conversation-history.ts b/src/main/conversation-history.ts
+index f9ff200..6046183 100644
+--- a/src/main/conversation-history.ts
++++ b/src/main/conversation-history.ts
+@@ -8,7 +8,7 @@ import type { AgentEvent, SessionProjection, TimelineItem } from '../shared/stru
+ import { emptyProjection, projectAgentEvent } from '../shared/structured-agent-reducer'
+ import type { StructuredAgentStore } from './structured-store'
+ 
+-type HistoryStore = Pick<StructuredAgentStore, 'snapshot' | 'spec' | 'journalFloor' | 'journalRange' | 'archive'>
++type HistoryStore = Pick<StructuredAgentStore, 'snapshot' | 'spec' | 'journalFloor' | 'journalRange' | 'archivePage'>
+ 
+ /** Journal rows read per step. Each step is one primary-key range scan, and the loop yields to the
+  *  event loop between steps, so rebuilding a long history never blocks the main process for long. */
+@@ -20,6 +20,8 @@ const STRADDLE = 400
+  *  older ones out of the running state at this size means it never truncates what we rebuild. */
+ const SETTLE_AT = 800, KEEP_LIVE = 300
+ const PAGE_LIMIT = 250, MAX_HITS = 1000
++/** Archive items read per step of Copy transcript, yielding between steps like the journal rebuild. */
++const ARCHIVE_PAGE = 1000
+ 
+ /** Everything older than a conversation's resident projection, rebuilt from its journal.
+  *  `boundary` is the resident projection's first item sequence when this was built; the running
+@@ -134,7 +136,7 @@ export class ConversationHistory {
+     const resident = this.store.snapshot(id)
+     if (!resident) throw new Error('This conversation is no longer stored.')
+     const region = await this.region(id)
+-    const archive = this.store.archive(id)
++    const archive = await this.archived(id)
+     const items = [...(archive?.items ?? []), ...(region?.items ?? []), ...resident.items.filter(isConversationActivity)]
+     const spec = this.store.spec<{ provider?: string }>(id)
+     const provider = resident.capabilities?.provider ?? spec?.provider
+@@ -148,6 +150,21 @@ export class ConversationHistory {
+     return { markdown, messages, olderUnavailable }
+   }
+ 
++  /** The durable archive, every item in sequence order, read in bounded keyset pages with a yield
++   *  between them. Later pages are capped at the first page's coverage, so a checkpoint that
++   *  archives more while this reads cannot add items the journal rebuild above already holds. */
++  private async archived(id: string): Promise<{ items: TimelineItem[]; from: number } | null> {
++    let page = this.store.archivePage(id, 0, ARCHIVE_PAGE)
++    if (!page) return null
++    const items = page.items, { from, through } = page
++    while (page?.hasMore) {
++      await this.pause()
++      page = this.store.archivePage(id, page.nextAfter, ARCHIVE_PAGE, through)
++      for (const item of page?.items ?? []) items.push(item)
++    }
++    return { items, from }
++  }
++
+   /** Null when the resident projection is the whole conversation. */
+   private region(id: string): Promise<Region | null> {
+     const pending = this.building.get(id)
+diff --git a/src/main/remote-control-host.test.ts b/src/main/remote-control-host.test.ts
+index 5b1776e..90d7394 100644
+--- a/src/main/remote-control-host.test.ts
++++ b/src/main/remote-control-host.test.ts
+@@ -12,6 +12,8 @@ import type { TerminalRuntime } from './remote-terminals'
+ import { RemoteAccessError, type RemotePeers } from './remote-peers'
+ import type { StructuredSessions } from './structured-sessions'
+ import { MAX_PROMPT_CHARS } from '../shared/structured-agent'
++import { DatabaseSync } from 'node:sqlite'
++import { StructuredAgentStore } from './structured-store'
+ 
+ /**
+  * The host is where an authenticated peer's calls meet this machine's disk and its tabs, so these
+@@ -717,3 +719,40 @@ describe('mirroring everything to the asking machine', () => {
+     expect(listed.map(project => project.id)).toContain('shared-project')
+   })
+ })
++
++describe('agents.history for a mirror', () => {
++  it('hands over native events after the cursor, oldest first, read bounded in SQL at the requested page', async () => {
++    const dir = mkdtempSync(join(root, 'history-'))
++    const db = new DatabaseSync(join(dir, 'events.sqlite'))
++    try {
++      db.exec("CREATE TABLE agent_sessions(id TEXT PRIMARY KEY); INSERT INTO agent_sessions(id) VALUES('agent-remote')")
++      const store = new StructuredAgentStore(db, dir)
++      store.register('agent-remote', 'shared-project', 'codex', {})
++      db.exec('BEGIN')
++      for (let sequence = 1; sequence <= 250; sequence++) store.append({ schemaVersion: 1, id: `event-${sequence}`, sequence, sessionId: 'agent-remote', runtimeId: 'runtime', provider: 'codex', projectId: 'shared-project', workspaceId: 'workspace-1', cwd: shared, timestamp: '2026-10-29T00:00:00.000Z', itemId: `item-${sequence}`, data: { type: 'text', role: 'assistant', text: `Message ${sequence}`, mode: 'snapshot' } })
++      db.exec('COMMIT')
++      const unbounded = vi.spyOn(store, 'events')
++      const page = vi.spyOn(store, 'eventsPage')
++      const host = fixture({
++        database: {
++          getProject: (id: string) => PROJECTS.find(entry => entry.id === id) ?? null,
++          getSession: (id: string) => id === 'workspace-1' ? { id, projectId: 'shared-project', layout: { version: 1, root: { type: 'group', id: 'group-1', activeTabId: 'agent-tab', tabs: [{ id: 'agent-tab', kind: 'agent', title: 'Remote agent', resourceId: 'agent-remote', state: { provider: 'codex' } }] } } } : null,
++          listSessions: () => [{ id: 'workspace-1', projectId: 'shared-project', name: 'Main' }],
++          listDetachedWindows: () => [],
++          structured: store
++        } as unknown as ConductorDatabase
++      })
++      const scope = { projectId: 'shared-project', sessionId: 'workspace-1', agentSessionId: 'agent-remote' }
++      const sequences = async (args: Record<string, unknown>): Promise<number[]> => (await host.call('agents.history', { ...scope, ...args }) as Array<{ sequence: number }>).map(entry => entry.sequence)
++      // An older mirror sends no limit and gets the 100 it always got.
++      expect(await sequences({})).toEqual(Array.from({ length: 100 }, (_, index) => index + 1))
++      expect(await sequences({ afterSequence: 200 })).toEqual(Array.from({ length: 50 }, (_, index) => index + 201))
++      expect(await sequences({ afterSequence: 10, limit: 5 })).toEqual([11, 12, 13, 14, 15])
++      expect(await sequences({ afterSequence: 0, limit: 1_000 })).toHaveLength(100)
++      expect(await sequences({ afterSequence: 250 })).toEqual([])
++      expect(page.mock.calls.map(call => call[2])).toEqual([100, 100, 5, 100, 100])
++      expect(unbounded).not.toHaveBeenCalled()
++      for (const limit of [0, -3, 2.5, '10']) expect(await host.refusal('agents.history', { ...scope, limit })).toMatch(/limit must be a whole number from 1 to 100/)
++    } finally { db.close() }
++  })
++})
+diff --git a/src/main/remote-control-host.ts b/src/main/remote-control-host.ts
+index e9483c6..4cb4138 100644
+--- a/src/main/remote-control-host.ts
++++ b/src/main/remote-control-host.ts
+@@ -43,6 +43,8 @@ const text = (args: Args, key: string, maximum = 20000): string => {
+   return value
+ }
+ 
++/** Native events per agents.history pull: the page a mirror has always been handed. */
++const REMOTE_HISTORY_PAGE = 100
+ const remoteMediaTypes: Record<string, { kind: 'image' | 'video'; mimeType: string }> = {
+   '.png': { kind: 'image', mimeType: 'image/png' },
+   '.jpg': { kind: 'image', mimeType: 'image/jpeg' },
+@@ -82,7 +84,7 @@ export const remoteToolSignatures = {
+   'tabs.close': '({projectId,sessionId,tabId})',
+   'agents.list': '({projectId,sessionId})',
+   'agents.snapshot': '({projectId,sessionId,agentSessionId})',
+-  'agents.history': '({projectId,sessionId,agentSessionId,afterSequence?}) — incremental events, for mirroring the tab remotely',
++  'agents.history': '({projectId,sessionId,agentSessionId,afterSequence?,limit?}) — incremental events after afterSequence, oldest first, up to limit (default and maximum 100), for mirroring the tab remotely',
+   'agents.submit': '({projectId,sessionId,agentSessionId,prompt,settings?})',
+   'agents.steer': '({projectId,sessionId,agentSessionId,prompt,settings?})',
+   'agents.queue': '({projectId,sessionId,agentSessionId,prompt,settings})',
+@@ -654,7 +656,9 @@ export class RemoteControlHost {
+       }
+       if (method === 'agents.history') {
+         const after = typeof args.afterSequence === 'number' && Number.isSafeInteger(args.afterSequence) && args.afterSequence >= 0 ? args.afterSequence : 0
+-        return database.structured.events(agentSessionId, after).slice(0, 100)
++        if (args.limit !== undefined && (typeof args.limit !== 'number' || !Number.isSafeInteger(args.limit) || args.limit < 1)) throw new RemoteAccessError(`limit must be a whole number from 1 to ${REMOTE_HISTORY_PAGE}`, 400)
++        // Bounded in SQL: a mirror pull used to read up to 20,001 journal rows to keep 100.
++        return database.structured.eventsPage(agentSessionId, after, Math.min((args.limit as number | undefined) ?? REMOTE_HISTORY_PAGE, REMOTE_HISTORY_PAGE)).events
+       }
+       const requestedSettings = args.settings === undefined ? state.settings : keepHostWizard(args.settings as SessionSettings, state.settings)
+       if (method === 'agents.interrupt') {
+diff --git a/src/main/structured-store.test.ts b/src/main/structured-store.test.ts
+index 53acbe4..a19207b 100644
+--- a/src/main/structured-store.test.ts
++++ b/src/main/structured-store.test.ts
+@@ -4,7 +4,8 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'n
+ import { tmpdir } from 'node:os'
+ import { join } from 'node:path'
+ import { fileURLToPath } from 'node:url'
+-import { CHECKPOINT_INTERVAL_MS, REDACTION_TARGETS, StructuredAgentStore, maskSecrets, redactSecretsChunk, registerSecretCheck, sanitizeDiagnostic } from './structured-store'
++import { CHECKPOINT_INTERVAL_MS, JOURNAL_PAGE_DEFAULT, JOURNAL_PAGE_MAX, REDACTION_TARGETS, StructuredAgentStore, journalPageSize, maskSecrets, redactSecretsChunk, registerSecretCheck, sanitizeDiagnostic } from './structured-store'
++import { anonymousConversations } from './local-models/anonymous'
+ import type { AgentEvent, AgentEventData } from '../shared/structured-agent'
+ import { emptyProjection } from '../shared/structured-agent-reducer'
+ 
+@@ -545,3 +546,149 @@ describe('conversations are resident only while used', () => {
+     for (const read of reads) expect(read).toMatch(/WHERE id=\?/)
+   })
+ })
++
++describe('caller-sized journal and archive pages, bounded in SQL', () => {
++  const text = (sequence: number, sessionId = 'one'): AgentEvent => event(sequence, { type: 'text', role: sequence % 2 ? 'assistant' : 'user', text: `Message ${sequence}`, mode: 'snapshot' }, { sessionId, itemId: `item-${sequence}` })
++  const seed = (store: StructuredAgentStore, db: DatabaseSync, count: number, sessionId = 'one'): void => {
++    db.exec('BEGIN')
++    for (let sequence = 1; sequence <= count; sequence++) store.append(text(sequence, sessionId))
++    db.exec('COMMIT')
++  }
++  /** Rows each prepared statement handed to JavaScript, so a test can see the bound was SQL's. */
++  const countRows = (db: DatabaseSync): Array<{ sql: string; rows: number }> => {
++    const reads: Array<{ sql: string; rows: number }> = []
++    const prepare = db.prepare.bind(db)
++    db.prepare = ((sql: string) => {
++      const statement = prepare(sql), all = statement.all.bind(statement)
++      statement.all = ((...args: Parameters<typeof all>) => { const rows = all(...args); reads.push({ sql, rows: rows.length }); return rows }) as typeof statement.all
++      return statement
++    }) as typeof db.prepare
++    return reads
++  }
++  /** A durable archive as `trimJournal` leaves it: rendered items plus its coverage row. */
++  const archiveRows = (db: DatabaseSync, sequences: number[], through: number, from = 1, body = (sequence: number) => `Archived ${sequence}`): void => {
++    db.exec('BEGIN')
++    const insert = db.prepare('INSERT INTO structured_transcript_archive(session_id,sequence,item_json) VALUES(?,?,?)')
++    for (const sequence of sequences) insert.run('one', sequence, JSON.stringify({ id: `archived-${sequence}`, sequence, data: { type: 'text', role: 'assistant', text: body(sequence), mode: 'snapshot' } }))
++    db.prepare(`INSERT INTO structured_transcript_archive_state(session_id,archived_through,archived_from) VALUES('one',?,?)
++      ON CONFLICT(session_id) DO UPDATE SET archived_through=excluded.archived_through`).run(through, from)
++    db.exec('COMMIT')
++  }
++
++  it('pages a journal larger than a page in exact sequence order, with a durable cursor and no gap or repeat', () => {
++    const f = fixture()
++    seed(f.store, f.db, 1_234)
++    const reads = countRows(f.db)
++    const seen: number[] = []
++    let cursor = 0, pages = 0
++    for (;;) {
++      const page = f.store.eventsPage('one', cursor, 100)
++      pages++
++      expect(page.events.length).toBeLessThanOrEqual(100)
++      seen.push(...page.events.map(entry => entry.sequence))
++      expect(page.nextAfter).toBe(page.events.at(-1)?.sequence ?? cursor)
++      cursor = page.nextAfter
++      if (!page.hasMore) break
++    }
++    expect(pages).toBe(13)
++    expect(seen).toEqual(Array.from({ length: 1_234 }, (_, index) => index + 1))
++    // Each page asked SQLite for at most limit+1 rows, never the 20,001 `events` reads.
++    expect(reads.filter(read => read.sql.includes('structured_events')).every(read => read.rows <= 101)).toBe(true)
++    // The cursor survives what happens between pages: new events continue after it, a trim below it is invisible.
++    f.store.append(text(1_235))
++    expect(f.store.eventsPage('one', cursor, 100)).toMatchObject({ events: [{ sequence: 1_235 }], nextAfter: 1_235, hasMore: false })
++    f.db.prepare('DELETE FROM structured_events WHERE session_id=? AND sequence<?').run('one', 1_000)
++    expect(f.store.eventsPage('one', 1_100, 3).events.map(entry => entry.sequence)).toEqual([1_101, 1_102, 1_103])
++    // Past the end: nothing, and the cursor stays where it was.
++    expect(f.store.eventsPage('one', 5_000, 10)).toEqual({ events: [], nextAfter: 5_000, hasMore: false })
++    // Another conversation's rows never leak into the page.
++    expect(f.store.eventsPage('two', 0, 10).events).toEqual([])
++  })
++
++  it('defaults a missing page size, caps an oversized one, and refuses an invalid size or cursor', () => {
++    const f = fixture()
++    seed(f.store, f.db, JOURNAL_PAGE_MAX + 2)
++    const fallback = f.store.eventsPage('one')
++    expect(fallback.events).toHaveLength(JOURNAL_PAGE_DEFAULT)
++    expect(fallback).toMatchObject({ nextAfter: JOURNAL_PAGE_DEFAULT, hasMore: true })
++    const capped = f.store.eventsPage('one', 0, 1_000_000)
++    expect(capped.events).toHaveLength(JOURNAL_PAGE_MAX)
++    expect(capped.hasMore).toBe(true)
++    expect(f.store.eventsPage('one', capped.nextAfter, 1_000_000)).toMatchObject({ events: [{ sequence: JOURNAL_PAGE_MAX + 1 }, { sequence: JOURNAL_PAGE_MAX + 2 }], hasMore: false })
++    for (const limit of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '10', null]) {
++      expect(() => f.store.eventsPage('one', 0, limit as number)).toThrow(RangeError)
++      expect(() => f.store.archivePage('one', 0, limit as number)).toThrow(RangeError)
++      expect(() => journalPageSize(limit)).toThrow(RangeError)
++    }
++    for (const after of [-1, 0.5, Number.NaN, '3']) {
++      expect(() => f.store.eventsPage('one', after as number, 10)).toThrow(RangeError)
++      expect(() => f.store.archivePage('one', after as number, 10)).toThrow(RangeError)
++    }
++    // journalRange keeps its callers' sizes uncapped but never lets a negative LIMIT read everything.
++    expect(f.store.journalRange('one', 1, Number.MAX_SAFE_INTEGER, JOURNAL_PAGE_MAX + 2)).toHaveLength(JOURNAL_PAGE_MAX + 2)
++    expect(() => f.store.journalRange('one', 1, 10, -1)).toThrow(RangeError)
++    expect(() => f.store.journalRange('one', 1, 10, 0)).toThrow(RangeError)
++    // The restore replay keeps its own default, untouched by the page reader's.
++    expect(f.store.events('one')).toHaveLength(JOURNAL_PAGE_MAX + 2)
++  })
++
++  it('pages the durable archive in order, reads it bounded in SQL, and keeps one consistent archive across a checkpoint', () => {
++    const f = fixture()
++    const sequences = Array.from({ length: 2_500 }, (_, index) => (index + 1) * 3)
++    archiveRows(f.db, sequences, 7_500, 1)
++    const reads = countRows(f.db)
++    const items: number[] = []
++    let page = f.store.archivePage('one', 0, 1_000)!
++    const through = page.through
++    expect(page).toMatchObject({ from: 1, through: 7_500, hasMore: true })
++    items.push(...page.items.map(item => item.sequence))
++    // A checkpoint archives more between pages: a reader that passes `through` back never sees it.
++    archiveRows(f.db, [7_503, 7_506], 7_510, 1)
++    while (page.hasMore) {
++      page = f.store.archivePage('one', page.nextAfter, 1_000, through)!
++      items.push(...page.items.map(item => item.sequence))
++    }
++    expect(items).toEqual(sequences)
++    expect(reads.filter(read => read.sql.includes('structured_transcript_archive ')).every(read => read.rows <= 1_001)).toBe(true)
++    // A fresh read sees the new coverage, and `archive` is the concatenation of every page.
++    const whole = f.store.archive('one')!
++    expect(whole.from).toBe(1)
++    expect(whole.items.map(item => item.sequence)).toEqual([...sequences, 7_503, 7_506])
++    const direct = (f.db.prepare('SELECT item_json FROM structured_transcript_archive WHERE session_id=? ORDER BY sequence').all('one') as Array<{ item_json: string }>).map(row => JSON.parse(row.item_json))
++    expect(whole.items).toEqual(direct)
++    // No archive yet is null, the same as before.
++    expect(f.store.archivePage('two')).toBeNull()
++    expect(f.store.archive('two')).toBeNull()
++  })
++
++  it('masks journal and archive rows the one-off redaction has not reached yet, on every page', () => {
++    const token = 'c0ffee'.repeat(10) + 'beef'
++    const f = fixture()
++    seed(f.store, f.db, 30)
++    archiveRows(f.db, [1, 2, 3], 3, 1, sequence => `ran CONDUCTOR_CONTROL_TOKEN=${token} step ${sequence}`)
++    f.db.prepare('UPDATE structured_events SET event_json=replace(event_json,?,?)').run('Message 2', `CONDUCTOR_CONTROL_TOKEN=${token} Message 2`)
++    f.db.close()
++    const db = new DatabaseSync(f.path); databases.push(db)
++    const store = new StructuredAgentStore(db, f.root)
++    let cursor = 0, journal = ''
++    for (let page = store.eventsPage('one', 0, 7); ; page = store.eventsPage('one', cursor, 7)) { journal += JSON.stringify(page.events); cursor = page.nextAfter; if (!page.hasMore) break }
++    expect(journal).not.toContain(token)
++    expect(journal).toContain('CONDUCTOR_CONTROL_TOKEN=[REDACTED] Message 2')
++    const archive = store.archivePage('one', 0, 2)!
++    expect(JSON.stringify([archive.items, store.archivePage('one', archive.nextAfter, 2, archive.through)!.items])).not.toContain(token)
++    expect(JSON.stringify(store.archive('one'))).toContain('CONDUCTOR_CONTROL_TOKEN=[REDACTED]')
++  })
++
++  it('reads nothing of an anonymous conversation', () => {
++    const f = fixture()
++    anonymousConversations.mark('ghost')
++    try {
++      f.store.register('ghost', 'project', 'local', {})
++      f.store.append(text(1, 'ghost'))
++      expect(f.store.eventsPage('ghost', 0, 10)).toEqual({ events: [], nextAfter: 0, hasMore: false })
++      expect(f.store.archivePage('ghost', 0, 10)).toBeNull()
++      expect(f.store.archive('ghost')).toBeNull()
++      expect(f.store.journalRange('ghost', 0, 100, 10)).toEqual([])
++    } finally { anonymousConversations.forget('ghost') }
++  })
++})
+diff --git a/src/main/structured-store.ts b/src/main/structured-store.ts
+index 9b2f275..9d0b417 100644
+--- a/src/main/structured-store.ts
++++ b/src/main/structured-store.ts
+@@ -24,6 +24,30 @@ const JOURNAL_WINDOW = 20_000
+  *  (typing-lag-long-conversation). The journal still gets every event at once, and a restore
+  *  replays what came after the snapshot, so nothing is lost by a snapshot a second old. */
+ export const CHECKPOINT_INTERVAL_MS = 1000
++/** Page sizes a caller may ask the journal and archive page readers for. Each page is one
++ *  primary-key keyset scan bounded in SQL (`sequence > cursor ORDER BY sequence LIMIT n+1`), the
++ *  pattern t3code pages its event replay with (OrchestrationEventStore, dd14848: READ_PAGE_SIZE
++ *  500, cursor = last sequence read), instead of reading up to 20,001 rows and slicing them. */
++export const JOURNAL_PAGE_DEFAULT = 500, JOURNAL_PAGE_MAX = 5000
++/** A caller's page size: missing means `fallback`, anything above the maximum is capped, and a
++ *  value that is not a whole number of at least 1 is refused rather than guessed at (SQLite would
++ *  read a negative LIMIT as no limit at all). */
++export function journalPageSize(limit: unknown, fallback = JOURNAL_PAGE_DEFAULT): number {
++  if (limit === undefined) return Math.min(fallback, JOURNAL_PAGE_MAX)
++  if (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1) throw new RangeError(`A page size must be a whole number from 1 to ${JOURNAL_PAGE_MAX}`)
++  return Math.min(limit, JOURNAL_PAGE_MAX)
++}
++const pageCursor = (after: unknown): number => {
++  if (typeof after !== 'number' || !Number.isSafeInteger(after) || after < 0) throw new RangeError('A page cursor must be a sequence number of 0 or more')
++  return after
++}
++/** One page of the journal, oldest first. `nextAfter` is the last sequence returned (`after` when
++ *  none was): sequences never move, so it stays a valid cursor across appends and trims. */
++export interface JournalPage { events: AgentEvent[]; nextAfter: number; hasMore: boolean }
++/** One page of the durable transcript archive, oldest first. `through` is the archive's coverage
++ *  (`archived_through`) when the page was read: pass it back to read later pages of the same
++ *  archive even if a checkpoint archives more in between. */
++export interface ArchivePage { items: TimelineItem[]; from: number; through: number; nextAfter: number; hasMore: boolean }
+ /**
+  * Conversations are resident in memory only while something uses them. Until 2026-10-22 the
+  * store parsed every stored projection at construction and kept all of them forever; the owner's
+@@ -656,11 +680,32 @@ export class StructuredAgentStore {
+    *  anything before it was already gone from the journal before this conversation's archive
+    *  started covering it. */
+   archive(id: string): { items: TimelineItem[]; from: number } | null {
++    // The whole archive in one synchronous piece, for callers that need exactly that; it is read
++    // in bounded pages so no single statement scans it whole. Copy transcript reads
++    // `archivePage` itself and yields between pages.
++    let page = this.archivePage(id, 0, JOURNAL_PAGE_MAX)
++    if (!page) return null
++    const items = page.items, { from, through } = page
++    while (page?.hasMore) {
++      page = this.archivePage(id, page.nextAfter, JOURNAL_PAGE_MAX, through)
++      for (const item of page?.items ?? []) items.push(item)
++    }
++    return { items, from }
++  }
++  /** One page of {@link archive} after the item sequence `after`, at most `limit` items, bounded in
++   *  SQL by the archive's primary key. `through` caps the read at an earlier page's coverage, so a
++   *  reader paging across a checkpoint sees one consistent archive: a later flush only adds items
++   *  above the coverage it extends (`settleArchiveTail` keeps nothing below the cut). Rows the
++   *  one-off redaction has not reached yet are masked on the way out, as the journal's are. */
++  archivePage(id: string, after = 0, limit?: number, through?: number): ArchivePage | null {
++    const size = journalPageSize(limit, JOURNAL_PAGE_MAX), cursor = pageCursor(after)
+     if (this.volatileSpecs.has(id)) return null
+-    const state = this.db.prepare('SELECT archived_from FROM structured_transcript_archive_state WHERE session_id=?').get(id) as { archived_from: number } | undefined
++    const state = this.db.prepare('SELECT archived_from, archived_through FROM structured_transcript_archive_state WHERE session_id=?').get(id) as { archived_from: number; archived_through: number } | undefined
+     if (!state) return null
+-    const rows = this.db.prepare('SELECT item_json FROM structured_transcript_archive WHERE session_id=? ORDER BY sequence').all(id) as Array<{ item_json: string }>
+-    return { items: rows.map(row => JSON.parse(row.item_json) as TimelineItem), from: state.archived_from }
++    const cap = through === undefined ? state.archived_through : Math.min(pageCursor(through), state.archived_through)
++    const rows = this.db.prepare('SELECT sequence, item_json FROM structured_transcript_archive WHERE session_id=? AND sequence>? AND sequence<=? ORDER BY sequence LIMIT ?').all(id, cursor, cap, size + 1) as Array<{ sequence: number; item_json: string }>
++    const page = rows.slice(0, size), items = page.map(row => JSON.parse(row.item_json) as TimelineItem)
++    return { items: this.redactionPending ? maskStrings(items) : items, from: state.archived_from, through: cap, nextAfter: page.at(-1)?.sequence ?? cursor, hasMore: rows.length > size }
+   }
+   update(id: string, values: Partial<Pick<SessionProjection, 'title' | 'archived' | 'settings'>>): void {
+     const state = this.snapshot(id)
+@@ -686,12 +731,25 @@ export class StructuredAgentStore {
+     if (this.volatileSpecs.has(id)) return []
+     return this.readBack((this.db.prepare('SELECT event_json FROM structured_events WHERE session_id=? AND sequence>? ORDER BY sequence LIMIT 20001').all(id, after) as Array<{ event_json: string }>).map(row => JSON.parse(row.event_json) as AgentEvent))
+   }
++  /** One caller-sized page of the journal after `after`, oldest first. Unlike {@link events} (the
++   *  restore and archive-tail replay, which keep their own cap) the page is bounded in SQL, and
++   *  one extra row tells `hasMore` without a second query. */
++  eventsPage(id: string, after = 0, limit?: number): JournalPage {
++    const size = journalPageSize(limit), cursor = pageCursor(after)
++    if (this.volatileSpecs.has(id)) return { events: [], nextAfter: cursor, hasMore: false }
++    const rows = this.db.prepare('SELECT sequence, event_json FROM structured_events WHERE session_id=? AND sequence>? ORDER BY sequence LIMIT ?').all(id, cursor, size + 1) as Array<{ sequence: number; event_json: string }>
++    const page = rows.slice(0, size)
++    return { events: this.readBack(page.map(row => JSON.parse(row.event_json) as AgentEvent)), nextAfter: page.at(-1)?.sequence ?? cursor, hasMore: rows.length > size }
++  }
+   /** The oldest sequence the journal still holds for a conversation; a primary-key seek. */
+   journalFloor(id: string): number | null {
+     return (this.db.prepare('SELECT sequence FROM structured_events WHERE session_id=? ORDER BY sequence LIMIT 1').get(id) as { sequence: number } | undefined)?.sequence ?? null
+   }
+   /** One primary-key-bounded slice of the journal, `from` <= sequence < `to`, at most `limit` rows. */
+   journalRange(id: string, from: number, to: number, limit: number): AgentEvent[] {
++    // Not capped (its callers detect the end by a short page), but never unbounded: SQLite reads a
++    // negative LIMIT as no limit at all.
++    if (!Number.isSafeInteger(limit) || limit < 1) throw new RangeError('A journal range needs a limit of at least 1')
+     return this.readBack((this.db.prepare('SELECT event_json FROM structured_events WHERE session_id=? AND sequence>=? AND sequence<? ORDER BY sequence LIMIT ?').all(id, from, to, limit) as Array<{ event_json: string }>).map(row => JSON.parse(row.event_json) as AgentEvent))
+   }
+   /** Journal rows handed out (agents.history, raw included) before the one-off redaction has
