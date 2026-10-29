@@ -160,8 +160,9 @@ function staleFor(known: KnownHead[] | null, head: { branch: string; sha: string
  * branch falls back to the one new claude/* head, and only while no other run from the folder that
  * lacks a branch of its own could have pushed it. A head another run's hint names more exactly is
  * that run's. Where candidates cannot be told apart (several, or contested by a concurrent run),
- * nothing is claimed: they are listed in `ambiguous` and in `verify` for the commits' session
- * evidence, which settles it either way.
+ * or which heads existed at the start is unknown (`known` null: a hinted branch may be an earlier
+ * same-named run's), nothing is claimed on the name: they are listed in `ambiguous` and in
+ * `verify`, and only the commits' session evidence claims one.
  */
 export function findResult(lines: string, hint: string | null, known: KnownHead[] | null, context: ResultContext = {}): { branch: string | null; head: string | null; pr: number | null; ambiguous: string[]; verify: Array<{ branch: string; sha: string }> } {
   const refs = lines.split('\n').map(line => line.trim().split(/\s+/)).filter(parts => parts.length === 2) as Array<[string, string]>
@@ -187,10 +188,12 @@ export function findResult(lines: string, hint: string | null, known: KnownHead[
   const candidates = heads.filter(head => own(head) >= 0 && evidence(head) !== 'other')
   const ours = candidates.filter(head => evidence(head) === 'ours')
   const open = candidates.filter(head => evidence(head) !== 'ours' && rival(head) <= own(head))
-  const free = open.filter(head => rival(head) < own(head))
+  // Uncontested, and known to be new since the run started.
+  const free = open.filter(head => rival(head) < own(head) && known !== null)
   const match = ours.find(head => head.branch === hint) ?? ours[0] ?? (open.length === 1 && free.length === 1 ? free[0] : undefined)
   // Evidence is worth asking for where it could change the answer: every fallback candidate (a
-  // foreign push is not this run's), and hint candidates that are several or contested.
+  // foreign push is not this run's), and hint candidates that are several, contested or of
+  // unknown age.
   const verify = ours.length ? [] : open.filter(head => evidence(head) === undefined && (!hint || open.length > 1 || free.length < open.length)).map(({ branch, sha }) => ({ branch, sha }))
   if (!match) return { branch: null, head: null, pr: null, ambiguous: open.map(head => head.branch), verify }
   return { branch: match.branch, head: match.sha, pr: pullFor(refs, match.sha), ambiguous: [], verify }
@@ -281,6 +284,8 @@ export class CloudRuns {
   private evidence = new Map<string, Record<string, SessionEvidence>>()
   /** The candidates the last look at origin could not attribute, per run. */
   private ambiguous = new Map<string, string[]>()
+  /** The pull request a run's own client printed (its session's, whatever origin shows). */
+  private screenPrs = new Map<string, string>()
   private disposed = false
 
   constructor(private options: CloudRunsOptions) {
@@ -483,10 +488,10 @@ export class CloudRuns {
         const url = repo ? `https://github.com/${repo}/pull/${found.pr}` : `pull/${found.pr}`
         if (url !== run.prUrl) patch.prUrl = url
       }
-      if (run.branch && found.branch !== run.branch) Object.assign(patch, this.retracted(run, refs, Boolean(found.pr)))
+      if (run.branch && found.branch !== run.branch) Object.assign(patch, this.retracted(run, Boolean(found.pr)))
       if (run.status === 'running') patch.status = 'pushed'
     } else if (run.branch && !this.stillOurs(run, refs)) {
-      Object.assign(patch, { branch: null, headCommit: null, ...this.retracted(run, refs, false) }, run.status === 'pushed' ? { status: 'running' as const } : {})
+      Object.assign(patch, { branch: null, headCommit: null, ...this.retracted(run, false) }, run.status === 'pushed' ? { status: 'running' as const } : {})
     }
     if (!Object.keys(patch).length) return run
     const next = this.update(id, patch)
@@ -507,14 +512,13 @@ export class CloudRuns {
     return this.evidence.get(run.id)?.[`${run.branch}@${run.headCommit}`] !== 'other'
   }
 
-  /** What goes with a retracted branch: the pull request opened from it (unless the new branch
-   *  brings its own) and a worktree fetched from it. */
-  private retracted(run: CloudRunSummary, refs: Array<[string, string]>, replacedPr: boolean): Partial<CloudRunSummary> {
+  /** What goes with a retracted branch: the pull request recorded with it, unless the new branch
+   *  brings its own or the run's own client printed it (a closed pull request's ref can be gone
+   *  from origin, so origin cannot vouch for it, and `fetch` would otherwise fetch it), and a
+   *  worktree fetched from it. */
+  private retracted(run: CloudRunSummary, replacedPr: boolean): Partial<CloudRunSummary> {
     const patch: Partial<CloudRunSummary> = {}
-    const number = run.prUrl ? /\/pull\/(\d+)/.exec(run.prUrl)?.[1] : undefined
-    const prHead = number ? refs.find(([, ref]) => ref === `refs/pull/${number}/head`)?.[0] : undefined
-    const branchHead = refs.find(([, ref]) => ref === `refs/heads/${run.branch}`)?.[0]
-    if (!replacedPr && prHead && (prHead === run.headCommit || prHead === branchHead)) patch.prUrl = null
+    if (!replacedPr && run.prUrl && run.prUrl !== this.screenPrs.get(run.id)) patch.prUrl = null
     if (run.worktreePath || run.fetchedCommit) { patch.worktreePath = null; patch.fetchedCommit = null }
     return patch
   }
@@ -597,7 +601,7 @@ export class CloudRuns {
     if (!run.branch && !run.prUrl) {
       const ambiguous = this.ambiguous.get(id) ?? []
       throw new Error(ambiguous.length
-        ? `New claude/* branches appeared that cannot be told apart from another cloud run's (none names this session in its commits): ${ambiguous.join(', ')}. Check ${run.sessionUrl ?? 'the session'} for the branch it pushed`
+        ? `New claude/* branches fit this run but cannot be attributed to its session (none names it in its commits; another or an earlier cloud run may have pushed them): ${ambiguous.join(', ')}. Check ${run.sessionUrl ?? 'the session'} for the branch it pushed`
         : run.branchHint ? `The session has not pushed ${run.branchHint} (or it with a suffix) yet` : 'The session has not pushed a branch yet')
     }
     const pr = run.prUrl ? /\/pull\/(\d+)/.exec(run.prUrl)?.[1] : undefined
@@ -804,6 +808,7 @@ export class CloudRuns {
       if (url) { patch.sessionId = url[1]!; patch.sessionUrl = `https://claude.ai/code/${url[1]}` }
     }
     const pr = [...shown.matchAll(PR_URL)].at(-1)?.[0]
+    if (pr) this.screenPrs.set(id, pr)
     if (pr && pr !== run.prUrl) patch.prUrl = pr
     if (Object.keys(patch).length) this.update(id, patch)
   }

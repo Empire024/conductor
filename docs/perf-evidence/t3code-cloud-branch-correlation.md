@@ -41,7 +41,10 @@ replaced; that was wrong and is corrected here. The code change is unaffected.)
    run's; a moved sha is this session pushing onto it. Old name-only snapshots still accept the
    exact hint (previous behaviour) but not a suffixed stale ref. A failed or missing snapshot is
    written/read as `null` (unknown), not `[]`, so it no longer makes every existing head look new.
-   `refreshResult` waits for a snapshot still being taken.
+   With an unknown snapshot a hinted branch may be an earlier same-named run's result, so it is
+   **never claimed on the name**, not even when it is the only match: it is listed as ambiguous and
+   in `verify`, and only this session's commit trailer (rule 5) claims it. The fallback takes
+   nothing then. `refreshResult` waits for a snapshot still being taken.
 3. **Concurrent runs from the same `cwd` are rivals** (created within the watch window, not
    `failed`, and the head is not stale for them). A head a rival's hint names more exactly is the
    rival's and is dropped; an equally strong claim (same hint, or two hintless runs) is
@@ -50,21 +53,24 @@ replaced; that was wrong and is corrected here. The code change is unaffected.)
    it is safe**: the head is not explained by any rival's hint and no unsettled hintless rival could
    have pushed it (a rival that started after the push saw it in its own snapshot and does not
    contest it). That is the sequential case it was written for.
-5. **Session evidence settles what names cannot.** For contested or multiple candidates, and for
-   every fallback candidate, the branch is fetched **without a destination**
+5. **Session evidence settles what names cannot.** For contested or multiple candidates, hinted
+   candidates of unknown age, and every fallback candidate, the branch is fetched **without a destination**
    (`git fetch --no-tags --no-write-fetch-head origin refs/heads/<b>`, no ref of the project moves)
    and `git log -n 20 --format=%B%x1e <sha>` is read. The first commit that names any
    `claude.ai/code/<session>` decides: this run's session → `ours` (claimed even over a rival);
    another session on the head commit → `other` (never claimed); otherwise `none`. Verdicts are
    cached per run per `branch@sha`; a failed look is not cached.
 6. **Unknown means no result.** Ambiguous candidates are kept in memory and `cloud.fetch` says they
-   cannot be told apart from another run's (with the session link); a hinted run with nothing
+   fit the run but cannot be attributed to its session (with the session link); a hinted run with nothing
    pushed says it has not pushed `<hint>` yet. No `pushed` status, branch, head or PR is reported.
 7. **Cached associations are re-validated every poll.** A recorded branch that the latest look did
    not choose is retracted (`branch`/`headCommit` → null, `pushed` → `running`) when it is still on
    origin (contested now) or does not fit the run's hint (the old fallback's mistake). Its PR URL
-   goes too when that PR's head is the retracted branch's sha, and a worktree fetched from it
-   (`worktreePath`/`fetchedCommit`) is forgotten. A branch that fits the hint and has left origin
+   goes too, unless the replacing branch brings its own PR or the run's own client printed that PR
+   URL (remembered in memory, from the session's own terminal output): origin is not asked to vouch
+   for it, because a closed PR's `refs/pull/N/head` can be gone, and a PR URL left behind would make
+   `cloud.fetch` (branch null, PR set) fetch the foreign PR. A worktree fetched from the retracted
+   branch (`worktreePath`/`fetchedCommit`) is forgotten. A branch that fits the hint and has left origin
    (merged and deleted) stays the run's result. When the correct branch is found later it replaces
    the wrong one (as the previous code already did once the hinted branch appeared).
 8. **`pushed` is still not "finished".** The status keeps its documented meaning (branch on
@@ -80,15 +86,25 @@ replaced; that was wrong and is corrected here. The code change is unaffected.)
   longer task names that share the prefix.
 - several suffix matches stay ambiguous until evidence; same-hint rivals; exact hint beats a
   shorter rival hint.
+- unknown snapshot: a unique pre-existing same-hint branch is not claimed; `none`/`other` evidence
+  claims nothing, `ours` claims it.
 - `readSessionEvidence` parsing.
 - integration through `CloudRuns` with a scripted CLI: three simultaneous runs, audit pushes
   first, timing later; two hintless runs settled by the commit trailer, with the destination-less
   fetch asserted; restart with the old wrong cached associations (all three on the audit
-  branch/PR/worktree) corrected, and a merged-and-deleted correct branch kept.
+  branch/PR/worktree) corrected, and a merged-and-deleted correct branch kept (start snapshots
+  present); a retracted wrong branch whose PR ref is gone from origin (and one whose branch is gone
+  too) loses the PR, and `cloud.fetch` refuses instead of fetching `pull/41`; a PR the run's own
+  client printed survives retraction of its branch; a restored run with an unknown snapshot ignores
+  an earlier session's signed same-hint branch and an unsigned one, and claims the branch once its
+  own session signs a commit. The older restart test now writes the start snapshot it relies on.
 
-Against the previous `runs.ts` 10 tests fail: the 8 new ones, and the 2 older ones that were
-updated only for the added `verify` field and the more specific "not pushed `<hint>`" message. With
-the fix all 21 pass. `npm run typecheck` is clean.
+Against the original `runs.ts` (`3f95349`) 10 of the first 21 tests fail: the 8 new ones, and the
+2 older ones that were updated only for the added `verify` field and the more specific "not pushed
+`<hint>`" message. The review follow-up (PR association on retraction, unknown snapshot) added 4
+tests; against the `runs.ts` of `15b27d9` 4 of the 25 fail: the 3 that cover those two cases and the
+hintless test, which fails only on the reworded ambiguity message. With the fix all 25 pass.
+`npm run typecheck` is clean.
 
 ## Surgical patch notes for integration
 
@@ -99,7 +115,9 @@ All in `src/main/cloud/runs.ts`; no other file depends on the changed internals
   `{ref, sha}`); new optional `context {siblings, evidence}`; result adds `verify: {branch, sha}[]`.
   New exports: `KnownHead`, `SessionEvidence`, `ResultSibling`, `ResultContext`, `hintStrength`,
   `readSessionEvidence`.
-- `CloudRuns`: new private maps `snapshots`, `evidence`, `ambiguous`; `knownHeads()` returns
+- `findResult`: a hinted candidate with `known === null` is never `free` (needs `ours` evidence).
+- `CloudRuns`: new private maps `snapshots`, `evidence`, `ambiguous`, `screenPrs` (set in
+  `analyse` when the client prints a PR URL); `retracted(run, replacedPr)` no longer takes refs; `knownHeads()` returns
   `null` for missing/failed snapshots; `start()` writes `{ref, sha}` entries (or `null`) and records
   the pending snapshot; `refreshResult()` rewritten (two-pass with evidence, retraction); new private
   `stillOurs`, `retracted`, `siblings`, `sessionEvidence`; `fetch()` error text from the last

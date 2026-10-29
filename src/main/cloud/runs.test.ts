@@ -273,6 +273,16 @@ describe('cloud runs', () => {
       expect(findResult(exact, 'claude/fix-tests', [], { siblings: [sibling('claude/fix', { known: [] })] })).toMatchObject({ branch: 'claude/fix-tests' })
     })
 
+    it('claims nothing on the name alone when which heads existed at the start is unknown', () => {
+      // The snapshot failed: claude/fix-old111 may be an earlier same-named run's result.
+      const lines = 's1\trefs/heads/claude/fix-old111'
+      const head = { branch: 'claude/fix-old111', sha: 's1' }
+      expect(findResult(lines, 'claude/fix', null)).toEqual({ branch: null, head: null, pr: null, ambiguous: [head.branch], verify: [head] })
+      expect(findResult(lines, 'claude/fix', null, { evidence: { 'claude/fix-old111@s1': 'none' } })).toEqual({ branch: null, head: null, pr: null, ambiguous: [head.branch], verify: [] })
+      expect(findResult(lines, 'claude/fix', null, { evidence: { 'claude/fix-old111@s1': 'other' } })).toMatchObject({ branch: null, ambiguous: [] })
+      expect(findResult(lines, 'claude/fix', null, { evidence: { 'claude/fix-old111@s1': 'ours' } })).toMatchObject({ branch: head.branch, head: 's1' })
+    })
+
     it('reads which session signed the commits on a branch', () => {
       const sign = (session: string): string => `Fix it\n\nClaude-Session: https://claude.ai/code/${session}\n`
       expect(readSessionEvidence(`${sign('session_01AUDIT')}\x1e`, 'session_01AUDIT')).toBe('ours')
@@ -286,7 +296,7 @@ describe('cloud runs', () => {
     })
 
     /** A CLI that creates a session per prompt with the branch hint the test names, and refuses attaching. */
-    const scriptedCli = (hints: Record<string, string | null>): CloudSpawn => (_file, args) => {
+    const scriptedCli = (hints: Record<string, string | null>, screens: Record<string, string> = {}): CloudSpawn => (_file, args) => {
       let exit: (event: { exitCode: number }) => void = () => undefined
       let data: (chunk: string) => void = () => undefined
       setTimeout(() => {
@@ -295,6 +305,7 @@ describe('cloud runs', () => {
           const hint = hints[args[1]!]
           const payload = hint ? `Creating session with payload: {"session_context":{"outcomes":[{"git_info":{"branches":["${hint}"]}}],"model":"claude-opus-5-5"}}\n` : ''
           writeFileSync(debugFile, `${payload}Successfully created remote session: session_01${args[1]!.toUpperCase()}\n`)
+          if (screens[args[1]!]) data(screens[args[1]!]!)
           exit({ exitCode: 0 })
         } else if (args[0] === '--cloud') { data('Attaching to an existing cloud session is not enabled for your account\r\n'); exit({ exitCode: 1 }) }
         else exit({ exitCode: 1 })
@@ -332,7 +343,7 @@ describe('cloud runs', () => {
       origin.state.refs = ['n1\trefs/heads/claude/new-work-abc123']
       await settle()
       for (const run of [one!, two!]) expect(runs.get(run.id)).toMatchObject({ status: 'running', branch: null })
-      await expect(runs.fetch(one!.id)).rejects.toThrow(/cannot be told apart.*claude\/new-work-abc123/)
+      await expect(runs.fetch(one!.id)).rejects.toThrow(/cannot be attributed to its session.*claude\/new-work-abc123/)
       // Evidence is fetched without a destination: no ref of the project moves.
       expect(origin.state.calls).toContainEqual(['fetch', '--no-tags', '--no-write-fetch-head', 'origin', 'refs/heads/claude/new-work-abc123'])
       // The next commit is signed by the second session: it is that run's, and only that run's.
@@ -355,6 +366,8 @@ describe('cloud runs', () => {
         { ...base, ...wrong, id: 'cloud_threads', branchHint: threads, sessionId: 'session_01THREADS', sessionUrl: 'https://claude.ai/code/session_01THREADS' },
         { ...base, ...wrong, id: 'cloud_merged', branchHint: 'claude/merged-work', branch: 'claude/merged-work-zz9', headCommit: 'm1', prUrl: 'https://github.com/Empire024/conductor/pull/9', sessionId: 'session_01MERGED', sessionUrl: 'https://claude.ai/code/session_01MERGED', cwd: join(project, 'elsewhere') }
       ]))
+      // Each of the three took its start snapshot before anything was pushed.
+      for (const id of ['cloud_audit', 'cloud_timing', 'cloud_threads']) writeFileSync(join(root, `${id}.heads.json`), '[]')
       const origin = fakeOrigin()
       origin.state.refs = [`a1\trefs/heads/${audit}-y4xpuw`, 'a1\trefs/pull/41/head', `t2\trefs/heads/${timing}-3aqudf`]
       const runs = make({ git: origin.git })
@@ -366,6 +379,66 @@ describe('cloud runs', () => {
       expect(runs.get('cloud_threads')).toMatchObject({ status: 'running', branch: null, headCommit: null, prUrl: null, worktreePath: null, fetchedCommit: null })
       // A branch that fits its own hint and left origin (merged, deleted) stays the run's result.
       expect(runs.get('cloud_merged')).toMatchObject({ status: 'pushed', branch: 'claude/merged-work-zz9', prUrl: 'https://github.com/Empire024/conductor/pull/9' })
+    })
+
+    it('drops a retracted branch\'s pull request even when origin no longer has its ref, so fetch cannot bring the foreign result', async () => {
+      const at = Date.now()
+      const base = { projectId: 'p', workspaceId: 'w', title: 't', prompt: 'p', model: 'claude-opus-5-5', effort: null, ref: null, cwd: project, attached: false, liveView: false, confirmedModel: null, transcriptAt: null, transcriptEntries: 0, usage: null, startedBy: 'owner', createdAt: at, updatedAt: at, endedAt: null, exitCode: null, error: null }
+      const wrong = { status: 'pushed', branch: `${audit}-y4xpuw`, headCommit: 'a1', prUrl: 'https://github.com/Empire024/conductor/pull/41', worktreePath: null, fetchedCommit: null }
+      writeFileSync(join(root, 'runs.json'), JSON.stringify([
+        // The audit branch is still on origin, but pull request 41 was closed and its ref is gone.
+        { ...base, ...wrong, id: 'cloud_timing', branchHint: timing, sessionId: 'session_01TIMING', sessionUrl: 'https://claude.ai/code/session_01TIMING' },
+        // The audit branch is gone too (deleted after merge); it never fitted this run's hint.
+        { ...base, ...wrong, id: 'cloud_threads', branchHint: threads, sessionId: 'session_01THREADS', sessionUrl: 'https://claude.ai/code/session_01THREADS', cwd: join(project, 'elsewhere') }
+      ]))
+      for (const id of ['cloud_timing', 'cloud_threads']) writeFileSync(join(root, `${id}.heads.json`), '[]')
+      const origin = fakeOrigin()
+      origin.state.refs = [`a1\trefs/heads/${audit}-y4xpuw`]
+      const runs = make({ git: origin.git })
+      await until(() => runs.get('cloud_timing').status === 'running' && runs.get('cloud_threads').status === 'running', 'the retractions')
+      for (const id of ['cloud_timing', 'cloud_threads']) expect(runs.get(id)).toMatchObject({ branch: null, headCommit: null, prUrl: null })
+      await expect(runs.fetch('cloud_timing')).rejects.toThrow(new RegExp(`not pushed ${timing} \\(or it with a suffix\\) yet`))
+      expect(origin.state.calls.filter(args => args[0] === 'fetch' && args.some(arg => arg.includes('pull/41')))).toEqual([])
+    })
+
+    it('keeps a pull request the run\'s own client printed when its branch is retracted', async () => {
+      const origin = fakeOrigin()
+      const pr = 'https://github.com/Empire024/conductor/pull/77'
+      const runs = make({ git: origin.git, prefixArgs: [], spawn: scriptedCli({ solo: null }, { solo: `Opened ${pr}\r\n` }) })
+      const run = start(runs, { prompt: 'solo' })
+      await until(() => runs.get(run.id).status === 'running' && runs.get(run.id).prUrl === pr, 'the session and its printed pull request')
+      // The one new head, sequentially: the fallback takes it.
+      origin.state.refs = ['x1\trefs/heads/claude/solo-work-abc123']
+      await until(() => runs.get(run.id).status === 'pushed', 'the fallback claim')
+      // A second new head makes it ambiguous: the branch is retracted, the printed pull request stays.
+      origin.state.refs.push('y1\trefs/heads/claude/other-work-def456')
+      await until(() => runs.get(run.id).status === 'running', 'the retraction')
+      expect(runs.get(run.id)).toMatchObject({ branch: null, headCommit: null, prUrl: pr })
+    })
+
+    it('follows a run whose start snapshot is unknown only once its own session signs the branch', async () => {
+      const at = Date.now()
+      writeFileSync(join(root, 'runs.json'), JSON.stringify([{ projectId: 'p', workspaceId: 'w', title: 't', prompt: 'p', model: 'claude-opus-5-5', effort: null, ref: null, cwd: project, attached: false, liveView: false, confirmedModel: null, branchHint: 'claude/fix', branch: null, headCommit: null, prUrl: null, transcriptAt: null, transcriptEntries: 0, usage: null, worktreePath: null, fetchedCommit: null, startedBy: 'owner', createdAt: at, updatedAt: at, endedAt: null, exitCode: null, error: null, id: 'cloud_unknown', status: 'running', sessionId: 'session_01UNKNOWN', sessionUrl: 'https://claude.ai/code/session_01UNKNOWN' }]))
+      writeFileSync(join(root, 'cloud_unknown.heads.json'), 'null')
+      const origin = fakeOrigin()
+      // An earlier run with the same task left claude/fix-old111, signed by its own session.
+      origin.state.refs = ['s1\trefs/heads/claude/fix-old111', 's1\trefs/pull/5/head']
+      origin.state.messages.s1 = 'Old\n\nClaude-Session: https://claude.ai/code/session_01EARLIER\x1e'
+      const runs = make({ git: origin.git })
+      await until(() => origin.state.calls.some(args => args[0] === 'log' && args[4] === 's1'), 'the evidence look')
+      await settle(200)
+      expect(runs.get('cloud_unknown')).toMatchObject({ status: 'running', branch: null, prUrl: null })
+      // Unsigned commits on a matching branch are not enough either.
+      origin.state.refs = ['u1\trefs/heads/claude/fix-new222']
+      await until(() => origin.state.calls.some(args => args[0] === 'log' && args[4] === 'u1'), 'the second evidence look')
+      await settle(200)
+      expect(runs.get('cloud_unknown')).toMatchObject({ status: 'running', branch: null })
+      await expect(runs.fetch('cloud_unknown')).rejects.toThrow(/cannot be attributed to its session.*claude\/fix-new222/)
+      // Its session signs the next commit: now it is this run's.
+      origin.state.refs = ['u2\trefs/heads/claude/fix-new222']
+      origin.state.messages.u2 = 'New\n\nClaude-Session: https://claude.ai/code/session_01UNKNOWN\x1e'
+      await until(() => runs.get('cloud_unknown').status === 'pushed', 'the signed push')
+      expect(runs.get('cloud_unknown')).toMatchObject({ branch: 'claude/fix-new222', headCommit: 'u2' })
     })
   })
 
@@ -401,6 +474,8 @@ describe('cloud runs', () => {
       { ...base, id: 'cloud_a', status: 'running', attached: true, sessionId: 'session_01AAAAAAAAAAAA', sessionUrl: 'https://claude.ai/code/session_01AAAAAAAAAAAA' },
       { ...base, id: 'cloud_b', status: 'starting', attached: true, sessionId: null, sessionUrl: null }
     ]))
+    // cloud_a took its start snapshot before the session pushed (an unknown one is covered above).
+    writeFileSync(join(root, 'cloud_a.heads.json'), '[]')
     const origin = fakeOrigin()
     origin.state.refs = ['d4\trefs/heads/claude/x-1']
     const runs = make({ git: origin.git })
