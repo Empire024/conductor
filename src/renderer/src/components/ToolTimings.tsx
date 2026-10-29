@@ -4,7 +4,8 @@ import { formatToolMs, type DurationStats, type ToolTimingsReport } from '../../
 import './ToolTimings.css'
 
 /**
- * Settings → Usage: where tool-call time goes across every tab and provider (src/main/tool-timings.ts).
+ * Settings → Usage: where recorded structured tool-call time goes (src/main/tool-timings.ts). What is
+ * not recorded is stated beside the numbers, not behind them.
  * A time nobody measured shows as “n/a” with how many calls were measured, never as zero.
  */
 const WINDOWS = [{ label: 'Last hour', ms: 3_600_000 }, { label: 'Last 24 hours', ms: 86_400_000 }, { label: 'Last 7 days', ms: 7 * 86_400_000 }, { label: 'Everything kept', ms: 0 }] as const
@@ -33,7 +34,7 @@ export function ToolTimingsSetting(): React.JSX.Element {
   useEffect(load, [load])
 
   return <section className="tool-timings-setting" aria-label="Tool timings">
-    <div className="settings-section-title"><Timer size={14} /><div><strong>Tool timings</strong><span>How long each agent tool call took, across every tab and provider. p50 / p95.</span></div></div>
+    <div className="settings-section-title"><Timer size={14} /><div><strong>Tool timings</strong><span>Structured tool calls recorded from Claude, Codex, Grok and local-model tabs. p50 / p95; a time nobody measured shows as n/a.</span></div></div>
     <div className="tool-timings-controls">
       <select aria-label="Tool timings window" value={windowMs} onChange={event => setWindowMs(Number(event.target.value))}>
         {WINDOWS.map(choice => <option key={choice.label} value={choice.ms}>{choice.label}</option>)}
@@ -43,6 +44,7 @@ export function ToolTimingsSetting(): React.JSX.Element {
       </select>
       <button type="button" onClick={load} title="Refresh"><RefreshCw size={12} /> Refresh</button>
     </div>
+    <p className="tool-timings-scope">Not recorded: raw CLI-view tabs, cloud coworkers and conversations mirrored from another machine. Execution and approval wait are shown only where a provider or Conductor observed them.</p>
     {error && <p className="usage-cap-error">{error}</p>}
     {report && <>
       <p className="tool-timings-summary" data-calls={report.totals.calls}>
@@ -70,10 +72,10 @@ export function ToolTimingsSetting(): React.JSX.Element {
         <h4>Slowest calls</h4>
         <ul className="tool-timings-slowest">{report.slowest.slice(0, 5).map(record => <li key={record.key}>
           <span>{record.tool}</span><code title={record.args}>{record.args || '—'}</code>
-          <span title={record.elapsedMs !== null ? `elapsed (${record.elapsedSource})` : `execution (${record.execSource})`}>{formatToolMs(record.elapsedMs ?? record.execMs)}</span>
+          <span title={record.elapsedMs !== null ? `elapsed (${record.elapsedSource})` : `execution (${record.execSource}); elapsed not measured`}>{formatToolMs(record.elapsedMs ?? record.execMs)} <small>{record.elapsedMs !== null ? 'elapsed' : `exec · ${record.execSource}`}</small></span>
         </li>)}</ul>
       </>}
-      <details className="tool-timings-gaps"><summary>What is not measured</summary><ul>{report.gaps.map(gap => <li key={gap}>{gap}</li>)}</ul>
+      <details className="tool-timings-gaps" open><summary>What each provider cannot report</summary><ul>{report.gaps.map(gap => <li key={gap}>{gap}</li>)}</ul>
         <p>Kept: {report.storage.records} of {report.storage.capacity} calls for {report.storage.retentionDays} days; {report.storage.deduplicated} restated events dropped.</p></details>
     </>}
   </section>

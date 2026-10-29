@@ -55,18 +55,30 @@ try {
   await expect(section.locator('.tool-timings-summary')).toContainText('9 calls')
   await expect(section.locator('.tool-timings-summary')).toContainText('elapsed 0%')
   await expect(section.locator('tr[data-tool="PowerShell"] td').nth(3)).toHaveText('n/a')
+  // The headline claims recorded structured calls only, and says what is not recorded.
+  await expect(section.locator('.settings-section-title')).toContainText('Structured tool calls recorded')
+  await expect(section.locator('.tool-timings-scope')).toContainText('Not recorded: raw CLI-view tabs, cloud coworkers')
+  await expect(section.locator('.tool-timings-gaps')).toHaveAttribute('open', '')
+  await expect(section.locator('.tool-timings-slowest li').first()).toContainText('exec · provider')
   await section.scrollIntoViewIfNeeded()
   await page.screenshot({ path: join(output, 'settings-usage.png'), fullPage: true })
-  results.checks.push('Settings > Usage shows the breakdown, with unmeasured elapsed time as n/a')
+  results.checks.push('Settings > Usage shows the breakdown, unmeasured elapsed as n/a, exec labelled by source, and what is not recorded')
   assert.deepEqual(errors, [])
 
-  // Quit flushes; the next launch reads the same records back, once.
+  // Quit writes what was not yet durable to the exit file; the next launch merges it into the
+  // main file once and removes it, so each call is read back exactly once.
   await app.close()
-  const file = await readFile(join(root, 'profile', 'tool-timings', 'tool-timings.jsonl'), 'utf8')
-  assert.equal(file.trim().split('\n').length, 9)
+  const directory = join(root, 'profile', 'tool-timings')
+  const keysIn = async name => (await readFile(join(directory, name), 'utf8').catch(() => '')).split('\n').filter(Boolean).map(line => JSON.parse(line).key)
+  const written = [...await keysIn('tool-timings.jsonl'), ...await keysIn('tool-timings.exit.jsonl')]
+  assert.equal(new Set(written).size, 9)
   ;({ app, page } = await launch())
   await expect.poll(() => page.evaluate(() => window.conductor.toolTimings.report({}).then(report => report.totals.calls))).toBe(9)
-  results.checks.push('Records survive a restart without duplication')
+  await expect.poll(async () => (await keysIn('tool-timings.exit.jsonl')).length).toBe(0)
+  const merged = await keysIn('tool-timings.jsonl')
+  assert.equal(merged.length, 9)
+  assert.equal(new Set(merged).size, 9)
+  results.checks.push('Records survive a restart exactly once: the exit file is merged into the main file and removed')
 } catch (error) {
   results.failures.push(error.stack ?? String(error))
   await page.screenshot({ path: join(output, 'failed.png'), fullPage: true }).catch(() => {})

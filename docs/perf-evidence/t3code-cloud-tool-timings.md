@@ -94,8 +94,18 @@ non-finite, or more than 7 days is dropped and the record is noted `invalid-prov
 - **Overlapping tool ids.** Ids repeat across tabs and runtime incarnations (a local runtime's
   `call-1`, for example), and the key keeps those calls apart. `concurrent` records how many other
   calls of the same conversation were already in flight when a call started.
-- **Restarts.** On quit, `dispose()` writes every open call as `abandoned` (note `app-exit`)
-  synchronously. If the runtime host kept the provider running, the next process amends that same
+- **Restarts and quitting mid-write.** On quit, `dispose()` records every open call as `abandoned`
+  (note `app-exit`). It then synchronously writes every line that is not yet durable to
+  `tool-timings.exit.jsonl`: lines still pending, and lines held by an append that is queued or in
+  flight. It never writes to the main file, because a compaction may be renaming over it. Queued
+  steps that have not started become no-ops. The next `load()` runs on the same write queue. It reads
+  the main file and then the exit file, merges them by key with the exit file winning, and rewrites
+  the main file. It deletes the exit file only once that rewrite is durable. A line that is both in
+  the exit file and appended by a step already in flight is read as one record. Two regressions hold
+  this in place: a quit while a compaction `rename` is held, and a quit while an `appendFile` is
+  held. Both reopen and assert that every record appears exactly once, and both fail against the
+  earlier synchronous append to the main file.
+- **Resuming an abandoned call.** If the runtime host kept the provider running, the next process amends that same
   record when the terminal event arrives, even under a new runtime id. Elapsed is then wall-clock
   (bounded to 24 h, never negative) and labelled `wall-clock`. The record keeps its key, so the
   file's later line replaces the abandoned one on load, and a call is never counted twice. The new
@@ -110,20 +120,53 @@ non-finite, or more than 7 days is dropped and the record is noted `invalid-prov
   as such.
 - **Secret redaction.** Summaries pass through `maskToolText` and then the journal's `maskSecrets`
   (Bearer tokens; `sk-`/`ghp_` keys; api_key, token and password assignments; the control token;
-  registered 64-hex secrets). `maskToolText` adds URL credentials, AWS key ids, Slack tokens,
-  secret-named environment assignments and `--password/--token/--secret/--api-key` flags. For
-  structured inputs only keys are summarized, and a secret-looking key name has its value replaced.
-  Inputs are clipped *before* masking, so a huge input costs nothing extra. Failure lines are masked
-  the same way. Full inputs and outputs are never stored.
+  registered 64-hex secrets). `maskToolText` adds:
+  - URL credentials;
+  - secret-named query parameters (`?token=`, `&sig=`, `X-Amz-Signature=`, an OAuth `?code=`; the
+    name list is deliberately wide);
+  - `Cookie` and `Set-Cookie` header values, `--cookie` flags and session cookies (`sessionid=`,
+    `connect.sid=`, `csrftoken=`);
+  - quoted and unquoted secret assignments in any case (`password = '…'`,
+    `"client_secret": "…"`, `apiKey: "…"`, `auth_token=…`);
+  - AWS key ids, Slack tokens, and secret-named environment assignments;
+  - `--password/--token/--secret/--api-key` flags.
+
+  Every pattern is compiled once. Arguments and failure lines are clipped to 640 characters *before*
+  masking, which bounds the masker's cost: a 100,000-character adversarial line stays under 250 ms in
+  the test, including the patterns' backtracking. For structured inputs only keys are summarized,
+  and a secret-looking key name has its value replaced. Full inputs and outputs are never stored.
+  Synthetic dummy secrets are tested through the persisted JSONL and through the report. The journal's
+  own `maskSecrets` (structured-store) was left unchanged because it is outside timing scope; the
+  same gaps there are a candidate follow-up for the journal's owner.
 - **Bounded storage and retention.** There are 5,000 records in memory (with a trim slack of 1.1×),
   14-day retention, at most 2,000 open calls (beyond that the oldest is abandoned with note
-  `open-limit`), and reads cut at 16 MiB. The file is append-only JSONL with a version field. It is
-  rewritten atomically (tmp + rename) on load whenever it holds stale or extra lines, and when it
-  grows past 1.5× capacity. Corrupt and unknown-version lines are counted (`parseErrors`) and
-  skipped. Report lists are bounded: `limit` up to 50 and `recent` up to 100.
-- **Hot-path overhead.** Measured in `tool-timings.test.ts` on this container: **22 ns per non-tool
-  event** (a single type check) and **14.3 µs per tool call**, start plus end, including summarizing a
-  2 KB command. Writes are batched every 2 s and done off the event path; loading is asynchronous
+  `open-limit`). `load()` reads at most the newest 16 MiB of each file through a file handle, using
+  a positioned tail read with a buffer of exactly that size. It never reads the whole file. Bytes
+  read are reported as `loadedBytes`. When the read starts mid-file, the partial first line is cut
+  at the first newline *byte*, before decoding; a newline byte never occurs inside a UTF-8 sequence,
+  so a split character is dropped with its line. The file is append-only JSONL with a version field.
+  It is rewritten atomically (tmp + rename) during the load step itself, before any queued append can
+  land, in any of these cases:
+  - it was larger than the bound;
+  - its last line was torn by a crash mid-append;
+  - it held stale or extra lines;
+  - an exit file was present.
+
+  It is also rewritten when it grows past 1.5× capacity. A rewrite skips records whose line an append
+  still owes, so nothing is written twice. Corrupt and unknown-version lines are counted
+  (`parseErrors`) and skipped. Regression tests cover:
+  - a 20 MiB file, of which exactly 16 MiB is read, the newest records are kept, and the file is
+    rewritten to 5,000 valid lines;
+  - a UTF-8 character split at the tail boundary;
+  - a torn last line raced against an append;
+  - a single unterminated line larger than the bound.
+
+  The directory is created once per process; the flag resets after a failed write. Report lists are
+  bounded: `limit` up to 50 and `recent` up to 100.
+- **Hot-path overhead.** Measured in `tool-timings.test.ts` on this container, over several runs:
+  **23–31 ns per non-tool event** (a single type check) and **12–26 µs per tool call**, start plus
+  end, including summarizing and masking a 2 KB command. The 21 µs figure is the wider masker on an
+  idle container; 26 µs was measured while the full suite ran alongside. Writes are batched every 2 s and done off the event path; loading is asynchronous
   after the database is up. The recorder catches its own errors (`errors` counter) and never throws
   into the event pipeline.
 - **Privacy scoping.** Anonymous conversations are skipped, the same rule as memory and
@@ -168,14 +211,20 @@ Detached background work is excluded from latency unless `includeDetached` is se
 
 The "Tool timings" section in Settings → Usage, below Token burn, has:
 
+- A headline that claims only what is recorded: "Structured tool calls recorded from Claude, Codex,
+  Grok and local-model tabs". Directly under the filters, always visible, it says what is **not**
+  recorded: raw CLI-view tabs, cloud coworkers and conversations mirrored from another machine.
+  It also says that execution and approval wait are shown only where a provider or Conductor
+  observed them.
 - Window and provider filters, and a refresh button.
 - A summary with a coverage line.
 - A per-tool table showing elapsed, execution and approval wait as p50 / p95. It shows "n/a" when
   nothing was measured, and "(k/n)" when only some calls were.
 - Top offenders, with suggestion and evidence.
-- The five slowest calls, each labelled with whether its time is elapsed or execution and from
-  which source.
-- A disclosure listing what is not measured, and how much storage is held.
+- The five slowest calls, each labelled visibly with whether its time is elapsed or execution and
+  from which source (for example "4 ms exec · provider" when elapsed was not measured). There is no
+  derived wait/execution split.
+- A list, open by default, of what each provider cannot report, and how much storage is held.
 
 The screenshot from the smoke is `artifacts/tool-timings/settings-usage.png`, which git ignores.
 
@@ -208,32 +257,53 @@ The screenshot from the smoke is `artifacts/tool-timings/settings-usage.png`, wh
 
 - `npx tsc --noEmit` passes with no errors.
 - `npx vitest run src/shared/tool-timings.test.ts src/main/tool-timings.test.ts src/main/tool-timings.pipeline.test.ts`
-  runs 25 tests, all passing.
+  runs 34 tests, all passing. These include:
+  - the bounded-load regressions;
+  - the two quit-mid-write regressions;
+  - the redaction cases with synthetic dummy secrets, through the persisted JSONL and the report;
+  - the masker's bounded-cost check.
+
+  The bounded-load and quit-mid-write regressions were each confirmed to fail against the code they
+  replace: 4 of 4 bounded-load tests fail against the original whole-file `readFile`, and 2 of 2
+  quit tests fail against the earlier synchronous append to the main file.
 - `npx vitest run src/main/agent-control.test.ts -t tools.timings` passes. It covers project scoping,
   the owner/wizard `"*"`, argument validation, the read-lane class, `tools.list` advertising, and the
   not-wired message.
-- Full `npx vitest run` in this Linux container: 6,336 passed, 17 failed. Breakdown of the 17:
-  - **15 also fail on the untouched base `3f95349`.** They depend on the host: where.exe/PATHEXT
-    lookup, icacls ACL repair, IPv6 relay, Python and pip path policy, process-kill timing, and the
-    approval and wizard listings that rely on them.
-  - **1 was a race.** `production/browser.test.ts > maxRequests` failed once under full-suite load
-    but passes 3 of 3 runs on its own; it touches nothing changed here.
-  - **1 was a race.** The new tool-timings case was picked up mid-edit; it passes now.
+- Full `npx vitest run` in this Linux container, on the final implementation: 6,347 passed,
+  **15 failed**, 78 skipped. The 15 are, by name, exactly the 15 that fail on the untouched base
+  `3f95349` in this container (checked in a clean worktree). They depend on the host:
+  where.exe/PATHEXT lookup, icacls ACL repair, IPv6 relay, Python and pip path policy,
+  process-kill timing, and the approval and wizard listings that rely on them.
 
-  The owner's Windows machine is the authoritative run for the host-specific tests.
+  **This is not a full-green run.** The owner's Windows machine is the authoritative run for those
+  tests. An earlier run of the first increment had 2 more failures: one load-sensitive production
+  browser test that passes 3 of 3 runs on its own, and one tool-timings test picked up mid-edit.
+  Neither recurred.
 - `npx electron-vite build`, then `ELECTRON_DISABLE_SANDBOX=1 xvfb-run -a node scripts/smoke-tool-timings.mjs`
   passes. It drives the parked window (`CONDUCTOR_TEST_USER_DATA`, offline) through the synthetic
   Codex scenario `synthetic:activity-groups` and checks that:
   - 9 calls are recorded, with exec = 4 ms from the provider, elapsed and wait null, and coverage 0 / 0 / 1;
   - there is 1 failure, with exit code 2;
-  - Settings → Usage shows "9 calls", with elapsed "n/a";
-  - after a quit and relaunch, the same 9 records load exactly once.
+  - Settings → Usage shows "9 calls", with elapsed "n/a" and "exec · provider";
+  - the headline claims only recorded structured calls, the not-recorded line is visible, and the
+    gaps list is open;
+  - after a quit and relaunch, the same 9 records load exactly once, the exit file is merged into
+    the main file and removed, and the main file holds 9 unique keys.
 
   `ELECTRON_DISABLE_SANDBOX` is set only because this Linux container runs as root.
 - On the owner's machine, run `npm run build && node scripts/smoke-tool-timings.mjs`. The window is
   parked, so it never takes the desktop.
 
 ## Integration plan and patch notes
+
+**Exact patch.** `docs/perf-evidence/t3code-cloud-tool-timings-integration.patch` is the exact
+`git diff` from base `3f95349` to the final implementation commit. That commit's SHA is in the
+patch's header lines; the header is ignored by `git apply` and `patch`. The patch excludes itself,
+and it contains no binaries (`artifacts/` is git-ignored). To apply it in a checkout that contains
+`3f95349`, run `git apply --3way docs/perf-evidence/t3code-cloud-tool-timings-integration.patch`.
+Where git cannot be run, it is a plain unified diff with `a/` and `b/` prefixes. Every hunk in a
+shared file is small, so apply those hunks by hand from the table below. That keeps the newer local
+async/IPC code and the root output-download hooks around them. Take the new files whole.
 
 The new files have no conflicts. Each shared-file hunk below is minimal and anchored, so if the
 92-commit-ahead checkout has moved a line, it can be re-applied by searching for the anchor.
@@ -269,6 +339,11 @@ The new files have no conflicts. Each shared-file hunk below is minimal and anch
   - `src/renderer/src/components/ToolTimings.css`
   - `scripts/smoke-tool-timings.mjs`
   - `docs/perf-evidence/t3code-cloud-tool-timings.md`
+  - `docs/perf-evidence/t3code-cloud-tool-timings-integration.patch` (for reference; it is not
+    application code)
 - Every file in the hunk table above.
+
+At runtime the recorder writes `<userData>/tool-timings/tool-timings.jsonl`, plus
+`tool-timings.exit.jsonl` between a quit and the next load.
 
 If `app.update` smokes are requested for acceptance, add `smoke-tool-timings`.

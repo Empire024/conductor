@@ -10,6 +10,7 @@
 }
 .tool-timings-controls button { display: inline-flex; align-items: center; gap: 4px; color: var(--accent-muted); }
 .tool-timings-summary { margin: 6px 0; color: var(--text-2); }
+.tool-timings-scope { margin: 4px 0; color: var(--text-3); font-size: 8px; line-height: 1.4; }
 .tool-timings-summary small, .tool-timings-stat small { color: var(--text-3); }
 .tool-timings-empty { color: var(--text-3); }
 .tool-timings-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; margin: 6px 0; color: var(--text-2); font-size: 8.5px; }

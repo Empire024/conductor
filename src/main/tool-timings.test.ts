@@ -1,4 +1,5 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFile, rename } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -9,9 +10,9 @@ const dirs: string[] = []
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }) })
 const tempDir = (): string => { const dir = mkdtempSync(join(tmpdir(), 'tool-timings-')); dirs.push(dir); return dir }
 
-function harness(options: { directory?: string; capacity?: number; retentionMs?: number; wall?: number } = {}) {
+function harness(options: { directory?: string; capacity?: number; retentionMs?: number; wall?: number; maxReadBytes?: number } = {}) {
   const clock = { mono: 1_000, wall: options.wall ?? Date.parse('2026-10-29T10:00:00.000Z') }
-  const recorder = new ToolTimingRecorder({ directory: options.directory, capacity: options.capacity, retentionMs: options.retentionMs, flushMs: 60_000, now: () => clock.mono, wallNow: () => clock.wall, mask: text => text.replace(/hunter2/g, '[REDACTED]') })
+  const recorder = new ToolTimingRecorder({ directory: options.directory, capacity: options.capacity, retentionMs: options.retentionMs, maxReadBytes: options.maxReadBytes, flushMs: 60_000, now: () => clock.mono, wallNow: () => clock.wall, mask: text => text.replace(/hunter2/g, '[REDACTED]') })
   let n = 0
   const tool = (itemId: string, status: Extract<AgentEventData, { type: 'tool' }>['status'], extra: Partial<Extract<AgentEventData, { type: 'tool' }>> = {}, at: { sessionId?: string; runtimeId?: string; provider?: string; projectId?: string } = {}) =>
     recorder.observe({ id: `e${++n}`, sessionId: at.sessionId ?? 's1', runtimeId: at.runtimeId ?? 'r1', provider: (at.provider ?? 'claude') as never, projectId: at.projectId ?? 'p1', itemId, timestamp: new Date(clock.wall).toISOString(), data: { type: 'tool', name: 'Bash', status, ...extra } }, 'opus')
@@ -156,6 +157,160 @@ describe('ToolTimingRecorder', () => {
     const lines = readFileSync(join(directory, 'tool-timings.jsonl'), 'utf8').trim().split('\n')
     expect(lines.length).toBeLessThanOrEqual(15)
     expect(lines.every(line => parseRecord(line))).toBe(true)
+  })
+
+  describe('loading a damaged or oversized file', () => {
+    const now = Date.parse('2026-10-29T10:00:00.000Z')
+    const line = (key: string, args = '', endedAt = new Date(now - 60_000).toISOString()): string => JSON.stringify({ v: 1, key, agentSessionId: 's', projectId: 'p', provider: 'codex', runtimeId: 'r', itemId: key, tool: 'Bash', category: 'shell', args, startedAt: null, endedAt, elapsedMs: null, elapsedSource: 'unavailable', waitMs: null, waitSource: 'unavailable', execMs: 4, execSource: 'provider', prepareMs: null, outcome: 'completed', concurrent: 0 })
+    const fileOf = (directory: string): string => join(directory, 'tool-timings.jsonl')
+    const lines = (directory: string): string[] => readFileSync(fileOf(directory), 'utf8').split('\n').filter(Boolean)
+
+    it('reads only the newest 16 MiB of a 20 MiB file, keeps its recent records and rewrites it under the bound', async () => {
+      const directory = tempDir()
+      // 4 MiB of garbage a whole-file read would pull in, then just over 16 MiB of valid records,
+      // so the newest 16 MiB hold valid records only (after the partial first line).
+      const garbage = ('x'.repeat(1023) + '\n').repeat(4 * 1024)
+      const lineBytes = Buffer.byteLength(line('k00000', 'a'.repeat(700))) + 1
+      const count = Math.ceil(16.5 * 1024 * 1024 / lineBytes)
+      const valid = Array.from({ length: count }, (_, index) => line(`k${String(index).padStart(5, '0')}`, 'a'.repeat(700))).join('\n') + '\n'
+      writeFileSync(fileOf(directory), garbage + valid)
+      expect(Buffer.byteLength(garbage + valid)).toBeGreaterThan(20 * 1024 * 1024)
+      const last = (offset: number): string => `k${String(count - 1 - offset).padStart(5, '0')}`
+      const { recorder } = harness({ directory, capacity: 5000, wall: now })
+      await recorder.load()
+      expect(recorder.loadedBytes).toBeLessThanOrEqual(16 * 1024 * 1024)
+      expect(recorder.loadedBytes).toBe(16 * 1024 * 1024)
+      const report = recorder.report({ recent: 3 })
+      expect(report.recent.map(record => record.key)).toEqual([last(0), last(1), last(2)])
+      expect(report.storage).toMatchObject({ records: 5000, parseErrors: 0 })
+      await recorder.flush()
+      const kept = lines(directory)
+      expect(kept).toHaveLength(5000)
+      expect(kept.every(text => parseRecord(text))).toBe(true)
+      expect(kept.at(-1)).toContain(`"${last(0)}"`)
+    })
+
+    it('drops a UTF-8 character split at the tail boundary with its partial line', async () => {
+      const directory = tempDir()
+      const first = line('first', 'café ✓ ünïcode'), second = line('second', 'naïve → ok'), third = line('third', 'emoji 😀 end')
+      const content = [first, second, third].join('\n') + '\n'
+      writeFileSync(fileOf(directory), content)
+      // Start reading on the second byte of the first line's 2-byte “é”.
+      const start = Buffer.from(content).indexOf(Buffer.from('é')) + 1
+      const { recorder } = harness({ directory, wall: now, maxReadBytes: Buffer.byteLength(content) - start })
+      await recorder.load()
+      expect(recorder.loadedBytes).toBe(Buffer.byteLength(content) - start)
+      const report = recorder.report({ recent: 10 })
+      expect(report.recent.map(record => [record.key, record.args])).toEqual([['third', 'emoji 😀 end'], ['second', 'naïve → ok']])
+      expect(report.storage.parseErrors).toBe(0)
+      await recorder.flush()
+      expect(lines(directory).map(text => parseRecord(text)?.key)).toEqual(['second', 'third'])
+    })
+
+    it('heals a line torn by a crash before an append can land on it, counting it as one parse error', async () => {
+      const directory = tempDir()
+      writeFileSync(fileOf(directory), line('kept') + '\n' + line('torn').slice(0, 40))
+      const { recorder, tool } = harness({ directory, wall: now })
+      const loading = recorder.load()
+      // Observed and flushed while the load is still pending: the append must queue behind it.
+      tool('fresh', 'completed', { durationMs: 3 })
+      const flushed = recorder.flush()
+      await loading
+      // Healed inside the load step, before the queued append: whole lines only, and the fresh
+      // record left to that append rather than written twice.
+      const healed = readFileSync(fileOf(directory), 'utf8')
+      expect(healed.endsWith('\n')).toBe(true)
+      expect(healed.split('\n').filter(Boolean).map(text => parseRecord(text)?.key)).toEqual(['kept'])
+      await flushed
+      await recorder.flush()
+      const keys = lines(directory).map(text => parseRecord(text)?.key)
+      expect(keys).toEqual([expect.stringContaining('kept'), expect.stringContaining('fresh')])
+      expect(recorder.report().storage.parseErrors).toBe(1)
+      expect(recorder.errors).toBe(0)
+    })
+
+    it('survives a file that is one unterminated line larger than the read bound', async () => {
+      const directory = tempDir()
+      writeFileSync(fileOf(directory), 'y'.repeat(4096))
+      const { recorder } = harness({ directory, wall: now, maxReadBytes: 1024 })
+      await recorder.load()
+      expect(recorder.loadedBytes).toBe(1024)
+      expect(recorder.report().storage).toMatchObject({ records: 0, parseErrors: 0 })
+      await recorder.flush()
+      expect(readFileSync(fileOf(directory), 'utf8')).toBe('')
+    })
+  })
+
+  it('persists and reports no secret from arguments or failure output (synthetic dummies)', async () => {
+    const directory = tempDir()
+    const { recorder, tool } = harness({ directory })
+    tool('q', 'completed', { input: { command: 'curl "https://example.test/a?token=dummyZq1&x=1" -H "Cookie: sessionid=dummyZq2"' } })
+    tool('j', 'completed', { input: { url: 'https://example.test/cb?code=dummyZq3' } })
+    tool('f', 'failed', { input: { command: 'deploy' }, output: 'step 1\nError: rejected {"client_secret": "dummyZq4"} at https://u:dummyZq5@example.test\n' })
+    await recorder.flush()
+    const persisted = readFileSync(join(directory, 'tool-timings.jsonl'), 'utf8')
+    const reported = JSON.stringify(recorder.report({ recent: 10 }))
+    for (const secret of ['dummyZq1', 'dummyZq2', 'dummyZq3', 'dummyZq4', 'dummyZq5']) {
+      expect(persisted).not.toContain(secret)
+      expect(reported).not.toContain(secret)
+    }
+    expect(persisted).toContain('curl \\"https://example.test/a?token=[REDACTED]&x=1\\"')
+  })
+
+  describe('quitting while a write is in flight', () => {
+    const gate = () => {
+      let release!: () => void, started!: () => void
+      const opened = new Promise<void>(resolve => { release = resolve })
+      const reached = new Promise<void>(resolve => { started = resolve })
+      return { release, reached, hold: async () => { started(); await opened } }
+    }
+    const keysOf = (report: { recent: Array<{ itemId: string; outcome: string }> }) => report.recent.map(record => `${record.itemId}:${record.outcome}`).sort()
+
+    it('keeps every record exactly once when the quit lands while a compaction rename is held', async () => {
+      const directory = tempDir()
+      const held = gate()
+      const recorder = new ToolTimingRecorder({ directory, capacity: 4, flushMs: 60_000, now: () => 0, io: { rename: (async (from: string, to: string) => { await held.hold(); return rename(from, to) }) as typeof rename } })
+      const tool = (itemId: string, status: 'running' | 'completed') => recorder.observe({ id: itemId, sessionId: 's', runtimeId: 'r', provider: 'codex', projectId: 'p', itemId, timestamp: '', data: { type: 'tool', name: 'Bash', status } })
+      for (let index = 0; index < 7; index++) tool(`c${index}`, 'completed')
+      // Seven lines into a file bounded at 4 × 1.5: the append is followed by a compaction.
+      const writing = recorder.flush()
+      await held.reached
+      tool('c7', 'completed'); tool('c8', 'completed'); tool('live', 'running')
+      recorder.dispose()
+      held.release()
+      await writing
+
+      const next = new ToolTimingRecorder({ directory, capacity: 100 })
+      await next.load()
+      expect(keysOf(next.report({ recent: 100 }))).toEqual(['c3:completed', 'c4:completed', 'c5:completed', 'c6:completed', 'c7:completed', 'c8:completed', 'live:abandoned'])
+      expect(existsSync(join(directory, 'tool-timings.exit.jsonl'))).toBe(false)
+      const durable = readFileSync(join(directory, 'tool-timings.jsonl'), 'utf8').split('\n').filter(Boolean).map(text => parseRecord(text)!.itemId)
+      expect(durable.sort()).toEqual(['c3', 'c4', 'c5', 'c6', 'c7', 'c8', 'live'])
+    })
+
+    it('keeps every record exactly once when the quit lands while an append is held, and skips steps not yet started', async () => {
+      const directory = tempDir()
+      const held = gate()
+      let appends = 0
+      const recorder = new ToolTimingRecorder({ directory, flushMs: 60_000, now: () => 0, io: { appendFile: (async (...args: Parameters<typeof appendFile>) => { appends++; await held.hold(); return appendFile(...args) }) as typeof appendFile } })
+      const tool = (itemId: string, status: 'running' | 'completed') => recorder.observe({ id: itemId, sessionId: 's', runtimeId: 'r', provider: 'codex', projectId: 'p', itemId, timestamp: '', data: { type: 'tool', name: 'Bash', status } })
+      tool('a0', 'completed'); tool('a1', 'completed')
+      const first = recorder.flush()
+      await held.reached
+      tool('a2', 'completed')
+      const second = recorder.flush()
+      tool('open', 'running')
+      recorder.dispose()
+      held.release()
+      await first; await second
+      expect(appends).toBe(1)
+
+      const next = new ToolTimingRecorder({ directory })
+      await next.load()
+      expect(keysOf(next.report({ recent: 100 }))).toEqual(['a0:completed', 'a1:completed', 'a2:completed', 'open:abandoned'])
+      expect(readFileSync(join(directory, 'tool-timings.jsonl'), 'utf8').split('\n').filter(Boolean)).toHaveLength(4)
+      expect(existsSync(join(directory, 'tool-timings.exit.jsonl'))).toBe(false)
+    })
   })
 
   it('caps open calls: the oldest becomes abandoned rather than growing without bound', () => {

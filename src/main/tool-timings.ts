@@ -1,6 +1,6 @@
 import type { IpcMain, IpcMainInvokeEvent } from 'electron'
 import { appendFileSync, mkdirSync } from 'node:fs'
-import { appendFile, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, open, rename, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import type { AgentEvent, ActivityStatus } from '../shared/structured-agent'
@@ -25,6 +25,9 @@ const DAY_MS = 24 * 60 * 60 * 1000
 /** A provider duration beyond this is a unit or clock error, not a measurement. */
 const MAX_PROVIDER_MS = 7 * DAY_MS
 const FILE = 'tool-timings.jsonl'
+/** Written only synchronously by dispose() and merged by the next load(): no async compaction ever
+ *  renames over it, so what a quit writes there cannot be lost to a rewrite still in flight. */
+const EXIT_FILE = 'tool-timings.exit.jsonl'
 const MAX_READ_BYTES = 16 * 1024 * 1024
 
 export interface ToolTimingsOptions {
@@ -34,11 +37,15 @@ export interface ToolTimingsOptions {
   retentionMs?: number
   maxOpen?: number
   flushMs?: number
+  /** Most bytes load() reads, from the end of the file; default 16 MiB. */
+  maxReadBytes?: number
   /** Monotonic milliseconds. */
   now?: () => number
   wallNow?: () => number
   /** The journal's secret masker (structured-store maskSecrets), applied to every summary. */
   mask?: (text: string) => string
+  /** The asynchronous file operations, replaceable so a test can hold one mid-flight. */
+  io?: Partial<{ appendFile: typeof appendFile; writeFile: typeof writeFile; rename: typeof rename }>
 }
 
 interface OpenCall {
@@ -59,6 +66,8 @@ export class ToolTimingRecorder {
   private readonly retentionMs: number
   private readonly maxOpen: number
   private readonly flushMs: number
+  private readonly maxReadBytes: number
+  private directoryReady = false
   private readonly now: () => number
   private readonly wallNow: () => number
   private readonly mask: (text: string) => string
@@ -71,7 +80,11 @@ export class ToolTimingRecorder {
   private readonly aliases = new WeakMap<ToolTimingRecord, string>()
   private readonly open = new Map<string, OpenCall>()
   private readonly inFlight = new Map<string, number>()
-  private pending: string[] = []
+  private pending: Array<{ key: string; line: string }> = []
+  /** Keys whose line is pending or on its way to the file, with their newest line: a rewrite leaves
+   *  them to that append, and dispose() writes exactly these to the exit file. */
+  private readonly unwritten = new Map<string, { count: number; line: string }>()
+  private readonly io: { appendFile: typeof appendFile; writeFile: typeof writeFile; rename: typeof rename }
   private timer: NodeJS.Timeout | undefined
   private writes: Promise<void> = Promise.resolve()
   private fileLines = 0
@@ -81,33 +94,69 @@ export class ToolTimingRecorder {
   private disposed = false
   /** Failures inside the recorder itself: it never breaks the event pipeline it observes. */
   errors = 0
+  /** Bytes the last load() read: never more than maxReadBytes. */
+  loadedBytes = 0
 
   constructor(private readonly options: ToolTimingsOptions = {}) {
     this.capacity = options.capacity ?? 5000
     this.retentionMs = options.retentionMs ?? 14 * DAY_MS
     this.maxOpen = options.maxOpen ?? 2000
     this.flushMs = options.flushMs ?? 2000
+    this.maxReadBytes = Math.max(1, Math.floor(options.maxReadBytes ?? MAX_READ_BYTES))
     this.now = options.now ?? (() => performance.now())
     this.wallNow = options.wallNow ?? Date.now
     this.mask = options.mask ?? (text => text)
+    this.io = { appendFile, writeFile, rename, ...options.io }
   }
 
   private get file(): string | undefined { return this.options.directory ? join(this.options.directory, FILE) : undefined }
+  private get exitFile(): string | undefined { return this.options.directory ? join(this.options.directory, EXIT_FILE) : undefined }
 
-  /** Read what earlier processes recorded. Calls observed meanwhile are kept and win on a clash. */
-  async load(): Promise<void> {
-    const file = this.file
-    if (!file) return
-    let text = ''
+  /** The newest `maxReadBytes` of a file, whole lines only; null when it does not exist. */
+  private async readTail(path: string): Promise<{ text: string; truncated: boolean } | null> {
+    let handle
+    try { handle = await open(path, 'r') } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error }
     try {
-      const size = (await stat(file)).size
-      const raw = await readFile(file)
-      text = (size > MAX_READ_BYTES ? raw.subarray(raw.length - MAX_READ_BYTES) : raw).toString('utf8')
-      if (size > MAX_READ_BYTES) text = text.slice(text.indexOf('\n') + 1)
-    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') this.errors++; return }
+      const size = (await handle.stat()).size, length = Math.min(size, this.maxReadBytes)
+      const buffer = Buffer.alloc(length)
+      let read = 0
+      while (read < length) {
+        const { bytesRead } = await handle.read(buffer, read, length - read, size - length + read)
+        if (!bytesRead) break
+        read += bytesRead
+      }
+      this.loadedBytes += read
+      let bytes = buffer.subarray(0, read)
+      const truncated = size > length
+      // Cut at a newline byte, which never occurs inside a UTF-8 sequence: the partial first
+      // line, and any split character with it, is dropped before decoding.
+      if (truncated) { const newline = bytes.indexOf(0x0a); bytes = bytes.subarray(newline < 0 ? bytes.length : newline + 1) }
+      return { text: bytes.toString('utf8'), truncated }
+    } finally { await handle.close() }
+  }
+
+  /** Read what earlier processes recorded. Calls observed meanwhile are kept and win on a clash.
+   *  Runs on the write queue, so no append lands on a torn last line before compaction heals it. */
+  load(): Promise<void> {
+    // Never rejects: index.ts starts it with `void`.
+    this.writes = this.writes.then(() => this.loadTail()).catch(() => { this.errors++ })
+    return this.writes
+  }
+
+  private async loadTail(): Promise<void> {
+    const file = this.file, exitFile = this.exitFile
+    if (!file || !exitFile) return
+    this.loadedBytes = 0
+    let main: { text: string; truncated: boolean } | null, exit: { text: string; truncated: boolean } | null
+    // Only the newest `maxReadBytes` of each file are ever read, however large it grew.
+    try { [main, exit] = [await this.readTail(file), await this.readTail(exitFile)] } catch { this.errors++; return }
+    if (!main && !exit) return
+    // A last line without its newline was cut off by a crash mid-append.
+    const torn = Boolean(main?.text && !main.text.endsWith('\n'))
     const cutoff = this.wallNow() - this.retentionMs, loaded = new Map<string, ToolTimingRecord>()
     let lines = 0
-    for (const line of text.split('\n')) {
+    // The exit file is read last: what a quit wrote there is newer than anything in the main file.
+    for (const line of [...(main?.text ?? '').split('\n'), ...(exit?.text ?? '').split('\n')]) {
       if (!line.trim()) continue
       lines++
       const record = parseRecord(line)
@@ -123,7 +172,15 @@ export class ToolTimingRecorder {
     for (const record of keep) this.index(record)
     this.records = [...keep, ...this.records]
     this.fileLines = lines
-    if (lines > keep.length) this.compact()
+    // An oversized, torn or partly stale file, or one with a quit's lines beside it, is rewritten
+    // from what was kept inside this queued step, so it is whole, merged and under the bound before
+    // any queued append lands on it. The exit file goes only once that rewrite is durable.
+    if (main?.truncated || torn || lines > keep.length || exit) {
+      try {
+        await this.rewrite()
+        if (exit) await unlink(exitFile).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error })
+      } catch { this.errors++; this.directoryReady = false }
+    }
   }
 
   observe(event: Observed, model?: string): void {
@@ -306,7 +363,8 @@ export class ToolTimingRecorder {
       }
     }
     if (!this.file) return
-    this.pending.push(JSON.stringify({ v: 1, ...record }))
+    this.pending.push({ key: record.key, line: JSON.stringify({ v: 1, ...record }) })
+    this.unwritten.set(record.key, { count: (this.unwritten.get(record.key)?.count ?? 0) + 1, line: this.pending.at(-1)!.line })
     if (!this.timer) { this.timer = setTimeout(() => { this.timer = undefined; this.flush() }, this.flushMs); this.timer.unref?.() }
   }
 
@@ -317,27 +375,35 @@ export class ToolTimingRecorder {
     const lines = this.pending
     this.pending = []
     this.writes = this.writes.then(async () => {
-      await mkdir(this.options.directory!, { recursive: true })
-      await appendFile(file, lines.join('\n') + '\n')
-      this.fileLines += lines.length
-    }).catch(() => { this.errors++ })
+      // After dispose() these lines are already in the exit file.
+      if (this.disposed) return
+      try {
+        if (!this.directoryReady) { await mkdir(this.options.directory!, { recursive: true }); this.directoryReady = true }
+        await this.io.appendFile(file, lines.map(entry => entry.line).join('\n') + '\n')
+        this.fileLines += lines.length
+      } finally {
+        for (const { key } of lines) { const entry = this.unwritten.get(key); if (entry && entry.count > 1) entry.count--; else this.unwritten.delete(key) }
+      }
+    }).catch(() => { this.errors++; this.directoryReady = false })
     if (this.fileLines + lines.length > this.capacity * 1.5) this.compact()
     return this.writes
   }
 
   private compact(): void {
+    if (!this.file) return
+    this.writes = this.writes.then(() => this.rewrite()).catch(() => { this.errors++; this.directoryReady = false })
+  }
+
+  /** The file rewritten from the kept records; a record whose line an append still owes is left to it. */
+  private async rewrite(): Promise<void> {
     const file = this.file
-    if (!file) return
-    this.writes = this.writes.then(async () => {
-      const cutoff = this.wallNow() - this.retentionMs
-      const keep = this.records.filter(record => Date.parse(record.endedAt) >= cutoff)
-      const pending = new Set(this.pending)
-      const lines = keep.map(record => JSON.stringify({ v: 1, ...record })).filter(line => !pending.has(line))
-      await mkdir(this.options.directory!, { recursive: true })
-      await writeFile(file + '.tmp', lines.length ? lines.join('\n') + '\n' : '')
-      await rename(file + '.tmp', file)
-      this.fileLines = lines.length
-    }).catch(() => { this.errors++ })
+    if (!file || this.disposed) return
+    const cutoff = this.wallNow() - this.retentionMs
+    const lines = this.records.filter(record => Date.parse(record.endedAt) >= cutoff && !this.unwritten.has(record.key)).map(record => JSON.stringify({ v: 1, ...record }))
+    if (!this.directoryReady) { await mkdir(this.options.directory!, { recursive: true }); this.directoryReady = true }
+    await this.io.writeFile(file + '.tmp', lines.length ? lines.join('\n') + '\n' : '')
+    await this.io.rename(file + '.tmp', file)
+    this.fileLines = lines.length
   }
 
   report(query: ToolTimingsQuery = {}): ToolTimingsReport {
@@ -351,18 +417,22 @@ export class ToolTimingRecorder {
   }
 
   /** On quit: calls still running are written as abandoned, so a runtime the host keeps running can
-   *  still end them in the next process; then every pending line is written synchronously. */
+   *  still end them in the next process. Every line not yet durable (pending, or held by an append
+   *  still queued or in flight) is written synchronously to the exit file, never to the main file a
+   *  compaction may be renaming over; queued steps that have not started become no-ops. A line both
+   *  there and appended by a step already in flight is one record: the next load merges by key. */
   dispose(): void {
     if (this.disposed) return
     const mono = this.now()
     for (const call of [...this.open.values()]) this.abandon(call, mono, 'app-exit')
     this.disposed = true
     if (this.timer) { clearTimeout(this.timer); this.timer = undefined }
-    const file = this.file
-    if (file && this.pending.length) {
-      try { mkdirSync(this.options.directory!, { recursive: true }); appendFileSync(file, this.pending.join('\n') + '\n') } catch { this.errors++ }
-      this.pending = []
+    const exitFile = this.exitFile
+    const lines = [...this.unwritten.values()].map(entry => entry.line)
+    if (exitFile && lines.length) {
+      try { mkdirSync(this.options.directory!, { recursive: true }); appendFileSync(exitFile, lines.join('\n') + '\n') } catch { this.errors++ }
     }
+    this.pending = []
   }
 }
 

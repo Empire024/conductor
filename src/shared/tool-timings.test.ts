@@ -28,6 +28,41 @@ describe('summarizeToolArgs', () => {
     expect(maskToolText('xoxb-123456789012-abc')).toBe('[REDACTED]')
   })
 
+  it('masks secret query parameters, cookies, session cookies and quoted assignments (synthetic dummies)', () => {
+    const cases: Array<[string, string]> = [
+      ['curl "https://api.example.test/v1/items?limit=5&token=dummyQ1&page=2"', 'dummyQ1'],
+      ['wget https://example.test/cb?code=dummyOAuthCode9#frag', 'dummyOAuthCode9'],
+      ['https://example.test/x?X-Amz-Signature=dummySig77&ok=1', 'dummySig77'],
+      ['curl -H "Cookie: sessionid=dummyS3ss; theme=dark" https://example.test', 'dummyS3ss'],
+      ['curl -H "Cookie: theme=dark; csrftoken=dummyCsrf1" https://example.test', 'dummyCsrf1'],
+      ['curl --cookie "connect.sid=dummyConn2" https://example.test', 'dummyConn2'],
+      ['Set-Cookie: __Host-session=dummyHost3; Path=/; Secure', 'dummyHost3'],
+      ['node -e "const password = \'dummyPw 4\'"', 'dummyPw 4'],
+      ['echo {"client_secret": "dummyCs5", "name": "ok"}', 'dummyCs5'],
+      ['config: apiKey: "dummyAk6"', 'dummyAk6'],
+      ['export SESSION_TOKEN=\'dummyEnv7\'', 'dummyEnv7'],
+      ['python run.py --api-key dummyFlag8', 'dummyFlag8'],
+      ['auth_token=dummyBare9 npm start', 'dummyBare9']
+    ]
+    for (const [text, secret] of cases) {
+      const masked = maskToolText(text)
+      expect(masked, text).not.toContain(secret)
+      expect(masked, text).toContain('[REDACTED]')
+    }
+    // Non-secret context survives: the command and the harmless parameters.
+    expect(maskToolText('curl "https://api.example.test/v1/items?limit=5&token=dummyQ1&page=2"')).toBe('curl "https://api.example.test/v1/items?limit=5&token=[REDACTED]&page=2"')
+    expect(maskToolText('Error: process exited with code: 2')).toBe('Error: process exited with code: 2')
+    expect(summarizeToolError('fatal: GET https://example.test/repo?access_token=dummyT0k failed', undefined)).toBe('fatal: GET https://example.test/repo?access_token=[REDACTED] failed')
+  })
+
+  it('keeps masking cheap on a long adversarial line', () => {
+    const word = 'a'.repeat(100_000)
+    const started = performance.now()
+    expect(summarizeToolError(word, undefined)!.length).toBeLessThanOrEqual(160)
+    expect(summarizeToolArgs('Bash', { command: `x ${word}=1` }).length).toBeLessThanOrEqual(160)
+    expect(performance.now() - started).toBeLessThan(250)
+  })
+
   it('names the meaningful line of a failure', () => {
     expect(summarizeToolError('compiling\nError: Cannot find module x\n  at y', undefined)).toBe('Error: Cannot find module x')
     expect(summarizeToolError('done', 'warning\nfatal: permission denied')).toBe('fatal: permission denied')

@@ -1,6 +1,7 @@
 /**
  * Tool-call timing analysis (docs/perf-evidence/t3code-cloud-tool-timings.md): how long each
- * agent tool call took, across every tab and provider, with the parts of that time a provider or
+ * structured agent tool call took (Claude, Codex, Grok and local-model tabs; raw CLI-view tabs,
+ * cloud coworkers and mirrored remote conversations are not recorded), with the parts of that time a provider or
  * Conductor actually observed. Pure: the recorder (src/main/tool-timings.ts), the tools.timings
  * control method and the Settings → Usage breakdown share these types and this aggregation.
  *
@@ -126,10 +127,25 @@ export const TOOL_TIMING_GAPS: Readonly<Record<string, string>> = {
 }
 
 const SECRETISH_KEY = /(secret|token|password|passwd|api[_-]?key|auth|credential|cookie|private)/i
-/** Extra forms beyond the journal's masker: URL credentials, AWS keys, Slack tokens, secret-named
- *  env assignments and flags. Applied before it, so both run on every summary. */
+/** A name that holds a secret, in a URL query, a cookie or an assignment. Deliberately wide: a
+ *  masked `max_tokens=8` costs a little detail, a missed `?token=` leaks a credential to disk. */
+const SECRET_NAME = String.raw`[\w.-]*(?:secret|token|passw(?:or)?d|pwd|api[_-]?key|apikey|access[_-]?key|private[_-]?key|auth|credential|session|sess(?:ion)?id|sid|signature|sig|cookie|csrf|xsrf)[\w.-]*`
+/** In a URL an OAuth `code` is a credential too; in prose `code: 2` is an exit status. */
+const SECRET_QUERY_NAME = String.raw`(?:${SECRET_NAME}|[\w.-]*code[\w.-]*)`
+// ?token=…, &sig=…, ;sessionid=… in a URL or a cookie string.
+const SECRET_QUERY = new RegExp(String.raw`([?&;]\s*${SECRET_QUERY_NAME}=)[^&#;\s"']+`, 'gi')
+// name = "value", "name": "value", name: 'value', name=value (any case).
+const SECRET_ASSIGNMENT = new RegExp(String.raw`((?:^|[\s{,(;])["']?${SECRET_NAME}["']?\s*[:=]\s*)("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|[^\s,;}&)"']+)`, 'gi')
+/** Extra forms beyond the journal's masker: URL credentials and secret-named query parameters,
+ *  cookie headers and session cookies, quoted and unquoted secret assignments (JSON, YAML, env,
+ *  code), AWS keys, Slack tokens, and secret flags. Applied before it, so both run on every summary. */
 export function maskToolText(text: string, mask: (text: string) => string = value => value): string {
   return mask(text
+    // A Cookie or Set-Cookie header (curl -H, fetch headers): its whole value.
+    .replace(/((?:set-)?cookie["']?\s*[:=]\s*)("[^"\n]*"|'[^'\n]*'|[^\n"']+)/gi, '$1[REDACTED]')
+    .replace(/(--cookie(?:=|\s+))("[^"]*"|'[^']*'|\S+)/gi, '$1[REDACTED]')
+    .replace(SECRET_QUERY, '$1[REDACTED]')
+    .replace(SECRET_ASSIGNMENT, '$1[REDACTED]')
     .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/:@]+:[^\s/@]+@/gi, '$1[REDACTED]@')
     .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, '[REDACTED]')
     .replace(/\bxox[abposr]-[A-Za-z0-9-]{10,}\b/g, '[REDACTED]')
@@ -185,7 +201,8 @@ export function summarizeToolError(output: string | undefined, stderr: string | 
   if (!text?.trim()) return undefined
   const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
   const line = lines.find(item => /error|fail|denied|not found|refused|timed? ?out|cannot|invalid|exception/i.test(item)) ?? lines.at(-1)!
-  return clip(maskToolText(oneLine(line), mask), TOOL_TIMING_LIMITS.error)
+  // Bounded before masking, like the arguments: the masker's cost grows with the line.
+  return clip(maskToolText(oneLine(line).slice(0, TOOL_TIMING_LIMITS.error * 4), mask), TOOL_TIMING_LIMITS.error)
 }
 
 /** Nearest-rank percentile over an ascending array. */
