@@ -1,6 +1,7 @@
 # Cloud runs: branch ↔ session correlation (t3code adoption fix)
 
-Scope: `src/main/cloud/runs.ts`, `src/main/cloud/runs.test.ts`. Nothing else changes: no shared
+Scope: `src/main/cloud/runs.ts`, `src/main/cloud/runs.test.ts`, this note, and the exported diff
+`t3code-cloud-branch-correlation-integration.patch` beside it. Nothing else changes: no shared
 types, no IPC, no renderer, no thread/timing code.
 
 ## What went wrong
@@ -9,15 +10,26 @@ Three cloud runs were started together from one project during the t3code adopti
 
 | Run | Hint the CLI logged | What it pushed |
 | --- | --- | --- |
-| runtime audit | `claude/t3code-cloud-runtime-audit` | `claude/t3code-cloud-runtime-audit-y4xpuw110fa4b` (first) |
-| tool timing analysis | `claude/t3code-tool-timing-analysis` | `claude/t3code-tool-timing-analysis-3aqudf` (later) |
-| thread separation | its own | nothing yet |
+| runtime audit | `claude/t3code-cloud-runtime-audit` | `claude/t3code-cloud-runtime-audit-y4xpuw` at `110fa4b` (first) |
+| tool timing analysis | `claude/t3code-tool-timing-analysis` | its own branch, later; head `0a519b3` |
+| thread separation | its own | its own branch, later; head `cc6879d` |
 
 `findResult` looked for the hinted branch and, **when that was not on origin yet, fell back to "the
 one new `claude/*` head since the run started"**. The audit's push was that one head for all three
-runs, so all three were marked `pushed` with the audit's branch, head and PR. The association was
-also never re-checked: `refreshResult` only ever overwrote `branch` with a new match, so a wrong one
-stayed after the timing run pushed its own branch.
+runs, so all three were marked `pushed` with the audit's branch, head and PR.
+
+The live evidence shows the previous `refreshResult` **did** replace the wrong audit branch as soon
+as each run's own hinted branch was pushed (thread at `cc6879d`, timing at `0a519b3`): a hint match
+always won over the fallback. The defect was therefore twofold, and only for the window before
+that push:
+
+- the unsafe fallback handed another run's branch, head and PR to a run whose own result was
+  absent (or ambiguous), and reported it `pushed`;
+- while the run's own result stayed absent or ambiguous, nothing retracted that wrong association:
+  `refreshResult` only patched in a new match, so with no match the audit's branch stayed.
+
+(The first version of this note and commit `0929f8c`'s message said a wrong branch was never
+replaced; that was wrong and is corrected here. The code change is unaffected.)
 
 ## The rule now
 
@@ -54,7 +66,7 @@ stayed after the timing run pushed its own branch.
    goes too when that PR's head is the retracted branch's sha, and a worktree fetched from it
    (`worktreePath`/`fetchedCommit`) is forgotten. A branch that fits the hint and has left origin
    (merged and deleted) stays the run's result. When the correct branch is found later it replaces
-   the wrong one.
+   the wrong one (as the previous code already did once the hinted branch appeared).
 8. **`pushed` is still not "finished".** The status keeps its documented meaning (branch on
    origin, the session may still be working); nothing here marks a run done.
 
@@ -74,9 +86,9 @@ stayed after the timing run pushed its own branch.
   fetch asserted; restart with the old wrong cached associations (all three on the audit
   branch/PR/worktree) corrected, and a merged-and-deleted correct branch kept.
 
-Against the previous `runs.ts` all 9 correlation-related tests fail (the two older tests only for
-the added `verify` field and the more specific "not pushed `<hint>`" message); with the fix all 21
-pass. `npm run typecheck` is clean.
+Against the previous `runs.ts` 10 tests fail: the 8 new ones, and the 2 older ones that were
+updated only for the added `verify` field and the more specific "not pushed `<hint>`" message. With
+the fix all 21 pass. `npm run typecheck` is clean.
 
 ## Surgical patch notes for integration
 
@@ -96,3 +108,11 @@ All in `src/main/cloud/runs.ts`; no other file depends on the changed internals
 - Git calls added in the project folder: `fetch --no-tags --no-write-fetch-head origin
   refs/heads/<claude/…>` (objects only; needs git ≥ 2.29, a failure just means no evidence) and
   `log`. Only for contested/multiple/fallback candidates, once per new sha.
+
+## Exported diff
+
+`docs/perf-evidence/t3code-cloud-branch-correlation-integration.patch` is the exact
+`git diff --full-index 3f95349 <implementation commit> -- src/main/cloud/runs.ts
+src/main/cloud/runs.test.ts docs/perf-evidence/t3code-cloud-branch-correlation.md` (the patch file
+itself is not in it). It applies with `git apply` (or `patch -p1`) on any tree whose three files
+still match `3f95349`; where local commits changed them, its hunks show the exact base lines.
