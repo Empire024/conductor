@@ -1,0 +1,639 @@
+diff --git a/docs/perf-evidence/t3code-cloud-branch-correlation.md b/docs/perf-evidence/t3code-cloud-branch-correlation.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..8a109f6386e114521fb23f633fd296fd7db7a2c6
+--- /dev/null
++++ b/docs/perf-evidence/t3code-cloud-branch-correlation.md
+@@ -0,0 +1,118 @@
++# Cloud runs: branch ↔ session correlation (t3code adoption fix)
++
++Scope: `src/main/cloud/runs.ts`, `src/main/cloud/runs.test.ts`, this note, and the exported diff
++`t3code-cloud-branch-correlation-integration.patch` beside it. Nothing else changes: no shared
++types, no IPC, no renderer, no thread/timing code.
++
++## What went wrong
++
++Three cloud runs were started together from one project during the t3code adoption:
++
++| Run | Hint the CLI logged | What it pushed |
++| --- | --- | --- |
++| runtime audit | `claude/t3code-cloud-runtime-audit` | `claude/t3code-cloud-runtime-audit-y4xpuw` at `110fa4b` (first) |
++| tool timing analysis | `claude/t3code-tool-timing-analysis` | its own branch, later; head `0a519b3` |
++| thread separation | its own | its own branch, later; head `cc6879d` |
++
++`findResult` looked for the hinted branch and, **when that was not on origin yet, fell back to "the
++one new `claude/*` head since the run started"**. The audit's push was that one head for all three
++runs, so all three were marked `pushed` with the audit's branch, head and PR.
++
++The live evidence shows the previous `refreshResult` **did** replace the wrong audit branch as soon
++as each run's own hinted branch was pushed (thread at `cc6879d`, timing at `0a519b3`): a hint match
++always won over the fallback. The defect was therefore twofold, and only for the window before
++that push:
++
++- the unsafe fallback handed another run's branch, head and PR to a run whose own result was
++  absent (or ambiguous), and reported it `pushed`;
++- while the run's own result stayed absent or ambiguous, nothing retracted that wrong association:
++  `refreshResult` only patched in a new match, so with no match the audit's branch stayed.
++
++(The first version of this note and commit `0929f8c`'s message said a wrong branch was never
++replaced; that was wrong and is corrected here. The code change is unaffected.)
++
++## The rule now
++
++1. **A run with a `branchHint` takes only its own branch**: the hint itself (strength 2) or the hint
++   plus the cloud's one-word suffix, `^<hint>-[A-Za-z0-9]+$` (strength 1). It never falls back to an
++   unrelated new head. `claude/fix-tests-x1` is not a match for hint `claude/fix` (another task).
++2. **Stale origin refs are not pushes.** The start snapshot (`<id>.heads.json`) now keeps each head's
++   sha. A hinted branch that was on origin with the same sha when the run started is an earlier
++   run's; a moved sha is this session pushing onto it. Old name-only snapshots still accept the
++   exact hint (previous behaviour) but not a suffixed stale ref. A failed or missing snapshot is
++   written/read as `null` (unknown), not `[]`, so it no longer makes every existing head look new.
++   `refreshResult` waits for a snapshot still being taken.
++3. **Concurrent runs from the same `cwd` are rivals** (created within the watch window, not
++   `failed`, and the head is not stale for them). A head a rival's hint names more exactly is the
++   rival's and is dropped; an equally strong claim (same hint, or two hintless runs) is
++   **contested** and nobody takes it on name alone.
++4. **The single-new-head fallback survives only for a run that never learned its hint, and only when
++   it is safe**: the head is not explained by any rival's hint and no unsettled hintless rival could
++   have pushed it (a rival that started after the push saw it in its own snapshot and does not
++   contest it). That is the sequential case it was written for.
++5. **Session evidence settles what names cannot.** For contested or multiple candidates, and for
++   every fallback candidate, the branch is fetched **without a destination**
++   (`git fetch --no-tags --no-write-fetch-head origin refs/heads/<b>`, no ref of the project moves)
++   and `git log -n 20 --format=%B%x1e <sha>` is read. The first commit that names any
++   `claude.ai/code/<session>` decides: this run's session → `ours` (claimed even over a rival);
++   another session on the head commit → `other` (never claimed); otherwise `none`. Verdicts are
++   cached per run per `branch@sha`; a failed look is not cached.
++6. **Unknown means no result.** Ambiguous candidates are kept in memory and `cloud.fetch` says they
++   cannot be told apart from another run's (with the session link); a hinted run with nothing
++   pushed says it has not pushed `<hint>` yet. No `pushed` status, branch, head or PR is reported.
++7. **Cached associations are re-validated every poll.** A recorded branch that the latest look did
++   not choose is retracted (`branch`/`headCommit` → null, `pushed` → `running`) when it is still on
++   origin (contested now) or does not fit the run's hint (the old fallback's mistake). Its PR URL
++   goes too when that PR's head is the retracted branch's sha, and a worktree fetched from it
++   (`worktreePath`/`fetchedCommit`) is forgotten. A branch that fits the hint and has left origin
++   (merged and deleted) stays the run's result. When the correct branch is found later it replaces
++   the wrong one (as the previous code already did once the hinted branch appeared).
++8. **`pushed` is still not "finished".** The status keeps its documented meaning (branch on
++   origin, the session may still be working); nothing here marks a run done.
++
++## Tests (src/main/cloud/runs.test.ts, `branch correlation between concurrent runs`)
++
++- the owner's case, pure: only the audit run takes the audit branch; timing and threads get
++  nothing (also with no siblings in sight); timing's later push goes to timing only.
++- sequential fallback compatibility, and each way it is refused (rival hint, concurrent hintless
++  rival, foreign-signed push, unknown snapshot); evidence `ours`/`other` settle a contested head.
++- stale refs (same sha), a push onto an existing name (moved sha), legacy name-only snapshots,
++  longer task names that share the prefix.
++- several suffix matches stay ambiguous until evidence; same-hint rivals; exact hint beats a
++  shorter rival hint.
++- `readSessionEvidence` parsing.
++- integration through `CloudRuns` with a scripted CLI: three simultaneous runs, audit pushes
++  first, timing later; two hintless runs settled by the commit trailer, with the destination-less
++  fetch asserted; restart with the old wrong cached associations (all three on the audit
++  branch/PR/worktree) corrected, and a merged-and-deleted correct branch kept.
++
++Against the previous `runs.ts` 10 tests fail: the 8 new ones, and the 2 older ones that were
++updated only for the added `verify` field and the more specific "not pushed `<hint>`" message. With
++the fix all 21 pass. `npm run typecheck` is clean.
++
++## Surgical patch notes for integration
++
++All in `src/main/cloud/runs.ts`; no other file depends on the changed internals
++(`agent-control.ts` imports only the `CloudRuns` type).
++
++- `findResult(lines, hint, known, context?)`: `known` is `KnownHead[] | null` (`string` legacy or
++  `{ref, sha}`); new optional `context {siblings, evidence}`; result adds `verify: {branch, sha}[]`.
++  New exports: `KnownHead`, `SessionEvidence`, `ResultSibling`, `ResultContext`, `hintStrength`,
++  `readSessionEvidence`.
++- `CloudRuns`: new private maps `snapshots`, `evidence`, `ambiguous`; `knownHeads()` returns
++  `null` for missing/failed snapshots; `start()` writes `{ref, sha}` entries (or `null`) and records
++  the pending snapshot; `refreshResult()` rewritten (two-pass with evidence, retraction); new private
++  `stillOurs`, `retracted`, `siblings`, `sessionEvidence`; `fetch()` error text from the last
++  refresh instead of a second `ls-remote`.
++- Persisted data: `runs.json` shape unchanged. `<id>.heads.json` gains shas; old files still load.
++- Git calls added in the project folder: `fetch --no-tags --no-write-fetch-head origin
++  refs/heads/<claude/…>` (objects only; needs git ≥ 2.29, a failure just means no evidence) and
++  `log`. Only for contested/multiple/fallback candidates, once per new sha.
++
++## Exported diff
++
++`docs/perf-evidence/t3code-cloud-branch-correlation-integration.patch` is the exact
++`git diff --full-index 3f95349 <implementation commit> -- src/main/cloud/runs.ts
++src/main/cloud/runs.test.ts docs/perf-evidence/t3code-cloud-branch-correlation.md` (the patch file
++itself is not in it). It applies with `git apply` (or `patch -p1`) on any tree whose three files
++still match `3f95349`; where local commits changed them, its hunks show the exact base lines.
+diff --git a/src/main/cloud/runs.test.ts b/src/main/cloud/runs.test.ts
+index fc35c5549bba34a68351587b35d0db6ea9317809..ee6e2a7ff25cb26d7abf1728a3fd088901078bc9 100644
+--- a/src/main/cloud/runs.test.ts
++++ b/src/main/cloud/runs.test.ts
+@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
+ import { join } from 'node:path'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import { CLOUD_MODELS, isCloudModel, type CloudRunSummary } from '../../shared/cloud'
+-import { CloudRuns, clientEnv, cloudArgs, findResult, parseTranscript, readCreateLog, type CloudExec, type CloudGit, type CloudPty, type CloudSpawn } from './runs'
++import { CloudRuns, clientEnv, cloudArgs, findResult, parseTranscript, readCreateLog, readSessionEvidence, type CloudExec, type CloudGit, type CloudPty, type CloudSpawn, type ResultSibling } from './runs'
+ 
+ const fixture = join(process.cwd(), 'scripts/fixtures/cloud-cli.cjs')
+ 
+@@ -37,7 +37,7 @@ const until = async (check: () => boolean, what: string, ms = 8000): Promise<voi
+ 
+ /** origin as git ls-remote shows it, changed by the test as the "cloud" pushes. */
+ function fakeOrigin() {
+-  const state = { refs: [] as string[], calls: [] as string[][], inProject: [] as string[][], localBranches: [] as string[] }
++  const state = { refs: [] as string[], calls: [] as string[][], inProject: [] as string[][], localBranches: [] as string[], messages: {} as Record<string, string> }
+   const git: CloudGit = async (cwd, args) => {
+     state.calls.push(args)
+     if (!cwd.includes('teleport')) state.inProject.push(args)
+@@ -48,6 +48,7 @@ function fakeOrigin() {
+     if (args[0] === 'branch' && args[1] === '--show-current') { state.localBranches.push('claude/fixture-note-ogcvln'); return 'claude/fixture-note-ogcvln\n' }
+     if (args[0] === 'branch' && args[1] === '-D') state.localBranches = state.localBranches.filter(name => name !== args[2])
+     if (args[0] === 'worktree' && args[1] === 'add') mkdirSync(args[3]!, { recursive: true })
++    if (args[0] === 'log') return state.messages[args[4]!] ?? ''
+     if (args[0] === 'rev-parse') return 'abc123\n'
+     if (args[0] === 'merge-base') return 'base000\n'
+     if (args[0] === 'diff') return ' NOTE.md | 1 +\n'
+@@ -183,7 +184,7 @@ describe('cloud runs', () => {
+     const runs = make({ git: origin.git })
+     const run = start(runs)
+     await until(() => runs.get(run.id).status === 'running', 'the session')
+-    await expect(runs.fetch(run.id)).rejects.toThrow(/not pushed a branch/)
++    await expect(runs.fetch(run.id)).rejects.toThrow(/not pushed claude\/fixture-note \(or it with a suffix\) yet/)
+     origin.state.refs = ['c86d864\trefs/heads/claude/fixture-note-x']
+     const result = await runs.fetch(run.id)
+     expect(result).toMatchObject({ commit: 'abc123', ref: 'refs/heads/claude/fixture-note-x', branch: 'claude/fixture-note-x', diffStat: 'NOTE.md | 1 +' })
+@@ -196,13 +197,178 @@ describe('cloud runs', () => {
+ 
+   it('finds the session branch on origin: the named one, one with a suffix, or the one new head', () => {
+     const lines = ['a1\trefs/heads/claude/old', 'b2\trefs/heads/claude/add-note-ogcvln', 'b2\trefs/pull/3/head', 'c3\trefs/heads/main'].join('\n')
+-    expect(findResult(lines, 'claude/add-note', [])).toEqual({ branch: 'claude/add-note-ogcvln', head: 'b2', pr: 3, ambiguous: [] })
++    expect(findResult(lines, 'claude/add-note', [])).toEqual({ branch: 'claude/add-note-ogcvln', head: 'b2', pr: 3, ambiguous: [], verify: [] })
+     expect(findResult(lines, 'claude/add-note-ogcvln', [])).toMatchObject({ branch: 'claude/add-note-ogcvln' })
+     expect(findResult(lines, null, ['refs/heads/claude/old'])).toMatchObject({ branch: 'claude/add-note-ogcvln', pr: 3 })
+     expect(findResult(lines, null, [])).toMatchObject({ branch: null, ambiguous: ['claude/old', 'claude/add-note-ogcvln'] })
+     expect(findResult(lines, 'claude/add-notes', ['refs/heads/claude/old', 'refs/heads/claude/add-note-ogcvln'])).toMatchObject({ branch: null })
+   })
+ 
++  describe('branch correlation between concurrent runs', () => {
++    const audit = 'claude/t3code-cloud-runtime-audit', timing = 'claude/t3code-tool-timing-analysis', threads = 'claude/t3code-thread-separation'
++    const known = [{ ref: 'refs/heads/claude/older', sha: 'o1' }]
++    const sibling = (hint: string | null, extra: Partial<ResultSibling> = {}): ResultSibling => ({ hint, known, settled: false, ...extra })
++
++    it('gives the one pushed branch only to the run it was hinted for, then each run its own', () => {
++      // The owner's case: three runs started together; the audit pushed first.
++      let lines = ['o1\trefs/heads/claude/older', `a1\trefs/heads/${audit}-y4xpuw`, 'a1\trefs/pull/41/head'].join('\n')
++      expect(findResult(lines, audit, known, { siblings: [sibling(timing), sibling(threads)] })).toMatchObject({ branch: `${audit}-y4xpuw`, head: 'a1', pr: 41 })
++      for (const [hint, others] of [[timing, [audit, threads]], [threads, [audit, timing]]] as const) {
++        expect(findResult(lines, hint, known, { siblings: others.map(other => sibling(other)) })).toEqual({ branch: null, head: null, pr: null, ambiguous: [], verify: [] })
++        // Even with no other run in sight, a hinted run never takes an unrelated single new head.
++        expect(findResult(lines, hint, known)).toMatchObject({ branch: null, ambiguous: [] })
++      }
++      // The timing analysis pushes later and gets its own branch; the thread run still waits.
++      lines += `\nt2\trefs/heads/${timing}-3aqudf`
++      expect(findResult(lines, timing, known, { siblings: [sibling(audit), sibling(threads)] })).toMatchObject({ branch: `${timing}-3aqudf`, head: 't2', pr: null })
++      expect(findResult(lines, audit, known, { siblings: [sibling(timing), sibling(threads)] })).toMatchObject({ branch: `${audit}-y4xpuw` })
++      expect(findResult(lines, threads, known, { siblings: [sibling(audit), sibling(timing)] })).toMatchObject({ branch: null, ambiguous: [] })
++    })
++
++    it('keeps the single-new-head fallback for a run without a hint only when no concurrent run could own it', () => {
++      const lines = ['o1\trefs/heads/claude/older', `a1\trefs/heads/${audit}-y4xpuw`].join('\n')
++      const head = { branch: `${audit}-y4xpuw`, sha: 'a1' }
++      // Sequential, as before: nothing else ran, so the one new head is this run's (and is checked).
++      expect(findResult(lines, null, known)).toMatchObject({ branch: head.branch, verify: [head] })
++      // A run that started after the push saw it already; it does not contest it.
++      expect(findResult(lines, null, known, { siblings: [sibling(null, { known: [...known, { ref: `refs/heads/${head.branch}`, sha: 'a1' }] })] })).toMatchObject({ branch: head.branch })
++      // A branch another run's hint names is that run's, not the fallback's.
++      expect(findResult(lines, null, known, { siblings: [sibling(audit)] })).toMatchObject({ branch: null, ambiguous: [] })
++      // Two hintless runs in flight: the head could be either's; neither claims it until its commits say.
++      const contested = findResult(lines, null, known, { siblings: [sibling(null)] })
++      expect(contested).toEqual({ branch: null, head: null, pr: null, ambiguous: [head.branch], verify: [head] })
++      expect(findResult(lines, null, known, { siblings: [sibling(null)], evidence: { [`${head.branch}@a1`]: 'ours' } })).toMatchObject({ branch: head.branch, verify: [] })
++      expect(findResult(lines, null, known, { siblings: [sibling(null)], evidence: { [`${head.branch}@a1`]: 'other' } })).toMatchObject({ branch: null, ambiguous: [] })
++      // A foreign push (another session signed it) is not taken even when sequential.
++      expect(findResult(lines, null, known, { evidence: { [`${head.branch}@a1`]: 'other' } })).toMatchObject({ branch: null })
++      // Which heads existed at the start is unknown: no head counts as new.
++      expect(findResult(lines, null, null)).toMatchObject({ branch: null, ambiguous: [], verify: [] })
++    })
++
++    it('ignores stale refs of an earlier run with the same task, and longer task names that only share the prefix', () => {
++      const lines = ['s1\trefs/heads/claude/fix-old111', 'x1\trefs/heads/claude/fix-tests-x1', 'e1\trefs/heads/claude/fix'].join('\n')
++      // fix-old111 and fix were on origin, untouched, when the run started; fix-tests-x1 is another task.
++      const before = [{ ref: 'refs/heads/claude/fix-old111', sha: 's1' }, { ref: 'refs/heads/claude/fix', sha: 'e1' }]
++      expect(findResult(lines, 'claude/fix', before)).toMatchObject({ branch: null, ambiguous: [] })
++      // The session pushed onto the existing name: its sha moved, so that is this run's.
++      expect(findResult(lines.replace('e1\t', 'e2\t'), 'claude/fix', before)).toMatchObject({ branch: 'claude/fix', head: 'e2' })
++      // A store from before shas were kept still accepts the exact name, but not a stale suffixed one.
++      expect(findResult(lines, 'claude/fix', ['refs/heads/claude/fix-old111', 'refs/heads/claude/fix'])).toMatchObject({ branch: 'claude/fix' })
++      expect(findResult(lines.replace('e1\trefs/heads/claude/fix', ''), 'claude/fix', ['refs/heads/claude/fix-old111'])).toMatchObject({ branch: null })
++    })
++
++    it('does not guess between several branches that fit the hint; session evidence or an exact hint settles it', () => {
++      const lines = ['a1\trefs/heads/claude/fix-aaa111', 'b1\trefs/heads/claude/fix-bbb222'].join('\n')
++      const both = findResult(lines, 'claude/fix', [])
++      expect(both).toMatchObject({ branch: null, ambiguous: ['claude/fix-aaa111', 'claude/fix-bbb222'] })
++      expect(both.verify).toEqual([{ branch: 'claude/fix-aaa111', sha: 'a1' }, { branch: 'claude/fix-bbb222', sha: 'b1' }])
++      expect(findResult(lines, 'claude/fix', [], { evidence: { 'claude/fix-aaa111@a1': 'none', 'claude/fix-bbb222@b1': 'ours' } })).toMatchObject({ branch: 'claude/fix-bbb222' })
++      expect(findResult(lines, 'claude/fix', [], { evidence: { 'claude/fix-aaa111@a1': 'other', 'claude/fix-bbb222@b1': 'none' } })).toMatchObject({ branch: 'claude/fix-bbb222' })
++      // Two runs told the same name: one push fits both, so neither takes it on the name alone.
++      const one = 'a1\trefs/heads/claude/fix-aaa111'
++      expect(findResult(one, 'claude/fix', [], { siblings: [sibling('claude/fix', { known: [] })] })).toMatchObject({ branch: null, ambiguous: ['claude/fix-aaa111'], verify: [{ branch: 'claude/fix-aaa111', sha: 'a1' }] })
++      // A run told the longer name exactly owns it over one whose shorter hint it only extends.
++      const exact = 'c1\trefs/heads/claude/fix-tests'
++      expect(findResult(exact, 'claude/fix', [], { siblings: [sibling('claude/fix-tests', { known: [] })] })).toMatchObject({ branch: null, ambiguous: [] })
++      expect(findResult(exact, 'claude/fix-tests', [], { siblings: [sibling('claude/fix', { known: [] })] })).toMatchObject({ branch: 'claude/fix-tests' })
++    })
++
++    it('reads which session signed the commits on a branch', () => {
++      const sign = (session: string): string => `Fix it\n\nClaude-Session: https://claude.ai/code/${session}\n`
++      expect(readSessionEvidence(`${sign('session_01AUDIT')}\x1e`, 'session_01AUDIT')).toBe('ours')
++      expect(readSessionEvidence(`${sign('session_01TIMING')}\x1e`, 'session_01AUDIT')).toBe('other')
++      // An unsigned head over another session's commit: that may be the base, so it decides nothing.
++      expect(readSessionEvidence(`Merge\x1e${sign('session_01TIMING')}\x1e`, 'session_01AUDIT')).toBe('none')
++      expect(readSessionEvidence(`Merge\x1e${sign('session_01AUDIT')}\x1e${sign('session_01TIMING')}\x1e`, 'session_01AUDIT')).toBe('ours')
++      expect(readSessionEvidence('', 'session_01AUDIT')).toBe('none')
++      // A longer id that merely starts with this one is another session.
++      expect(readSessionEvidence(`${sign('session_01AUDITX')}\x1e`, 'session_01AUDIT')).toBe('other')
++    })
++
++    /** A CLI that creates a session per prompt with the branch hint the test names, and refuses attaching. */
++    const scriptedCli = (hints: Record<string, string | null>): CloudSpawn => (_file, args) => {
++      let exit: (event: { exitCode: number }) => void = () => undefined
++      let data: (chunk: string) => void = () => undefined
++      setTimeout(() => {
++        const debugFile = args[args.indexOf('--debug-file') + 1]
++        if (args[0] === '--cloud' && args[1]! in hints && debugFile) {
++          const hint = hints[args[1]!]
++          const payload = hint ? `Creating session with payload: {"session_context":{"outcomes":[{"git_info":{"branches":["${hint}"]}}],"model":"claude-opus-5-5"}}\n` : ''
++          writeFileSync(debugFile, `${payload}Successfully created remote session: session_01${args[1]!.toUpperCase()}\n`)
++          exit({ exitCode: 0 })
++        } else if (args[0] === '--cloud') { data('Attaching to an existing cloud session is not enabled for your account\r\n'); exit({ exitCode: 1 }) }
++        else exit({ exitCode: 1 })
++      }, 20)
++      return { onData: listener => { data = listener }, onExit: listener => { exit = listener }, write: () => undefined, resize: () => undefined, kill: () => undefined }
++    }
++    const settle = (ms = 400): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
++
++    it('follows three simultaneous runs: each gets its own branch when it pushes, none takes another\'s', async () => {
++      const origin = fakeOrigin()
++      origin.state.refs = ['o1\trefs/heads/claude/older']
++      const runs = make({ git: origin.git, prefixArgs: [], spawn: scriptedCli({ audit, timing, threads }) })
++      const [a, t, h] = ['audit', 'timing', 'threads'].map(prompt => start(runs, { prompt }))
++      await until(() => [a, t, h].every(run => runs.get(run!.id).status === 'running' && runs.get(run!.id).branchHint !== null), 'three sessions')
++      origin.state.refs.push(`a1\trefs/heads/${audit}-y4xpuw`, 'a1\trefs/pull/41/head')
++      await until(() => runs.get(a!.id).status === 'pushed', 'the audit push')
++      await settle()
++      expect(runs.get(a!.id)).toMatchObject({ branch: `${audit}-y4xpuw`, headCommit: 'a1', prUrl: 'https://github.com/Empire024/conductor/pull/41' })
++      for (const run of [t!, h!]) expect(runs.get(run.id)).toMatchObject({ status: 'running', branch: null, headCommit: null, prUrl: null })
++      await expect(runs.fetch(t!.id)).rejects.toThrow(new RegExp(`not pushed ${timing} \\(or it with a suffix\\) yet`))
++      // The timing analysis pushes later: it gets its own branch, the audit keeps its.
++      origin.state.refs.push(`t2\trefs/heads/${timing}-3aqudf`)
++      await until(() => runs.get(t!.id).status === 'pushed', 'the timing push')
++      await settle()
++      expect(runs.get(t!.id)).toMatchObject({ branch: `${timing}-3aqudf`, headCommit: 't2', prUrl: null })
++      expect(runs.get(a!.id).branch).toBe(`${audit}-y4xpuw`)
++      expect(runs.get(h!.id)).toMatchObject({ status: 'running', branch: null })
++    })
++
++    it('lets two hintless runs claim the one new head only by the session that signed it', async () => {
++      const origin = fakeOrigin()
++      const runs = make({ git: origin.git, prefixArgs: [], spawn: scriptedCli({ first: null, second: null }) })
++      const [one, two] = ['first', 'second'].map(prompt => start(runs, { prompt }))
++      await until(() => [one, two].every(run => runs.get(run!.id).status === 'running'), 'two sessions')
++      origin.state.refs = ['n1\trefs/heads/claude/new-work-abc123']
++      await settle()
++      for (const run of [one!, two!]) expect(runs.get(run.id)).toMatchObject({ status: 'running', branch: null })
++      await expect(runs.fetch(one!.id)).rejects.toThrow(/cannot be told apart.*claude\/new-work-abc123/)
++      // Evidence is fetched without a destination: no ref of the project moves.
++      expect(origin.state.calls).toContainEqual(['fetch', '--no-tags', '--no-write-fetch-head', 'origin', 'refs/heads/claude/new-work-abc123'])
++      // The next commit is signed by the second session: it is that run's, and only that run's.
++      origin.state.refs = ['n2\trefs/heads/claude/new-work-abc123']
++      origin.state.messages.n2 = `Work\n\nClaude-Session: https://claude.ai/code/${runs.get(two!.id).sessionId}\x1e`
++      await until(() => runs.get(two!.id).status === 'pushed', 'the signed push')
++      await settle()
++      expect(runs.get(two!.id)).toMatchObject({ branch: 'claude/new-work-abc123', headCommit: 'n2' })
++      expect(runs.get(one!.id)).toMatchObject({ status: 'running', branch: null })
++    })
++
++    it('retracts associations the old fallback cached, and keeps a correct branch that was merged and deleted', async () => {
++      const at = Date.now()
++      const base = { projectId: 'p', workspaceId: 'w', title: 't', prompt: 'p', model: 'claude-opus-5-5', effort: null, ref: null, cwd: project, attached: false, liveView: false, confirmedModel: null, transcriptAt: null, transcriptEntries: 0, usage: null, startedBy: 'owner', createdAt: at, updatedAt: at, endedAt: null, exitCode: null, error: null }
++      // What the old fallback left behind: all three runs on the audit's branch and pull request.
++      const wrong = { status: 'pushed', branch: `${audit}-y4xpuw`, headCommit: 'a1', prUrl: 'https://github.com/Empire024/conductor/pull/41', worktreePath: join(root, 'worktrees', 'x'), fetchedCommit: 'a1' }
++      writeFileSync(join(root, 'runs.json'), JSON.stringify([
++        { ...base, ...wrong, id: 'cloud_audit', branchHint: audit, sessionId: 'session_01AUDIT', sessionUrl: 'https://claude.ai/code/session_01AUDIT' },
++        { ...base, ...wrong, id: 'cloud_timing', branchHint: timing, sessionId: 'session_01TIMING', sessionUrl: 'https://claude.ai/code/session_01TIMING' },
++        { ...base, ...wrong, id: 'cloud_threads', branchHint: threads, sessionId: 'session_01THREADS', sessionUrl: 'https://claude.ai/code/session_01THREADS' },
++        { ...base, ...wrong, id: 'cloud_merged', branchHint: 'claude/merged-work', branch: 'claude/merged-work-zz9', headCommit: 'm1', prUrl: 'https://github.com/Empire024/conductor/pull/9', sessionId: 'session_01MERGED', sessionUrl: 'https://claude.ai/code/session_01MERGED', cwd: join(project, 'elsewhere') }
++      ]))
++      const origin = fakeOrigin()
++      origin.state.refs = [`a1\trefs/heads/${audit}-y4xpuw`, 'a1\trefs/pull/41/head', `t2\trefs/heads/${timing}-3aqudf`]
++      const runs = make({ git: origin.git })
++      await until(() => runs.get('cloud_timing').branch === `${timing}-3aqudf` && runs.get('cloud_threads').status === 'running', 'the corrections')
++      expect(runs.get('cloud_audit')).toMatchObject({ status: 'pushed', branch: `${audit}-y4xpuw`, prUrl: 'https://github.com/Empire024/conductor/pull/41', fetchedCommit: 'a1' })
++      // The timing run moves to its own branch, without the audit's pull request or fetched worktree.
++      expect(runs.get('cloud_timing')).toMatchObject({ status: 'pushed', headCommit: 't2', prUrl: null, worktreePath: null, fetchedCommit: null })
++      // The thread run has pushed nothing: it is running again, with nothing claimed.
++      expect(runs.get('cloud_threads')).toMatchObject({ status: 'running', branch: null, headCommit: null, prUrl: null, worktreePath: null, fetchedCommit: null })
++      // A branch that fits its own hint and left origin (merged, deleted) stays the run's result.
++      expect(runs.get('cloud_merged')).toMatchObject({ status: 'pushed', branch: 'claude/merged-work-zz9', prUrl: 'https://github.com/Empire024/conductor/pull/9' })
++    })
++  })
++
+   it('reads the session, model and branch from the debug log the real CLI writes', () => {
+     const log = [
+       '2026-09-25T17:03:26.012Z [DEBUG] "Creating session with payload: {\\n  \\"title\\": \\"Cloud E2E\\",\\n  \\"session_context\\": {\\n    \\"outcomes\\": [\\n      {\\n        \\"git_info\\": {\\n          \\"branches\\": [\\n            \\"claude/add-cloud-coworker-log\\"\\n          ]\\n        }\\n      }\\n    ],\\n    \\"model\\": \\"claude-opus-5-5\\"\\n  }\\n}"',
+diff --git a/src/main/cloud/runs.ts b/src/main/cloud/runs.ts
+index a99b72072029de60b6352f7a37b58e4da90e8b76..36d2138a2a3a48347100de68b46ad5227c702a3f 100644
+--- a/src/main/cloud/runs.ts
++++ b/src/main/cloud/runs.ts
+@@ -112,21 +112,107 @@ export function cloudArgs(run: Pick<CloudRunSummary, 'prompt' | 'model' | 'effor
+   return ['--cloud', run.prompt, '--model', run.model, ...(run.effort ? ['--effort', run.effort] : []), ...(run.ref ? ['--ref', run.ref] : []), '--name', run.title, '--debug-file', debugFile]
+ }
+ 
+-/** The session's branch and pull request among origin's heads: the branch it was told to use
+- *  (the cloud may add a suffix), else the one new claude/* head since the run started. */
+-export function findResult(lines: string, hint: string | null, known: string[]): { branch: string | null; head: string | null; pr: number | null; ambiguous: string[] } {
++/** An origin head that existed when a run started: `{ref, sha}`, or a bare ref from a store
++ *  written before the sha was kept. */
++export type KnownHead = string | { ref: string; sha: string }
++/** What the commits on a pushed branch say about the session that wrote them (the cloud signs
++ *  its commits with a `claude.ai/code/<session>` link): this run's, another session's, or nothing. */
++export type SessionEvidence = 'ours' | 'other' | 'none'
++/** Another run from the same project folder that may push while this one runs. */
++export interface ResultSibling { hint: string | null; known: KnownHead[] | null; settled: boolean }
++export interface ResultContext {
++  siblings?: ResultSibling[]
++  /** Session evidence by `branch@sha`; a candidate missing here is listed in `verify`. */
++  evidence?: Record<string, SessionEvidence>
++}
++
++/** How strongly `branch` is the one a session told to push `hint` would push: 2 the name itself,
++ *  1 the name plus the cloud's one-word suffix (`-ogcvln`), 0 not at all. A longer task name that
++ *  merely starts with the hint (`claude/fix` vs `claude/fix-tests-x1`) is another task's branch. */
++export function hintStrength(branch: string, hint: string | null): number {
++  if (!hint) return 0
++  if (branch === hint) return 2
++  return branch.startsWith(hint + '-') && /^[A-Za-z0-9]+$/.test(branch.slice(hint.length + 1)) ? 1 : 0
++}
++
++/** The sha `ref` had when the run started: undefined when it did not exist, null when the store
++ *  only kept its name. */
++function knownSha(known: KnownHead[], ref: string): string | null | undefined {
++  for (const entry of known) {
++    if (typeof entry === 'string') { if (entry === ref) return null }
++    else if (entry.ref === ref) return entry.sha
++  }
++  return undefined
++}
++
++/** A head that was already on origin, untouched, when the run started. */
++function staleFor(known: KnownHead[] | null, head: { branch: string; sha: string }): boolean {
++  if (!known) return false
++  const sha = knownSha(known, `refs/heads/${head.branch}`)
++  return sha === null || sha === head.sha
++}
++
++/**
++ * The session's branch and pull request among origin's heads. A run that knows the branch it was
++ * told to push (`hint`) takes only that branch or it with the cloud's suffix, pushed since it
++ * started, and never falls back to some other new head: three runs started together each wait for
++ * their own branch instead of all taking the first one pushed. Only a run that never learned its
++ * branch falls back to the one new claude/* head, and only while no other run from the folder that
++ * lacks a branch of its own could have pushed it. A head another run's hint names more exactly is
++ * that run's. Where candidates cannot be told apart (several, or contested by a concurrent run),
++ * nothing is claimed: they are listed in `ambiguous` and in `verify` for the commits' session
++ * evidence, which settles it either way.
++ */
++export function findResult(lines: string, hint: string | null, known: KnownHead[] | null, context: ResultContext = {}): { branch: string | null; head: string | null; pr: number | null; ambiguous: string[]; verify: Array<{ branch: string; sha: string }> } {
+   const refs = lines.split('\n').map(line => line.trim().split(/\s+/)).filter(parts => parts.length === 2) as Array<[string, string]>
+   const heads = refs.filter(([, ref]) => ref.startsWith('refs/heads/claude/')).map(([sha, ref]) => ({ sha, branch: ref.slice('refs/heads/'.length) }))
+-  let match = hint ? heads.find(head => head.branch === hint) ?? heads.filter(head => head.branch.startsWith(hint + '-')).at(-1) : undefined
+-  let ambiguous: string[] = []
+-  if (!match) {
+-    const fresh = heads.filter(head => !known.includes(`refs/heads/${head.branch}`))
+-    if (fresh.length === 1) match = fresh[0]
+-    else if (fresh.length > 1) ambiguous = fresh.map(head => head.branch)
+-  }
+-  if (!match) return { branch: null, head: null, pr: null, ambiguous }
+-  const pull = refs.find(([sha, ref]) => sha === match!.sha && /^refs\/pull\/\d+\/head$/.test(ref))
+-  return { branch: match.branch, head: match.sha, pr: pull ? Number(pull[1].split('/')[2]) : null, ambiguous: [] }
++  const siblings = context.siblings ?? []
++  const evidence = (head: { branch: string; sha: string }): SessionEvidence | undefined => context.evidence?.[`${head.branch}@${head.sha}`]
++  // How strongly this run, and the strongest concurrent run, could own a head (-1: not at all).
++  const own = (head: { branch: string; sha: string }): number => {
++    if (hint) {
++      const strength = hintStrength(head.branch, hint)
++      if (!strength || !known) return strength || -1
++      const sha = knownSha(known, `refs/heads/${head.branch}`)
++      // A stale ref of an earlier run with the same task name is not this session's push. A store
++      // that only kept names still accepts the exact name, as before.
++      return sha === undefined || (sha !== null && sha !== head.sha) || (sha === null && strength === 2) ? strength : -1
++    }
++    // The fallback, as before: any head that did not exist when the run started, and only when
++    // which heads existed then is known.
++    return known && knownSha(known, `refs/heads/${head.branch}`) === undefined ? 0 : -1
++  }
++  const rival = (head: { branch: string; sha: string }): number => Math.max(-1, ...siblings.filter(sibling => !staleFor(sibling.known, head))
++    .map(sibling => sibling.hint ? hintStrength(head.branch, sibling.hint) || -1 : sibling.settled ? -1 : 0))
++  const candidates = heads.filter(head => own(head) >= 0 && evidence(head) !== 'other')
++  const ours = candidates.filter(head => evidence(head) === 'ours')
++  const open = candidates.filter(head => evidence(head) !== 'ours' && rival(head) <= own(head))
++  const free = open.filter(head => rival(head) < own(head))
++  const match = ours.find(head => head.branch === hint) ?? ours[0] ?? (open.length === 1 && free.length === 1 ? free[0] : undefined)
++  // Evidence is worth asking for where it could change the answer: every fallback candidate (a
++  // foreign push is not this run's), and hint candidates that are several or contested.
++  const verify = ours.length ? [] : open.filter(head => evidence(head) === undefined && (!hint || open.length > 1 || free.length < open.length)).map(({ branch, sha }) => ({ branch, sha }))
++  if (!match) return { branch: null, head: null, pr: null, ambiguous: open.map(head => head.branch), verify }
++  return { branch: match.branch, head: match.sha, pr: pullFor(refs, match.sha), ambiguous: [], verify }
++}
++
++function pullFor(refs: Array<[string, string]>, sha: string): number | null {
++  const pull = refs.find(([at, ref]) => at === sha && /^refs\/pull\/\d+\/head$/.test(ref))
++  return pull ? Number(pull[1].split('/')[2]) : null
++}
++
++/** Session evidence from `git log --format=%B%x1e` output, newest first: the first commit that
++ *  names any session decides. Another session counts only when it signed the head itself; deeper
++ *  down it may be the base the branch grew from. */
++export function readSessionEvidence(log: string, sessionId: string): SessionEvidence {
++  const bodies = log.split('\x1e').map(body => body.trim()).filter(Boolean)
++  for (const [index, body] of bodies.entries()) {
++    const named = [...body.matchAll(/claude\.ai\/code\/((?:session|cse)_[A-Za-z0-9_]+)/g)].map(found => found[1])
++    if (!named.length) continue
++    if (named.includes(sessionId)) return 'ours'
++    return index === 0 ? 'other' : 'none'
++  }
++  return 'none'
+ }
+ 
+ /** The transcript the CLI's teleport saved (one JSON record per line), as readable entries plus
+@@ -174,7 +260,8 @@ export function parseTranscript(jsonl: string): { entries: CloudTranscriptEntry[
+  * - It then tries once to attach a live client (`claude --cloud <session_id>`). Where the account
+  *   allows it, the tab shows the session live and messages are typed into it; where it does not
+  *   (the CLI says so), the run is followed on GitHub instead.
+- * - Origin is watched for the session's branch and pull request, and `transcript` pulls the
++ * - Origin is watched for the session's branch and pull request (`findResult`: its own hinted
++ *   branch, never another run's), and `transcript` pulls the
+  *   session's messages with the CLI's teleport into a scratch worktree of its own.
+  */
+ export class CloudRuns {
+@@ -188,6 +275,12 @@ export class CloudRuns {
+   private saveTimer: ReturnType<typeof setTimeout> | null = null
+   private teleports = new Set<CloudPty>()
+   private pulls = new Map<string, Promise<CloudTranscriptEntry[]>>()
++  /** The start-time snapshot of origin's heads, while it is still being taken. */
++  private snapshots = new Map<string, Promise<void>>()
++  /** Session evidence per run, by `branch@sha` (a commit's message does not change). */
++  private evidence = new Map<string, Record<string, SessionEvidence>>()
++  /** The candidates the last look at origin could not attribute, per run. */
++  private ambiguous = new Map<string, string[]>()
+   private disposed = false
+ 
+   constructor(private options: CloudRunsOptions) {
+@@ -210,7 +303,11 @@ export class CloudRuns {
+   private debugFile(id: string): string { return join(this.options.root, `${id}.debug.log`) }
+   private transcriptFile(id: string): string { return join(this.options.root, `${id}.transcript.json`) }
+   private knownHeadsFile(id: string): string { return join(this.options.root, `${id}.heads.json`) }
+-  private knownHeads(id: string): string[] { try { return JSON.parse(readFileSync(this.knownHeadsFile(id), 'utf8')) as string[] } catch { return [] } }
++  /** Origin's claude/* heads when the run started, or null when that is not known (the snapshot
++   *  failed, or the run predates it): then no head counts as new for the fallback. */
++  private knownHeads(id: string): KnownHead[] | null {
++    try { const saved = JSON.parse(readFileSync(this.knownHeadsFile(id), 'utf8')) as unknown; return Array.isArray(saved) ? saved as KnownHead[] : null } catch { return null }
++  }
+   private cli(): string {
+     const executable = this.options.executable()
+     if (!executable) throw new Error('The Claude Code CLI is not installed on this machine')
+@@ -252,9 +349,13 @@ export class CloudRuns {
+     }
+     this.runs.set(run.id, run)
+     // Which claude/* branches exist before the session can push one, so a new one is recognisable.
+-    void this.git(input.cwd, ['ls-remote', '--heads', 'origin', 'refs/heads/claude/*'])
+-      .then(out => writeFileSync(this.knownHeadsFile(run.id), JSON.stringify(out.split('\n').map(line => line.split('\t')[1]?.trim()).filter(Boolean))))
+-      .catch(() => writeFileSync(this.knownHeadsFile(run.id), '[]'))
++    // With each head's sha, so a stale ref of an earlier run is told from a push to it.
++    const snapshot = this.git(input.cwd, ['ls-remote', '--heads', 'origin', 'refs/heads/claude/*'])
++      .then(out => out.split('\n').map(line => line.trim().split(/\s+/)).filter(parts => parts.length === 2 && parts[1]!.startsWith('refs/heads/')).map(([sha, ref]) => ({ ref: ref!, sha: sha! })))
++      .then(heads => writeFileSync(this.knownHeadsFile(run.id), JSON.stringify(heads)), () => writeFileSync(this.knownHeadsFile(run.id), 'null'))
++      .catch(() => undefined)
++      .finally(() => this.snapshots.delete(run.id))
++    this.snapshots.set(run.id, snapshot)
+     this.spawn(run, cloudArgs(run, this.debugFile(run.id)), false)
+     return this.get(run.id)
+   }
+@@ -358,19 +459,35 @@ export class CloudRuns {
+ 
+   /** Asks origin for the session's branch and pull request now. */
+   async refreshResult(id: string): Promise<CloudRunSummary> {
+-    const run = this.get(id)
+-    if (!run.sessionId) return run
+-    const out = await this.git(run.cwd, ['ls-remote', 'origin', 'refs/heads/claude/*', 'refs/pull/*/head'])
+-    const found = findResult(out, run.branchHint, this.knownHeads(id))
++    if (!this.get(id).sessionId) return this.get(id)
++    await this.snapshots.get(id)
++    const cwd = this.get(id).cwd
++    const out = await this.git(cwd, ['ls-remote', 'origin', 'refs/heads/claude/*', 'refs/pull/*/head'])
++    // Read again after the awaits: the debug log may have named the branch meanwhile.
++    let run = this.get(id)
++    const context = (): ResultContext => ({ siblings: this.siblings(run), evidence: this.evidence.get(id) })
++    let found = findResult(out, run.branchHint, this.knownHeads(id), context())
++    if (found.verify.length) {
++      for (const head of found.verify) await this.sessionEvidence(run, head.branch, head.sha)
++      run = this.get(id)
++      found = findResult(out, run.branchHint, this.knownHeads(id), context())
++    }
++    this.ambiguous.set(id, found.ambiguous)
++    const refs = out.split('\n').map(line => line.trim().split(/\s+/)).filter(parts => parts.length === 2) as Array<[string, string]>
+     const patch: Partial<CloudRunSummary> = {}
+-    if (found.branch && found.branch !== run.branch) patch.branch = found.branch
+-    if (found.head && found.head !== run.headCommit) patch.headCommit = found.head
+-    if (found.pr) {
+-      const repo = /github\.com[/:]([^/]+\/[^/.\s]+)/.exec(await this.git(run.cwd, ['remote', 'get-url', 'origin']).catch(() => ''))?.[1]
+-      const url = repo ? `https://github.com/${repo}/pull/${found.pr}` : `pull/${found.pr}`
+-      if (url !== run.prUrl) patch.prUrl = url
++    if (found.branch) {
++      if (found.branch !== run.branch) patch.branch = found.branch
++      if (found.head !== run.headCommit) patch.headCommit = found.head
++      if (found.pr) {
++        const repo = /github\.com[/:]([^/]+\/[^/.\s]+)/.exec(await this.git(run.cwd, ['remote', 'get-url', 'origin']).catch(() => ''))?.[1]
++        const url = repo ? `https://github.com/${repo}/pull/${found.pr}` : `pull/${found.pr}`
++        if (url !== run.prUrl) patch.prUrl = url
++      }
++      if (run.branch && found.branch !== run.branch) Object.assign(patch, this.retracted(run, refs, Boolean(found.pr)))
++      if (run.status === 'running') patch.status = 'pushed'
++    } else if (run.branch && !this.stillOurs(run, refs)) {
++      Object.assign(patch, { branch: null, headCommit: null, ...this.retracted(run, refs, false) }, run.status === 'pushed' ? { status: 'running' as const } : {})
+     }
+-    if (found.branch && run.status === 'running') patch.status = 'pushed'
+     if (!Object.keys(patch).length) return run
+     const next = this.update(id, patch)
+     // The first push is when there is something to read: pull the transcript once, unasked.
+@@ -378,6 +495,57 @@ export class CloudRuns {
+     return next
+   }
+ 
++  /** A branch recorded earlier that the last look at origin did not choose stays the run's only
++   *  while nothing speaks against it: it is gone from origin (a merged pull request deletes it),
++   *  still fits the run's own hint, and its commits name no other session. One that is still on
++   *  origin and was not chosen is contested now; one that does not fit the hint was some other
++   *  session's push, taken by the old single-new-branch fallback. */
++  private stillOurs(run: CloudRunSummary, refs: Array<[string, string]>): boolean {
++    if (!run.branch) return false
++    if (refs.some(([, ref]) => ref === `refs/heads/${run.branch}`)) return false
++    if (run.branchHint && !hintStrength(run.branch, run.branchHint)) return false
++    return this.evidence.get(run.id)?.[`${run.branch}@${run.headCommit}`] !== 'other'
++  }
++
++  /** What goes with a retracted branch: the pull request opened from it (unless the new branch
++   *  brings its own) and a worktree fetched from it. */
++  private retracted(run: CloudRunSummary, refs: Array<[string, string]>, replacedPr: boolean): Partial<CloudRunSummary> {
++    const patch: Partial<CloudRunSummary> = {}
++    const number = run.prUrl ? /\/pull\/(\d+)/.exec(run.prUrl)?.[1] : undefined
++    const prHead = number ? refs.find(([, ref]) => ref === `refs/pull/${number}/head`)?.[0] : undefined
++    const branchHead = refs.find(([, ref]) => ref === `refs/heads/${run.branch}`)?.[0]
++    if (!replacedPr && prHead && (prHead === run.headCommit || prHead === branchHead)) patch.prUrl = null
++    if (run.worktreePath || run.fetchedCommit) { patch.worktreePath = null; patch.fetchedCommit = null }
++    return patch
++  }
++
++  /** Other runs from the same project folder whose session may push while this one runs. */
++  private siblings(run: CloudRunSummary): ResultSibling[] {
++    const window = this.options.watchForMs ?? 24 * 3600_000
++    return [...this.runs.values()]
++      .filter(other => other.id !== run.id && other.cwd === run.cwd && other.status !== 'failed' && other.createdAt <= this.now() && other.createdAt + window > run.createdAt)
++      .map(other => ({
++        hint: other.branchHint,
++        known: this.knownHeads(other.id),
++        settled: Boolean(other.branch && this.evidence.get(other.id)?.[`${other.branch}@${other.headCommit}`] === 'ours')
++      }))
++  }
++
++  /** Whether the commits on `branch` name this run's session, another one, or none. Fetched
++   *  without a destination, so no ref of the project changes; a commit's message never changes,
++   *  so a verdict is kept per sha. A failed look decides nothing and is asked again next time. */
++  private async sessionEvidence(run: CloudRunSummary, branch: string, sha: string): Promise<SessionEvidence> {
++    const key = `${branch}@${sha}`
++    const cached = this.evidence.get(run.id)?.[key]
++    if (cached) return cached
++    try {
++      await this.git(run.cwd, ['fetch', '--no-tags', '--no-write-fetch-head', 'origin', `refs/heads/${branch}`])
++      const verdict = readSessionEvidence(await this.git(run.cwd, ['log', '-n', '20', '--format=%B%x1e', sha]), run.sessionId!)
++      this.evidence.set(run.id, { ...this.evidence.get(run.id), [key]: verdict })
++      return verdict
++    } catch { return 'none' }
++  }
++
+   /**
+    * The session's messages. With `refresh`, the CLI's teleport pulls them from the cloud into a
+    * scratch worktree of this store (`claude --teleport <session_id>` checks the session's branch
+@@ -427,8 +595,10 @@ export class CloudRuns {
+     let run = await this.refreshResult(id)
+     const git = (args: string[]): Promise<string> => this.git(run.cwd, args)
+     if (!run.branch && !run.prUrl) {
+-      const found = findResult(await git(['ls-remote', 'origin', 'refs/heads/claude/*']), run.branchHint, this.knownHeads(id))
+-      throw new Error(found.ambiguous.length ? `Several new claude/* branches appeared: ${found.ambiguous.join(', ')}` : 'The session has not pushed a branch yet')
++      const ambiguous = this.ambiguous.get(id) ?? []
++      throw new Error(ambiguous.length
++        ? `New claude/* branches appeared that cannot be told apart from another cloud run's (none names this session in its commits): ${ambiguous.join(', ')}. Check ${run.sessionUrl ?? 'the session'} for the branch it pushed`
++        : run.branchHint ? `The session has not pushed ${run.branchHint} (or it with a suffix) yet` : 'The session has not pushed a branch yet')
+     }
+     const pr = run.prUrl ? /\/pull\/(\d+)/.exec(run.prUrl)?.[1] : undefined
+     const [ref, local] = run.branch ? [`refs/heads/${run.branch}`, `refs/remotes/origin/${run.branch}`] : [`refs/pull/${pr}/head`, `refs/remotes/origin/cloud-pr-${pr}`]
