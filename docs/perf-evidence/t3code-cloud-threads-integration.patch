@@ -1,0 +1,1773 @@
+diff --git a/docs/perf-evidence/t3code-cloud-threads.md b/docs/perf-evidence/t3code-cloud-threads.md
+new file mode 100644
+index 0000000..e5e2d06
+--- /dev/null
++++ b/docs/perf-evidence/t3code-cloud-threads.md
+@@ -0,0 +1,246 @@
++# Threads without a project — t3code adoption, first slice (CLOUD)
++
++Cloud-only implementation commissioned by the owner; Sol integrates it locally. Branch
++`claude/cloud-thread-adoption-t3code-yt2ywb`, cut from `origin/main` at `3f95349`
++(2026-10-28). **The owner's checkout is ~92 local commits ahead of that base, so nothing here claims
++parity with the installed app**; see *Integration notes* before shipping.
++
++The feature-list task `c85d40b6-ad59-4cfb-b644-3700c9ff1674` is **not in this checkout's
++`feature-list.md`** (it was added in the commits not yet pushed to `origin/main`), so I could not
++read it. I worked from the commission text: "new tab/thread without requiring the owner to choose or
++create a project, in a smart thread view inspired by the t3 sidebar and the Conductor phone UI". Sol
++should check the task's wording against what is listed below. `feature-list.md` was not edited.
++
++## Reference: pingdotgg/t3code, pinned
++
++- Commit **`dd148481531a0a090780a2ade20588566db099a2`** (2026-10-29, "perf(server): idle servers run
++  100x fewer background queries…"). It is a shallow, read-only clone; nothing was pushed there.
++- What t3code does, and what Conductor took from it:
++
++| t3code (path at the pinned SHA) | What it does | Conductor in this slice |
++|---|---|---|
++| `apps/server/src/project/ManagedProjectFolders.ts:253-297`, `packages/contracts/src/rpc.ts:408` (`projects.ensureScratch`) | "No project" is a hidden scratch project rooted at `<baseDir>/scratch` | **Adopted.** The *General* project is a real local project, made on first use under the projects root (`src/main/general-threads.ts`) |
++| `ManagedProjectFolders.ts:317-342` | One folder per scratch thread (`<date>-<words>-<id>`) | **Not yet.** All General threads share one folder (ranked improvement #1) |
++| `packages/contracts/src/orchestrationV2.ts:3348-3354`, `apps/server/src/project/ScratchThreadPromotion.ts:57-129` | "Turn into project" adopts the folder in place, so the working directory never changes | **Adopted** as *Turn General into a project…* (renames the row only) |
++| `Orchestrator.ts:4050-4063` | Refuses to move a thread whose working directory is not the target's root | **Same rule.** A started thread is never re-rooted; *Continue in project* opens a new thread with a drafted handoff instead |
++| `apps/web/src/components/NoProjectsHero.tsx:30-53` | "What should we work on?" with **Start without a project** and **Add project** | **Adopted** (`EmptyState.tsx`) |
++| `apps/web/src/components/Sidebar.logic.ts:167-178`, `:1073-1175` | Sidebar sections by state (pinned, active, working, snoozed, settled), with a priority-ordered status pill | **Partly adopted.** Threads are grouped *Needs you / Working / Today / Earlier* and carry a state pill; pin, settle and snooze are later work |
++| `apps/web/src/timestampFormat.ts:231-254` | Compact relative age on each row | **Adopted** (`threadAge`) |
++| `Sidebar.logic.ts:989-1021` | Searches titles first, then messages | **Partly adopted.** Searches title, project, workspace and last message only |
++| `packages/shared/src/keybindings.ts:147-239` (`mod+alt+n` = `chat.newWithoutProject`) | Shortcut for a new thread without a project | **Adopted:** Ctrl+Alt+N, plus a palette entry |
++| `apps/web/src/components/chat/useComposerMenuItems.ts:213-274`, `apps/server/src/provider/Drivers/ClaudeSkills.ts:451-479` | One slash menu holding built-ins, provider commands and `/skill:name` discovered from `.claude/skills` | **Not changed.** Conductor already has `src/shared/slash-commands.ts`; see ranked improvement #7 |
++| `apps/server/src/orchestration-v2/ProviderSessionManager.ts:1723`, `RestartContinuation.ts` | Durable native resume references, with "Continue where you left off" after a restart | **Unchanged.** Conductor's own resume and continuation path already does this; General threads use it as is |
++
++## What changed (adoption 1)
++
++1. **First launch / no project.** The empty state now asks *What should we work on?* and offers
++   **Start without a project** before **New project**. The sidebar's Threads section says *No open
++   threads. Start one — no project needed.*
++2. **New thread** (empty-state button, the Threads `+`, **Ctrl+Alt+N**, or the palette entry *New
++   thread without a project*):
++   - Main ensures the General project (`threads:new-general`).
++   - The window loads it and shows a launcher in its workspace. The owner picks an agent and types;
++     nothing asks for a project.
++   - A second new thread reuses General. Two clicks at once still make only one General.
++3. **Internal anchor, user-facing "no project"**:
++   - General is an ordinary local project row. Its folder is `<projectsRoot>/General`, made by the same
++     path as the owner's *New project* (`addLocalProject`): backlog, file watcher and remote sharing
++     come with it.
++   - The settings key `generalThreadsAnchor` = `{projectId, path}` remembers it.
++   - Lists sent to the window carry `general: true` (`ProjectRecord.general`, never stored). The row
++     shows a dashed-message glyph and a tooltip that reads *Threads started without a project*.
++4. **Working-directory safety**:
++   - The agent's working directory is `project.path`, exactly as for any project (`tab-keep-alive.ts`).
++     Every project-scope guard therefore applies unchanged.
++   - `safeGeneralFolder` refuses a drive root, the home folder, the projects root, or any folder above
++     them, both for a stored anchor and for whatever the project maker returns. Conductor never starts
++     threads in a folder that would hand an Auto agent everything under it.
++5. **Restart and resume**:
++   - Layouts, agent specs and journals belong to the General project like any other, so they restore
++     and resume through the existing paths.
++   - If the folder is deleted behind Conductor's back, it is made again at the same path, so Claude's
++     working-directory-keyed resume still finds its transcript.
++   - If General is removed from Conductor, it comes back on its old folder instead of as *General 2*.
++6. **Joining a project later** (*subsequent project association*):
++   - **Turn General into a project…** (the Threads `⋯` menu, `threads:promote`): the row is renamed and
++     the folder, working directories and threads stay put. The anchor is cleared, so the next new thread
++     makes a fresh General.
++   - **Continue in project ›** (right-click a General thread, `threads:handoff`): opens a new thread with
++     the same provider in the chosen local project. Its composer is pre-filled through `seedDraft` with
++     a handoff: the title, the old folder, and the last six messages clipped to 600 characters each.
++     It is left **unsent**, and the General thread is untouched.
++   - A started thread is never moved to another working directory: a native CLI resumes from the folder
++     it began in (claude `--resume`), so moving it would lose the conversation on the next restart.
++7. **Smart thread view** (`ThreadList.tsx` above Projects; the view is built in main by
++   `buildThreadView` from `PhoneAccessService.phoneState().sessions`, the same source the phone uses):
++   - It lists every open conversation in every project, grouped *Needs you* (attention, failed,
++     disconnected), *Working* (working, usage limit), *Today*, *Earlier*.
++   - Within a group a wizard comes first, then the newest.
++   - A coworker that does not need the owner is folded into its controller's row (*+N coworkers*), so a
++     swarm does not bury the conversation the owner is in. A coworker that needs the owner is always
++     listed.
++   - Each row shows a state pill (Approval / Question / Working / Limit / Failed / Disconnected) or an
++     age, plus the project, or *General* with its glyph.
++   - Search appears once there are more than six threads.
++   - The view refreshes on the window's phase changes, a 5-second poll while visible, and window focus.
++   - Clicking a row focuses the tab through the existing `agentControl.focusTab`, across projects.
++
++## Evidence
++
++### Typecheck, unit tests and build
++
++- `npx tsc --noEmit` passes; `npx electron-vite build` passes.
++- New tests, all passing:
++  - `src/shared/threads.test.ts` (8): bucket order, open-only listing, swarm folding with
++    attention exempted, wizard first, search, the row cap, age labels, state labels, handoff clipping
++    and caps, anchor parsing.
++  - `src/main/general-threads.test.ts` (7, real SQLite and real folders):
++    - first launch;
++    - **restart**: the database is closed and reopened, giving the same General, the same workspace,
++      and the agent tab still in the saved layout;
++    - two concurrent ensures make one project;
++    - a deleted folder is made again at the same path;
++    - a removed General comes back on the same folder, and a fresh one is made when the folder is
++      also gone;
++    - an anchor in the home folder is refused, as is a maker that returns the projects root;
++    - promote renames in place, the agent's working directory is unchanged, and the next General is
++      `General 2`.
++  - `src/main/threads-ipc.test.ts` (3): handoff uses top-level messages only and continues only a
++    General thread into another open project; every channel checks the sender; project-change
++    broadcasts; dispose removes the handlers.
++  - `src/renderer/src/components/ThreadList.test.ts` (3): the empty state offers the thread first,
++    the old single action stays without a handler, and the Threads section renders.
++- Full `vitest run` on Linux: see *Full suite* below.
++
++### Real app, Linux container (Xvfb), built `out/` — 10/10 PASS
++
++Linux is not the owner's platform, and `scripts/verify-kit.mjs` is Windows-only (its process accounting
++uses Win32_Process). So I drove the built app directly with Playwright's Electron launcher and the
++same parked environment: `CONDUCTOR_TEST_USER_DATA` (a fresh profile), `CONDUCTOR_PROJECTS_ROOT` and
++`CONDUCTOR_OFFLINE_TESTS=1`. The provider was a synthetic Claude fixture that replies with its own
++working directory. The driver is
++[`t3code-cloud-threads/linux-threads-run.mjs`](t3code-cloud-threads/linux-threads-run.mjs) and the raw
++verdicts are in [`results.json`](t3code-cloud-threads/results.json).
++
++| Check | Result |
++|---|---|
++| First launch with no project: the empty state offers *Start without a project* | PASS — 0 projects |
++| Click it: General is made at `<root>/projects/General`, marked, active, with a launcher | PASS |
++| A Claude turn in General runs **in the General folder** | PASS — reply: "working in /tmp/…/projects/General" |
++| The thread is listed as a General thread (Today, done) | PASS |
++| Ctrl+Alt+N again reuses General | PASS — still 1 project |
++| Quit and relaunch on the same profile: same General, thread still listed with its turn | PASS — 2 text items kept |
++| Handoff drafted for project *Brand*, with the same provider | PASS — 412 characters, claude |
++| *Continue in project › Brand* from the context menu: Brand is active and the draft is seeded | PASS |
++| *Turn General into a project*: same id and folder, the thread still answers, next General is `General 2` | PASS |
++
++Screenshots: [first launch](t3code-cloud-threads/1-first-launch.png) ·
++[thread in the Threads view](t3code-cloud-threads/3-thread-in-sidebar.png) ·
++[continued in Brand with the drafted handoff](t3code-cloud-threads/5-continued-in-brand.png).
++
++### Parked smoke for Windows (written, **not run here**)
++
++`scripts/smoke-cloud-threads.mjs` covers the same scenario through verify-kit in spawn mode. It
++restarts with a real `app.restart` and relaunch, not quit-and-launch. Run it with
++`node scripts/smoke-lock.mjs --timeout-min 20 -- node scripts/smoke-cloud-threads.mjs`; evidence goes
++to `artifacts/cloud-threads/`. It could not run in this container because verify-kit refuses
++non-Windows hosts.
++
++### Full suite
++
++FULL_SUITE_PLACEHOLDER
++
++## Limitations (truthful)
++
++- No run on Windows or against the installed app. The parked smoke is unrun, and no `app.update` was
++  done (cloud session).
++- A project created through app control (`projects.open`) reaches an *already open* window only after
++  a reload. This was already the case and verify-kit's `openProject` works around it the same way;
++  this slice did not change it.
++- Continue in project offers **local projects only**. A project on a paired machine runs its threads
++  there, and that path was not exercised.
++- All General threads share one folder. Two General threads writing the same file name will collide
++  (t3code avoids this with one folder per thread; ranked improvement #1).
++- The Threads view lists **open** conversations only; closed ones stay in the existing history.
++- The thread view polls `phoneState()` every 5 s while visible and expanded. This is the same
++  computation the phone polls, with no push channel yet (ranked improvement #5). On an owner-scale
++  profile it should be measured before shipping.
++- Phone UI: General threads appear there as project *General*, but the phone's new-tab sheet still
++  needs a project. It does show General once General exists.
++- General is made through the same `addLocalProject` path as *New project*, so a paired machine sees
++  MAIN's General as an ordinary remote project called "General", without the marker. Hiding it there,
++  or marking it, is a decision for the owner.
++- Ctrl+Alt+N matches the key produced, not the physical key, and ignores AltGr. On a layout where
++  Ctrl+Alt+N itself produces a character (Windows treats Ctrl+Alt as AltGr), only the palette entry
++  and the `+` button work. Not tested on the owner's keyboard.
++
++## Ranked improvements (next slices)
++
++Estimates are for one engineer, including tests and a parked smoke.
++
++| # | Improvement (UX / skills / commands) | Why | Estimate |
++|---|---|---|---|
++| 1 | One folder per General thread (t3 `ManagedProjectFolders`), with *Turn into project* adopting that one folder | Threads stop sharing files; promotion can be per thread. Needs a thread-level working-directory override in `AgentSpec` and file scope | 2–3 days |
++| 2 | Unread-aware *Done* / *Failed* pills and *Mark unread*, from the existing `tab-seen.ts` | Today a finished thread looks the same whether or not the owner has seen it | 1 day |
++| 3 | Pin / Settle / Snooze sections, drag between sections, with Undo (t3 `Sidebar.logic.ts:222-421`) | Lets a long-lived owner inbox be kept tidy | 2–3 days |
++| 4 | Push updates (`threads:changed` published on phase or title change, like `attention:changed`) instead of the 5 s poll | Removes polling cost; the list updates at once | 1 day |
++| 5 | Thread keyboard: Alt+Shift+[ / ] for previous/next thread, Alt+1..9 to jump (Ctrl+digit is already tabs) | Moves between threads without the mouse | 0.5 day |
++| 6 | *New thread in…* palette picker that carries over the current model, effort and mode (t3 `useHandleNewThread.ts:116-136`) | One step from any context | 1 day |
++| 7 | Discovered skills in the composer's `/` menu as `/skill:name` (t3 `useComposerMenuItems.ts:240-274`, `ClaudeSkills.ts`); Conductor today routes `/skills` to the connections view | Makes skills usable without knowing their names | 1–2 days |
++| 8 | Message-history search in the Threads view, using `structured-message-search` | Finds a thread by what was said | 1 day |
++| 9 | Phone: *New thread without a project* in the new-tab sheet, through `threads:new-general` | Matches the desktop on the phone | 1 day |
++| 10 | App-control `threads.new` / `threads.list` for agents (coordinate with the tools.timings owner on `agent-control.ts`) | Lets a wizard start General threads | 0.5 day |
++| 11 | Continue in project for remote projects, and an in-place move for runtimes whose resume is not tied to the folder (Codex thread id), after a provider probe | Completes association | 2 days |
++| 12 | *Unsent draft* rows for a launcher or empty agent tab (t3 `SidebarDraftBlock.tsx`) | Shows unsent drafts in the list | 0.5–1 day |
++
++## Exact changed paths
++
++New:
++- `src/shared/threads.ts`, `src/shared/threads.test.ts`
++- `src/main/general-threads.ts`, `src/main/general-threads.test.ts`
++- `src/main/threads-ipc.ts`, `src/main/threads-ipc.test.ts`
++- `src/preload/threads.ts`
++- `src/renderer/src/components/ThreadList.tsx`, `ThreadList.css`, `ThreadList.test.ts`, `EmptyState.css`
++- `scripts/smoke-cloud-threads.mjs`
++- `docs/perf-evidence/t3code-cloud-threads.md`, `docs/perf-evidence/t3code-cloud-threads/*` (driver,
++  results, 3 PNGs)
++
++Modified (each is a small addition):
++- `src/main/index.ts`: two imports and two module variables. `GeneralThreads` and `registerThreadsIpc`
++  are wired just before the `projects:list` handler, `projects:list` now marks General, and there is
++  one dispose entry.
++- `src/shared/models.ts`: `ProjectRecord.general?: true`.
++- `src/shared/ipc.ts`: `threads` on `ConductorBridge`.
++- `src/preload/index.ts`: the `threadsBridge` import and entry.
++- `src/renderer/src/App.tsx`: the `pendingThread` state; `newThread`, `openThread`,
++  `continueInProject` and `promoteGeneral`; the pending-thread effect; Ctrl+Alt+N; the palette entry;
++  the `threads` prop on Sidebar; `onNewThread` on EmptyState.
++- `src/renderer/src/components/Sidebar.tsx`: the `threads` prop, `<ThreadList>` above Projects, and
++  the glyph and tooltip on the General row.
++- `src/renderer/src/components/EmptyState.tsx`: rewritten (still about 20 lines).
++- `src/renderer/src/panes/use-composer-draft.ts`: `seedDraft`.
++
++Not touched: `feature-list.md`, `agent-control.ts`, any tool-timing module or `tools.timings`, audio,
++other projects (miron).
++
++## Integration notes for Sol
++
++- **Fetch** `claude/cloud-thread-adoption-t3code-yt2ywb` and **merge or cherry-pick** onto the local
++  `main`. Do not reset to it: it lacks the 92 local commits.
++- Likely conflict points are the hot files above, all small hunks:
++  - `App.tsx`: the palette list, the Sidebar props, the EmptyState line, and the new block placed just
++    before `openJobTab`.
++  - `Sidebar.tsx`: the imports, the end of the props interface, the Projects section start, and the
++    project-row button.
++  - `index.ts`: the imports after `session-archive`, the variables after `disposeLogicLoopsIpc`, the
++    dispose list, and just before `projects:list`.
++  - In each case, keep both sides.
++- Check after merging:
++  - Ctrl+Alt+N is still free in the local `App.tsx` and main menus.
++  - `phoneState()` still returns `sessions` with `tabId`, `controllerId`, `wizard` and `state`.
++  - `agentControl.focusTab` still has the same signature.
++  - `ProjectRecord` still has no other `general` field.
++- Ship: `git.ship({message, paths:[…the paths above…]})`, then `app.update({commit,
++  smoke:["smoke-cloud-threads"]})` alongside the other cloud worker's tools.timings batch.
++- Measure the Threads poll on the owner-scale profile (`scripts/owner-scale-profile.mjs`). If
++  `phoneState()` is heavy there, raise `POLL_MS` in `ThreadList.tsx` or do ranked improvement #4 first.
+diff --git a/scripts/smoke-cloud-threads.mjs b/scripts/smoke-cloud-threads.mjs
+new file mode 100644
+index 0000000..bf29d2c
+--- /dev/null
++++ b/scripts/smoke-cloud-threads.mjs
+@@ -0,0 +1,105 @@
++// Parked check: threads without a project (src/shared/threads.ts, docs/perf-evidence/t3code-cloud-threads.md).
++// node scripts/smoke-lock.mjs --timeout-min 20 -- node scripts/smoke-cloud-threads.mjs
++// First launch with no project offers "Start without a project"; a new thread opens in the General
++// project (a folder Conductor made under the projects root), its agent works in that folder, the
++// Threads view lists it, a second new thread reuses General, an app.restart keeps all of it, and a
++// General thread can continue in a real project (drafted, unsent) or General can become a project in place.
++import assert from 'node:assert/strict'
++import { existsSync } from 'node:fs'
++import { mkdir } from 'node:fs/promises'
++import { join } from 'node:path'
++import { call, configure, failed, finish, launchParked, page, poll, record, relaunched, shot, step, watchdog } from './verify-kit.mjs'
++
++configure({ name: 'cloud-threads', output: 'artifacts/cloud-threads' })
++watchdog(900)
++
++// Answers any prompt, saying where it runs, so the working directory is evidence, not an assumption.
++const FIXTURE = `
++import readline from 'node:readline'
++import { randomUUID } from 'node:crypto'
++const send = message => process.stdout.write(JSON.stringify(message) + '\\n')
++const session = process.argv.includes('--resume') ? process.argv[process.argv.indexOf('--resume') + 1] : randomUUID()
++const emit = message => send({ uuid: randomUUID(), session_id: session, parent_tool_use_id: null, ...message })
++readline.createInterface({ input: process.stdin }).on('line', line => {
++  const message = JSON.parse(line)
++  if (message.type === 'control_request') { send({ type: 'control_response', response: { subtype: 'success', request_id: message.request_id, response: message.request.subtype === 'initialize' ? { models: [{ value: 'synthetic-claude', displayName: 'Synthetic' }] } : {} } }); return }
++  if (message.type !== 'user') return
++  const blocks = message.message.content
++  const prompt = Array.isArray(blocks) ? blocks.filter(block => block.type === 'text').map(block => block.text).join('') : String(blocks)
++  emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', cwd: process.cwd() })
++  emit({ type: 'assistant', message: { id: randomUUID(), content: [{ type: 'text', text: 'Working in ' + process.cwd() + ': ' + prompt.split('\\n', 1)[0].slice(0, 60) }] } })
++  emit({ type: 'result', subtype: 'success', is_error: false, usage: {} })
++})
++`
++
++const threadsOf = view => view.evaluate(() => window.conductor.threads.list(''))
++const listed = (view, id) => poll(async () => (await threadsOf(view)).groups.flatMap(group => group.threads).find(thread => thread.id === id) ?? null, { timeoutMs: 30_000, label: `thread ${id} listed` })
++
++try {
++  const inst = await launchParked({ mode: 'spawn', fixtures: { 'fake-claude.mjs': FIXTURE } })
++  let view = await page(inst)
++
++  step('first launch, no project: the empty state offers a thread first')
++  assert.deepEqual(await view.evaluate(() => window.conductor.projects.list()), [])
++  await view.locator('[data-empty-new-thread]').waitFor({ timeout: 30_000 })
++  record('first-launch', 'PASS', {}, `empty state offers "${await view.locator('[data-empty-new-thread]').innerText()}"; ${await shot('first-launch')}`)
++
++  step('Start without a project: General is made under the projects root and shows a launcher')
++  await view.locator('[data-empty-new-thread]').click()
++  await view.locator('.project-row.active[data-general-project]').waitFor({ timeout: 30_000 })
++  await view.locator('.pane-workspace').first().waitFor({ timeout: 30_000 })
++  const projects = await view.evaluate(() => window.conductor.projects.list())
++  const general = projects.find(project => project.general)
++  const expected = join(inst.root, 'projects', 'General')
++  record('general-made', projects.length === 1 && general?.path.toLowerCase() === expected.toLowerCase() && existsSync(expected) ? 'PASS' : 'FAIL', { projects: projects.length }, `${general?.name} at ${general?.path}`)
++  inst.projectId = general.id
++
++  step('a conversation in General works in the General folder and is listed as a General thread')
++  const tab = await call('tabs.open', { kind: 'agent', provider: 'claude', title: 'Logo ideas' }, { projectId: general.id })
++  await poll(() => call('agents.status', { agentSessionId: tab.resourceId }), { timeoutMs: 30_000, label: 'agents.status' })
++  await call('agents.submit', { agentSessionId: tab.resourceId, prompt: 'Sketch three logo directions' })
++  await poll(async () => (await call('agents.status', { agentSessionId: tab.resourceId })).phase === 'completed', { timeoutMs: 60_000, label: 'turn completed' })
++  const reply = await view.evaluate(id => window.conductor.structured.snapshot(id).then(state => state.items.filter(item => item.data.type === 'text' && item.data.role === 'assistant').map(item => item.data.text).join(' ')), tab.resourceId)
++  record('general-cwd', reply.toLowerCase().includes(general.path.toLowerCase()) ? 'PASS' : 'FAIL', {}, reply.slice(0, 200))
++  const thread = await listed(view, tab.resourceId)
++  await view.locator(`[data-thread-id="${tab.resourceId}"][data-thread-general]`).waitFor({ timeout: 20_000 })
++  record('thread-listed', thread.general && thread.tabId ? 'PASS' : 'FAIL', { state: thread.state }, `${thread.title} (${thread.projectName}); ${await shot('thread-listed')}`)
++
++  step('Ctrl+Alt+N again reuses General')
++  await view.keyboard.press('Control+Alt+n')
++  await view.waitForTimeout(1500)
++  const again = await view.evaluate(() => window.conductor.projects.list())
++  record('reuse-general', again.length === 1 && again[0].id === general.id ? 'PASS' : 'FAIL', { projects: again.length })
++
++  step('app.restart keeps General, the thread and its turn')
++  const firstPid = inst.credential.pid
++  await call('app.restart', { force: true })
++  const seconds = await relaunched(inst, firstPid, { timeoutMs: 90_000 })
++  view = await page(inst)
++  const restarted = (await view.evaluate(() => window.conductor.projects.list())).find(project => project.general)
++  const kept = await listed(view, tab.resourceId)
++  const items = await view.evaluate(id => window.conductor.structured.snapshot(id).then(state => state?.items.filter(item => item.data.type === 'text').length ?? 0), tab.resourceId)
++  record('restart', restarted?.id === general.id && kept.tabId && items >= 2 ? 'PASS' : 'FAIL', { seconds, items }, await shot('after-restart'))
++
++  step('continue in a real project: a new thread there with the handoff drafted and unsent')
++  await mkdir(join(inst.root, 'src', 'brand'), { recursive: true })
++  const brand = await call('projects.open', { path: join(inst.root, 'src', 'brand'), name: 'Brand' }, { projectId: null })
++  // As verify-kit's openProject does: a project made through control reaches an open window on reload.
++  if (!await view.locator('.project-row').filter({ hasText: 'Brand' }).first().isVisible().catch(() => false)) { await view.reload(); await view.waitForFunction(() => Boolean(window.conductor), null, { timeout: 30_000 }) }
++  await view.locator(`[data-thread-id="${tab.resourceId}"]`).click({ button: 'right' })
++  await view.locator(`[data-continue-project="${brand.id}"]`).click()
++  await view.locator('.project-row.active').filter({ hasText: 'Brand' }).first().waitFor({ timeout: 30_000 })
++  const drafted = await poll(() => view.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('conductor.structured.draft.')).some(key => (localStorage.getItem(key) ?? '').includes('Sketch three logo directions'))), { timeoutMs: 20_000, label: 'handoff draft' })
++  record('continue-in-project', drafted ? 'PASS' : 'FAIL', {}, await shot('continued-in-brand'))
++
++  step('turn General into a project in place: same folder, the thread still answers, a fresh General next time')
++  const promoted = await view.evaluate(() => window.conductor.threads.promote('Logo work'))
++  await call('agents.submit', { agentSessionId: tab.resourceId, prompt: 'One more direction' }, { projectId: general.id })
++  await poll(async () => (await call('agents.status', { agentSessionId: tab.resourceId }, { projectId: general.id })).phase === 'completed', { timeoutMs: 60_000, label: 'turn after promote' })
++  const next = await view.evaluate(() => window.conductor.threads.newGeneral())
++  record('promote-in-place', promoted.id === general.id && promoted.path === general.path && next.project.id !== general.id ? 'PASS' : 'FAIL', { promoted: promoted.name }, `next General at ${next.project.path}`)
++  assert.deepEqual(inst.errors, [], 'no renderer errors')
++} catch (error) {
++  await failed(error)
++}
++await finish()
+diff --git a/src/main/general-threads.test.ts b/src/main/general-threads.test.ts
+new file mode 100644
+index 0000000..0852871
+--- /dev/null
++++ b/src/main/general-threads.test.ts
+@@ -0,0 +1,153 @@
++import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
++import { mkdir, stat } from 'node:fs/promises'
++import { tmpdir } from 'node:os'
++import { basename, join } from 'node:path'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import type { AgentSpec, WorkspaceLayout } from '../shared/models'
++import { GENERAL_ANCHOR_SETTING } from '../shared/threads'
++import { ConductorDatabase } from './database'
++import { GeneralThreads, safeGeneralFolder } from './general-threads'
++
++const roots: string[] = []
++afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 }) })
++
++/** The same wiring main/index.ts uses, on a real database and real folders under a temp "home". */
++function setup(root = mkdtempSync(join(tmpdir(), 'conductor-general-threads-'))) {
++  if (!roots.includes(root)) roots.push(root)
++  const home = join(root, 'home')
++  const projectsRoot = join(home, 'Conductor')
++  mkdirSync(projectsRoot, { recursive: true })
++  const database = new ConductorDatabase(join(root, 'conductor.db'))
++  const folderExists = async (path: string): Promise<boolean> => { try { return (await stat(path)).isDirectory() } catch { return false } }
++  const created: string[] = [], registered: string[] = []
++  const general = new GeneralThreads({
++    getSetting: key => database.getSetting(key),
++    setSetting: (key, value) => database.setSetting(key, value),
++    getProject: id => database.getProject(id),
++    listSessions: projectId => database.listSessions(projectId),
++    createSession: (projectId, name) => database.createSession(projectId, name),
++    projectsRoot: () => projectsRoot,
++    folderExists,
++    makeFolder: async path => { await mkdir(path, { recursive: true }) },
++    createProject: async name => {
++      let target = join(projectsRoot, name), suffix = 2
++      while (await folderExists(target)) target = join(projectsRoot, `${name} ${suffix++}`)
++      await mkdir(target)
++      created.push(target)
++      return database.upsertProject(target, basename(target))
++    },
++    registerFolder: async (path, name) => { registered.push(path); return database.upsertProject(path, name) },
++    renameRow: (projectId, name) => database.updateProjectLocation(projectId, database.getProject(projectId)!.path, name),
++    home: () => home
++  })
++  return { root, home, projectsRoot, database, general, created, registered }
++}
++
++describe('GeneralThreads', () => {
++  it('first launch: makes General in the projects folder, marks it, and is the same project after a restart', async () => {
++    const first = setup()
++    expect(first.general.projectId()).toBeNull()
++    const { project, workspace } = await first.general.ensure()
++    expect(project).toMatchObject({ name: 'General', path: join(first.projectsRoot, 'General'), general: true })
++    expect(existsSync(project.path)).toBe(true)
++    expect(workspace.projectId).toBe(project.id)
++    expect(first.general.mark(first.database.listDeskProjects())).toEqual([expect.objectContaining({ id: project.id, general: true })])
++
++    // A thread in it: an agent whose working directory is the General folder, in a saved layout.
++    const spec: AgentSpec = { id: 'agent_general_1', projectId: project.id, sessionId: workspace.id, provider: 'claude', title: 'Logo ideas', cwd: project.path }
++    first.database.upsertAgent(spec, 'idle')
++    const layout: WorkspaceLayout = { version: 1, root: { type: 'group', id: 'group_1', tabs: [{ id: 'pane_1', kind: 'agent', title: 'Logo ideas', resourceId: spec.id, state: { provider: 'claude' } }], activeTabId: 'pane_1' } }
++    first.database.saveSession(workspace.id, layout, null, [])
++    first.database.close()
++
++    const second = setup(first.root)
++    expect(second.general.projectId()).toBe(project.id)
++    const again = await second.general.ensure()
++    expect(again.project.id).toBe(project.id)
++    expect(again.workspace.id).toBe(workspace.id)
++    expect(JSON.stringify(again.workspace.layout)).toContain(spec.id)
++    expect(second.created).toEqual([])
++    second.database.close()
++  })
++
++  it('makes one General when asked twice at once', async () => {
++    const { general, created, database } = setup()
++    const [a, b] = await Promise.all([general.ensure(), general.ensure()])
++    expect(a.project.id).toBe(b.project.id)
++    expect(created).toHaveLength(1)
++    expect(database.listProjects()).toHaveLength(1)
++    database.close()
++  })
++
++  it('makes a deleted General folder again at the same path, so kept threads resume from it', async () => {
++    const { general, database } = setup()
++    const { project } = await general.ensure()
++    rmSync(project.path, { recursive: true })
++    const again = await general.ensure()
++    expect(again.project.id).toBe(project.id)
++    expect(existsSync(project.path)).toBe(true)
++    database.close()
++  })
++
++  it('brings a removed General back on its old folder instead of making General 2', async () => {
++    const { general, database, registered, created } = setup()
++    const { project } = await general.ensure()
++    database.removeProject(project.id)
++    expect(general.projectId()).toBeNull()
++    const again = await general.ensure()
++    expect(again.project.path).toBe(project.path)
++    expect(registered).toEqual([project.path])
++    expect(created).toHaveLength(1)
++    // Removed and its folder gone too: a fresh one.
++    database.removeProject(again.project.id)
++    rmSync(project.path, { recursive: true })
++    expect((await general.ensure()).project.path).toBe(project.path)
++    expect(created).toHaveLength(2)
++    database.close()
++  })
++
++  it('never anchors threads in the home folder, the projects root or above them', async () => {
++    const { general, database, home, projectsRoot, created } = setup()
++    const homeProject = database.upsertProject(home, 'Home')
++    database.setSetting(GENERAL_ANCHOR_SETTING, JSON.stringify({ projectId: homeProject.id, path: home }))
++    const { project } = await general.ensure()
++    expect(project.id).not.toBe(homeProject.id)
++    expect(project.path).toBe(join(projectsRoot, 'General'))
++    expect(created).toHaveLength(1)
++    expect(safeGeneralFolder(join(projectsRoot, 'General'), projectsRoot, home)).toBe(true)
++    for (const unsafe of [home, projectsRoot, join(home, '..'), '/', '']) expect(safeGeneralFolder(unsafe, projectsRoot, home)).toBe(false)
++    database.close()
++  })
++
++  it('refuses a General whose folder would be unsafe even when the project maker returns one', async () => {
++    const { database, home, projectsRoot } = setup()
++    const general = new GeneralThreads({
++      getSetting: key => database.getSetting(key), setSetting: (key, value) => database.setSetting(key, value),
++      getProject: id => database.getProject(id), listSessions: id => database.listSessions(id), createSession: (id, name) => database.createSession(id, name),
++      projectsRoot: () => projectsRoot, folderExists: async () => true, makeFolder: vi.fn(),
++      createProject: async () => database.upsertProject(projectsRoot, 'General'),
++      registerFolder: vi.fn(), renameRow: vi.fn(), home: () => home
++    })
++    await expect(general.ensure()).rejects.toThrow(/will not start threads/)
++    expect(database.getSetting(GENERAL_ANCHOR_SETTING)).toBeNull()
++    database.close()
++  })
++
++  it('turns General into a project in place: same folder and threads, a fresh General next time', async () => {
++    const { general, database } = setup()
++    const { project, workspace } = await general.ensure()
++    database.upsertAgent({ id: 'agent_general_2', projectId: project.id, sessionId: workspace.id, provider: 'codex', title: 'Spike', cwd: project.path }, 'idle')
++    expect(() => general.promote('  ')).toThrow(/Name the project/)
++    expect(() => general.promote('general')).toThrow(/other than General/)
++    const promoted = general.promote('Brand spike')
++    expect(promoted).toMatchObject({ id: project.id, name: 'Brand spike', path: project.path })
++    expect(promoted.general).toBeUndefined()
++    expect(database.sessionArchive('check').agents.find(agent => agent.spec.id === 'agent_general_2')?.spec.cwd).toBe(project.path)
++    expect(general.projectId()).toBeNull()
++    const fresh = await general.ensure()
++    expect(fresh.project.id).not.toBe(project.id)
++    expect(fresh.project.path).toBe(project.path + ' 2')
++    expect(() => setup().general.promote('x')).toThrow(/no General project/)
++    database.close()
++  })
++})
+diff --git a/src/main/general-threads.ts b/src/main/general-threads.ts
+new file mode 100644
+index 0000000..80828c2
+--- /dev/null
++++ b/src/main/general-threads.ts
+@@ -0,0 +1,115 @@
++/**
++ * The General project: where a thread the owner starts without choosing a project lives
++ * (src/shared/threads.ts). It is an ordinary local project, made on first use in the owner's
++ * projects folder, so the agent's working directory is a dedicated folder Conductor created - never
++ * the home folder, the projects root itself or a drive root - and every project guard applies.
++ *
++ * The settings table remembers it as {projectId, path}: the id survives a rename, the path lets a
++ * General the owner removed from Conductor come back on the same folder (its files are still there)
++ * instead of piling up "General 2", "General 3". A folder deleted behind Conductor's back is made
++ * again at the same path, so the conversations kept there still resume from the folder they began in.
++ */
++import { homedir } from 'node:os'
++import { parse, resolve, sep } from 'node:path'
++import type { ProjectRecord, SessionRecord } from '../shared/models'
++import { GENERAL_ANCHOR_SETTING, GENERAL_PROJECT_NAME, GENERAL_WORKSPACE_NAME, readGeneralAnchor, type GeneralAnchor, type GeneralThreadTarget } from '../shared/threads'
++
++export interface GeneralThreadsDeps {
++  getSetting(key: string): string | null
++  setSetting(key: string, value: string): void
++  getProject(id: string): ProjectRecord | null
++  listSessions(projectId: string): SessionRecord[]
++  createSession(projectId: string, name: string): SessionRecord
++  projectsRoot(): string
++  folderExists(path: string): Promise<boolean>
++  makeFolder(path: string): Promise<void>
++  /** A new project folder under the projects root (the owner's "New project"). */
++  createProject(name: string): Promise<ProjectRecord>
++  /** An existing folder registered as a project (the owner's "Open existing folder"). */
++  registerFolder(path: string, name: string): Promise<ProjectRecord>
++  /** Renames the project row only; the folder, and so every working directory, stays put. */
++  renameRow(projectId: string, name: string): ProjectRecord
++  home?(): string
++}
++
++const normalized = (path: string): string => {
++  const full = resolve(path)
++  return process.platform === 'win32' || process.platform === 'darwin' ? full.toLowerCase() : full
++}
++const isSelfOrAncestor = (candidate: string, of: string): boolean =>
++  of === candidate || of.startsWith(candidate.endsWith(sep) ? candidate : candidate + sep)
++
++/** A folder an agent in Auto may write anywhere inside: never a drive root, and never the home
++ *  folder, the projects root or a folder above either (each would hand the agent everything under it). */
++export function safeGeneralFolder(path: string, projectsRoot: string, home = homedir()): boolean {
++  if (!path) return false
++  const target = normalized(path)
++  if (target === normalized(parse(resolve(path)).root)) return false
++  return ![home, projectsRoot].some(guarded => guarded && isSelfOrAncestor(target, normalized(guarded)))
++}
++
++export class GeneralThreads {
++  private pending: Promise<GeneralThreadTarget> | null = null
++
++  constructor(private readonly deps: GeneralThreadsDeps) {}
++
++  anchor(): GeneralAnchor | null { return readGeneralAnchor(this.deps.getSetting(GENERAL_ANCHOR_SETTING)) }
++
++  /** The General project's id while it is still in Conductor, else null. */
++  projectId(): string | null {
++    const anchor = this.anchor()
++    const project = anchor ? this.deps.getProject(anchor.projectId) : null
++    return project && !project.remote ? project.id : null
++  }
++
++  /** Marks the General project in a project list, so the window can call it what it is. */
++  mark(projects: ProjectRecord[]): ProjectRecord[] {
++    const id = this.projectId()
++    return id ? projects.map(project => project.id === id ? { ...project, general: true as const } : project) : projects
++  }
++
++  /** The General project and the workspace new threads open in; made on first use. Two clicks at
++   *  once share one creation. */
++  ensure(): Promise<GeneralThreadTarget> {
++    if (!this.pending) this.pending = this.resolve().finally(() => { this.pending = null })
++    return this.pending
++  }
++
++  /**
++   * "Turn into a project" (t3code's adopt-folder): the General project becomes an ordinary project
++   * under the owner's name for it. Only the row is renamed - the folder and every conversation's
++   * working directory stay exactly where they are, so each thread resumes as before. The next
++   * "New thread" starts a fresh General.
++   */
++  promote(name: string): ProjectRecord {
++    const trimmed = String(name ?? '').trim().slice(0, 120)
++    if (!trimmed) throw new Error('Name the project')
++    const id = this.projectId()
++    if (!id) throw new Error('There is no General project to turn into a project')
++    if (trimmed.toLowerCase() === GENERAL_PROJECT_NAME.toLowerCase()) throw new Error('Choose a name other than General')
++    const renamed = this.deps.renameRow(id, trimmed)
++    this.deps.setSetting(GENERAL_ANCHOR_SETTING, '')
++    return renamed
++  }
++
++  private async resolve(): Promise<GeneralThreadTarget> {
++    const root = this.deps.projectsRoot()
++    const home = this.deps.home?.() ?? homedir()
++    const anchor = this.anchor()
++    let project: ProjectRecord | null = anchor ? this.deps.getProject(anchor.projectId) : null
++    if (project?.remote) project = null
++    if (project && !safeGeneralFolder(project.path, root, home)) project = null
++    if (project) {
++      // Deleted behind Conductor's back: the same folder again, so kept conversations still resume.
++      if (!await this.deps.folderExists(project.path)) await this.deps.makeFolder(project.path)
++    } else if (anchor && safeGeneralFolder(anchor.path, root, home) && await this.deps.folderExists(anchor.path)) {
++      project = await this.deps.registerFolder(anchor.path, GENERAL_PROJECT_NAME)
++    } else {
++      project = await this.deps.createProject(GENERAL_PROJECT_NAME)
++    }
++    if (!safeGeneralFolder(project.path, root, home)) throw new Error(`Conductor will not start threads in ${project.path}`)
++    this.deps.setSetting(GENERAL_ANCHOR_SETTING, JSON.stringify({ projectId: project.id, path: project.path } satisfies GeneralAnchor))
++    const workspace = this.deps.listSessions(project.id)[0] ?? this.deps.createSession(project.id, GENERAL_WORKSPACE_NAME)
++    return { project: { ...project, general: true }, workspace }
++  }
++}
+diff --git a/src/main/index.ts b/src/main/index.ts
+index a1a6fbd..8f834ca 100644
+--- a/src/main/index.ts
++++ b/src/main/index.ts
+@@ -173,6 +173,8 @@ import { LOCAL_MACHINE_ID } from '../shared/remote-control'
+ import type { EditorDraft } from '../shared/models'
+ import type { BrowserPresentation, BrowserSurfaceCommand, BrowserSurfaceRequest } from '../shared/browser-surface'
+ import type { SessionArchive, SessionArchiveResult } from '../shared/session-archive'
++import { GeneralThreads } from './general-threads'
++import { registerThreadsIpc } from './threads-ipc'
+ 
+ const projectPreview = new ProjectPreviewServer()
+ /** Host telemetry for the performance chip. Nothing is sampled until a renderer asks, and
+@@ -216,6 +218,8 @@ let disposeIdeaRunsIpc: (() => void) | undefined
+ let productionApp: ProductionApp | undefined
+ let disposeProductionIpc: (() => void) | undefined
+ let disposeLogicLoopsIpc: (() => void) | undefined
++let disposeThreadsIpc: (() => void) | undefined
++let generalThreads: GeneralThreads | undefined
+ let collaboration: AgentCollaborationStore
+ let disposeCollaborationIpc: (() => void) | undefined
+ let disposeProjectActivity: (() => void) | undefined
+@@ -780,6 +784,7 @@ const disposeRuntimeServices = (): void => {
+     ['schedule IPC', () => disposeScheduleIpc?.()],
+     ['delivery IPC', () => disposeDeliveryIpc?.()],
+     ['logic loops IPC', () => disposeLogicLoopsIpc?.()],
++    ['threads IPC', () => disposeThreadsIpc?.()],
+     ['orchestration IPC', () => disposeOrchestrationIpc?.()],
+     ['collaboration IPC', () => disposeCollaborationIpc?.()],
+     ['project activity', () => { disposeProjectActivity?.(); if (projectActivityTimer) clearTimeout(projectActivityTimer); projectActivityTimer = null }],
+@@ -1900,7 +1905,36 @@ const registerIpc = (): void => {
+     authorize: (event, projectId) => { trustedStructured(event); requireLocalProject(database, projectId, 'Logic loops') },
+     projectPath: projectId => localProject(database, projectId, 'Logic loops').path,
+     changed: projectId => { for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed()) window.webContents.send('logic-loops:changed', projectId) } })
+-  ipcMain.handle('projects:list', () => database.listDeskProjects())
++  // The General project (threads started without a project) is marked so the window names it
++  // as such; it is otherwise an ordinary local project (src/main/general-threads.ts).
++  generalThreads = new GeneralThreads({
++    getSetting: key => database.getSetting(key),
++    setSetting: (key, value) => database.setSetting(key, value),
++    getProject: id => database.getProject(id),
++    listSessions: projectId => database.listSessions(projectId),
++    createSession: (projectId, name) => database.createSession(projectId, name),
++    projectsRoot: () => getAppSettings().projectsRoot,
++    folderExists,
++    makeFolder: async path => { await fs.mkdir(path, { recursive: true }) },
++    createProject: name => addLocalProject(name),
++    registerFolder: (path, name) => registerProjectFolder(path, name),
++    renameRow: (projectId, name) => { const project = localProject(database, projectId, 'Turning General into a project'); return database.updateProjectLocation(project.id, project.path, name) }
++  })
++  disposeThreadsIpc = registerThreadsIpc({
++    ipcMain, trusted: trustedStructured, general: generalThreads,
++    sessions: () => phoneAccess?.phoneState().sessions ?? [],
++    spec: id => database.structured.spec<AgentSpec>(id),
++    items: id => database.structured.snapshot(id)?.items ?? [],
++    // The name the owner sees on the tab and in the Threads list, before the conversation's own.
++    title: id => phoneAccess?.phoneState().sessions.find(session => session.id === id)?.title ?? database.structured.snapshot(id)?.title ?? null,
++    getProject: id => database.getProject(id),
++    projectsChanged: () => {
++      const projects = generalThreads!.mark(database.listDeskProjects())
++      for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('projects:changed', projects)
++      phoneAccess?.refresh()
++    }
++  })
++  ipcMain.handle('projects:list', () => generalThreads?.mark(database.listDeskProjects()) ?? database.listDeskProjects())
+   ipcMain.handle('projects:open-folder', async () => {
+     const result = await testDialogs.showOpenDialog(null, {
+       title: 'Open a project folder',
+diff --git a/src/main/threads-ipc.test.ts b/src/main/threads-ipc.test.ts
+new file mode 100644
+index 0000000..eed797e
+--- /dev/null
++++ b/src/main/threads-ipc.test.ts
+@@ -0,0 +1,89 @@
++import { describe, expect, it, vi } from 'vitest'
++import type { AgentSpec, ProjectRecord, SessionRecord } from '../shared/models'
++import type { PhoneSessionSummary } from '../shared/phone-access'
++import type { TimelineItem } from '../shared/structured-agent'
++import type { GeneralThreads } from './general-threads'
++import { conversationMessages, registerThreadsIpc, THREAD_CHANNELS, threadHandoff, type ThreadsIpcDeps } from './threads-ipc'
++
++const project = (id: string, name: string, path: string): ProjectRecord => ({ id, name, path, createdAt: '', updatedAt: '' })
++const projects = new Map([
++  ['project_general', project('project_general', 'General', '/home/o/Conductor/General')],
++  ['project_brand', project('project_brand', 'Brand', '/home/o/Conductor/Brand')]
++])
++const text = (id: string, role: 'user' | 'assistant' | 'status', value: string, parentId?: string): TimelineItem =>
++  ({ id, runtimeId: 'r', sequence: 1, timestamp: '2026-10-29T10:00:00.000Z', ...(parentId ? { parentId } : {}), data: { type: 'text', role, text: value, mode: 'snapshot' } }) as TimelineItem
++const items: TimelineItem[] = [
++  text('1', 'user', 'Sketch three logo directions'),
++  text('2', 'status', 'Thinking…'),
++  text('3', 'assistant', 'Here are three directions.'),
++  text('4', 'assistant', 'subagent chatter', 'tool_1'),
++  { id: '5', runtimeId: 'r', sequence: 2, timestamp: '', data: { type: 'usage' } } as unknown as TimelineItem
++]
++const specs: Record<string, AgentSpec> = {
++  agent_general: { id: 'agent_general', projectId: 'project_general', sessionId: 'ws_g', provider: 'claude', model: 'default', title: 'Claude', cwd: '/home/o/Conductor/General' },
++  agent_brand: { id: 'agent_brand', projectId: 'project_brand', sessionId: 'ws_b', provider: 'codex', model: 'gpt-6.1', title: 'Codex', cwd: '/home/o/Conductor/Brand' }
++}
++const general = (id: string | null = 'project_general'): GeneralThreads => ({
++  projectId: () => id,
++  ensure: vi.fn(async () => ({ project: { ...projects.get('project_general')!, general: true as const }, workspace: { id: 'ws_g', projectId: 'project_general' } as SessionRecord })),
++  promote: vi.fn((name: string) => ({ ...projects.get('project_general')!, name }))
++}) as unknown as GeneralThreads
++const deps = (overrides: Partial<ThreadsIpcDeps> = {}): Omit<ThreadsIpcDeps, 'ipcMain'> => ({
++  trusted: vi.fn(), general: general(), sessions: () => [],
++  spec: id => specs[id] ?? null, items: () => items, title: id => id === 'agent_general' ? 'Logo ideas' : null,
++  getProject: id => projects.get(id) ?? null, projectsChanged: vi.fn(), now: () => Date.parse('2026-10-29T12:00:00.000Z'), ...overrides
++})
++
++describe('threadHandoff', () => {
++  it('drafts the first message for the same provider from top-level messages only', () => {
++    const handoff = threadHandoff(deps(), 'agent_general', 'project_brand')!
++    expect(handoff.provider).toBe('claude')
++    expect(handoff).not.toHaveProperty('model')
++    expect(handoff.text).toContain('"Logo ideas"')
++    expect(handoff.text).toContain('/home/o/Conductor/General')
++    expect(handoff.text).toContain('Me: Sketch three logo directions')
++    expect(handoff.text).toContain('Agent: Here are three directions.')
++    expect(handoff.text).not.toContain('Thinking')
++    expect(handoff.text).not.toContain('subagent chatter')
++    expect(conversationMessages(items)).toHaveLength(2)
++  })
++
++  it('continues only a General thread, into another open project', () => {
++    expect(() => threadHandoff(deps(), 'agent_brand', 'project_general')).toThrow(/started without a project/)
++    expect(() => threadHandoff(deps(), 'agent_general', 'project_general')).toThrow(/another project/)
++    expect(() => threadHandoff(deps(), 'agent_general', 'project_gone')).toThrow(/another project/)
++    expect(() => threadHandoff(deps({ general: general(null) }), 'agent_general', 'project_brand')).toThrow(/started without a project/)
++    expect(() => threadHandoff(deps(), '../etc', 'project_brand')).toThrow(/Choose a thread/)
++    expect(threadHandoff(deps(), 'agent_unknown', 'project_brand')).toBeNull()
++  })
++})
++
++describe('registerThreadsIpc', () => {
++  it('checks the sender on every channel, announces project changes and removes its handlers', async () => {
++    const handlers = new Map<string, (...args: unknown[]) => unknown>()
++    const ipcMain = { handle: vi.fn((channel: string, run: (...args: unknown[]) => unknown) => { handlers.set(channel, run) }), removeHandler: vi.fn((channel: string) => { handlers.delete(channel) }) }
++    const summary = { id: 'agent_general', projectId: 'project_general', projectName: 'General', workspaceId: 'ws_g', workspaceName: 'Workspace', tabId: 'pane_1', title: 'Logo ideas', provider: 'claude', machineId: 'local', machineName: 'MAIN', phase: 'idle', activity: 'idle', state: 'done', needs: null, updatedAt: '2026-10-29T11:59:00.000Z', queued: 0, archived: false } as PhoneSessionSummary
++    const wiring = deps({ sessions: () => [summary] })
++    const dispose = registerThreadsIpc({ ...wiring, ipcMain } as unknown as ThreadsIpcDeps)
++    expect([...handlers.keys()].sort()).toEqual([...THREAD_CHANNELS].sort())
++    const event = {}
++    const target = await handlers.get('threads:new-general')!(event) as { project: ProjectRecord }
++    expect(target.project.general).toBe(true)
++    expect(wiring.projectsChanged).toHaveBeenCalledTimes(1)
++    expect(await handlers.get('threads:general-id')!(event)).toBe('project_general')
++    const view = await handlers.get('threads:list')!(event, 'logo') as { groups: Array<{ threads: Array<{ general: boolean }> }>; total: number }
++    expect(view.total).toBe(1)
++    expect(view.groups[0]!.threads[0]!.general).toBe(true)
++    expect(await handlers.get('threads:list')!(event, 42)).toMatchObject({ total: 1 })
++    expect(await handlers.get('threads:promote')!(event, 'Brand spike')).toMatchObject({ name: 'Brand spike' })
++    expect(wiring.projectsChanged).toHaveBeenCalledTimes(2)
++    expect(await handlers.get('threads:handoff')!(event, 'agent_general', 'project_brand')).toMatchObject({ provider: 'claude' })
++    expect(wiring.trusted).toHaveBeenCalledTimes(6)
++    const refused = deps({ trusted: () => { throw new Error('Structured controls require the trusted Conductor document') } })
++    registerThreadsIpc({ ...refused, ipcMain } as unknown as ThreadsIpcDeps)
++    await expect(Promise.resolve().then(() => handlers.get('threads:new-general')!(event))).rejects.toThrow(/trusted/)
++    expect(refused.general.ensure).not.toHaveBeenCalled()
++    dispose()
++    expect(handlers.size).toBe(0)
++  })
++})
+diff --git a/src/main/threads-ipc.ts b/src/main/threads-ipc.ts
+new file mode 100644
+index 0000000..0e0d219
+--- /dev/null
++++ b/src/main/threads-ipc.ts
+@@ -0,0 +1,73 @@
++/** The window's half of threads without a project (src/shared/threads.ts): the General project on
++ *  first use, the cross-project Threads view, and the two ways a General thread joins a project. */
++import type { IpcMain, IpcMainInvokeEvent } from 'electron'
++import type { AgentProviderId, AgentSpec, ProjectRecord } from '../shared/models'
++import type { PhoneSessionSummary } from '../shared/phone-access'
++import type { TimelineItem } from '../shared/structured-agent'
++import { buildThreadView, draftThreadHandoff, type GeneralThreadTarget, type ThreadView } from '../shared/threads'
++import type { GeneralThreads } from './general-threads'
++
++export interface ThreadsIpcDeps {
++  ipcMain: Pick<IpcMain, 'handle' | 'removeHandler'>
++  trusted(event: IpcMainInvokeEvent): void
++  general: GeneralThreads
++  /** Every conversation the phone list would show (PhoneAccessService.phoneState().sessions). */
++  sessions(): PhoneSessionSummary[]
++  spec(agentSessionId: string): AgentSpec | null
++  items(agentSessionId: string): readonly TimelineItem[]
++  title(agentSessionId: string): string | null
++  getProject(projectId: string): ProjectRecord | null
++  /** projects:changed for every window, after the General project appears or is renamed. */
++  projectsChanged(): void
++  now?(): number
++}
++
++const AGENT_ID = /^agent_[A-Za-z0-9_-]{1,150}$/
++
++export const THREAD_CHANNELS = ['threads:new-general', 'threads:general-id', 'threads:list', 'threads:handoff', 'threads:promote'] as const
++
++/** Top-level owner and agent messages, oldest first; status lines and subagent output are left out. */
++export function conversationMessages(items: readonly TimelineItem[]): Array<{ role: 'user' | 'assistant'; text: string }> {
++  const messages: Array<{ role: 'user' | 'assistant'; text: string }> = []
++  for (const item of items) {
++    if (item.parentId || item.data.type !== 'text' || item.data.role === 'status' || !item.data.text.trim()) continue
++    messages.push({ role: item.data.role, text: item.data.text })
++  }
++  return messages
++}
++
++export function threadHandoff(deps: Pick<ThreadsIpcDeps, 'general' | 'spec' | 'items' | 'title' | 'getProject'>, agentSessionId: unknown, targetProjectId: unknown): { text: string; provider: AgentProviderId; model?: string } | null {
++  if (typeof agentSessionId !== 'string' || !AGENT_ID.test(agentSessionId) || typeof targetProjectId !== 'string' || !targetProjectId) throw new Error('Choose a thread and a project')
++  const spec = deps.spec(agentSessionId)
++  if (!spec) return null
++  const generalId = deps.general.projectId()
++  if (!generalId || spec.projectId !== generalId) throw new Error('Only a thread started without a project continues in a project')
++  const source = deps.getProject(spec.projectId)
++  const target = deps.getProject(targetProjectId)
++  if (!source || !target || target.id === source.id) throw new Error('Choose another project that is open in Conductor')
++  const text = draftThreadHandoff({ title: deps.title(agentSessionId) || spec.title || 'Thread', folder: source.path, projectName: target.name, messages: conversationMessages(deps.items(agentSessionId)) })
++  return { text, provider: spec.provider, ...(spec.model && spec.model !== 'default' ? { model: spec.model } : {}) }
++}
++
++export function registerThreadsIpc(deps: ThreadsIpcDeps): () => void {
++  const now = deps.now ?? Date.now
++  deps.ipcMain.handle('threads:new-general', async (event): Promise<GeneralThreadTarget> => {
++    deps.trusted(event)
++    const target = await deps.general.ensure()
++    deps.projectsChanged()
++    return target
++  })
++  deps.ipcMain.handle('threads:general-id', event => { deps.trusted(event); return deps.general.projectId() })
++  deps.ipcMain.handle('threads:list', (event, query: unknown): ThreadView => {
++    deps.trusted(event)
++    return buildThreadView(deps.sessions(), { generalProjectId: deps.general.projectId(), now: now(), query: typeof query === 'string' ? query.slice(0, 200) : '' })
++  })
++  deps.ipcMain.handle('threads:handoff', (event, agentSessionId: unknown, targetProjectId: unknown) => { deps.trusted(event); return threadHandoff(deps, agentSessionId, targetProjectId) })
++  deps.ipcMain.handle('threads:promote', (event, name: unknown) => {
++    deps.trusted(event)
++    const project = deps.general.promote(typeof name === 'string' ? name : '')
++    deps.projectsChanged()
++    return project
++  })
++  return () => { for (const channel of THREAD_CHANNELS) deps.ipcMain.removeHandler(channel) }
++}
+diff --git a/src/preload/index.ts b/src/preload/index.ts
+index c124b23..a3e1e1c 100644
+--- a/src/preload/index.ts
++++ b/src/preload/index.ts
+@@ -20,6 +20,7 @@ import { providerLoginBridge } from './provider-login'
+ import { durableJobsBridge } from './durable-jobs'
+ import { tokenBurnBridge } from './token-burn'
+ import { needsAttentionBridge } from './needs-attention'
++import { threadsBridge } from './threads'
+ import { productionBridge } from './production'
+ import { cloudBridge } from './cloud'
+ import { logicLoopsBridge } from './logic-loops'
+@@ -216,6 +217,7 @@ const bridge: ConductorBridge = {
+   durableJobs: durableJobsBridge,
+   tokenBurn: tokenBurnBridge,
+   needsAttention: needsAttentionBridge,
++  threads: threadsBridge,
+   production: productionBridge,
+   cloud: cloudBridge,
+   ideas: ideasBridge,
+diff --git a/src/preload/threads.ts b/src/preload/threads.ts
+new file mode 100644
+index 0000000..1bb5ed2
+--- /dev/null
++++ b/src/preload/threads.ts
+@@ -0,0 +1,10 @@
++import { ipcRenderer } from 'electron'
++import type { ThreadsBridge } from '../shared/threads'
++
++export const threadsBridge: ThreadsBridge = {
++  newGeneral: () => ipcRenderer.invoke('threads:new-general'),
++  generalProjectId: () => ipcRenderer.invoke('threads:general-id'),
++  list: query => ipcRenderer.invoke('threads:list', query),
++  handoff: (agentSessionId, targetProjectId) => ipcRenderer.invoke('threads:handoff', agentSessionId, targetProjectId),
++  promote: name => ipcRenderer.invoke('threads:promote', name)
++}
+diff --git a/src/renderer/src/App.tsx b/src/renderer/src/App.tsx
+index 34f6f8f..350d588 100644
+--- a/src/renderer/src/App.tsx
++++ b/src/renderer/src/App.tsx
+@@ -111,6 +111,9 @@ import { spinPhaseStyle } from './spin-sync'
+ import { CONDUCTOR_FILE_DRAG, decodeConductorFileDrag } from './components/composer-file-drop'
+ import type { MachineDescriptor } from '../../shared/remote-control'
+ import { LOCAL_MACHINE_ID } from '../../shared/remote-control'
++import type { ThreadSummary } from '../../shared/threads'
++import { seedDraft } from './panes/use-composer-draft'
++import { revealConversation } from './components/permission-grants/PendingGrantDock'
+ 
+ const workspaceDocumentsSnapshot = workspaceDocumentsReader(() => localStorage, (workspaceId): WorkspaceDocumentState => {
+   // Load through the same migration the file tabs use, so a record left by an older
+@@ -174,6 +177,9 @@ export function App(): React.JSX.Element {
+   const [appSettings, setAppSettings] = useState<AppSettings>(() => window.conductor.settings.getStartup())
+   const [resolvedThemeVariant, setResolvedThemeVariant] = useState<ThemeVariant>(() => resolveThemeVariant(appSettings))
+   const [toast, setToast] = useState('')
++  /** A thread asked for before its workspace was showing: a launcher (New thread) or an agent tab with
++   *  an unsent first message (Continue in project), opened once that workspace is active. */
++  const [pendingThread, setPendingThread] = useState<{ projectId: string; sessionId?: string; provider?: AgentProviderId; draft?: string } | null>(null)
+   const [loading, setLoading] = useState(true)
+   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem('conductor.sidebarCollapsed') === 'true')
+   const [phaseAttentionResourceIds, setPhaseAttentionResourceIds] = useState<Set<string>>(() => new Set())
+@@ -1118,6 +1124,85 @@ export function App(): React.JSX.Element {
+     setFocusedGroupId(group.id)
+   }, [activeSession, focusedGroupId, setLayout])
+ 
++  /**
++   * New thread without a project (t3code's "Start without a project"; src/shared/threads.ts): the
++   * General project is made on first use and its workspace shows a launcher, so the owner picks an
++   * agent and types - no project to choose or create first.
++   */
++  const newThread = useCallback(async (): Promise<void> => {
++    try {
++      const { project, workspace } = await window.conductor.threads.newGeneral()
++      setProjects(current => current.some(item => item.id === project.id) ? current.map(item => item.id === project.id ? project : item) : [project, ...current])
++      const known = activeProjectIdRef.current === project.id ? sessionsRef.current.find(session => session.id === workspace.id) : undefined
++      if (known) selectSession(known)
++      else await loadProject(project.id, workspace.id)
++      setPendingThread({ projectId: project.id, sessionId: workspace.id })
++    } catch (reason) { setToast(cleanIpcError(reason)) }
++  }, [loadProject, selectSession])
++
++  const openThread = useCallback((thread: ThreadSummary): void => {
++    if (!thread.tabId) return
++    window.conductor.agentControl.focusTab(thread.projectId, thread.workspaceId, thread.tabId)
++      .then(() => revealConversation(thread.id), (reason: unknown) => setToast(cleanIpcError(reason)))
++  }, [])
++
++  /** "Continue in project": a new thread in that project, its first message drafted from the General
++   *  thread and left unsent. The General thread is not moved - its working directory is where it resumes. */
++  const continueInProject = useCallback(async (thread: ThreadSummary, projectId: string): Promise<void> => {
++    try {
++      const handoff = await window.conductor.threads.handoff(thread.id, projectId)
++      if (!handoff) { setToast('That thread is no longer open'); return }
++      if (activeProjectIdRef.current !== projectId) await loadProject(projectId)
++      setPendingThread({ projectId, provider: handoff.provider, draft: handoff.text })
++      setToast(`Continuing “${thread.title}” in ${projects.find(project => project.id === projectId)?.name ?? 'that project'}; review the drafted message and send it. The General thread stays as it is.`)
++    } catch (reason) { setToast(cleanIpcError(reason)) }
++  }, [loadProject, projects])
++
++  const promoteGeneral = useCallback(async (name: string): Promise<void> => {
++    const project = await window.conductor.threads.promote(name)
++    setProjects(current => current.map(item => item.id === project.id ? project : item))
++    setToast(`General is now the project ${project.name}; its threads keep working in ${project.path}`)
++  }, [])
++
++  useEffect(() => {
++    if (!pendingThread || !activeSession || activeSession.projectId !== pendingThread.projectId) return
++    if (pendingThread.sessionId && activeSession.id !== pendingThread.sessionId) return
++    setPendingThread(null)
++    const group = findGroup(activeSession.layout.root, focusedGroupId) ?? listGroups(activeSession.layout.root)[0]
++    if (!group) return
++    const current = group.tabs.find(tab => tab.id === group.activeTabId)
++    if (!pendingThread.provider) {
++      if (current?.kind !== 'launcher') openInFocused('launcher')
++      return
++    }
++    const tab = createPaneTab('agent', { provider: pendingThread.provider })
++    if (pendingThread.draft && tab.resourceId) seedDraft(pendingThread.projectId, tab.resourceId, pendingThread.draft)
++    setLayout(current?.kind === 'launcher' ? replaceTab(activeSession.layout, group.id, current.id, tab) : addTab(activeSession.layout, group.id, tab))
++    setFocusedGroupId(group.id)
++  }, [activeSession, focusedGroupId, openInFocused, pendingThread, setLayout])
++
++  useEffect(() => {
++    const shortcut = (event: KeyboardEvent): void => {
++      // AltGr arrives as Ctrl+Alt on Windows and types a character on many layouts (Slovak AltGr+N is
++      // '}'), so it never counts; matching the produced key rather than the physical one keeps it so.
++      if (!(event.ctrlKey || event.metaKey) || !event.altKey || event.shiftKey || event.getModifierState?.('AltGraph') || event.key.toLowerCase() !== 'n') return
++      event.preventDefault(); event.stopPropagation(); void newThread()
++    }
++    window.addEventListener('keydown', shortcut, true)
++    return () => window.removeEventListener('keydown', shortcut, true)
++  }, [newThread])
++
++  const threadsRefreshKey = useMemo(() => [...correctedActivityPhases].map(([id, phase]) => id + ':' + phase).join('|'), [correctedActivityPhases])
++  const focusedAgentSessionId = useMemo(() => {
++    const group = activeSession ? findGroup(activeSession.layout.root, focusedGroupId) ?? listGroups(activeSession.layout.root)[0] : undefined
++    const tab = group?.tabs.find(item => item.id === group.activeTabId)
++    return tab?.kind === 'agent' ? tab.resourceId ?? null : null
++  }, [activeSession, focusedGroupId])
++  const threadsSidebar = useMemo(() => ({
++    activeAgentSessionId: focusedAgentSessionId, refreshKey: threadsRefreshKey, onNewThread: () => void newThread(), onOpenThread: openThread,
++    onContinueInProject: (thread: ThreadSummary, projectId: string) => void continueInProject(thread, projectId), onPromoteGeneral: promoteGeneral
++  }), [continueInProject, focusedAgentSessionId, newThread, openThread, promoteGeneral, threadsRefreshKey])
++
+   /** One view per job and workspace: an open job tab is focused, otherwise one is added to the
+    *  focused group. The tab's resourceId is the job id, which is all that identifies the job. */
+   const openJobTab = useCallback((job: { id: string; title: string }): void => {
+@@ -1407,6 +1492,7 @@ export function App(): React.JSX.Element {
+   useEffect(() => { setLiveWorkspaces(activeProjectId, sessions.filter(session => session.projectId === activeProjectId), projects) }, [activeProjectId, sessions, projects])
+ 
+   const commands = useMemo<PaletteCommand[]>(() => [
++    { id: 'new-thread', label: 'New thread without a project', detail: 'Starts in General; turn it into a project or continue it in one later', category: 'Agents', icon: 'agent', shortcut: 'Ctrl+Alt+N', run: () => void newThread() },
+     { id: 'open-claude', label: 'Open Claude Code', detail: 'Open in the focused tab group', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then C', run: () => openInFocused('agent', 'claude') },
+     { id: 'open-codex', label: 'Open Codex', detail: 'Open in the focused tab group', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then X', run: () => openInFocused('agent', 'codex') },
+     { id: 'open-grok', label: 'Open Grok', detail: 'Open in the focused tab group', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then R', run: () => openInFocused('agent', 'grok') },
+@@ -1437,7 +1523,7 @@ export function App(): React.JSX.Element {
+     { id: 'snap-tab', label: 'Snap tab area to the next stop', detail: 'Preset widths instead of a 5% nudge', category: 'Layout', icon: 'layout', run: () => nudgeFocusedGroup('right', true) },
+     { id: 'move-tab-right', label: 'Move tab right', detail: 'Relocate the tab itself, not the divider', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift Alt →', run: () => moveFocusedTabTo('right') },
+     { id: 'move-tab-left', label: 'Move tab left', detail: 'Relocate the tab itself, not the divider', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift Alt ←', run: () => moveFocusedTabTo('left') }
+-  ], [cycleFocusedTab, moveFocusedTabTo, nudgeFocusedGroup, openInFocused, openProductionQueue, reopenClosed, splitFocused])
++  ], [cycleFocusedTab, moveFocusedTabTo, newThread, nudgeFocusedGroup, openInFocused, openProductionQueue, reopenClosed, splitFocused])
+ 
+   // The subagent roster links a background task back to the runtime it is driving.
+   useEffect(() => {
+@@ -1693,6 +1779,7 @@ export function App(): React.JSX.Element {
+           activityPhases={correctedActivityPhases}
+           projectActivity={projectActivityStatuses}
+           machines={machines}
++          threads={threadsSidebar}
+         />
+         <div className="main-stage">
+           {activeProject ? (
+@@ -1849,7 +1936,7 @@ export function App(): React.JSX.Element {
+               </div>
+             </>
+           ) : !loading ? (
+-            <EmptyState onOpen={() => void createManagedProject()} />
++            <EmptyState onOpen={() => void createManagedProject()} onNewThread={() => void newThread()} />
+           ) : (
+             <div className="app-loading"><i style={spinPhaseStyle(Date.now())} /><span>Restoring your workspace</span></div>
+           )}
+diff --git a/src/renderer/src/components/EmptyState.css b/src/renderer/src/components/EmptyState.css
+new file mode 100644
+index 0000000..b77731f
+--- /dev/null
++++ b/src/renderer/src/components/EmptyState.css
+@@ -0,0 +1,3 @@
++/* The empty state's second offer (EmptyState.tsx) sits under "Start without a project". */
++.empty-content .secondary-action { height: 30px; margin-top: 8px; padding: 0 10px; display: flex; align-items: center; gap: 8px; border: 1px solid var(--border-soft); border-radius: 6px; background: transparent; color: var(--text-2); font-size: 9px; font-weight: 600; cursor: pointer; }
++.empty-content .secondary-action:hover { background: var(--surface-hover); color: var(--text); }
+diff --git a/src/renderer/src/components/EmptyState.tsx b/src/renderer/src/components/EmptyState.tsx
+index 46375e7..2b48fcb 100644
+--- a/src/renderer/src/components/EmptyState.tsx
++++ b/src/renderer/src/components/EmptyState.tsx
+@@ -1,12 +1,22 @@
+-import { FolderOpen } from 'lucide-react'
++import { FolderOpen, MessageSquarePlus } from 'lucide-react'
++import './EmptyState.css'
+ 
+-export function EmptyState({ onOpen }: { onOpen(): void }): React.JSX.Element {
++/**
++ * First launch, or every project removed. A thread needs no project (src/shared/threads.ts), so
++ * starting one is the first offer; making a project stays one click away.
++ */
++export function EmptyState({ onOpen, onNewThread }: { onOpen(): void; onNewThread?(): void }): React.JSX.Element {
+   return (
+     <main className="empty-state">
+       <div className="empty-glow" />
+       <div className="empty-content">
+-        <h1>Open a project</h1>
+-        <button className="primary-action" onClick={onOpen}>
++        <h1>{onNewThread ? 'What should we work on?' : 'Open a project'}</h1>
++        {onNewThread && (
++          <button className="primary-action" data-empty-new-thread onClick={onNewThread} title="Ctrl+Alt+N">
++            <MessageSquarePlus size={16} /> Start without a project
++          </button>
++        )}
++        <button className={onNewThread ? 'secondary-action' : 'primary-action'} data-empty-new-project onClick={onOpen}>
+           <FolderOpen size={16} /> New project
+         </button>
+       </div>
+diff --git a/src/renderer/src/components/Sidebar.tsx b/src/renderer/src/components/Sidebar.tsx
+index 033284d..27eb093 100644
+--- a/src/renderer/src/components/Sidebar.tsx
++++ b/src/renderer/src/components/Sidebar.tsx
+@@ -6,6 +6,8 @@ import type { WorkspaceTabDrag } from '../layout/workspace-tab-move'
+ import { RemoveProjectDialog } from './RemoveProjectDialog'
+ import { ProcessStatusSummary } from './ProcessStatusSummary'
+ import { NeedsAttention } from './NeedsAttention'
++import { ThreadList } from './ThreadList'
++import type { ThreadSummary } from '../../../shared/threads'
+ import { ProviderAllowance } from './ProviderAllowance'
+ import { UsageOverview } from './UsageOverview'
+ import type { TabGroupAction } from '../layout/tab-groups'
+@@ -31,6 +33,7 @@ import {
+   LayoutGrid,
+   ListTodo,
+   MemoryStick,
++  MessageSquareDashed,
+   MonitorSmartphone,
+   ShieldCheck,
+   MoreHorizontal,
+@@ -102,6 +105,15 @@ interface SidebarProps {
+   sessionActivity: ReadonlyMap<string, SessionActivityStatus>
+   activityPhases: ReadonlyMap<string, AgentActivityPhase>
+   projectActivity: ReadonlyMap<string, ProjectActivityStatus>
++  /** Threads across every project (ThreadList.tsx); absent hides the section. */
++  threads?: {
++    activeAgentSessionId?: string | null
++    refreshKey: string
++    onNewThread(): void
++    onOpenThread(thread: ThreadSummary): void
++    onContinueInProject(thread: ThreadSummary, projectId: string): void
++    onPromoteGeneral(name: string): Promise<void>
++  }
+ }
+ 
+ export type WorkspacePanel = 'backlog' | 'agents' | 'tasks' | 'routines' | 'memory' | 'processes'
+@@ -369,6 +381,8 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
+           <kbd>Ctrl K</kbd>
+         </button>
+ 
++        {props.threads && <ThreadList projects={props.projects} {...props.threads} />}
++
+         <section className="sidebar-section projects-section">
+           <div className="sidebar-heading">
+             <span>Projects</span>
+@@ -449,9 +463,10 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
+                         onDoubleClick={(event) => { event.preventDefault(); beginProjectRename(project) }}
+                         onKeyDown={(event) => { if (event.key === 'F2') { event.preventDefault(); beginProjectRename(project) } }}
+                         title={badge ? `${badge.title}
+-${project.path} (on ${project.remote!.machineName})` : project.path}
++${project.path} (on ${project.remote!.machineName})` : project.general ? `Threads started without a project\n${project.path}` : project.path}
++                        data-general-project={project.general || undefined}
+                       >
+-                        <span className="project-glyph">{badge ? <MonitorSmartphone size={14} /> : <FolderGit2 size={14} />}</span>
++                        <span className="project-glyph">{badge ? <MonitorSmartphone size={14} /> : project.general ? <MessageSquareDashed size={14} /> : <FolderGit2 size={14} />}</span>
+                         <span className="ellipsis">{project.name}</span>
+                         {badge && <span className={`project-remote-badge ${badge.unavailable ? 'unavailable' : ''}`} title={badge.title}>{badge.label}</span>}
+                         {projectStatus === 'attention' && <span className="session-attention-badge" title="An agent in this project needs your attention"><Bell size={11} strokeWidth={1.7} /></span>}
+diff --git a/src/renderer/src/components/ThreadList.css b/src/renderer/src/components/ThreadList.css
+new file mode 100644
+index 0000000..2da12de
+--- /dev/null
++++ b/src/renderer/src/components/ThreadList.css
+@@ -0,0 +1,26 @@
++/* Threads above the projects list (ThreadList.tsx): compact rows, state first, then recency. */
++.threads-section { display: flex; flex-direction: column; min-height: 0; }
++.sidebar-heading .threads-toggle { display: inline-flex; white-space: nowrap; margin-left: -3px; align-items: center; gap: 4px; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; text-transform: inherit; letter-spacing: inherit; cursor: pointer; }
++.sidebar-heading .threads-toggle small { color: var(--text-3); font-size: 9px; font-variant-numeric: tabular-nums; }
++.threads-body { display: flex; flex-direction: column; gap: 4px; max-height: 38vh; overflow-y: auto; padding: 0 6px 6px 8px; }
++.threads-search, .threads-promote-input { width: 100%; height: 22px; padding: 0 6px; border: 1px solid var(--border-soft); border-radius: 4px; background: var(--surface-hover); color: var(--text); font-size: 10px; }
++.thread-group { display: flex; flex-direction: column; gap: 1px; }
++.thread-group-label { padding: 2px 4px 1px; color: var(--text-3); font-size: 9px; text-transform: uppercase; letter-spacing: .05em; }
++.thread-group-needs-you .thread-group-label { color: #e2b872; }
++.thread-row { width: 100%; min-width: 0; padding: 3px 4px; display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; grid-template-rows: auto auto; column-gap: 6px; align-items: center; border: 0; border-radius: 4px; background: transparent; color: var(--text-2); font-size: 11px; text-align: left; cursor: pointer; }
++.thread-row:hover, .thread-row:focus-visible { background: var(--surface-hover); color: var(--text); }
++.thread-row.active { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--text); }
++.thread-dot { grid-row: 1 / span 2; width: 6px; height: 6px; border-radius: 50%; background: var(--text-3); opacity: .45; }
++.thread-dot.working { background: var(--accent); opacity: 1; animation: session-activity-pulse 1.2s ease-in-out infinite; }
++.thread-dot.attention, .thread-dot.limited { background: #ecc48d; opacity: 1; }
++.thread-dot.failed, .thread-dot.disconnected { background: var(--danger); opacity: 1; }
++.thread-dot.done { background: #22c57a; opacity: .8; }
++.thread-title { min-width: 0; }
++.thread-row time { color: var(--text-3); font-size: 9px; font-variant-numeric: tabular-nums; }
++.thread-pill { padding: 0 4px; border-radius: 4px; background: color-mix(in srgb, #e2b872 14%, transparent); color: #e2b872; font-size: 8px; font-style: normal; text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; }
++.thread-pill.working { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); }
++.thread-pill.failed, .thread-pill.disconnected { background: color-mix(in srgb, var(--danger) 14%, transparent); color: color-mix(in srgb, var(--danger) 80%, var(--text-2)); }
++.thread-meta { grid-column: 2 / span 2; display: inline-flex; align-items: center; gap: 3px; color: var(--text-3); font-size: 9px; }
++.threads-empty, .threads-note { margin: 2px 4px; color: var(--text-3); font-size: 10px; }
++.threads-empty button { padding: 0; border: 0; background: transparent; color: var(--accent); font: inherit; cursor: pointer; }
++@media (prefers-reduced-motion: reduce) { .thread-dot.working { animation: none; } }
+diff --git a/src/renderer/src/components/ThreadList.test.ts b/src/renderer/src/components/ThreadList.test.ts
+new file mode 100644
+index 0000000..ae59b0c
+--- /dev/null
++++ b/src/renderer/src/components/ThreadList.test.ts
+@@ -0,0 +1,30 @@
++import { createElement } from 'react'
++import { renderToStaticMarkup } from 'react-dom/server'
++import { describe, expect, it, vi } from 'vitest'
++import { EmptyState } from './EmptyState'
++import { ThreadList } from './ThreadList'
++
++describe('starting a thread without a project', () => {
++  it('offers "Start without a project" before "New project" on the empty state', () => {
++    const html = renderToStaticMarkup(createElement(EmptyState, { onOpen: vi.fn(), onNewThread: vi.fn() }))
++    expect(html).toContain('What should we work on?')
++    expect(html.indexOf('data-empty-new-thread')).toBeGreaterThan(-1)
++    expect(html.indexOf('data-empty-new-thread')).toBeLessThan(html.indexOf('data-empty-new-project'))
++    expect(html).toContain('Start without a project')
++  })
++
++  it('keeps the old single action when the window has no thread handler', () => {
++    const html = renderToStaticMarkup(createElement(EmptyState, { onOpen: vi.fn() }))
++    expect(html).toContain('Open a project')
++    expect(html).not.toContain('data-empty-new-thread')
++  })
++
++  it('shows the Threads section with a New thread button before anything has loaded', () => {
++    const html = renderToStaticMarkup(createElement(ThreadList, {
++      projects: [], refreshKey: '', onNewThread: vi.fn(), onOpenThread: vi.fn(), onContinueInProject: vi.fn(), onPromoteGeneral: vi.fn(async () => undefined)
++    }))
++    expect(html).toContain('aria-label="Threads"')
++    expect(html).toContain('aria-label="New thread"')
++    expect(html).toContain('Ctrl+Alt+N')
++  })
++})
+diff --git a/src/renderer/src/components/ThreadList.tsx b/src/renderer/src/components/ThreadList.tsx
+new file mode 100644
+index 0000000..cc35c42
+--- /dev/null
++++ b/src/renderer/src/components/ThreadList.tsx
+@@ -0,0 +1,155 @@
++import { memo, useCallback, useEffect, useRef, useState } from 'react'
++import { createPortal } from 'react-dom'
++import { ChevronDown, ChevronRight, FolderGit2, FolderInput, MessageSquareDashed, MoreHorizontal, Plus } from 'lucide-react'
++import type { ProjectRecord } from '../../../shared/models'
++import { GENERAL_PROJECT_NAME, threadAge, threadStateLabel, type ThreadSummary, type ThreadView } from '../../../shared/threads'
++import './ThreadList.css'
++
++const COLLAPSED_KEY = 'conductor.threadsCollapsed'
++const POLL_MS = 5000
++
++interface ThreadListProps {
++  projects: ProjectRecord[]
++  /** The conversation in the focused tab, highlighted in the list. */
++  activeAgentSessionId?: string | null
++  /** Changes whenever a conversation's phase changes, so the list follows without waiting for the poll. */
++  refreshKey: string
++  onNewThread(): void
++  onOpenThread(thread: ThreadSummary): void
++  onContinueInProject(thread: ThreadSummary, projectId: string): void
++  onPromoteGeneral(name: string): Promise<void>
++}
++
++const readCollapsed = (): boolean => { try { return localStorage.getItem(COLLAPSED_KEY) === 'true' } catch { return false } }
++
++/**
++ * Threads (t3code's sidebar, Conductor's phone list): every open conversation in every project,
++ * grouped by what needs the owner, what is working, and recency, newest first. A thread started
++ * without a project is labelled "General". Main builds the view (src/shared/threads.ts); this only
++ * shows it.
++ */
++export const ThreadList = memo(function ThreadList(props: ThreadListProps): React.JSX.Element {
++  const [view, setView] = useState<ThreadView | null>(null)
++  const [query, setQuery] = useState('')
++  const [collapsed, setCollapsed] = useState(readCollapsed)
++  const [menu, setMenu] = useState<{ thread: ThreadSummary | null; x: number; y: number } | null>(null)
++  const [promoting, setPromoting] = useState<string | null>(null)
++  const [note, setNote] = useState('')
++  const now = useRef(Date.now())
++  const refresh = useCallback(() => {
++    void window.conductor.threads.list(query).then(next => { now.current = Date.parse(next.observedAt) || Date.now(); setView(next) }).catch(() => undefined)
++  }, [query])
++  useEffect(() => { if (!collapsed) refresh() }, [collapsed, refresh, props.refreshKey])
++  useEffect(() => {
++    if (collapsed) return
++    const timer = window.setInterval(() => { if (document.visibilityState === 'visible') refresh() }, POLL_MS)
++    window.addEventListener('focus', refresh)
++    return () => { window.clearInterval(timer); window.removeEventListener('focus', refresh) }
++  }, [collapsed, refresh])
++  useEffect(() => {
++    if (!menu) return
++    const close = (event: Event): void => { if (event.target instanceof Element && event.target.closest('.thread-menu')) return; setMenu(null) }
++    const escape = (event: KeyboardEvent): void => { if (event.key === 'Escape') setMenu(null) }
++    window.addEventListener('mousedown', close)
++    window.addEventListener('keydown', escape)
++    return () => { window.removeEventListener('mousedown', close); window.removeEventListener('keydown', escape) }
++  }, [menu])
++
++  const toggle = (): void => {
++    setCollapsed(current => { const next = !current; try { localStorage.setItem(COLLAPSED_KEY, String(next)) } catch { /* per-window convenience */ } return next })
++  }
++  const openMenu = (event: React.MouseEvent, thread: ThreadSummary | null): void => {
++    event.preventDefault(); event.stopPropagation()
++    setMenu({ thread, x: Math.min(event.clientX, window.innerWidth - 230), y: Math.min(event.clientY, window.innerHeight - 260) })
++  }
++  const finishPromote = async (commit: boolean): Promise<void> => {
++    const name = promoting?.trim()
++    setPromoting(null)
++    if (!commit || !name) return
++    try { await props.onPromoteGeneral(name); setNote(''); refresh() } catch (error) { setNote(error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+': Error: /, '') : String(error)) }
++  }
++  // A project on another machine runs its threads there; continuing into one is a later slice.
++  const targets = props.projects.filter(project => !project.general && !project.remote)
++  const hasGeneral = Boolean(view?.generalProjectId)
++  const total = view?.total ?? 0
++
++  return (
++    <section className="sidebar-section threads-section" aria-label="Threads" data-thread-count={total}>
++      <div className="sidebar-heading">
++        <button type="button" className="threads-toggle" onClick={toggle} aria-expanded={!collapsed}>
++          {collapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
++          <span>Threads</span>
++          {total > 0 && <small>{total}</small>}
++        </button>
++        <div className="heading-actions">
++          <button type="button" className="threads-new" title="New thread, no project needed (Ctrl+Alt+N)" aria-label="New thread" onClick={props.onNewThread}><Plus size={14} /></button>
++          {hasGeneral && <button type="button" title="More thread actions" aria-label="More thread actions" onClick={event => openMenu(event, null)}><MoreHorizontal size={14} /></button>}
++        </div>
++      </div>
++      {!collapsed && (
++        <div className="threads-body">
++          {promoting !== null && (
++            <input className="threads-promote-input" autoFocus aria-label="Name for the new project" placeholder="Project name" value={promoting}
++              onChange={event => setPromoting(event.target.value)} onBlur={() => void finishPromote(false)}
++              onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); void finishPromote(true) } if (event.key === 'Escape') { event.preventDefault(); void finishPromote(false) } }} />
++          )}
++          {(total > 6 || query) && (
++            <input className="threads-search" type="search" placeholder="Search threads" aria-label="Search threads" value={query} onChange={event => setQuery(event.target.value)} />
++          )}
++          {view?.groups.map(group => (
++            <div key={group.bucket} className={`thread-group thread-group-${group.bucket}`}>
++              <div className="thread-group-label">{group.label}</div>
++              {group.threads.map(thread => {
++                const pill = threadStateLabel(thread)
++                return (
++                  <button key={thread.id} type="button"
++                    className={`thread-row${thread.id === props.activeAgentSessionId ? ' active' : ''}`}
++                    data-thread-id={thread.id} data-thread-state={thread.state} data-thread-general={thread.general || undefined}
++                    title={`${thread.title}\n${thread.general ? `${GENERAL_PROJECT_NAME} (no project)` : thread.projectName} / ${thread.workspaceName} · ${thread.machineName}${thread.lastText ? `\n${thread.lastRole === 'user' ? 'You: ' : ''}${thread.lastText}` : ''}`}
++                    onClick={() => props.onOpenThread(thread)}
++                    onContextMenu={event => openMenu(event, thread)}>
++                    <span className={`thread-dot ${thread.state}`} aria-hidden="true" />
++                    <span className="thread-title ellipsis">{thread.wizard ? '✦ ' : ''}{thread.title}</span>
++                    {pill ? <em className={`thread-pill ${thread.state}`}>{pill}</em> : <time dateTime={thread.updatedAt}>{threadAge(thread.updatedAt, now.current)}</time>}
++                    <small className="thread-meta ellipsis">
++                      {thread.general ? <><MessageSquareDashed size={10} aria-hidden="true" /> {GENERAL_PROJECT_NAME}</> : thread.projectName}
++                      {thread.coworkers ? ` · +${thread.coworkers} coworker${thread.coworkers === 1 ? '' : 's'}` : ''}
++                    </small>
++                  </button>
++                )
++              })}
++            </div>
++          ))}
++          {view && view.hidden > 0 && <p className="threads-note">{view.hidden} more; search to find them.</p>}
++          {view && !total && (
++            <p className="threads-empty">{query ? 'No thread matches.' : <>No open threads. <button type="button" onClick={props.onNewThread}>Start one</button> — no project needed.</>}</p>
++          )}
++          {note && <p className="threads-note" role="status">{note}</p>}
++        </div>
++      )}
++      {menu && createPortal(
++        <div className="cursor-context-menu project-context-menu thread-menu" style={{ left: menu.x, top: menu.y }} onMouseDown={event => event.stopPropagation()}>
++          {menu.thread ? (
++            <>
++              <div className="context-menu-label">{menu.thread.title}</div>
++              {menu.thread.general && targets.length > 0 && <>
++                <div className="context-menu-label">Continue in project</div>
++                {targets.map(project => (
++                  <button key={project.id} type="button" data-continue-project={project.id} onClick={() => { const thread = menu.thread!; setMenu(null); props.onContinueInProject(thread, project.id) }}>
++                    <FolderGit2 size={14} /> {project.name}
++                  </button>
++                ))}
++              </>}
++              {menu.thread.general && !targets.length && <div className="context-menu-label">Open a project to continue this thread there</div>}
++            </>
++          ) : (
++            <button type="button" data-promote-general onClick={() => { setMenu(null); setPromoting('') }}>
++              <FolderInput size={14} /> Turn General into a project…
++            </button>
++          )}
++        </div>,
++        document.body
++      )}
++    </section>
++  )
++})
+diff --git a/src/renderer/src/panes/use-composer-draft.ts b/src/renderer/src/panes/use-composer-draft.ts
+index 12d2c37..eed51b5 100644
+--- a/src/renderer/src/panes/use-composer-draft.ts
++++ b/src/renderer/src/panes/use-composer-draft.ts
+@@ -25,6 +25,12 @@ export function attachToDraft(projectId: string, sessionId: string, attachment:
+   }))
+ }
+ 
++/** Puts an unsent first message into a conversation that has no pane yet ("Continue in project",
++ *  src/shared/threads.ts); words the owner already typed there are never replaced. */
++export function seedDraft(projectId: string, sessionId: string, message: string): void {
++  drafts.update(composerDraftKey(projectId, sessionId), draft => draft.message.trim() ? draft : { ...draft, message })
++}
++
+ /** Moves a predecessor's unsent draft onto its successor's, once per follow, and tells a mounted
+  *  successor pane it arrived. */
+ export function deliverSuccessionDraft(follow: SuccessionFollow): { caret: number; moved: boolean } {
+diff --git a/src/shared/ipc.ts b/src/shared/ipc.ts
+index b98fad0..b6218ef 100644
+--- a/src/shared/ipc.ts
++++ b/src/shared/ipc.ts
+@@ -92,6 +92,7 @@ export interface ConductorBridge {
+   durableJobs: import('./durable-jobs-bridge').DurableJobsBridge
+   tokenBurn: import('./token-burn').TokenBurnBridge
+   needsAttention: import('./needs-attention').NeedsAttentionBridge
++  threads: import('./threads').ThreadsBridge
+   production: import('./production').ProductionBridge
+   cloud: import('./cloud').CloudBridge
+   ideas: import('./ideas').IdeasBridge
+diff --git a/src/shared/models.ts b/src/shared/models.ts
+index 2c0148f..f8e669b 100644
+--- a/src/shared/models.ts
++++ b/src/shared/models.ts
+@@ -174,6 +174,9 @@ export interface ProjectRecord {
+   updatedAt: string
+   /** Absent for every project that lives on this computer, which is all of them in standalone use. */
+   remote?: RemoteProjectOrigin
++  /** The General project, where threads started without a project live (src/shared/threads.ts).
++   *  Set by the main process on the lists it sends the window; never stored. */
++  general?: true
+ }
+ 
+ export interface AppSettings {
+diff --git a/src/shared/threads.test.ts b/src/shared/threads.test.ts
+new file mode 100644
+index 0000000..d887ae7
+--- /dev/null
++++ b/src/shared/threads.test.ts
+@@ -0,0 +1,115 @@
++import { describe, expect, it } from 'vitest'
++import type { PhoneSessionSummary } from './phone-access'
++import { buildThreadView, draftThreadHandoff, HANDOFF_CHARS_PER_MESSAGE, HANDOFF_MAX_CHARS, readGeneralAnchor, threadAge, threadBucket, threadStateLabel } from './threads'
++
++const NOW = Date.parse('2026-10-29T12:00:00.000Z')
++const ago = (minutes: number): string => new Date(NOW - minutes * 60_000).toISOString()
++
++let counter = 0
++const session = (fields: Partial<PhoneSessionSummary> = {}): PhoneSessionSummary => {
++  counter += 1
++  return {
++    id: `agent_${counter}`, projectId: 'project_a', projectName: 'Alpha', workspaceId: 'ws_a', workspaceName: 'Workspace',
++    tabId: `pane_${counter}`, title: `Thread ${counter}`, provider: 'claude', machineId: 'local', machineName: 'MAIN',
++    phase: 'idle', activity: 'idle', state: 'idle', needs: null, updatedAt: ago(5), queued: 0, archived: false, ...fields
++  }
++}
++
++describe('buildThreadView', () => {
++  it('groups open threads by what needs the owner, then work, then recency, newest first', () => {
++    const asks = session({ state: 'attention', needs: 'approval', updatedAt: ago(30) })
++    const failed = session({ state: 'failed', updatedAt: ago(10) })
++    const running = session({ state: 'working', updatedAt: ago(1) })
++    const limited = session({ state: 'limited', updatedAt: ago(2) })
++    const fresh = session({ state: 'done', updatedAt: ago(3) })
++    const older = session({ state: 'idle', updatedAt: ago(4) })
++    const old = session({ state: 'done', updatedAt: ago(60 * 30) })
++    const view = buildThreadView([old, older, fresh, limited, running, failed, asks], { generalProjectId: null, now: NOW })
++    expect(view.groups.map(group => [group.bucket, group.threads.map(thread => thread.id)])).toEqual([
++      ['needs-you', [failed.id, asks.id]],
++      ['working', [running.id, limited.id]],
++      ['recent', [fresh.id, older.id]],
++      ['earlier', [old.id]]
++    ])
++    expect(view.total).toBe(7)
++    expect(view.hidden).toBe(0)
++  })
++
++  it('lists only open, unarchived conversations and names General threads as such', () => {
++    const general = session({ projectId: 'project_general', projectName: 'General' })
++    const closed = session({ tabId: null })
++    const archived = session({ archived: true })
++    const view = buildThreadView([general, closed, archived], { generalProjectId: 'project_general', now: NOW })
++    const listed = view.groups.flatMap(group => group.threads)
++    expect(listed.map(thread => thread.id)).toEqual([general.id])
++    expect(listed[0]!.general).toBe(true)
++    expect(buildThreadView([general], { generalProjectId: null, now: NOW }).groups[0]!.threads[0]!.general).toBe(false)
++  })
++
++  it('folds a swarm under its controller but always lists a coworker that needs the owner', () => {
++    const controller = session({ title: 'Controller', state: 'working' })
++    const quiet = Array.from({ length: 20 }, () => session({ controllerId: controller.id, state: 'working' }))
++    const stuck = session({ controllerId: controller.id, state: 'attention', needs: 'question' })
++    const orphan = session({ controllerId: 'agent_closed_controller', state: 'done' })
++    const view = buildThreadView([controller, ...quiet, stuck, orphan], { generalProjectId: null, now: NOW })
++    const listed = view.groups.flatMap(group => group.threads)
++    expect(listed.map(thread => thread.id).sort()).toEqual([controller.id, stuck.id, orphan.id].sort())
++    expect(listed.find(thread => thread.id === controller.id)!.coworkers).toBe(20)
++    expect(view.total).toBe(3)
++  })
++
++  it('puts a wizard first in its group, filters by words across title, project and last message, and caps rows', () => {
++    const plain = session({ title: 'Fix the parser', updatedAt: ago(1), lastText: 'grammar repaired' })
++    const wizard = session({ title: 'Orchestrator', wizard: true, updatedAt: ago(9), projectName: 'Conductor' })
++    expect(buildThreadView([plain, wizard], { generalProjectId: null, now: NOW }).groups[0]!.threads.map(thread => thread.id)).toEqual([wizard.id, plain.id])
++    expect(buildThreadView([plain, wizard], { generalProjectId: null, now: NOW, query: 'GRAMMAR fix' }).groups.flatMap(group => group.threads).map(thread => thread.id)).toEqual([plain.id])
++    expect(buildThreadView([plain, wizard], { generalProjectId: null, now: NOW, query: 'conductor' }).total).toBe(1)
++    const many = Array.from({ length: 10 }, (_, index) => session({ updatedAt: ago(index + 1) }))
++    const capped = buildThreadView(many, { generalProjectId: null, now: NOW, limit: 4 })
++    expect(capped.groups.flatMap(group => group.threads)).toHaveLength(4)
++    expect(capped).toMatchObject({ total: 10, hidden: 6 })
++  })
++})
++
++describe('thread labels', () => {
++  it('buckets by state before age', () => {
++    expect(threadBucket({ state: 'disconnected', updatedAt: ago(60 * 48) }, NOW)).toBe('needs-you')
++    expect(threadBucket({ state: 'idle', updatedAt: 'not a date' }, NOW)).toBe('earlier')
++  })
++
++  it('shows compact ages and a state word only when there is something to say', () => {
++    expect([0.2, 5, 125, 60 * 30, 60 * 24 * 10].map(minutes => threadAge(ago(minutes), NOW))).toEqual(['now', '5m', '2h', '1d', '1w'])
++    expect(threadAge(ago(60 * 24 * 60), NOW)).toBe('2026-08-30')
++    expect(threadAge('', NOW)).toBe('')
++    expect(threadStateLabel({ state: 'attention', needs: 'approval' })).toBe('Approval')
++    expect(threadStateLabel({ state: 'attention', needs: null })).toBe('Needs you')
++    expect(threadStateLabel({ state: 'working', needs: null })).toBe('Working')
++    expect(threadStateLabel({ state: 'done', needs: null })).toBeNull()
++  })
++})
++
++describe('draftThreadHandoff', () => {
++  it('names the folder and the project, keeps the last messages and clips long ones', () => {
++    const long = 'x'.repeat(HANDOFF_CHARS_PER_MESSAGE * 2)
++    const text = draftThreadHandoff({
++      title: 'Logo ideas', folder: 'C:/Conductor/General', projectName: 'Brand',
++      messages: [{ role: 'user', text: 'first, dropped' }, ...Array.from({ length: 5 }, (_, index) => ({ role: 'assistant' as const, text: `answer ${index}` })), { role: 'user', text: long }, { role: 'assistant', text: '   ' }]
++    })
++    expect(text).toContain('"Logo ideas"')
++    expect(text).toContain('C:/Conductor/General')
++    expect(text).toContain('project Brand')
++    expect(text).not.toContain('first, dropped')
++    expect(text).toContain('Agent: answer 0')
++    expect(text).toContain('Me: ' + 'x'.repeat(HANDOFF_CHARS_PER_MESSAGE - 1) + '…')
++    expect(text.endsWith('Next: ')).toBe(true)
++    expect(draftThreadHandoff({ title: 't', folder: 'f', projectName: 'p', messages: [] })).not.toContain('Where it left off')
++    expect(draftThreadHandoff({ title: 'y'.repeat(HANDOFF_MAX_CHARS * 2), folder: 'f', projectName: 'p', messages: [] }).length).toBe(HANDOFF_MAX_CHARS)
++  })
++})
++
++describe('readGeneralAnchor', () => {
++  it('reads only a complete anchor', () => {
++    expect(readGeneralAnchor(JSON.stringify({ projectId: 'project_1', path: '/x/General' }))).toEqual({ projectId: 'project_1', path: '/x/General' })
++    for (const raw of [null, '', '{', '{}', JSON.stringify({ projectId: 'p' }), JSON.stringify({ projectId: '', path: '/x' }), 'null']) expect(readGeneralAnchor(raw)).toBeNull()
++  })
++})
+diff --git a/src/shared/threads.ts b/src/shared/threads.ts
+new file mode 100644
+index 0000000..e3fc5d0
+--- /dev/null
++++ b/src/shared/threads.ts
+@@ -0,0 +1,210 @@
++/**
++ * Threads without a project (t3code adoption, first slice; docs/perf-evidence/t3code-cloud-threads.md).
++ *
++ * The owner can start a conversation without choosing or creating a project. Such a thread lives in
++ * the "General" project: an ordinary local project row whose folder Conductor made under the projects
++ * root (src/main/general-threads.ts), so every guard that keys on a project - the working directory,
++ * file scope, permissions, restart and resume - applies unchanged. Only the UI treats it as "no
++ * project": the empty state offers "New thread" first, and the Threads view lists every open
++ * conversation across projects by what needs the owner and by recency, the way t3code's sidebar and
++ * Conductor's phone list do.
++ *
++ * Everything here is pure, so the grouping, the age labels and the handoff text are unit-tested.
++ */
++import type { AgentProviderId, ProjectRecord, SessionRecord } from './models'
++import type { PhoneSessionState, PhoneSessionSummary } from './phone-access'
++
++export const GENERAL_PROJECT_NAME = 'General'
++export const GENERAL_WORKSPACE_NAME = 'Threads'
++/** Where the anchor ({projectId, path}) is kept in the settings table. */
++export const GENERAL_ANCHOR_SETTING = 'generalThreadsAnchor'
++
++export interface GeneralAnchor { projectId: string; path: string }
++
++export function readGeneralAnchor(raw: string | null | undefined): GeneralAnchor | null {
++  if (!raw) return null
++  try {
++    const value = JSON.parse(raw) as Partial<GeneralAnchor> | null
++    return value && typeof value.projectId === 'string' && value.projectId && typeof value.path === 'string' && value.path
++      ? { projectId: value.projectId, path: value.path } : null
++  } catch { return null }
++}
++
++/** One conversation as the Threads view shows it. */
++export interface ThreadSummary {
++  id: string
++  title: string
++  projectId: string
++  projectName: string
++  /** The thread lives in the General project: shown as "General", never as a project the owner chose. */
++  general: boolean
++  workspaceId: string
++  workspaceName: string
++  tabId: string | null
++  provider: AgentProviderId
++  model?: string
++  machineName: string
++  state: PhoneSessionState
++  needs: 'approval' | 'question' | null
++  updatedAt: string
++  lastText?: string
++  lastRole?: 'user' | 'assistant'
++  wizard?: true
++  /** Set on a coworker another tab opened; the view folds coworkers under their controller. */
++  controllerId?: string
++  /** Coworkers folded under this row (open, not needing the owner). */
++  coworkers?: number
++}
++
++export type ThreadBucket = 'needs-you' | 'working' | 'recent' | 'earlier'
++
++export const THREAD_BUCKET_LABEL: Record<ThreadBucket, string> = {
++  'needs-you': 'Needs you',
++  working: 'Working',
++  recent: 'Today',
++  earlier: 'Earlier'
++}
++
++export interface ThreadGroup { bucket: ThreadBucket; label: string; threads: ThreadSummary[] }
++
++export interface ThreadView {
++  generalProjectId: string | null
++  groups: ThreadGroup[]
++  /** Threads listed (coworkers folded into their controller are not counted). */
++  total: number
++  /** Rows left out by the limit. */
++  hidden: number
++  observedAt: string
++}
++
++export const THREAD_VIEW_LIMIT = 60
++export const RECENT_WINDOW_MS = 24 * 60 * 60 * 1000
++
++const NEEDS_YOU = new Set<PhoneSessionState>(['attention', 'failed', 'disconnected'])
++const WORKING = new Set<PhoneSessionState>(['working', 'limited'])
++
++export function threadBucket(thread: Pick<ThreadSummary, 'state' | 'updatedAt'>, now: number, recentMs = RECENT_WINDOW_MS): ThreadBucket {
++  if (NEEDS_YOU.has(thread.state)) return 'needs-you'
++  if (WORKING.has(thread.state)) return 'working'
++  const at = Date.parse(thread.updatedAt)
++  return Number.isFinite(at) && now - at <= recentMs ? 'recent' : 'earlier'
++}
++
++export function toThreadSummary(session: PhoneSessionSummary, generalProjectId: string | null): ThreadSummary {
++  return {
++    id: session.id, title: session.title, projectId: session.projectId, projectName: session.projectName,
++    general: Boolean(generalProjectId) && session.projectId === generalProjectId,
++    workspaceId: session.workspaceId, workspaceName: session.workspaceName, tabId: session.tabId,
++    provider: session.provider, ...(session.model ? { model: session.model } : {}), machineName: session.machineName,
++    state: session.state, needs: session.needs, updatedAt: session.updatedAt,
++    ...(session.lastText ? { lastText: session.lastText } : {}), ...(session.lastRole ? { lastRole: session.lastRole } : {}),
++    ...(session.wizard ? { wizard: true as const } : {}), ...(session.controllerId ? { controllerId: session.controllerId } : {})
++  }
++}
++
++const matches = (thread: ThreadSummary, query: string): boolean => {
++  if (!query) return true
++  const haystack = `${thread.title}\n${thread.general ? GENERAL_PROJECT_NAME : thread.projectName}\n${thread.workspaceName}\n${thread.lastText ?? ''}`.toLowerCase()
++  return query.toLowerCase().split(/\s+/).filter(Boolean).every(word => haystack.includes(word))
++}
++
++/**
++ * The smart thread list: open conversations only (a closed one is in history, not here), every
++ * project together. A coworker that does not need the owner is folded into its controller's row
++ * (a swarm of twenty must not bury the conversation the owner is having); one that needs the owner
++ * is always listed. Within a bucket a wizard comes first, then the newest.
++ */
++export function buildThreadView(sessions: readonly PhoneSessionSummary[], options: { generalProjectId: string | null; now: number; query?: string; limit?: number; recentMs?: number }): ThreadView {
++  const { generalProjectId, now } = options
++  const query = (options.query ?? '').trim()
++  const limit = Math.max(1, Math.min(options.limit ?? THREAD_VIEW_LIMIT, 500))
++  const open = sessions.filter(session => session.tabId && !session.archived).map(session => toThreadSummary(session, generalProjectId))
++  const ids = new Set(open.map(thread => thread.id))
++  const folded = new Map<string, number>()
++  const listed: ThreadSummary[] = []
++  for (const thread of open) {
++    const controlled = thread.controllerId && ids.has(thread.controllerId) && thread.controllerId !== thread.id
++    if (controlled && !NEEDS_YOU.has(thread.state)) { folded.set(thread.controllerId!, (folded.get(thread.controllerId!) ?? 0) + 1); continue }
++    listed.push(thread)
++  }
++  const shown = listed.map(thread => folded.get(thread.id) ? { ...thread, coworkers: folded.get(thread.id) } : thread).filter(thread => matches(thread, query))
++  const order: ThreadBucket[] = ['needs-you', 'working', 'recent', 'earlier']
++  const byBucket = new Map<ThreadBucket, ThreadSummary[]>(order.map(bucket => [bucket, []]))
++  for (const thread of shown) byBucket.get(threadBucket(thread, now, options.recentMs))!.push(thread)
++  let budget = limit
++  const groups: ThreadGroup[] = []
++  for (const bucket of order) {
++    const threads = byBucket.get(bucket)!.sort((a, b) => Number(Boolean(b.wizard)) - Number(Boolean(a.wizard)) || (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0) || a.title.localeCompare(b.title))
++    if (!threads.length || budget <= 0) continue
++    const kept = threads.slice(0, budget)
++    budget -= kept.length
++    groups.push({ bucket, label: THREAD_BUCKET_LABEL[bucket], threads: kept })
++  }
++  const total = shown.length
++  return { generalProjectId, groups, total, hidden: total - groups.reduce((sum, group) => sum + group.threads.length, 0), observedAt: new Date(now).toISOString() }
++}
++
++/** A compact age, as t3code's sidebar shows it: "now", "5m", "3h", "2d", "4w", then a date. */
++export function threadAge(iso: string, now: number): string {
++  const at = Date.parse(iso)
++  if (!Number.isFinite(at)) return ''
++  const seconds = Math.max(0, Math.round((now - at) / 1000))
++  if (seconds < 60) return 'now'
++  const minutes = Math.floor(seconds / 60)
++  if (minutes < 60) return `${minutes}m`
++  const hours = Math.floor(minutes / 60)
++  if (hours < 24) return `${hours}h`
++  const days = Math.floor(hours / 24)
++  if (days < 7) return `${days}d`
++  if (days < 35) return `${Math.floor(days / 7)}w`
++  return new Date(at).toISOString().slice(0, 10)
++}
++
++/** The row's one-word state, or null for a thread that is simply idle or done. */
++export function threadStateLabel(thread: Pick<ThreadSummary, 'state' | 'needs'>): string | null {
++  if (thread.state === 'attention') return thread.needs === 'approval' ? 'Approval' : thread.needs === 'question' ? 'Question' : 'Needs you'
++  return ({ working: 'Working', limited: 'Limit', failed: 'Failed', disconnected: 'Disconnected' } as Partial<Record<PhoneSessionState, string>>)[thread.state] ?? null
++}
++
++/**
++ * Moving a running conversation into a project is not offered: a native CLI conversation resumes
++ * from its working directory (claude --resume finds the transcript under the folder it was started
++ * in), so changing the folder of a started thread would lose the conversation on the next restart.
++ * "Continue in project" instead opens a new thread in the chosen project with this text as its
++ * unsent first message; the General thread stays where it is, intact.
++ */
++export const HANDOFF_MESSAGE_LIMIT = 6
++export const HANDOFF_CHARS_PER_MESSAGE = 600
++export const HANDOFF_MAX_CHARS = 6000
++
++export function draftThreadHandoff(input: { title: string; folder: string; projectName: string; messages: ReadonlyArray<{ role: 'user' | 'assistant'; text: string }> }): string {
++  const recent = input.messages.filter(message => message.text.trim()).slice(-HANDOFF_MESSAGE_LIMIT)
++  const clip = (text: string): string => {
++    const flat = text.trim().replace(/\n{3,}/g, '\n\n')
++    return flat.length > HANDOFF_CHARS_PER_MESSAGE ? flat.slice(0, HANDOFF_CHARS_PER_MESSAGE - 1).trimEnd() + '…' : flat
++  }
++  const lines = [
++    `Continuing the thread "${input.title}" that I started without a project (its files, if any, are in ${input.folder}).`,
++    `This conversation now belongs to the project ${input.projectName}; work in this project's folder.`
++  ]
++  if (recent.length) {
++    lines.push('', 'Where it left off:')
++    for (const message of recent) lines.push(`${message.role === 'user' ? 'Me' : 'Agent'}: ${clip(message.text)}`)
++  }
++  lines.push('', 'Next: ')
++  const text = lines.join('\n')
++  return text.length > HANDOFF_MAX_CHARS ? text.slice(text.length - HANDOFF_MAX_CHARS) : text
++}
++
++export interface GeneralThreadTarget { project: ProjectRecord; workspace: SessionRecord }
++
++export interface ThreadsBridge {
++  /** The General project and the workspace a new thread opens in, created on first use. */
++  newGeneral(): Promise<GeneralThreadTarget>
++  generalProjectId(): Promise<string | null>
++  list(query?: string): Promise<ThreadView>
++  /** The unsent first message for "Continue in project"; null when the conversation is unknown. */
++  handoff(agentSessionId: string, targetProjectId: string): Promise<{ text: string; provider: AgentProviderId; model?: string } | null>
++  /** "Turn into a project": the General project keeps its folder and threads under the owner's name for it. */
++  promote(name: string): Promise<ProjectRecord>
++}

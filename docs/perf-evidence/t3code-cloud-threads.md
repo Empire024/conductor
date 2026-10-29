@@ -148,7 +148,21 @@ non-Windows hosts.
 
 ### Full suite
 
-FULL_SUITE_PLACEHOLDER
+**Unverified.** One Linux run of `CI=1 npx vitest run` on this branch finished with 12 failing files
+(26 tests) out of 565 files (6,322 tests passed). Ten of those files fail identically on the clean base
+`3f95349`, so they are pre-existing on Linux: `agent-control`, `approval-policy`, `conductor-relay`,
+`path-lookup`, `phone-access`, `production/profile`, `wizard-approvals`, `local-assist/tools`,
+`providers/codex-approval-spam` and `providers/codex-sandbox-acl`. The other two failed on the branch
+and pass on the base: `providers/local` (10 tests) and `production/browser` (1 test). That branch run
+shared the CPU with an Electron build and the real-app run; both files time-sensitive, ran ~10× slower
+than on the base. Neither file imports anything this change touches. They are being rerun alone; until
+then, treat the full suite as unverified.
+
+**Integration patch:** [`t3code-cloud-threads-integration.patch`](t3code-cloud-threads-integration.patch)
+is exactly `git diff 3f95349 cc6879d -- src scripts docs/perf-evidence/t3code-cloud-threads.md`
+(21 files, no binaries). `git apply --check` passes against `3f95349`. Locally, the
+`phoneState()`/`snapshot()` calls in `src/main/index.ts` (threads wiring) are expected to be adapted
+to the already delivered `phoneStateAsync({history:false})` / `peekAsync`.
 
 ## Limitations (truthful)
 
