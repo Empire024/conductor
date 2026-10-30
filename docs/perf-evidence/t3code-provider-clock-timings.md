@@ -138,7 +138,7 @@ Results in this Linux container:
 | `vitest run src/main/providers/codex-provider-clock.test.ts src/main/tool-timings.test.ts src/shared/tool-timings.test.ts` | 48/48 passed |
 | `vitest run src/main/providers/ src/shared/` | 509 passed, 3 failed, 2 files fail to load. Unmodified base: 499 passed, the same 3 failures (Windows `icacls` sandbox-ACL tests) and the same 2 files (`claude.test.ts` and `claude-ui-fixture.test.ts` need the Electron binary). |
 | `src/main/tool-timings.pipeline.test.ts` | Not run: it needs the Electron binary. |
-| Full suite | See the delivery notes below. |
+| Full `npx vitest run` | 5,660 passed, 16 failed, 78 skipped. 32 files fail to load: they need the Electron binary or the native `node-pty` build, which `--ignore-scripts` did not fetch. I reran the failing files on the unmodified base `2205f97`: the same 15 failures (host-dependent: where.exe, icacls, IPv6 relay, Python/pip path policy, process-kill timing, and the approval/wizard listings built on them) and the same 32 load failures. The one extra failure, `local-models.test.ts` "still finds a port when the whole neighbouring range is unavailable", is outside this change and passed 3 of 3 runs on its own. This is not a full-green run. |
 
 Dependencies were restored with `npm ci --ignore-scripts`, so the Electron binary was not
 downloaded. The parked smoke `smoke-tool-timings` was therefore not run here. Its scenario
