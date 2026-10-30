@@ -1,0 +1,1218 @@
+diff --git a/docs/skill-discovery.md b/docs/skill-discovery.md
+new file mode 100644
+index 0000000..89dfe57
+--- /dev/null
++++ b/docs/skill-discovery.md
+@@ -0,0 +1,87 @@
++# Skills in the composer (`/skill:name`)
++
++Typing `/skill:` in a Chat conversation lists the skills that conversation's runtime can run, each
++with its description and where it came from (Project skill, User skill, Plugin skill…). Typing part
++of a name works too: `/rev` finds `/skill:review-pr`. Choosing one (Enter, Tab or a click) **only
++writes the runtime's own syntax into the draft** — Claude `/review-pr `, Codex `$research ` — so the
++owner can add arguments; nothing is sent until the message is sent. Typing `/skill:review-pr args`
++and sending it directly works as well and sends the same native text.
++
++Adapted from t3code (`apps/server/src/provider/Drivers/ClaudeSkills.ts`,
++`apps/web/src/components/chat/useComposerMenuItems.ts`, pinned at
++`dd148481531a0a090780a2ade20588566db099a2`); see
++`docs/perf-evidence/t3code-cloud-skill-discovery.md` for what was taken and what was left out.
++
++## Where the list comes from
++
++It rides the existing provider discovery call (`structured:discover`, loaded when the `/` list
++first opens), not a separate harness:
++
++| Runtime | Source | Invoked as |
++| --- | --- | --- |
++| Claude Code | `ClaudeAdapter.discover()` adds `skillCatalog`, a bounded scan of skill folders in the main process (`src/main/skill-discovery.ts`) | `/name args` (native, the CLI expands the skill) |
++| Codex | the App Server's `skills/list`, already part of `CodexAdapter.discover()` | `$name args` in an ordinary message |
++| Grok, local models | none | `/skill:x` answers inline that the runtime has no skills |
++
++Claude roots, in Claude Code's own precedence (the first root with a name keeps it; the other is
++recorded under `shadowed`):
++
++1. **User**: `<CLAUDE_CONFIG_DIR or ~/.claude>/skills/<name>/SKILL.md`
++2. **Project**: `<project>/.claude/skills/<name>/SKILL.md`
++
++The skill's name is its folder name (what Claude invokes); the frontmatter supplies `description`,
++`user-invocable: false` (agent-only: not listed, not invocable from Chat) and
++`disable-model-invocation` (listed; owner-only). `skillOverrides` in `~/.claude/settings.json`,
++`.claude/settings.json` and `.claude/settings.local.json` switch a skill off the same way Claude does.
++Plugin skills (`plugin:skill`) are not scanned; the CLI reports them in its own command list, and
++`/skill:plugin:skill` accepts a name the CLI reported.
++
++## Safety and bounds
++
++- Discovery reads names and frontmatter only. No script, prompt or file in a skill folder is run,
++  imported or sent to a model; descriptions are untrusted display text (control and bidi characters
++  removed, one line, at most 160 characters).
++- Bounded I/O (`SKILL_LIMITS`, `src/shared/skill-catalog.ts`): 400 directory entries per root, 200
++  skills, SKILL.md up to 64 KiB (a larger one is skipped unread), settings files up to 256 KiB.
++  Names are sorted before reading, so a truncated list is the same on every run.
++- A skill folder or SKILL.md that is a symlink resolving outside its root is ignored, and a project
++  `.claude/skills` that resolves outside the project is not read (`roots[].state: outside-project`).
++  A user root may itself be a symlink (dotfiles), but entries must stay inside where it resolves.
++- Malformed frontmatter (an unclosed `---`, a top-level line that is not `key: value`), binary
++  content, and names that are not a single token are skipped and counted in `skipped`.
++- Reviewer and evaluation runtimes, which Claude starts without skills, report
++  `status: unavailable`. A failed scan never fails the discovery call.
++
++## Precedence and collisions
++
++Unchanged: Conductor and protocol mappings first, then commands the CLI reported, then the catalog's
++unsupported reasons (`docs/slash-commands.md`). For skills:
++
++- A Claude skill whose name is a Chat command or alias (`model`, `clear`, `compact`, `skills`…) is
++  not listed, and `/skill:model` answers inline: sending `/model` would run the command, not the
++  skill. Rename the skill folder to use it from Chat. Codex `$name` never collides.
++- A reported Claude command that is also a listed skill is shown once, as `/skill:name`.
++- A listed skill typed bare (`/review-pr`) runs natively even if it was created after the CLI
++  reported its list. Once discovery has answered, `/skill:` with a name nobody listed is refused
++  inline; before it answers, Claude is the judge, as for any other Claude command.
++- `/skills` still opens Skills & connections, and `//skill:x` still sends a literal message.
++
++## Loading and errors
++
++While the list loads, the header says so. With `/skill:` typed and nothing to show, the list stays
++open with one status line: loading, the discovery error (for example a disconnected conversation;
++opening the list again retries), "This runtime has no skills Conductor can list", "No skills found…"
++or "No skill matches…". A note also says when skills were left out (agent-only, switched off,
++named like a command) or the list was truncated.
++
++## Verification
++
++- `src/main/skill-discovery.test.ts` — roots, precedence, CLAUDE_CONFIG_DIR, malformed/oversized/
++  binary skips, symlink escapes, overrides, bounds, description cleaning, frontmatter subset.
++- `src/shared/slash-skill-commands.test.ts` — `/skill:` resolution per provider, collisions,
++  unknown after discovery, `//` escape, `/skills` unchanged.
++- `src/renderer/src/panes/composer-skills.test.ts` — menu entries, Codex mapping, disabled
++  providers, loading/error text, filtering, bounded order, selection drafts and never sends.
++- `scripts/smoke-slash-commands.mjs` (parked window, synthetic runtimes) — a project skill is listed
++  with its description and source, an agent-only one is not, and choosing it only drafts
++  `/smoke-skill`.
+diff --git a/docs/slash-commands.md b/docs/slash-commands.md
+index ed4bbed..40e9d87 100644
+--- a/docs/slash-commands.md
++++ b/docs/slash-commands.md
+@@ -35,6 +35,10 @@ provider, each once under its own name (`/approvals`, `/clear` and `/cost` find
+ puts a command that takes arguments (or one the runtime reported) into the draft so they can
+ follow. A `$skill` always goes into the draft, because it prefixes a prompt.
+ 
++Skills are listed as `/skill:name` (Claude skills from `.claude/skills` and `~/.claude/skills`,
++Codex skills from `skills/list`); choosing one only drafts the runtime's own `/name ` or `$name `.
++Discovery, bounds, collisions and errors: `docs/skill-discovery.md`.
++
+ ## Commands
+ 
+ Arguments in brackets are optional.
+diff --git a/scripts/smoke-slash-commands.mjs b/scripts/smoke-slash-commands.mjs
+index 61c3ea2..126b098 100644
+--- a/scripts/smoke-slash-commands.mjs
++++ b/scripts/smoke-slash-commands.mjs
+@@ -1,5 +1,5 @@
+ import { _electron as electron, expect } from '@playwright/test'
+-import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises'
++import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+ import { existsSync } from 'node:fs'
+ import { tmpdir } from 'node:os'
+ import { join, resolve } from 'node:path'
+@@ -28,6 +28,11 @@ try {
+   await page.waitForFunction(() => Boolean(window.conductor?.structured))
+   await page.evaluate(async () => { await window.conductor.settings.setZoom(1); await window.conductor.settings.setThemeAuto(false); await window.conductor.settings.setThemeVariant('night') })
+   const project = await page.evaluate(() => window.conductor.projects.create('Slash commands smoke'))
++  // A project skill for the /skill: list, and an agent-only one it must leave out (docs/skill-discovery.md).
++  for (const [name, frontmatter] of [['smoke-skill', 'description: Summarize the smoke project'], ['hidden-helper', 'description: Agent only\nuser-invocable: false']]) {
++    await mkdir(join(project.path, '.claude', 'skills', name), { recursive: true })
++    await writeFile(join(project.path, '.claude', 'skills', name, 'SKILL.md'), `---\n${frontmatter}\n---\nNever run by discovery.\n`)
++  }
+   await page.evaluate(async projectId => {
+     const [session] = await window.conductor.sessions.list(projectId)
+     const layout = JSON.parse(JSON.stringify(session.layout))
+@@ -161,6 +166,21 @@ try {
+   await shot(page, '8-claude-passthrough')
+   results.checks.push('Claude /compact passes through to the CLI as typed; a name the CLI did not report answers inline')
+ 
++  await claudeComposer.fill('/skill:smoke')
++  const skillOption = claudeMenu.locator('[role="option"]', { hasText: '/skill:smoke-skill' })
++  await expect(skillOption).toHaveCount(1, { timeout: 20_000 })
++  await expect(skillOption).toContainText('Summarize the smoke project')
++  await expect(skillOption).toContainText('Project skill')
++  await shot(page, '9-claude-skill-menu')
++  const sentBefore = await userTexts(claude)
++  await claudeComposer.press('Enter')
++  await expect(claudeComposer).toHaveValue('/smoke-skill ')
++  assert.deepEqual(await userTexts(claude), sentBefore, 'choosing a skill sends nothing')
++  await claudeComposer.fill('/skill:hidden')
++  await expect(claude.locator('.sa-command-status')).toContainText('No skill matches')
++  await claudeComposer.fill('')
++  results.checks.push('Claude /skill: lists the project skill with its description and source, leaves out an agent-only one, and choosing it only drafts /smoke-skill')
++
+   assert.deepEqual(errors, [])
+ } catch (error) {
+   // What the window showed when a check failed: its error bars, notices and the Codex projection.
+diff --git a/src/main/providers/claude.ts b/src/main/providers/claude.ts
+index 43a2269..744671d 100644
+--- a/src/main/providers/claude.ts
++++ b/src/main/providers/claude.ts
+@@ -1,4 +1,5 @@
+ import { readClaudeTaskOutput } from './claude-task-output'
++import { claudeSkillCatalog } from '../skill-discovery'
+ import { execFile } from 'node:child_process'
+ import { createHash, randomUUID } from 'node:crypto'
+ import { open } from 'node:fs/promises'
+@@ -818,7 +819,9 @@ export class ClaudeAdapter implements ProviderAdapter {
+   }
+ 
+   async discover(): Promise<Json> {
+-    return structuredClone({ connection: 'local-cli', runtimeVersion: this.capabilities.runtimeVersion, initialize: this.initializedMetadata, configuration: this.configurationMetadata })
++    // The composer's /skill:name list (docs/skill-discovery.md): read from the skill folders, never run.
++    const skillCatalog = await claudeSkillCatalog({ cwd: this.options.cwd, environment: this.options.environment ?? process.env, isolated: Boolean(this.options.approvalReviewer) || this.options.profile === 'evaluation' })
++    return structuredClone({ connection: 'local-cli', runtimeVersion: this.capabilities.runtimeVersion, initialize: this.initializedMetadata, configuration: this.configurationMetadata, skillCatalog: skillCatalog as unknown as Json })
+   }
+ 
+   private emit(event: AdapterEvent): void {
+diff --git a/src/main/skill-discovery.test.ts b/src/main/skill-discovery.test.ts
+new file mode 100644
+index 0000000..ddf28b5
+--- /dev/null
++++ b/src/main/skill-discovery.test.ts
+@@ -0,0 +1,133 @@
++import { afterEach, beforeEach, describe, expect, it } from 'vitest'
++import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { claudeSkillCatalog, discoverClaudeSkills, parseSkillFrontmatter } from './skill-discovery'
++import { SKILL_LIMITS } from '../shared/skill-catalog'
++
++let base: string, project: string, home: string, outside: string
++const skill = async (root: string, name: string, body: string): Promise<void> => {
++  await mkdir(join(root, name), { recursive: true })
++  await writeFile(join(root, name, 'SKILL.md'), body)
++}
++const md = (fields: string, body = 'Do the thing.'): string => `---\n${fields}\n---\n${body}\n`
++const discover = (environment: NodeJS.ProcessEnv = {}) => discoverClaudeSkills({ cwd: project, home, environment })
++
++beforeEach(async () => {
++  base = await mkdtemp(join(tmpdir(), 'conductor-skills-'))
++  project = join(base, 'project'); home = join(base, 'home'); outside = join(base, 'outside')
++  await Promise.all([mkdir(join(project, '.claude', 'skills'), { recursive: true }), mkdir(join(home, '.claude', 'skills'), { recursive: true }), mkdir(outside, { recursive: true })])
++})
++afterEach(async () => { await rm(base, { recursive: true, force: true }) })
++
++describe('Claude skill discovery', () => {
++  it('lists project and user skills by name, user first on a collision, with where each came from', async () => {
++    await skill(join(project, '.claude', 'skills'), 'review-pr', md('name: review-pr\ndescription: Review the open pull request'))
++    await skill(join(project, '.claude', 'skills'), 'deploy', md('description: "Ship it: carefully"'))
++    await skill(join(home, '.claude', 'skills'), 'deploy', md('description: My personal deploy'))
++    await skill(join(home, '.claude', 'skills'), 'notes', 'No frontmatter at all.')
++    const catalog = await discover()
++    expect(catalog.status).toBe('available')
++    expect(catalog.skills).toEqual([
++      { name: 'deploy', description: 'My personal deploy', source: 'user', enabled: true, userInvocable: true, modelInvocable: true, location: '~/.claude/skills/deploy/SKILL.md' },
++      { name: 'notes', source: 'user', enabled: true, userInvocable: true, modelInvocable: true, location: '~/.claude/skills/notes/SKILL.md' },
++      { name: 'review-pr', description: 'Review the open pull request', source: 'project', enabled: true, userInvocable: true, modelInvocable: true, location: '.claude/skills/review-pr/SKILL.md' }
++    ])
++    expect(catalog.shadowed).toEqual([{ name: 'deploy', source: 'project', by: 'user' }])
++    expect(catalog.roots).toEqual([{ source: 'user', location: '~/.claude/skills', state: 'read' }, { source: 'project', location: '.claude/skills', state: 'read' }])
++  })
++
++  it('reads the user root from CLAUDE_CONFIG_DIR and reports missing roots', async () => {
++    const config = join(base, 'config')
++    await skill(join(config, 'skills'), 'from-config', md('description: Configured'))
++    await rm(join(project, '.claude'), { recursive: true })
++    const catalog = await discover({ CLAUDE_CONFIG_DIR: config })
++    expect(catalog.skills.map(entry => entry.name)).toEqual(['from-config'])
++    expect(catalog.roots).toEqual([{ source: 'user', location: join(config, 'skills'), state: 'read' }, { source: 'project', location: '.claude/skills', state: 'missing' }])
++  })
++
++  it('skips malformed, oversized, binary and badly named skills without failing the scan', async () => {
++    const root = join(project, '.claude', 'skills')
++    await skill(root, 'good', md('description: Fine'))
++    await skill(root, 'unclosed', '---\ndescription: never closed\n')
++    await skill(root, 'not-yaml', md('- a list item'))
++    await skill(root, 'huge', md('description: big', 'x'.repeat(SKILL_LIMITS.fileBytes)))
++    await skill(root, 'binary', md('description: has\u0000nul'))
++    await skill(root, 'bad name!', md('description: spaces'))
++    await mkdir(join(root, 'no-skill-file'))
++    await writeFile(join(root, 'loose-file.md'), 'not a folder')
++    await skill(root, '.hidden', md('description: hidden'))
++    const catalog = await discover()
++    expect(catalog.skills.map(entry => entry.name)).toEqual(['good'])
++    expect(catalog.skipped).toBe(5)
++  })
++
++  it('ignores symlinks that leave their root, and a project skills folder outside the project', async () => {
++    const root = join(project, '.claude', 'skills')
++    await skill(outside, 'escaped', md('description: Outside the project'))
++    await symlink(join(outside, 'escaped'), join(root, 'escaped'), 'dir')
++    await mkdir(join(root, 'linked-file'))
++    await symlink(join(outside, 'escaped', 'SKILL.md'), join(root, 'linked-file', 'SKILL.md'))
++    await skill(root, 'real', md('description: Inside'))
++    await symlink(join(root, 'real'), join(root, 'alias'), 'dir')
++    const catalog = await discover()
++    expect(catalog.skills.map(entry => entry.name)).toEqual(['alias', 'real'])
++    expect(catalog.skipped).toBe(2)
++
++    await rm(root, { recursive: true })
++    await symlink(outside, root, 'dir')
++    const moved = await discover()
++    expect(moved.skills).toEqual([])
++    expect(moved.roots?.[1]).toEqual({ source: 'project', location: '.claude/skills', state: 'outside-project' })
++  })
++
++  it('applies invocation frontmatter and settings overrides, ignoring a settings file Claude would reject', async () => {
++    const root = join(project, '.claude', 'skills')
++    await skill(root, 'agent-only', md('description: For the model\nuser-invocable: false'))
++    await skill(root, 'owner-only', md('description: For the owner\ndisable-model-invocation: yes'))
++    await skill(root, 'switched-off', md('description: Off in settings'))
++    await skill(root, 'kept', md('description: Kept'))
++    await writeFile(join(project, '.claude', 'settings.json'), JSON.stringify({ skillOverrides: { 'switched-off': 'off', 'kept': 'user-invocable-only' } }))
++    await writeFile(join(project, '.claude', 'settings.local.json'), JSON.stringify({ skillOverrides: { kept: 'off', other: true } }))
++    const byName = Object.fromEntries((await discover()).skills.map(entry => [entry.name, entry]))
++    expect(byName['agent-only']).toMatchObject({ userInvocable: false, enabled: true })
++    expect(byName['owner-only']).toMatchObject({ userInvocable: true, modelInvocable: false })
++    expect(byName['switched-off']).toMatchObject({ enabled: false })
++    expect(byName.kept).toMatchObject({ enabled: true, modelInvocable: false })
++  })
++
++  it('stops at the skill bound with a deterministic, sorted prefix', async () => {
++    const root = join(project, '.claude', 'skills')
++    const names = Array.from({ length: SKILL_LIMITS.skills + 5 }, (_, index) => `s${String(SKILL_LIMITS.skills + 4 - index).padStart(3, '0')}`)
++    for (const name of names) await skill(root, name, md('description: x'))
++    const catalog = await discover()
++    expect(catalog.truncated).toBe(true)
++    expect(catalog.skills).toHaveLength(SKILL_LIMITS.skills)
++    expect(catalog.skills[0]!.name).toBe('s000')
++    expect(catalog.skills.at(-1)!.name).toBe(`s${String(SKILL_LIMITS.skills - 1).padStart(3, '0')}`)
++  })
++
++  it('cleans untrusted descriptions to one bounded line', async () => {
++    await skill(join(project, '.claude', 'skills'), 'noisy', md(`description: >\n  First line\n  second‮ line\u0007 ${'y'.repeat(300)}`))
++    const [entry] = (await discover()).skills
++    expect(entry!.description!.startsWith('First line second line y')).toBe(true)
++    expect(entry!.description!.length).toBe(SKILL_LIMITS.description)
++    expect(entry!.description!.endsWith('…')).toBe(true)
++  })
++
++  it('reports isolated runtimes and scan failures as unavailable rather than failing discovery', async () => {
++    expect(await claudeSkillCatalog({ cwd: project, home, environment: {}, isolated: true })).toEqual({ status: 'unavailable', skills: [], message: 'This runtime is started without skills.' })
++    const catalog = await claudeSkillCatalog({ cwd: project, home, environment: { CLAUDE_CONFIG_DIR: join(base, 'missing') } })
++    expect(catalog.status).toBe('available')
++  })
++})
++
++describe('SKILL.md frontmatter', () => {
++  it('reads the keys the menu needs from the YAML subset skills use', () => {
++    expect(parseSkillFrontmatter('---\nname: x\ndescription: \'It\'\'s fine\' # note\nuser-invocable: "false"\n---\nbody')).toEqual({ kind: 'parsed', name: 'x', description: 'It\'s fine', userInvocable: false })
++    expect(parseSkillFrontmatter('﻿---\r\ndescription: |\r\n  one\r\n  two\r\ndisable-model-invocation: on\r\n---\r\n')).toEqual({ kind: 'parsed', description: 'one\ntwo', disableModelInvocation: true })
++    expect(parseSkillFrontmatter('---\ndescription: plain # comment\n  continued\nallowed-tools:\n  - Bash\n---')).toEqual({ kind: 'parsed', description: 'plain continued' })
++    expect(parseSkillFrontmatter('# Title\n---\n')).toEqual({ kind: 'missing' })
++    expect(parseSkillFrontmatter('---\ndescription: "unterminated\n---')).toEqual({ kind: 'malformed' })
++  })
++})
+diff --git a/src/main/skill-discovery.ts b/src/main/skill-discovery.ts
+new file mode 100644
+index 0000000..cacf5f6
+--- /dev/null
++++ b/src/main/skill-discovery.ts
+@@ -0,0 +1,221 @@
++import { homedir } from 'node:os'
++import { isAbsolute, join, relative, resolve } from 'node:path'
++import { open, opendir, realpath, stat } from 'node:fs/promises'
++import { cleanSkillDescription, isSkillName, SKILL_LIMITS, type DiscoveredSkill, type SkillCatalog, type SkillRootReport, type SkillSource } from '../shared/skill-catalog'
++
++/**
++ * Claude Code's skills, read from disk for the composer's `/skill:name` list (docs/skill-discovery.md,
++ * after t3code's Drivers/ClaudeSkills.ts at dd148481). Claude's own init reports only bare command
++ * names, so descriptions and sources come from the files themselves.
++ *
++ * Only names and frontmatter are read. Nothing in a skill folder is executed, imported or sent to
++ * a model, and every read is bounded: a fixed number of directory entries per root, SKILL.md files
++ * up to SKILL_LIMITS.fileBytes (a larger one is skipped unread), a fixed number of skills. A skill
++ * folder or SKILL.md that is a symlink out of its root is ignored, and a project `.claude/skills`
++ * that resolves outside the project is not read.
++ *
++ * Roots, in Claude Code's precedence (a name is taken by the first root that has it):
++ * the user's `<CLAUDE_CONFIG_DIR or ~/.claude>/skills`, then the project's `.claude/skills`.
++ * Plugin skills are namespaced (`plugin:skill`) and come from the CLI's own report instead.
++ */
++export interface ClaudeSkillDiscoveryOptions {
++  cwd: string
++  environment?: NodeJS.ProcessEnv
++  home?: string
++}
++
++type Frontmatter =
++  | { kind: 'missing' }
++  | { kind: 'malformed' }
++  | { kind: 'parsed'; name?: string; description?: string; disableModelInvocation?: boolean; userInvocable?: boolean }
++
++const yamlBoolean = (value: string | undefined): boolean | undefined => {
++  switch (value?.trim().toLowerCase()) {
++    case 'true': case 'yes': case 'on': case 'y': case '1': return true
++    case 'false': case 'no': case 'off': case 'n': case '0': return false
++    default: return undefined
++  }
++}
++const scalar = (raw: string): string | undefined => {
++  const value = raw.trim()
++  if (value.startsWith('"')) {
++    const end = value.lastIndexOf('"')
++    if (end <= 0) return undefined
++    try { return JSON.parse(value.slice(0, end + 1)) as string } catch { return value.slice(1, end) }
++  }
++  if (value.startsWith("'")) {
++    const end = value.lastIndexOf("'")
++    return end <= 0 ? undefined : value.slice(1, end).replaceAll("''", "'")
++  }
++  // A plain scalar ends at a comment.
++  return value.replace(/\s+#.*$/, '')
++}
++
++/**
++ * The few frontmatter keys the menu needs, from the YAML subset SKILL.md files use: `key: value`
++ * scalars (plain, quoted, or `|`/`>` blocks and indented continuations). An opening `---` with no
++ * closing one, or a top-level line that is not a key, is malformed and the skill is left out.
++ */
++export function parseSkillFrontmatter(contents: string): Frontmatter {
++  const lines = contents.replace(/^﻿/, '').split(/\r?\n/)
++  if (lines[0]?.trim() !== '---') return { kind: 'missing' }
++  const close = lines.findIndex((line, index) => index > 0 && /^(---|\.\.\.)\s*$/.test(line))
++  if (close < 0) return { kind: 'malformed' }
++  const values = new Map<string, string>()
++  let index = 1
++  while (index < close) {
++    const line = lines[index]!
++    if (!line.trim() || /^\s*#/.test(line)) { index++; continue }
++    const match = /^([A-Za-z_][\w-]*)\s*:(?:\s+(.*)|\s*)$/.exec(line)
++    if (!match) return { kind: 'malformed' }
++    const key = match[1]!.toLowerCase(), head = (match[2] ?? '').trim()
++    const continuation: string[] = []
++    index++
++    while (index < close && (/^\s/.test(lines[index]!) || !lines[index]!.trim())) continuation.push(lines[index++]!)
++    const block = /^([|>])[+-]?\d*\s*(#.*)?$/.exec(head)
++    if (block) {
++      const body = continuation.map(text => text.trim())
++      values.set(key, block[1] === '|' ? body.join('\n') : body.filter(Boolean).join(' '))
++    } else {
++      const first = head ? scalar(head) : ''
++      if (first === undefined) return { kind: 'malformed' }
++      values.set(key, [first, ...continuation.map(text => text.trim())].filter(Boolean).join(' '))
++    }
++  }
++  return {
++    kind: 'parsed',
++    ...(values.get('name')?.trim() ? { name: values.get('name')!.trim() } : {}),
++    ...(values.get('description')?.trim() ? { description: values.get('description')!.trim() } : {}),
++    ...(yamlBoolean(values.get('disable-model-invocation')) === true ? { disableModelInvocation: true } : {}),
++    ...(yamlBoolean(values.get('user-invocable')) === false ? { userInvocable: false } : {})
++  }
++}
++
++const inside = (root: string, candidate: string): boolean => {
++  const path = relative(root, candidate)
++  return path === '' || (!path.startsWith('..') && !isAbsolute(path))
++}
++const realOrUndefined = async (path: string): Promise<string | undefined> => { try { return await realpath(path) } catch { return undefined } }
++
++/** At most `limit` bytes of a regular file, or undefined when it is larger or not a file. */
++async function readBounded(path: string, limit: number): Promise<string | undefined> {
++  const file = await open(path, 'r')
++  try {
++    const metadata = await file.stat()
++    if (!metadata.isFile() || metadata.size > limit) return undefined
++    const buffer = Buffer.alloc(limit + 1)
++    let offset = 0
++    while (offset < buffer.length) {
++      const { bytesRead } = await file.read(buffer, offset, buffer.length - offset, offset)
++      if (!bytesRead) break
++      offset += bytesRead
++    }
++    // Grown past the bound since stat: still too large.
++    return offset > limit ? undefined : buffer.subarray(0, offset).toString('utf8')
++  } finally { await file.close() }
++}
++
++type Override = { enabled: boolean; modelInvocable: boolean }
++/** `skillOverrides` from the settings layers Claude Code reads, later layers winning. A file that
++ *  does not parse, or holds a value Claude does not accept, contributes nothing (Claude drops it too). */
++async function skillOverrides(configDir: string, cwd: string): Promise<Map<string, Override>> {
++  const overrides = new Map<string, Override>()
++  for (const path of [join(configDir, 'settings.json'), join(cwd, '.claude', 'settings.json'), join(cwd, '.claude', 'settings.local.json')]) {
++    let parsed: unknown
++    try { parsed = JSON.parse(await readBounded(path, SKILL_LIMITS.settingsBytes) ?? 'null') } catch { continue }
++    const map = parsed && typeof parsed === 'object' ? (parsed as { skillOverrides?: unknown }).skillOverrides : undefined
++    if (!map || typeof map !== 'object' || Array.isArray(map)) continue
++    const entries = Object.entries(map as Record<string, unknown>)
++    if (!entries.every(([, value]) => value === 'on' || value === 'off' || value === 'name-only' || value === 'user-invocable-only')) continue
++    for (const [name, value] of entries) overrides.set(name, { enabled: value !== 'off', modelInvocable: value !== 'user-invocable-only' })
++  }
++  return overrides
++}
++
++export function claudeConfigDirectory(environment: NodeJS.ProcessEnv, cwd: string, home = homedir()): string {
++  const configured = environment.CLAUDE_CONFIG_DIR?.trim()
++  return configured ? resolve(cwd, configured) : join(home, '.claude')
++}
++
++export async function discoverClaudeSkills(options: ClaudeSkillDiscoveryOptions): Promise<SkillCatalog> {
++  const environment = options.environment ?? process.env
++  const home = options.home ?? homedir()
++  const configDir = claudeConfigDirectory(environment, options.cwd, home)
++  const userLocation = configDir === join(home, '.claude') ? '~/.claude/skills' : join(configDir, 'skills')
++  const roots: Array<{ directory: string; source: SkillSource; location: string; containedIn?: string }> = [
++    { directory: join(configDir, 'skills'), source: 'user', location: userLocation },
++    { directory: join(options.cwd, '.claude', 'skills'), source: 'project', location: '.claude/skills', containedIn: options.cwd }
++  ]
++  const overrides = await skillOverrides(configDir, options.cwd)
++  const skills = new Map<string, DiscoveredSkill>()
++  const shadowed: NonNullable<SkillCatalog['shadowed']> = []
++  const reports: SkillRootReport[] = []
++  let skipped = 0, truncated = false
++  for (const root of roots) {
++    const realRoot = await realOrUndefined(root.directory)
++    if (!realRoot || !(await stat(realRoot).then(value => value.isDirectory(), () => false))) { reports.push({ source: root.source, location: root.location, state: 'missing' }); continue }
++    if (root.containedIn) {
++      const project = await realOrUndefined(root.containedIn)
++      if (!project || !inside(project, realRoot)) { reports.push({ source: root.source, location: root.location, state: 'outside-project' }); continue }
++    }
++    // Entries are collected up to the bound, then sorted, so the result does not depend on the
++    // order the file system lists them in.
++    const names: string[] = []
++    try {
++      const directory = await opendir(realRoot)
++      try {
++        for await (const entry of directory) {
++          if (names.length >= SKILL_LIMITS.entriesPerRoot) { truncated = true; break }
++          if (!entry.name.startsWith('.')) names.push(entry.name)
++        }
++      } finally { await directory.close().catch(() => undefined) }
++    } catch { reports.push({ source: root.source, location: root.location, state: 'unreadable' }); continue }
++    reports.push({ source: root.source, location: root.location, state: 'read' })
++    for (const name of names.sort()) {
++      if (skills.size >= SKILL_LIMITS.skills) { truncated = true; break }
++      // A symlinked folder or SKILL.md that leaves the root (or a dangling one) is not this root's skill.
++      const folder = await realOrUndefined(join(realRoot, name))
++      if (!folder || folder === realRoot || !inside(realRoot, folder)) { skipped++; continue }
++      if (!(await stat(folder).then(value => value.isDirectory(), () => false))) continue
++      if (!isSkillName(name) || name.includes(':')) { skipped++; continue }
++      const file = await realOrUndefined(join(folder, 'SKILL.md'))
++      if (!file) continue
++      if (!inside(realRoot, file)) { skipped++; continue }
++      let contents: string | undefined
++      try { contents = await readBounded(file, SKILL_LIMITS.fileBytes) } catch { contents = undefined }
++      if (contents === undefined || contents.includes('\u0000')) { skipped++; continue }
++      const frontmatter = parseSkillFrontmatter(contents)
++      if (frontmatter.kind === 'malformed') { skipped++; continue }
++      const existing = skills.get(name)
++      if (existing) { shadowed.push({ name, source: root.source, by: existing.source }); continue }
++      const override = overrides.get(name)
++      const parsed = frontmatter.kind === 'parsed' ? frontmatter : undefined
++      const description = cleanSkillDescription(parsed?.description)
++      skills.set(name, {
++        name,
++        ...(description ? { description } : {}),
++        source: root.source,
++        enabled: override?.enabled ?? true,
++        userInvocable: parsed?.userInvocable !== false,
++        modelInvocable: parsed?.disableModelInvocation !== true && override?.modelInvocable !== false,
++        location: `${root.location}/${name}/SKILL.md`
++      })
++    }
++  }
++  return {
++    status: 'available',
++    skills: [...skills.values()].sort((left, right) => left.name.localeCompare(right.name)),
++    ...(shadowed.length ? { shadowed } : {}),
++    roots: reports,
++    ...(skipped ? { skipped } : {}),
++    ...(truncated ? { truncated: true } : {})
++  }
++}
++
++/** The catalog, or why there is none; discovery never fails the provider call it is part of. */
++export async function claudeSkillCatalog(options: ClaudeSkillDiscoveryOptions & { isolated?: boolean }): Promise<SkillCatalog> {
++  if (options.isolated) return { status: 'unavailable', skills: [], message: 'This runtime is started without skills.' }
++  try { return await discoverClaudeSkills(options) } catch (error) {
++    return { status: 'unavailable', skills: [], message: 'Skill discovery failed: ' + (error instanceof Error ? error.message : String(error)) }
++  }
++}
+diff --git a/src/renderer/src/panes/CommandAutocomplete.tsx b/src/renderer/src/panes/CommandAutocomplete.tsx
+index edcf6c6..481fb58 100644
+--- a/src/renderer/src/panes/CommandAutocomplete.tsx
++++ b/src/renderer/src/panes/CommandAutocomplete.tsx
+@@ -1,13 +1,15 @@
+ import { useEffect, useRef } from 'react'
+ import { Command } from 'lucide-react'
+ import type { ComposerCommand } from './composer-commands'
++import { skillStatusText, type ComposerSkills } from './composer-skills'
+ /** @browser is the view-driven control: reveal the project's persistent left browser. The
+  * composer globe has a deliberately different job and changes model-tool authority only. */
+ export function activateBrowserMention(): void {
+   window.dispatchEvent(new CustomEvent('conductor:sidebar-mode', { detail: 'browser' }))
+ }
+-export function CommandAutocomplete({ id, commands, selected, loading, onSelect, onChoose }: { id: string; commands: ComposerCommand[]; selected: number; loading: boolean; onSelect(index: number): void; onChoose(command: ComposerCommand): void }): React.JSX.Element {
++export function CommandAutocomplete({ id, commands, selected, loading, skillStatus, onSelect, onChoose }: { id: string; commands: ComposerCommand[]; selected: number; loading: boolean; skillStatus?: ComposerSkills; onSelect(index: number): void; onChoose(command: ComposerCommand): void }): React.JSX.Element {
+   const host = useRef<HTMLDivElement>(null)
+   useEffect(() => { host.current?.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: 'nearest' }) }, [selected])
+-  return <div ref={host} className="sa-command-menu"><header><Command size={13} /> Commands{loading && <small>Loading provider commands...</small>}</header><div role="listbox" aria-label="Chat commands" id={id}>{commands.map((command, index) => <button type="button" role="option" id={id + '-' + index} aria-selected={index === selected} key={command.name} onMouseDown={event => event.preventDefault()} onPointerMove={() => onSelect(index)} onClick={() => onChoose(command)}><strong>{command.trigger ?? '/'}{command.name}</strong><span>{command.description}{command.argumentHint && <em className="sa-command-hint"> {command.argumentHint}</em>}</span></button>)}</div><small>Arrow keys to choose · Enter runs · Tab adds arguments · Esc dismisses · // sends a slash as text</small></div>
++  const status = skillStatus && skillStatusText(skillStatus, commands.some(command => command.kind === 'skill'))
++  return <div ref={host} className="sa-command-menu"><header><Command size={13} /> Commands{loading && <small>Loading provider commands...</small>}</header>{status && <p className="sa-command-status" role="status">{status}</p>}<div role="listbox" aria-label="Chat commands" id={id}>{commands.map((command, index) => <button type="button" role="option" data-kind={command.kind} id={id + '-' + index} aria-selected={index === selected} key={command.name} onMouseDown={event => event.preventDefault()} onPointerMove={() => onSelect(index)} onClick={() => onChoose(command)}><strong>{command.trigger ?? '/'}{command.name}</strong><span>{command.description}{command.argumentHint && <em className="sa-command-hint"> {command.argumentHint}</em>}{command.source && <em className="sa-command-hint"> · {command.source}</em>}</span></button>)}</div><small>Arrow keys to choose · Enter runs · Tab adds arguments · Esc dismisses · // sends a slash as text{commands.some(command => command.kind === 'skill') && ' · a skill goes into the draft, to send with your message'}</small></div>
+ }
+diff --git a/src/renderer/src/panes/StructuredAgentPane.css b/src/renderer/src/panes/StructuredAgentPane.css
+index 45e7e5b..a50fefd 100644
+--- a/src/renderer/src/panes/StructuredAgentPane.css
++++ b/src/renderer/src/panes/StructuredAgentPane.css
+@@ -376,6 +376,8 @@
+ .sa-command-menu [role="option"] span { min-width: 0; color: var(--text-2); }
+ .sa-command-menu > small { display: block; padding: 7px 7px 2px; color: var(--text-3); font-size: 10px; }
+ .sa-command-hint { color: var(--text-3); font-style: normal; font-family: var(--font-mono, monospace); font-size: 10px; }
++.sa-command-menu [role="option"][data-kind="skill"] strong { width: auto; flex: 0 1 auto; max-width: 45%; overflow-wrap: anywhere; }
++.sa-command-status { margin: 0; padding: 0 7px 6px; color: var(--text-3); font-size: 11px; }
+ .sa-command-notice { display: flex; align-items: flex-start; gap: 8px; margin: 0 0 6px; padding: 6px 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-1); color: var(--text-2); font-size: 11px; }
+ .sa-command-notice[data-tone="unsupported"] { border-color: color-mix(in srgb, var(--warning, #d9a400) 45%, var(--border)); }
+ .sa-command-notice > span { flex: 1; white-space: pre-wrap; overflow-wrap: anywhere; }
+diff --git a/src/renderer/src/panes/StructuredAgentPane.tsx b/src/renderer/src/panes/StructuredAgentPane.tsx
+index 7bd07b8..d661da9 100644
+--- a/src/renderer/src/panes/StructuredAgentPane.tsx
++++ b/src/renderer/src/panes/StructuredAgentPane.tsx
+@@ -31,7 +31,8 @@ import { FileAttachmentInput } from '../components/FileAttachmentInput'
+ import { composerEnterSends } from './composer-enter'
+ import { composerChildKey, composerSendBlock, conversationModes, modelDisplayName, nextComposerSettings, resolvedComposerSettings } from './composer-settings'
+ import { activateBrowserMention, CommandAutocomplete } from './CommandAutocomplete'
+-import { composerCommands, matchingComposerCommands, nativeCommandNames, type ComposerCommand } from './composer-commands'
++import { composerCommandChoice, composerCommands, matchingComposerCommands, nativeCommandNames, type ComposerCommand } from './composer-commands'
++import { composerSkills, DISCOVERY_ERROR, invocableSkillNames } from './composer-skills'
+ import { resolveSlashCommand, type ConductorSlashAction, type SlashHandling } from '../../../shared/slash-commands'
+ import { conversationStatusText, lastAssistantText, matchConversationMode, matchEffort, matchModel } from './slash-command-actions'
+ import { modelEfforts, supportedEffortChoices } from '../../../shared/model-effort'
+@@ -272,9 +273,12 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
+   const [commandDismissed, setCommandDismissed] = useState(false)
+   const [commandIndex, setCommandIndex] = useState(0)
+   const commandListId = useId()
+-  const commands = matchingComposerCommands(draftView.commandQuery, composerCommands(projection.capabilities, commandDiscovery))
++  const skillState = composerSkills(structuredProvider, commandDiscovery, commandLoading)
++  const commands = matchingComposerCommands(draftView.commandQuery, composerCommands(projection.capabilities, commandDiscovery, skillState))
+   const starterChoices = useMemo(() => composerStarterChoices(projection.capabilities, commandDiscovery), [projection.capabilities, commandDiscovery])
+   const commandsOpen = !commandDismissed && !addFileOpen && !historical && commands.length > 0
++  // `/skill:` with nothing to list still opens the list, to say whether skills are loading, failed or absent.
++  const skillStatusOpen = !commandDismissed && !addFileOpen && !historical && !commands.length && draftView.commandQuery.toLowerCase().startsWith('/skill:')
+   const [newOutput, setNewOutput] = useState(false)
+   const newOutputRef = useRef(newOutput); newOutputRef.current = newOutput
+   const [dockedQuestions, setDockedQuestions] = useState<ReadonlySet<string>>(() => new Set())
+@@ -519,7 +523,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
+     // it, the runtime's protocol runs it, the runtime runs it as typed, or it answers inline why not.
+     let nativeCommand = false, commandPrompt = false
+     if (!oversized) {
+-      const slash = resolveSlashCommand(provider, text, nativeCommandNames(commandDiscovery))
++      const slash = resolveSlashCommand(provider, text, nativeCommandNames(commandDiscovery), invocableSkillNames(provider, commandDiscovery))
+       if (slash.kind === 'literal') text = slash.text
+       else if (slash.kind === 'unknown') { setCommandNotice({ text: slash.reason, tone: 'unsupported' }); return }
+       else if (slash.kind === 'command') {
+@@ -527,6 +531,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
+         if (handling.kind === 'unsupported') { setCommandNotice({ text: `/${invocation.name}: ${handling.reason}`, tone: 'unsupported' }); return }
+         if (handling.kind === 'conductor' || handling.kind === 'protocol') { void runSlashCommand(invocation.name, invocation.args, handling).then(used => { if (used) clearSubmitted(draft.revision) }); return }
+         if (handling.kind === 'prompt') { commandPrompt = true; text = handling.prompt + (invocation.args ? '\n\n' + invocation.args : '') }
++        else if (handling.kind === 'skill') text = handling.text + (invocation.args ? ' ' + invocation.args : '')
+         else {
+           nativeCommand = true
+           if (handling.as) text = handling.as + (invocation.args ? ' ' + invocation.args : '')
+@@ -674,12 +679,18 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
+   const loadComposerDiscovery = (): void => {
+     if (commandLoad.current === activeId || !ready || historical) return
+     commandLoad.current = activeId; setCommandLoading(true)
+-    void connect().then(() => window.conductor.structured.discover(activeId)).then(result => { if (activeIdRef.current === activeId) setCommandDiscovery(result) }).catch(() => { /* Local commands remain available if provider discovery fails. */ }).finally(() => { if (activeIdRef.current === activeId) setCommandLoading(false) })
++    void connect().then(() => window.conductor.structured.discover(activeId)).then(result => { if (activeIdRef.current === activeId) setCommandDiscovery(result) }).catch((reason: unknown) => {
++      // Local commands remain available if provider discovery fails; the list says skills did not
++      // load, and opening it again retries.
++      if (activeIdRef.current !== activeId) return
++      commandLoad.current = null
++      setCommandDiscovery({ [DISCOVERY_ERROR]: reason instanceof Error ? reason.message : String(reason) })
++    }).finally(() => { if (activeIdRef.current === activeId) setCommandLoading(false) })
+   }
+   useEffect(() => {
+-    if (!commandsOpen) return
++    if (!commandsOpen && !skillStatusOpen) return
+     loadComposerDiscovery()
+-  }, [commandsOpen, activeId, ready, historical])
++  }, [commandsOpen, skillStatusOpen, activeId, ready, historical])
+ 
+   const stop = (expediteSubmittedInput = false): void => { void window.conductor.structured.interrupt(activeId, expediteSubmittedInput).catch((reason: unknown) => setError(String(reason))) }
+   const needsResume = !historical && Boolean(projection.nativeSessionId) && ['interrupted', 'disconnected'].includes(projection.phase)
+@@ -1234,9 +1245,10 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
+    *  that takes arguments in the draft so they can follow. A `$skill` always goes in the draft. */
+   const chooseCommand = (command: ComposerCommand, complete = false): void => {
+     setCommandDismissed(true); setCommandIndex(0)
+-    if (command.name === 'browser' && command.trigger === '@') { setMessage(''); activateBrowserMention(); return }
+-    if (command.insert?.startsWith('$') || complete && (command.insert || command.argumentHint)) { setMessage(command.insert ?? '/' + command.name + ' '); composer.current?.focus(); return }
+-    setMessage('/' + command.name)
++    const choice = composerCommandChoice(command, complete)
++    if (choice.action === 'browser') { setMessage(''); activateBrowserMention(); return }
++    if (choice.action === 'draft') { setMessage(choice.text); composer.current?.focus(); return }
++    setMessage(choice.text)
+     void submitRef.current()
+   }
+ 
+@@ -1329,7 +1341,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
+       {attachments.length > 0 && <div className="sa-context-chips">{attachments.map(attachment => <span key={attachment.id}><button type="button" title={canOpenPastedText(attachment) ? 'Open the pasted text as a file' : 'Inspect attached context'} onClick={() => { if (canOpenPastedText(attachment)) void openPastedText(props.project.id, attachment); else setInspectAttachment(attachment) }}>{attachment.kind === 'image' && <PromptImageThumbnail projectId={props.project.id} attachment={attachment} />}{attachment.name}{attachment.startLine ? ':' + attachment.startLine + (attachment.endLine ? '–' + attachment.endLine : '') : ''}</button>{isPastedText(attachment) && <button type="button" aria-label={'Put ' + attachment.name + ' back in the message as text'} title="Put back in the message as text" onClick={() => { const next = unfoldPastedText(draftRef.current.message, draftRef.current.attachments, attachment.id); setDraft(next.message, next.attachments) }}><Undo2 size={11} /></button>}<button type="button" aria-label={'Remove context ' + attachment.name} onClick={() => { if (isPastedText(attachment)) { const next = removePastedText(draftRef.current.message, draftRef.current.attachments, attachment.id); setDraft(next.message, next.attachments) } else setAttachments(current => current.filter(item => item.id !== attachment.id)) }}><X size={11} /></button></span>)}</div>}
+       {promptChars > MAX_PROMPT_CHARS * 0.9 && <p className={'sa-prompt-limit' + (sendBlocked === 'oversized' ? ' sa-prompt-limit-over' : '')} role="status">{sendBlocked === 'oversized' ? `Too large to send: ${promptChars.toLocaleString()} of ${MAX_PROMPT_CHARS.toLocaleString()} characters including attachments. Remove or shorten an attachment, or trim the message.` : `${promptChars.toLocaleString()} / ${MAX_PROMPT_CHARS.toLocaleString()} characters`}</p>}
+       {commandNotice && <div className="sa-command-notice" role="status" data-tone={commandNotice.tone}><span>{commandNotice.text}</span><button type="button" aria-label="Dismiss command message" onClick={() => setCommandNotice(null)}><X size={12} /></button></div>}
+-      {commandsOpen && <CommandAutocomplete id={commandListId} commands={commands} selected={Math.min(commandIndex, commands.length - 1)} loading={commandLoading} onSelect={setCommandIndex} onChoose={chooseCommand} />}
++      {(commandsOpen || skillStatusOpen) && <CommandAutocomplete id={commandListId} commands={commands} selected={Math.min(commandIndex, commands.length - 1)} loading={commandLoading} skillStatus={draftView.commandQuery.toLowerCase().startsWith('/skill') ? skillState : undefined} onSelect={setCommandIndex} onChoose={chooseCommand} />}
+       <ComposerTextarea projectId={props.project.id} sessionId={activeId} textareaRef={composer} aria-autocomplete="list" aria-controls={commandsOpen ? commandListId : undefined} aria-expanded={commandsOpen} aria-activedescendant={commandsOpen ? commandListId + '-' + Math.min(commandIndex, commands.length - 1) : undefined} aria-label={'Message ' + name} placeholder={sendBlocked !== 'empty' ? undefined : succession ? `Continued in ${succession.title}; send messages there` : cliOwned ? 'The native CLI has this conversation. Continue in Chat to send here.' : historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : steering ? (pendingSteering.some(input => input.status === 'sending' || input.status === 'accepted') ? 'Add another message (Ctrl+Enter sends)' : 'Message after the next tool use (Ctrl+Enter sends)') : turnRunning ? 'Queue a message after this turn (Ctrl+Enter sends)' : activePhases.has(projection.phase) ? 'Queue a message after this turn' : 'Message ' + name} disabled={(!ready && !arriving) || historical || resuming || projection.archived || cliOwned} rows={2} onFocus={() => { if (ready && !historical && !projection.nativeSessionId && !activePhases.has(projection.phase)) void connect().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }} onBlur={() => { setCommandDismissed(true); flushDraft() }} onChange={event => {
+         // A long paste or drop folds into a "[Pasted text #N: L lines]" chip, as the Claude CLI does.
+         // Only an event that could have inserted a long run pays for diffing the whole draft.
+diff --git a/src/renderer/src/panes/composer-commands.test.ts b/src/renderer/src/panes/composer-commands.test.ts
+index 4646b5c..aa643f0 100644
+--- a/src/renderer/src/panes/composer-commands.test.ts
++++ b/src/renderer/src/panes/composer-commands.test.ts
+@@ -25,10 +25,10 @@ describe('chat command discovery', () => {
+     expect(commands.some(command => command.name === 'clear')).toBe(false)
+     expect(commands.some(command => command.name === 'bad path' || command.name === 'not-a-command')).toBe(false)
+   })
+-  it('turns Codex skills into $ tokens', () => {
++  it('turns Codex skills into /skill:name entries that draft $ tokens', () => {
+     const commands = composerCommands(undefined, { skills: { status: 'available', payload: { data: [{ skills: [{ name: 'research', enabled: true }, { name: 'disabled', enabled: false }] }] } } })
+-    expect(commands.find(command => command.name === 'research')).toMatchObject({ insert: '$research ' })
+-    expect(commands.some(command => command.name === 'disabled')).toBe(false)
++    expect(commands.find(command => command.name === 'skill:research')).toMatchObject({ insert: '$research ', kind: 'skill' })
++    expect(commands.some(command => command.name.endsWith('disabled'))).toBe(false)
+   })
+   it('reads the names a runtime reported, or nothing before discovery', () => {
+     expect(nativeCommandNames(undefined)).toBeUndefined()
+diff --git a/src/renderer/src/panes/composer-commands.ts b/src/renderer/src/panes/composer-commands.ts
+index b04379f..4246054 100644
+--- a/src/renderer/src/panes/composer-commands.ts
++++ b/src/renderer/src/panes/composer-commands.ts
+@@ -1,6 +1,10 @@
+ import type { Json, ProviderCapabilities } from '../../../shared/structured-agent'
+ import { findSlashCommand, slashHandling, supportedSlashCommands } from '../../../shared/slash-commands'
+-export interface ComposerCommand { name: string; description: string; insert?: string; trigger?: '/' | '@'; argumentHint?: string }
++import { SKILL_COMMAND_PREFIX } from '../../../shared/skill-catalog'
++import { composerSkills, skillComposerCommands, type ComposerSkills } from './composer-skills'
++export interface ComposerCommand { name: string; description: string; insert?: string; trigger?: '/' | '@'; argumentHint?: string
++  /** A discovered skill (`/skill:name`, composer-skills.ts); `source` says where it was found. */
++  kind?: 'skill'; source?: string }
+ const object = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+ /** The names a runtime reported it runs itself (Claude's initialize commands and init
+  *  slash_commands); undefined until discovery has answered. */
+@@ -15,8 +19,8 @@ export function nativeCommandNames(discovery?: Json): string[] | undefined {
+   })
+ }
+ /** The `/` list for a conversation: the provider's supported commands (shared/slash-commands.ts),
+- *  then what the runtime itself reported (Claude commands and skills, Codex `$skills`). */
+-export function composerCommands(capabilities?: ProviderCapabilities, discovery?: Json): ComposerCommand[] {
++ *  then what the runtime itself reported (Claude commands), then its skills as `/skill:name`. */
++export function composerCommands(capabilities?: ProviderCapabilities, discovery?: Json, skills: ComposerSkills = composerSkills(capabilities?.provider, discovery)): ComposerCommand[] {
+   const provider = capabilities?.provider
+   const commands: ComposerCommand[] = supportedSlashCommands(provider)
+     .filter(entry => entry.handling.kind !== 'conductor' || (entry.handling.action !== 'plan' || capabilities?.plans) && (entry.handling.action !== 'fork' || capabilities?.fork))
+@@ -24,23 +28,33 @@ export function composerCommands(capabilities?: ProviderCapabilities, discovery?
+   commands.push({ name: 'browser', description: 'Attach the browser preview to this turn', trigger: '@' })
+   const data = object(discovery)
+   const initialized = object(data.initialize), configuration = object(data.configuration)
+-  const add = (value: unknown, skill = false): void => {
++  // A reported command that is also a listed skill is listed once, as /skill:name.
++  const skillNames = new Set(skills.skills.map(skill => skill.name.toLowerCase()))
++  const add = (value: unknown): void => {
+     const item = object(value)
+     const raw = typeof value === 'string' ? value : item.name
+     if (typeof raw !== 'string' || item.enabled === false) return
+     const name = raw.replace(/^[/\$]/, '')
+-    if (!/^[a-zA-Z0-9][a-zA-Z0-9:_-]*$/.test(name) || commands.some(command => command.name === name)) return
++    if (!/^[a-zA-Z0-9][a-zA-Z0-9:_-]*$/.test(name) || commands.some(command => command.name === name) || skillNames.has(name.toLowerCase())) return
+     // A reported command Conductor maps (Claude's /clear, /model) is already listed under its Conductor name.
+-    const spec = skill ? undefined : findSlashCommand(name)
++    const spec = findSlashCommand(name)
+     const handling = spec && slashHandling(spec, provider)
+     if (handling && handling.kind !== 'unsupported') return
+-    commands.push({ name, description: typeof item.description === 'string' ? item.description : skill ? 'Use this configured skill' : 'Provider command', insert: (skill ? '$' : '/') + name + ' ', ...(typeof item.argumentHint === 'string' && item.argumentHint ? { argumentHint: item.argumentHint } : {}) })
++    commands.push({ name, description: typeof item.description === 'string' ? item.description : 'Provider command', insert: '/' + name + ' ', ...(typeof item.argumentHint === 'string' && item.argumentHint ? { argumentHint: item.argumentHint } : {}) })
+   }
+   for (const list of [initialized.commands, configuration.slash_commands, configuration.commands]) if (Array.isArray(list)) list.forEach(value => add(value))
+-  const skillGroups = object(object(data.skills).payload).data
+-  if (Array.isArray(skillGroups)) for (const group of skillGroups) { const skills = object(group).skills; if (Array.isArray(skills)) skills.forEach(value => add(value, true)) }
++  commands.push(...skillComposerCommands(skills))
+   return commands
+ }
++export type ComposerCommandChoice = { action: 'browser' } | { action: 'draft'; text: string } | { action: 'send'; text: string }
++/** What choosing a list entry does. A skill (or a `$skill`) only goes into the draft, in the
++ *  runtime's own syntax: choosing it never sends anything. Tab puts a command that takes arguments
++ *  into the draft; otherwise the command runs as if typed and sent. */
++export function composerCommandChoice(command: ComposerCommand, complete = false): ComposerCommandChoice {
++  if (command.name === 'browser' && command.trigger === '@') return { action: 'browser' }
++  if (command.kind === 'skill' || command.insert?.startsWith('$') || complete && (command.insert || command.argumentHint)) return { action: 'draft', text: command.insert ?? '/' + command.name + ' ' }
++  return { action: 'send', text: '/' + command.name }
++}
+ const triggerPatterns: Record<'/' | '@', RegExp> = { '/': /^\/[a-zA-Z0-9:_-]*$/, '@': /^@[a-zA-Z0-9:_-]*$/ }
+ /** The draft while it can open the / or @ command list, '' otherwise: all matchingComposerCommands needs of it. */
+ export function composerCommandQuery(message: string): string {
+@@ -52,7 +66,8 @@ export function matchingComposerCommands(message: string, commands: ComposerComm
+   const trigger = message[0] as '/' | '@'
+   const query = message.slice(1).toLowerCase()
+   const candidates = commands.filter(command => (command.trigger ?? '/') === trigger)
+-  const matches = candidates.filter(command => command.name.toLowerCase().startsWith(query))
++  // A skill is found by /skill:name and by its bare name (/rev finds /skill:review-pr).
++  const matches = candidates.filter(command => command.name.toLowerCase().startsWith(query) || command.kind === 'skill' && query && command.name.slice(SKILL_COMMAND_PREFIX.length).toLowerCase().startsWith(query))
+   // An alias (/approvals, /clear, /cost) finds the command it names.
+   const spec = trigger === '/' && query ? findSlashCommand(query) : undefined
+   const aliased = spec && !matches.some(command => command.name === spec.name) ? candidates.filter(command => command.name === spec.name) : []
+diff --git a/src/renderer/src/panes/composer-skills.test.ts b/src/renderer/src/panes/composer-skills.test.ts
+new file mode 100644
+index 0000000..8710768
+--- /dev/null
++++ b/src/renderer/src/panes/composer-skills.test.ts
+@@ -0,0 +1,114 @@
++import { describe, expect, it } from 'vitest'
++import { composerCommandChoice, composerCommands, matchingComposerCommands, nativeCommandNames } from './composer-commands'
++import { composerSkills, DISCOVERY_ERROR, invocableSkillNames, skillStatusText } from './composer-skills'
++import { resolveSlashCommand } from '../../../shared/slash-commands'
++import type { Json, ProviderCapabilities } from '../../../shared/structured-agent'
++
++const claude = { provider: 'claude' } as ProviderCapabilities
++const codex = { provider: 'codex' } as ProviderCapabilities
++const entry = (name: string, extra: { [key: string]: Json } = {}): Json => ({ name, enabled: true, userInvocable: true, modelInvocable: true, source: 'project', ...extra })
++const claudeDiscovery: Json = {
++  initialize: { commands: [{ name: 'compact' }, { name: 'review-pr', description: 'Reported by the CLI' }, { name: 'code-review', description: 'Review changes' }] },
++  configuration: { slash_commands: ['/compact', '/review-pr', '/code-review'] },
++  skillCatalog: { status: 'available', skills: [
++    entry('review-pr', { description: 'Review the open pull request', location: '.claude/skills/review-pr/SKILL.md' }),
++    entry('deploy', { source: 'user', description: 'Ship it' }),
++    entry('model', { description: 'Named like a command' }),
++    entry('helper', { userInvocable: false }),
++    entry('retired', { enabled: false })
++  ] }
++}
++const codexDiscovery: Json = { skills: { status: 'available', payload: { data: [{ skills: [
++  { name: 'research', description: 'Long description', interface: { shortDescription: 'Research a topic' }, scope: 'repo', enabled: true, pluginId: null },
++  { name: 'gh:fix-ci', description: 'Fix CI', scope: 'user', enabled: true, pluginId: 'gh@local' },
++  { name: 'disabled', description: 'Off', scope: 'user', enabled: false }
++] }, { skills: [{ name: 'research', description: 'Duplicate from another root', scope: 'user', enabled: true }] }] } } }
++
++describe('composer skills', () => {
++  it('lists Claude skills the owner can invoke as /skill:name, with source and native draft syntax', () => {
++    const skills = composerSkills('claude', claudeDiscovery)
++    expect(skills.state).toBe('ready')
++    expect(skills.skills.map(skill => skill.name)).toEqual(['deploy', 'review-pr'])
++    expect(skills.message).toContain('3 skills are agent-only, switched off or named like a command')
++    const commands = composerCommands(claude, claudeDiscovery, skills)
++    expect(commands.filter(command => command.kind === 'skill')).toEqual([
++      { name: 'skill:deploy', description: 'Ship it', insert: '/deploy ', kind: 'skill', source: 'User skill' },
++      { name: 'skill:review-pr', description: 'Review the open pull request', insert: '/review-pr ', kind: 'skill', source: 'Project skill' }
++    ])
++    // The CLI's own report of the same skill is not listed a second time; other commands stay.
++    expect(commands.filter(command => command.name === 'review-pr')).toEqual([])
++    expect(commands.find(command => command.name === 'code-review')).toMatchObject({ insert: '/code-review ' })
++    expect(commands.find(command => command.name === 'model')).toMatchObject({ description: 'Choose the model for this conversation' })
++  })
++
++  it('lists Codex skills once each, as $name drafts, preferring their short description', () => {
++    const skills = composerSkills('codex', codexDiscovery)
++    expect(skills.skills).toEqual([
++      { name: 'gh:fix-ci', description: 'Fix CI', source: 'plugin', syntax: '$' },
++      { name: 'research', description: 'Research a topic', source: 'project', syntax: '$' }
++    ])
++    const commands = composerCommands(codex, codexDiscovery, skills).filter(command => command.kind === 'skill')
++    expect(commands.map(command => [command.name, command.insert])).toEqual([['skill:gh:fix-ci', '$gh:fix-ci '], ['skill:research', '$research ']])
++  })
++
++  it('offers no skills on runtimes without them, and says why', () => {
++    for (const provider of ['local', 'grok'] as const) {
++      const skills = composerSkills(provider, claudeDiscovery)
++      expect(skills).toEqual({ state: 'unsupported', skills: [] })
++      expect(composerCommands({ provider } as ProviderCapabilities, claudeDiscovery, skills).some(command => command.kind === 'skill')).toBe(false)
++      expect(skillStatusText(skills, false)).toBe('This runtime has no skills Conductor can list.')
++    }
++  })
++
++  it('reports loading, failure and an empty catalog', () => {
++    expect(composerSkills('claude', undefined, true)).toEqual({ state: 'loading', skills: [] })
++    expect(skillStatusText(composerSkills('claude', undefined, true), false)).toBe('Loading skills…')
++    const failed = composerSkills('claude', { [DISCOVERY_ERROR]: 'Resume the native conversation before discovering runtime features' })
++    expect(failed.state).toBe('error')
++    expect(skillStatusText(failed, false)).toContain('Resume the native conversation')
++    const isolated = composerSkills('claude', { skillCatalog: { status: 'unavailable', skills: [], message: 'This runtime is started without skills.' } })
++    expect(skillStatusText(isolated, false)).toBe('This runtime is started without skills.')
++    expect(composerSkills('codex', { skills: { status: 'unavailable', message: 'skills/list failed' } })).toMatchObject({ state: 'error', message: 'Skills are unavailable: skills/list failed' })
++    expect(skillStatusText(composerSkills('claude', { skillCatalog: { status: 'available', skills: [] } }), false)).toContain('No skills found')
++    expect(invocableSkillNames('claude', undefined)).toBeUndefined()
++    expect(invocableSkillNames('claude', { [DISCOVERY_ERROR]: 'x' })).toBeUndefined()
++  })
++
++  it('filters by /skill:prefix and by bare name, in a deterministic bounded order', () => {
++    const commands = composerCommands(claude, claudeDiscovery)
++    expect(matchingComposerCommands('/skill:', commands).map(command => command.name)).toEqual(['skill:deploy', 'skill:review-pr'])
++    expect(matchingComposerCommands('/skill:re', commands).map(command => command.name)).toEqual(['skill:review-pr'])
++    expect(matchingComposerCommands('/rev', commands).map(command => command.name)).toEqual(['skill:review-pr'])
++    expect(matchingComposerCommands('/skill', commands).map(command => command.name)).toEqual(['skills', 'skill:deploy', 'skill:review-pr'])
++    expect(matchingComposerCommands('/skill:zzz', commands)).toEqual([])
++    const many: Json = { skillCatalog: { status: 'available', skills: Array.from({ length: 260 }, (_, index) => entry(`s${String(259 - index).padStart(3, '0')}`)) } }
++    const listed = composerSkills('claude', many)
++    expect(listed.skills).toHaveLength(200)
++    expect(listed.skills[0]!.name).toBe('s000')
++    expect(listed.message).toContain('Only the first skills found are listed.')
++    expect(matchingComposerCommands('/skill:', composerCommands(claude, many))).toHaveLength(60)
++  })
++
++  it('puts a chosen skill into the draft and never sends it on Enter, Tab or click', () => {
++    const [review] = matchingComposerCommands('/skill:review', composerCommands(claude, claudeDiscovery))
++    for (const complete of [false, true]) expect(composerCommandChoice(review!, complete)).toEqual({ action: 'draft', text: '/review-pr ' })
++    const [research] = matchingComposerCommands('/skill:research', composerCommands(codex, codexDiscovery))
++    expect(composerCommandChoice(research!)).toEqual({ action: 'draft', text: '$research ' })
++    // Ordinary commands keep their behavior.
++    const [status] = matchingComposerCommands('/status', composerCommands(claude))
++    expect(composerCommandChoice(status!)).toEqual({ action: 'send', text: '/status' })
++    expect(composerCommandChoice({ name: 'browser', description: '', trigger: '@' })).toEqual({ action: 'browser' })
++  })
++
++  it('sends the drafted skill in the runtime syntax once the owner sends it', () => {
++    const names = invocableSkillNames('claude', claudeDiscovery)
++    expect(names).toEqual(['deploy', 'review-pr'])
++    expect(resolveSlashCommand('claude', '/review-pr check the auth change', nativeCommandNames(claudeDiscovery), names)).toMatchObject({ kind: 'command', handling: { kind: 'native' } })
++    expect(resolveSlashCommand('claude', '/skill:deploy', nativeCommandNames(claudeDiscovery), names)).toMatchObject({ handling: { kind: 'native', as: '/deploy' } })
++    // An agent-only or switched-off skill cannot be invoked by name from Chat.
++    expect(resolveSlashCommand('claude', '/skill:helper', [], names)).toMatchObject({ kind: 'unknown' })
++    expect(resolveSlashCommand('claude', '/skill:retired', [], names)).toMatchObject({ kind: 'unknown' })
++    // A $skill draft is an ordinary message.
++    expect(resolveSlashCommand('codex', '$research the cache', undefined, invocableSkillNames('codex', codexDiscovery))).toEqual({ kind: 'message' })
++  })
++})
+diff --git a/src/renderer/src/panes/composer-skills.ts b/src/renderer/src/panes/composer-skills.ts
+new file mode 100644
+index 0000000..4c7fd1c
+--- /dev/null
++++ b/src/renderer/src/panes/composer-skills.ts
+@@ -0,0 +1,101 @@
++import type { Json, StructuredProvider } from '../../../shared/structured-agent'
++import { cleanSkillDescription, isSkillName, SKILL_COMMAND_PREFIX, SKILL_LIMITS, skillSourceLabel, skillSyntax, type SkillSource, type SkillSyntax } from '../../../shared/skill-catalog'
++import { skillCommandCollision } from '../../../shared/slash-commands'
++import type { ComposerCommand } from './composer-commands'
++
++/**
++ * The skills a conversation can invoke, as the composer's `/skill:name` entries
++ * (docs/skill-discovery.md). Read from provider discovery: Claude's `skillCatalog` (main-process
++ * file scan) and Codex's `skills/list`. Choosing one only writes its native syntax into the draft;
++ * nothing is sent until the owner sends the message.
++ */
++export interface ComposerSkill { name: string; description?: string; source: SkillSource; syntax: SkillSyntax; location?: string }
++export interface ComposerSkills {
++  state: 'loading' | 'ready' | 'error' | 'unsupported'
++  skills: ComposerSkill[]
++  /** For the owner: why the list is empty or incomplete. */
++  message?: string
++}
++/** Set on the composer's discovery value when the provider's discovery call failed. */
++export const DISCOVERY_ERROR = 'discoveryError'
++
++const object = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
++const text = (value: unknown): string | undefined => typeof value === 'string' && value.trim() ? value : undefined
++const CODEX_SCOPES: Record<string, SkillSource> = { repo: 'project', user: 'user', system: 'system', admin: 'admin' }
++const SOURCE_ORDER: Record<SkillSource, number> = { project: 0, user: 1, plugin: 2, admin: 3, system: 4, other: 5 }
++
++function claudeSkills(discovery: Record<string, unknown>): ComposerSkills | undefined {
++  const catalog = object(discovery.skillCatalog)
++  if (!Array.isArray(catalog.skills)) return undefined
++  if (catalog.status === 'unavailable') return { state: 'error', skills: [], message: text(catalog.message) ?? 'Skills are unavailable for this conversation.' }
++  const skills = catalog.skills.flatMap((value): ComposerSkill[] => {
++    const skill = object(value)
++    const name = text(skill.name)
++    // An agent-only skill (user-invocable: false) or one switched off in settings is not offered;
++    // nor is one whose name a command holds, since `/name` would run that command.
++    if (!name || !isSkillName(name) || skill.enabled === false || skill.userInvocable === false || skillCommandCollision(name)) return []
++    const description = cleanSkillDescription(text(skill.description))
++    const source = typeof skill.source === 'string' && skill.source in SOURCE_ORDER ? skill.source as SkillSource : 'other'
++    return [{ name, ...(description ? { description } : {}), source, syntax: '/', ...(text(skill.location) ? { location: text(skill.location) } : {}) }]
++  })
++  const hidden = catalog.skills.length - skills.length
++  const notes = [catalog.truncated === true ? 'Only the first skills found are listed.' : '', hidden > 0 ? `${hidden} skill${hidden === 1 ? ' is' : 's are'} agent-only, switched off or named like a command.` : ''].filter(Boolean)
++  return { state: 'ready', skills, ...(notes.length ? { message: notes.join(' ') } : {}) }
++}
++function codexSkills(discovery: Record<string, unknown>): ComposerSkills | undefined {
++  const report = object(discovery.skills)
++  if (!Object.keys(report).length) return undefined
++  if (report.status === 'unavailable') return { state: 'error', skills: [], message: text(report.message) ? 'Skills are unavailable: ' + text(report.message) : 'Skills are unavailable for this conversation.' }
++  const groups = object(report.payload).data
++  const skills = (Array.isArray(groups) ? groups : []).flatMap(group => {
++    const list = object(group).skills
++    return (Array.isArray(list) ? list : []).flatMap((value): ComposerSkill[] => {
++      const skill = object(value)
++      const name = text(skill.name)?.replace(/^\$/, '')
++      if (!name || !isSkillName(name) || skill.enabled === false) return []
++      const description = cleanSkillDescription(text(object(skill.interface).shortDescription) ?? text(skill.shortDescription) ?? text(skill.description))
++      const source: SkillSource = skill.pluginId ? 'plugin' : CODEX_SCOPES[String(skill.scope)] ?? 'other'
++      return [{ name, ...(description ? { description } : {}), source, syntax: '$' }]
++    })
++  })
++  return { state: 'ready', skills }
++}
++/** The conversation's skills: deduplicated by name (first report wins), sorted by name, bounded. */
++export function composerSkills(provider: StructuredProvider | undefined, discovery: Json | undefined, loading = false): ComposerSkills {
++  const data = object(discovery)
++  // Before the runtime reports its capabilities, the discovery's own shape says whose it is.
++  const syntax = skillSyntax(provider) ?? (provider !== undefined ? undefined : Array.isArray(object(data.skillCatalog).skills) ? '/' : Object.keys(object(data.skills)).length ? '$' : undefined)
++  if (discovery === undefined) return { state: provider !== undefined && !syntax ? 'unsupported' : loading ? 'loading' : 'ready', skills: [] }
++  if (!syntax) return { state: provider === undefined ? 'ready' : 'unsupported', skills: [] }
++  if (text(data[DISCOVERY_ERROR])) return { state: 'error', skills: [], message: 'Skills could not be loaded: ' + text(data[DISCOVERY_ERROR]) }
++  const found = (syntax === '/' ? claudeSkills(data) : codexSkills(data)) ?? { state: 'ready' as const, skills: [] }
++  const seen = new Set<string>()
++  const skills = found.skills.filter(skill => !seen.has(skill.name.toLowerCase()) && Boolean(seen.add(skill.name.toLowerCase())))
++    .sort((left, right) => left.name.localeCompare(right.name) || SOURCE_ORDER[left.source] - SOURCE_ORDER[right.source])
++  const bounded = skills.slice(0, SKILL_LIMITS.skills)
++  return { ...found, skills: bounded, ...(bounded.length < skills.length ? { message: [found.message, 'Only the first skills found are listed.'].filter(Boolean).join(' ') } : {}) }
++}
++/** The names `/skill:name` may resolve to, or undefined until discovery has answered. */
++export function invocableSkillNames(provider: StructuredProvider | undefined, discovery: Json | undefined): string[] | undefined {
++  const found = composerSkills(provider, discovery)
++  return discovery === undefined || found.state !== 'ready' ? undefined : found.skills.map(skill => skill.name)
++}
++/** `/skill:name` entries for the `/` list. Each inserts the native syntax (`/name ` or `$name `). */
++export function skillComposerCommands(skills: ComposerSkills): ComposerCommand[] {
++  return skills.skills.map(skill => ({
++    name: SKILL_COMMAND_PREFIX + skill.name,
++    description: skill.description ?? 'No description',
++    insert: skill.syntax + skill.name + ' ',
++    kind: 'skill' as const,
++    source: skillSourceLabel(skill.source)
++  }))
++}
++/** The line above the list while `/skill…` is typed: loading, failed, none, or a note on what is left out. */
++export function skillStatusText(skills: ComposerSkills, listed: boolean): string | undefined {
++  if (skills.state === 'loading' && !listed) return 'Loading skills…'
++  if (skills.state === 'unsupported') return 'This runtime has no skills Conductor can list.'
++  if (skills.state === 'error') return skills.message ?? 'Skills could not be loaded.'
++  if (!skills.skills.length) return [skills.message, 'No skills found. Claude reads .claude/skills in the project and ~/.claude/skills; Codex reports its own.'].filter(Boolean).join(' ')
++  if (!listed) return `No skill matches. ${skills.skills.length} skill${skills.skills.length === 1 ? '' : 's'} available; type /skill: to list them.`
++  return skills.message
++}
+diff --git a/src/renderer/src/panes/composer-starters.ts b/src/renderer/src/panes/composer-starters.ts
+index ae0ceaa..79035f5 100644
+--- a/src/renderer/src/panes/composer-starters.ts
++++ b/src/renderer/src/panes/composer-starters.ts
+@@ -34,9 +34,10 @@ export const BUILT_IN_STARTERS: ComposerStarterChoice[] = [
+ export function composerStarterChoices(capabilities?: ProviderCapabilities, discovery?: Json): ComposerStarterChoice[] {
+   const configured = composerCommands(capabilities, discovery).flatMap(command => command.insert ? [{
+     id: `configured:${command.insert.trim()}`,
+-    label: `${command.insert.startsWith('$') ? '$' : command.trigger ?? '/'}${command.name}`,
++    // A skill is labelled with what it puts in the draft (`/review-pr`, `$research`), not `/skill:name`.
++    label: command.kind === 'skill' ? command.insert.trim() : `${command.insert.startsWith('$') ? '$' : command.trigger ?? '/'}${command.name}`,
+     description: command.description,
+-    kind: (command.insert.startsWith('$') ? 'configured-skill' : 'configured-command') as ComposerStarterKind,
++    kind: (command.kind === 'skill' || command.insert.startsWith('$') ? 'configured-skill' : 'configured-command') as ComposerStarterKind,
+     draft: command.insert
+   }] : [])
+   return [...BUILT_IN_STARTERS, ...configured]
+diff --git a/src/shared/skill-catalog.ts b/src/shared/skill-catalog.ts
+new file mode 100644
+index 0000000..a03b4ee
+--- /dev/null
++++ b/src/shared/skill-catalog.ts
+@@ -0,0 +1,80 @@
++import type { StructuredProvider } from './structured-agent'
++
++/**
++ * Skills a conversation's runtime can run, as the composer lists them: `/skill:name` in the `/`
++ * menu (docs/skill-discovery.md). Discovery only reads names and frontmatter; it never runs a
++ * skill, its scripts or its prompt, and the text it reads is untrusted display data.
++ *
++ * Claude's catalog is read from disk by the main process (src/main/skill-discovery.ts); Codex's
++ * comes from the App Server's `skills/list` in the same provider discovery call. Either way the
++ * runtime invokes a chosen skill itself, in its own syntax: Claude `/name args`, Codex `$name args`.
++ */
++export type SkillSource = 'project' | 'user' | 'plugin' | 'system' | 'admin' | 'other'
++export interface DiscoveredSkill {
++  /** The name the runtime invokes: Claude's skill folder, Codex's reported name. */
++  name: string
++  /** Frontmatter description, whitespace-collapsed and cut to SKILL_LIMITS.description. */
++  description?: string
++  source: SkillSource
++  /** False when a settings override turns it off (`skillOverrides: { name: "off" }`) or Codex reports it disabled. */
++  enabled: boolean
++  /** False for an agent-only skill (`user-invocable: false`): the model may use it, the owner cannot invoke it. */
++  userInvocable: boolean
++  /** False when only the owner may start it (`disable-model-invocation: true`). */
++  modelInvocable: boolean
++  /** Where it was read, for the owner: `.claude/skills/x/SKILL.md` or `~/.claude/skills/x/SKILL.md`. */
++  location?: string
++}
++export interface SkillRootReport {
++  source: SkillSource
++  /** Display path of the root (`.claude/skills`, `~/.claude/skills`). */
++  location: string
++  state: 'read' | 'missing' | 'outside-project' | 'unreadable'
++}
++export interface SkillCatalog {
++  status: 'available' | 'unavailable'
++  /** Sorted by name; one entry per name, the higher-precedence source winning. */
++  skills: DiscoveredSkill[]
++  /** A lower-precedence skill hidden by one of the same name. */
++  shadowed?: Array<{ name: string; source: SkillSource; by: SkillSource }>
++  roots?: SkillRootReport[]
++  /** Entries left out: malformed or oversized SKILL.md, a symlink out of its root, a bad name. */
++  skipped?: number
++  /** The scan stopped at a bound (SKILL_LIMITS); the list is incomplete. */
++  truncated?: boolean
++  message?: string
++}
++
++export const SKILL_LIMITS = {
++  /** Skills kept per catalog. */
++  skills: 200,
++  /** Directory entries looked at per root; the rest are not read at all. */
++  entriesPerRoot: 400,
++  /** A SKILL.md larger than this is ignored, never read. */
++  fileBytes: 64 * 1024,
++  /** Settings files (skill overrides) larger than this are ignored. */
++  settingsBytes: 256 * 1024,
++  description: 160,
++  name: 64
++} as const
++
++/** A name the composer can carry as a single token in both runtimes' syntax. */
++export const SKILL_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]*(?::[A-Za-z0-9][A-Za-z0-9_-]*)?$/
++export const isSkillName = (name: string): boolean => name.length <= SKILL_LIMITS.name && SKILL_NAME.test(name)
++
++/** The prefix of an explicit skill command: `/skill:review-pr`. */
++export const SKILL_COMMAND_PREFIX = 'skill:'
++export type SkillSyntax = '/' | '$'
++/** How the runtime invokes a skill, or undefined when it has none Conductor can list. */
++export function skillSyntax(provider: StructuredProvider | undefined): SkillSyntax | undefined {
++  return provider === 'claude' ? '/' : provider === 'codex' ? '$' : undefined
++}
++const SOURCE_LABELS: Record<SkillSource, string> = { project: 'Project skill', user: 'User skill', plugin: 'Plugin skill', system: 'Built-in skill', admin: 'Managed skill', other: 'Skill' }
++export const skillSourceLabel = (source: SkillSource): string => SOURCE_LABELS[source]
++
++export function cleanSkillDescription(value: string | undefined): string | undefined {
++  // Control characters and bidi overrides are dropped: this is text from a file in the project.
++  const text = value?.replace(/[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁦-⁩]+/g, ' ').replace(/\s+/g, ' ').trim()
++  if (!text) return undefined
++  return text.length > SKILL_LIMITS.description ? text.slice(0, SKILL_LIMITS.description - 1).trimEnd() + '…' : text
++}
+diff --git a/src/shared/slash-commands.ts b/src/shared/slash-commands.ts
+index 63cca19..1ddd15e 100644
+--- a/src/shared/slash-commands.ts
++++ b/src/shared/slash-commands.ts
+@@ -1,4 +1,5 @@
+ import type { StructuredProvider } from './structured-agent'
++import { isSkillName, SKILL_COMMAND_PREFIX, skillSyntax } from './skill-catalog'
+ 
+ /**
+  * What a `/command` typed into a Chat conversation does, per provider (docs/slash-commands.md).
+@@ -23,6 +24,8 @@ export type SlashHandling =
+   | { kind: 'protocol'; command: NativeSlashCommand }
+   /** The CLI's command is a canned prompt; Conductor sends the same request as a message. */
+   | { kind: 'prompt'; prompt: string }
++  /** `/skill:name`: a message that names the skill in the runtime's own syntax (Codex `$name`); Claude's `/name` is native. */
++  | { kind: 'skill'; text: string }
+   | { kind: 'unsupported'; reason: string }
+ type Handler = SlashHandling | ((args: string) => SlashHandling)
+ export interface SlashCommandSpec {
+@@ -120,14 +123,17 @@ const runtimeName = (provider: StructuredProvider | undefined): string => provid
+  * A Conductor mapping wins over a native one (the composer owns model, mode and the session), a
+  * reported native command wins over an "unsupported" entry, and anything else is unknown.
+  */
+-export function resolveSlashCommand(provider: StructuredProvider | undefined, text: string, nativeCommands?: readonly string[]): SlashResolution {
++export function resolveSlashCommand(provider: StructuredProvider | undefined, text: string, nativeCommands?: readonly string[], skills?: readonly string[]): SlashResolution {
+   const trimmed = text.trim()
+   if (trimmed.startsWith('//')) return { kind: 'literal', text: trimmed.slice(1) }
+   const invocation = parseSlashCommand(trimmed)
+   if (!invocation) return { kind: 'message' }
++  // The name is lowercased for lookup; a skill keeps the case it was typed in (ASCII, same length).
++  if (invocation.name.startsWith(SKILL_COMMAND_PREFIX)) return resolveSkillCommand(provider, invocation, trimmed.slice(1 + SKILL_COMMAND_PREFIX.length, 1 + invocation.name.length), nativeCommands, skills)
+   const spec = findSlashCommand(invocation.name)
+   const handling = spec && slashHandling(spec, provider, invocation.args)
+-  const reported = provider === 'claude' && Boolean(nativeCommands?.some(name => name.toLowerCase() === invocation.name))
++  // A listed skill typed as `/name` is the CLI's own command too, even one created after the CLI reported its list.
++  const reported = provider === 'claude' && [...nativeCommands ?? [], ...skills ?? []].some(name => name.toLowerCase() === invocation.name)
+   if (handling && handling.kind !== 'unsupported' && handling.kind !== 'native') return { kind: 'command', invocation, spec, handling }
+   if (reported) return { kind: 'command', invocation, spec, handling: handling?.kind === 'native' ? handling : native }
+   if (handling?.kind === 'native') {
+@@ -141,6 +147,33 @@ export function resolveSlashCommand(provider: StructuredProvider | undefined, te
+   return { kind: 'unknown', invocation, reason: `/${invocation.name} is not a ${runtimeName(provider)} or Conductor command. Type /help for the list, or start the message with // to send it as text.` }
+ }
+ 
++/** Why a skill cannot be invoked as `/name`: the name is a command Conductor or the CLI already
++ *  answers, so Claude would run that command instead of the skill. */
++export function skillCommandCollision(name: string): string | undefined {
++  const spec = findSlashCommand(name)
++  if (!spec) return undefined
++  return `/${name} is ${spec.name === name.toLowerCase() ? 'a command' : 'another name for /' + spec.name} in Chat, so typing it runs that command, not the skill. Rename the skill’s folder to invoke it from here.`
++}
++/**
++ * `/skill:name [args]`: the skill in the runtime's own syntax. `skills` are the names discovery
++ * listed (undefined until it answers). A skill that is not listed is refused once discovery has
++ * answered, except a name the Claude CLI itself reported (its plugin skills); before that the
++ * runtime is the judge, as for any other Claude command.
++ */
++function resolveSkillCommand(provider: StructuredProvider | undefined, invocation: SlashInvocation, typed: string, nativeCommands: readonly string[] | undefined, skills: readonly string[] | undefined): SlashResolution {
++  const syntax = skillSyntax(provider)
++  if (!syntax) return { kind: 'unknown', invocation, reason: `${runtimeName(provider)[0]!.toUpperCase() + runtimeName(provider).slice(1)} has no skills Conductor can invoke.` }
++  if (!isSkillName(typed)) return { kind: 'unknown', invocation, reason: '/skill: needs a skill name, as in /skill:review-pr. Type /skill: to list this conversation’s skills.' }
++  const same = (name: string): boolean => name.toLowerCase() === typed.toLowerCase()
++  const name = skills?.find(same) ?? nativeCommands?.find(same) ?? typed
++  const missing = skills !== undefined && !skills.some(same) && !(syntax === '/' && nativeCommands?.some(same))
++  if (missing) return { kind: 'unknown', invocation, reason: `No skill named ${typed} was found for ${runtimeName(provider)} in this project. Type /skill: to list the skills it has.` }
++  if (syntax === '$') return { kind: 'command', invocation, handling: { kind: 'skill', text: '$' + name } }
++  const collision = skillCommandCollision(name)
++  if (collision) return { kind: 'unknown', invocation, reason: collision }
++  return { kind: 'command', invocation, handling: { kind: 'native', as: '/' + name } }
++}
++
+ export interface SlashMenuEntry { name: string; description: string; argumentHint?: string; handling: SlashHandling }
+ /** The commands the composer offers for a provider: everything that does something (no
+  *  unsupported entries), aliases left out so each job is listed once. */
+diff --git a/src/shared/slash-skill-commands.test.ts b/src/shared/slash-skill-commands.test.ts
+new file mode 100644
+index 0000000..fef6b3d
+--- /dev/null
++++ b/src/shared/slash-skill-commands.test.ts
+@@ -0,0 +1,49 @@
++import { describe, expect, it } from 'vitest'
++import { resolveSlashCommand, skillCommandCollision } from './slash-commands'
++
++describe('/skill:name', () => {
++  it('runs a listed Claude skill as its native /name, keeping the typed case and arguments', () => {
++    expect(resolveSlashCommand('claude', '/skill:Review-PR 42 please', [], ['review-pr'])).toEqual({ kind: 'command', invocation: { name: 'skill:review-pr', args: '42 please' }, handling: { kind: 'native', as: '/review-pr' } })
++    // Before discovery answers, Claude is the judge, as for any other Claude command.
++    expect(resolveSlashCommand('claude', '/skill:New-One')).toMatchObject({ kind: 'command', handling: { kind: 'native', as: '/New-One' } })
++    // A plugin skill the CLI reported is invocable even though the file scan does not list plugins.
++    expect(resolveSlashCommand('claude', '/skill:tools:lint', ['tools:lint'], [])).toMatchObject({ kind: 'command', handling: { kind: 'native', as: '/tools:lint' } })
++  })
++
++  it('refuses a skill discovery did not find, without reaching the model', () => {
++    const resolution = resolveSlashCommand('claude', '/skill:missing', ['compact'], ['review-pr'])
++    expect(resolution).toMatchObject({ kind: 'unknown' })
++    if (resolution.kind === 'unknown') expect(resolution.reason).toContain('No skill named missing')
++    expect(resolveSlashCommand('codex', '/skill:missing', undefined, ['research'])).toMatchObject({ kind: 'unknown' })
++    expect(resolveSlashCommand('claude', '/skill:', [], [])).toMatchObject({ kind: 'unknown', reason: expect.stringContaining('needs a skill name') })
++  })
++
++  it('never lets a skill named like a command run that command instead', () => {
++    for (const name of ['model', 'clear', 'compact', 'skills']) {
++      const resolution = resolveSlashCommand('claude', `/skill:${name}`, [name], [name])
++      expect(resolution, name).toMatchObject({ kind: 'unknown' })
++    }
++    expect(skillCommandCollision('clear')).toContain('another name for /new')
++    expect(skillCommandCollision('review-pr')).toBeUndefined()
++  })
++
++  it('sends a Codex skill as a $name message, since Codex has no slash form for skills', () => {
++    expect(resolveSlashCommand('codex', '/skill:research find the bug', undefined, ['research'])).toEqual({ kind: 'command', invocation: { name: 'skill:research', args: 'find the bug' }, handling: { kind: 'skill', text: '$research' } })
++    // Codex skills never collide with slash commands.
++    expect(resolveSlashCommand('codex', '/skill:model', undefined, ['model'])).toMatchObject({ handling: { kind: 'skill', text: '$model' } })
++  })
++
++  it('answers inline on runtimes without skills', () => {
++    for (const provider of ['local', 'grok'] as const) expect(resolveSlashCommand(provider, '/skill:research', undefined, undefined)).toMatchObject({ kind: 'unknown', reason: expect.stringContaining('has no skills') })
++  })
++
++  it('leaves existing commands, the // escape and paths as they were', () => {
++    expect(resolveSlashCommand('claude', '/skills', [], ['skills'])).toMatchObject({ kind: 'command', handling: { kind: 'conductor', action: 'connections' } })
++    expect(resolveSlashCommand('claude', '//skill:review-pr now', [], ['review-pr'])).toEqual({ kind: 'literal', text: '/skill:review-pr now' })
++    expect(resolveSlashCommand('codex', '/skill/notes.md is wrong')).toEqual({ kind: 'message' })
++    expect(resolveSlashCommand('claude', '/model', ['model'], ['model'])).toMatchObject({ kind: 'command', handling: { kind: 'conductor', action: 'model' } })
++    // A listed skill typed bare runs natively even when the CLI's own list predates it.
++    expect(resolveSlashCommand('claude', '/review-pr', ['compact'], ['review-pr'])).toMatchObject({ kind: 'command', handling: { kind: 'native' } })
++    expect(resolveSlashCommand('claude', '/review-pr', ['compact'], [])).toMatchObject({ kind: 'unknown' })
++  })
++})
