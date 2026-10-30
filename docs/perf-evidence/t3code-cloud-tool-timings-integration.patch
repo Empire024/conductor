@@ -1,15 +1,15 @@
 # Conductor tool-call timing: exact integration patch.
 # base:           3f9534920f6950def7eb315e5d3f5706949ed88c
-# implementation: 98598f726bb158ae190749143c765e8d01fbe5fa (branch claude/t3code-tool-timing-analysis-3aqudf)
-# generated with: git diff --no-color --no-ext-diff 3f9534920f6950def7eb315e5d3f5706949ed88c 98598f726bb158ae190749143c765e8d01fbe5fa
+# implementation: ecf5b27dcba5de93a1c10ba181fe6369b943efdb (branch claude/t3code-tool-timing-analysis-3aqudf)
+# generated with: git diff --no-color --no-ext-diff 3f9534920f6950def7eb315e5d3f5706949ed88c ecf5b27dcba5de93a1c10ba181fe6369b943efdb -- . ':(exclude)docs/perf-evidence/t3code-cloud-tool-timings-integration.patch'
 # Excludes this patch file itself; contains no binaries. Apply: git apply --3way <this file>
 
 diff --git a/docs/perf-evidence/t3code-cloud-tool-timings.md b/docs/perf-evidence/t3code-cloud-tool-timings.md
 new file mode 100644
-index 0000000..70d4d30
+index 0000000..fe74fc5
 --- /dev/null
 +++ b/docs/perf-evidence/t3code-cloud-tool-timings.md
-@@ -0,0 +1,349 @@
+@@ -0,0 +1,378 @@
 +# Tool-call timing analysis: t3code survey and the Conductor equivalent
 +
 +Cloud-session delivery, 2026-10-29. Branch `claude/t3code-tool-timing-analysis-3aqudf`.
@@ -110,13 +110,37 @@ index 0000000..70d4d30
 +  (note `app-exit`). It then synchronously writes every line that is not yet durable to
 +  `tool-timings.exit.jsonl`: lines still pending, and lines held by an append that is queued or in
 +  flight. It never writes to the main file, because a compaction may be renaming over it. Queued
-+  steps that have not started become no-ops. The next `load()` runs on the same write queue. It reads
-+  the main file and then the exit file, merges them by key with the exit file winning, and rewrites
-+  the main file. It deletes the exit file only once that rewrite is durable. A line that is both in
-+  the exit file and appended by a step already in flight is read as one record. Two regressions hold
-+  this in place: a quit while a compaction `rename` is held, and a quit while an `appendFile` is
-+  held. Both reopen and assert that every record appears exactly once, and both fail against the
-+  earlier synchronous append to the main file.
++  steps that have not started become no-ops. A line that is both in the exit file and appended by a
++  step already in flight is read as one record.
++
++  **Load ownership.** The next `load()` runs on the same write queue and does nothing once disposed.
++  It never reads or deletes `tool-timings.exit.jsonl` in place:
++  - It first renames the exit file to a claimed file of its own,
++    `tool-timings.exit.<13-digit ms>-<pid>-<random>.claimed.jsonl`. A quit during that load
++    therefore writes a fresh exit file, which this load never touches. The quit is synchronous on
++    the main thread, so it cannot interleave with the rename callback and the read that follows it.
++  - It reads the main file, then every claimed file, oldest first. That includes claimed files left
++    behind by earlier loads that never finished. It merges them by key, with later lines winning,
++    and rewrites the main file.
++  - It deletes only the claimed files it read, and only when `rewrite()` reports that the new main
++    file is in place. A rewrite skipped because the app is quitting deletes nothing, and those
++    claimed files are read again by the next load.
++
++  Leftover claimed files are bounded: the newest 8 are read. Older ones exist only after more than 8
++  loads in a row each failed to reach a durable rewrite; they are deleted after the next durable
++  rewrite, and their rows are dropped. If renaming a busy exit file fails (Windows, while a quit
++  writes it), the file stays where it is for the next load.
++
++  Four regressions hold this in place. Each reopens with a fresh recorder and asserts that every
++  record appears exactly once:
++  - a quit while a compaction `rename` is held;
++  - a quit while an `appendFile` is held;
++  - a quit while a load's rewrite `rename` is held, with an earlier exit file present (the
++    earlier quit's row, the new quit's rows and the main row all survive);
++  - a quit while the load is still reading the exit file. The skipped rewrite deletes nothing, and
++    the claimed file and the new exit file both remain until the next load.
++
++  Each fails against the code it replaces.
 +- **Resuming an abandoned call.** If the runtime host kept the provider running, the next process amends that same
 +  record when the terminal event arrives, even under a new runtime id. Elapsed is then wall-clock
 +  (bounded to 24 h, never negative) and labelled `wall-clock`. The record keeps its key, so the
@@ -269,19 +293,23 @@ index 0000000..70d4d30
 +
 +- `npx tsc --noEmit` passes with no errors.
 +- `npx vitest run src/shared/tool-timings.test.ts src/main/tool-timings.test.ts src/main/tool-timings.pipeline.test.ts`
-+  runs 34 tests, all passing. These include:
++  runs 36 tests, all passing. These include:
 +  - the bounded-load regressions;
-+  - the two quit-mid-write regressions;
++  - the four quit-mid-write and load-ownership regressions;
 +  - the redaction cases with synthetic dummy secrets, through the persisted JSONL and the report;
 +  - the masker's bounded-cost check.
 +
 +  The bounded-load and quit-mid-write regressions were each confirmed to fail against the code they
-+  replace: 4 of 4 bounded-load tests fail against the original whole-file `readFile`, and 2 of 2
-+  quit tests fail against the earlier synchronous append to the main file.
++  replace:
++  - 4 of 4 bounded-load tests fail against the original whole-file `readFile`.
++  - 2 of 2 quit tests fail against the earlier synchronous append to the main file.
++  - Both load-ownership tests fail against `5f08f38`. The held-rewrite case fails by assertion. The
++    held-read case fails by assertion against `5f08f38` with only an `io.open` hook added, since
++    that version had no way to hold a read.
 +- `npx vitest run src/main/agent-control.test.ts -t tools.timings` passes. It covers project scoping,
 +  the owner/wizard `"*"`, argument validation, the read-lane class, `tools.list` advertising, and the
 +  not-wired message.
-+- Full `npx vitest run` in this Linux container, on the final implementation: 6,347 passed,
++- Full `npx vitest run` in this Linux container, on the final implementation: 6,349 passed,
 +  **15 failed**, 78 skipped. The 15 are, by name, exactly the 15 that fail on the untouched base
 +  `3f95349` in this container (checked in a clean worktree). They depend on the host:
 +  where.exe/PATHEXT lookup, icacls ACL repair, IPv6 relay, Python and pip path policy,
@@ -299,8 +327,8 @@ index 0000000..70d4d30
 +  - Settings → Usage shows "9 calls", with elapsed "n/a" and "exec · provider";
 +  - the headline claims only recorded structured calls, the not-recorded line is visible, and the
 +    gaps list is open;
-+  - after a quit and relaunch, the same 9 records load exactly once, the exit file is merged into
-+    the main file and removed, and the main file holds 9 unique keys.
++  - after a quit and relaunch, the same 9 records load exactly once; the exit file is claimed and
++    merged into the main file; no exit or claimed file remains; and the main file holds 9 unique keys.
 +
 +  `ELECTRON_DISABLE_SANDBOX` is set only because this Linux container runs as root.
 +- On the owner's machine, run `npm run build && node scripts/smoke-tool-timings.mjs`. The window is
@@ -355,18 +383,19 @@ index 0000000..70d4d30
 +    application code)
 +- Every file in the hunk table above.
 +
-+At runtime the recorder writes `<userData>/tool-timings/tool-timings.jsonl`, plus
-+`tool-timings.exit.jsonl` between a quit and the next load.
++At runtime the recorder writes `<userData>/tool-timings/tool-timings.jsonl`. Between a quit and
++the next load's durable rewrite there is also `tool-timings.exit.jsonl`, and possibly
++`tool-timings.exit.*.claimed.jsonl` files.
 +
 +If `app.update` smokes are requested for acceptance, add `smoke-tool-timings`.
 diff --git a/scripts/smoke-tool-timings.mjs b/scripts/smoke-tool-timings.mjs
 new file mode 100644
-index 0000000..c0a8556
+index 0000000..e5ae591
 --- /dev/null
 +++ b/scripts/smoke-tool-timings.mjs
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,91 @@
 +import { _electron as electron, expect } from '@playwright/test'
-+import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
++import { mkdtemp, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 +import { tmpdir } from 'node:os'
 +import { join, resolve } from 'node:path'
 +import assert from 'node:assert/strict'
@@ -441,11 +470,12 @@ index 0000000..c0a8556
 +  assert.equal(new Set(written).size, 9)
 +  ;({ app, page } = await launch())
 +  await expect.poll(() => page.evaluate(() => window.conductor.toolTimings.report({}).then(report => report.totals.calls))).toBe(9)
-+  await expect.poll(async () => (await keysIn('tool-timings.exit.jsonl')).length).toBe(0)
++  // The relaunch claimed the quit's exit file and deleted its claim once the rewrite was durable.
++  await expect.poll(async () => (await readdir(directory)).filter(name => name.includes('.exit.'))).toEqual([])
 +  const merged = await keysIn('tool-timings.jsonl')
 +  assert.equal(merged.length, 9)
 +  assert.equal(new Set(merged).size, 9)
-+  results.checks.push('Records survive a restart exactly once: the exit file is merged into the main file and removed')
++  results.checks.push('Records survive a restart exactly once: the exit file is claimed, merged into the main file, and no exit or claimed file remains')
 +} catch (error) {
 +  results.failures.push(error.stack ?? String(error))
 +  await page.screenshot({ path: join(output, 'failed.png'), fullPage: true }).catch(() => {})
@@ -730,12 +760,12 @@ index 0000000..b5075b8
 +})
 diff --git a/src/main/tool-timings.test.ts b/src/main/tool-timings.test.ts
 new file mode 100644
-index 0000000..b4a7246
+index 0000000..7a2013d
 --- /dev/null
 +++ b/src/main/tool-timings.test.ts
-@@ -0,0 +1,352 @@
-+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-+import { appendFile, rename } from 'node:fs/promises'
+@@ -0,0 +1,398 @@
++import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
++import { appendFile, open, rename } from 'node:fs/promises'
 +import { tmpdir } from 'node:os'
 +import { join } from 'node:path'
 +import { afterEach, describe, expect, it } from 'vitest'
@@ -1024,6 +1054,52 @@ index 0000000..b4a7246
 +      expect(durable.sort()).toEqual(['c3', 'c4', 'c5', 'c6', 'c7', 'c8', 'live'])
 +    })
 +
++    const row = (itemId: string): string => JSON.stringify({ v: 1, key: `s\u0000r\u0000${itemId}`, agentSessionId: 's', projectId: 'p', provider: 'codex', runtimeId: 'r', itemId, tool: 'Bash', category: 'shell', args: '', startedAt: null, endedAt: new Date().toISOString(), elapsedMs: null, elapsedSource: 'unavailable', waitMs: null, waitSource: 'unavailable', execMs: 4, execSource: 'provider', prepareMs: null, outcome: 'completed', concurrent: 0 }) + '\n'
++    const exitFiles = (directory: string): string[] => readdirSync(directory).filter(name => name.includes('.exit.')).sort()
++
++    it('keeps an earlier quit\'s rows and a new quit\'s rows when the new quit lands while the load\'s rewrite is held', async () => {
++      const directory = tempDir(), main = join(directory, 'tool-timings.jsonl')
++      writeFileSync(main, row('m'))
++      writeFileSync(join(directory, 'tool-timings.exit.jsonl'), row('old'))
++      const held = gate()
++      const recorder = new ToolTimingRecorder({ directory, flushMs: 60_000, now: () => 0, io: { rename: (async (from: string, to: string) => { if (to === main) await held.hold(); return rename(from, to) }) as typeof rename } })
++      const tool = (itemId: string, status: 'running' | 'completed') => recorder.observe({ id: itemId, sessionId: 's', runtimeId: 'r', provider: 'codex', projectId: 'p', itemId, timestamp: '', data: { type: 'tool', name: 'Bash', status } })
++      const loading = recorder.load()
++      await held.reached
++      tool('n', 'completed'); tool('live', 'running')
++      recorder.dispose()
++      held.release()
++      await loading
++
++      const next = new ToolTimingRecorder({ directory })
++      await next.load()
++      expect(keysOf(next.report({ recent: 100 }))).toEqual(['live:abandoned', 'm:completed', 'n:completed', 'old:completed'])
++      expect(exitFiles(directory)).toEqual([])
++      const durable = readFileSync(main, 'utf8').split('\n').filter(Boolean).map(text => parseRecord(text)!.itemId)
++      expect(durable.sort()).toEqual(['live', 'm', 'n', 'old'])
++    })
++
++    it('deletes no exit rows when a quit lands while the load is still reading them, and the next load keeps old and new once', async () => {
++      const directory = tempDir()
++      writeFileSync(join(directory, 'tool-timings.jsonl'), row('m'))
++      writeFileSync(join(directory, 'tool-timings.exit.jsonl'), row('old'))
++      const held = gate()
++      const recorder = new ToolTimingRecorder({ directory, flushMs: 60_000, now: () => 0, io: { open: (async (...args: Parameters<typeof open>) => { if (String(args[0]).includes('.exit.')) await held.hold(); return open(...args) }) as typeof open } })
++      const loading = recorder.load()
++      await held.reached
++      recorder.observe({ id: 'n2', sessionId: 's', runtimeId: 'r', provider: 'codex', projectId: 'p', itemId: 'n2', timestamp: '', data: { type: 'tool', name: 'Bash', status: 'running' } })
++      recorder.dispose()
++      held.release()
++      await loading
++      // The skipped rewrite deleted nothing: the claimed earlier file and the new quit's file remain.
++      expect(exitFiles(directory)).toEqual([expect.stringMatching(/^tool-timings\.exit\.\d{13}-\d+-[0-9a-z]+\.claimed\.jsonl$/), 'tool-timings.exit.jsonl'])
++
++      const next = new ToolTimingRecorder({ directory })
++      await next.load()
++      expect(keysOf(next.report({ recent: 100 }))).toEqual(['m:completed', 'n2:abandoned', 'old:completed'])
++      expect(exitFiles(directory)).toEqual([])
++    })
++
 +    it('keeps every record exactly once when the quit lands while an append is held, and skips steps not yet started', async () => {
 +      const directory = tempDir()
 +      const held = gate()
@@ -1088,13 +1164,13 @@ index 0000000..b4a7246
 +})
 diff --git a/src/main/tool-timings.ts b/src/main/tool-timings.ts
 new file mode 100644
-index 0000000..cbdd039
+index 0000000..ba60ade
 --- /dev/null
 +++ b/src/main/tool-timings.ts
-@@ -0,0 +1,492 @@
+@@ -0,0 +1,520 @@
 +import type { IpcMain, IpcMainInvokeEvent } from 'electron'
 +import { appendFileSync, mkdirSync } from 'node:fs'
-+import { appendFile, mkdir, open, rename, unlink, writeFile } from 'node:fs/promises'
++import { appendFile, mkdir, open, readdir, rename, unlink, writeFile } from 'node:fs/promises'
 +import { join } from 'node:path'
 +import { performance } from 'node:perf_hooks'
 +import type { AgentEvent, ActivityStatus } from '../shared/structured-agent'
@@ -1119,9 +1195,15 @@ index 0000000..cbdd039
 +/** A provider duration beyond this is a unit or clock error, not a measurement. */
 +const MAX_PROVIDER_MS = 7 * DAY_MS
 +const FILE = 'tool-timings.jsonl'
-+/** Written only synchronously by dispose() and merged by the next load(): no async compaction ever
-+ *  renames over it, so what a quit writes there cannot be lost to a rewrite still in flight. */
++/** Written only synchronously by dispose(): no async compaction ever renames over it, so what a quit
++ *  writes there cannot be lost to a rewrite still in flight. A load never reads or deletes it in
++ *  place: it first renames it to a claimed file of its own, so a quit during that load starts a fresh
++ *  exit file the load cannot touch. A claimed file is deleted only once a rewrite holding its lines
++ *  is durable; otherwise the next load reads it again. */
 +const EXIT_FILE = 'tool-timings.exit.jsonl'
++const CLAIMED = /^tool-timings\.exit\.\d{13}-\d+-[0-9a-z]+\.claimed\.jsonl$/
++/** Claimed files left by loads that never reached a durable rewrite; beyond this many, the oldest go. */
++const MAX_CLAIMED = 8
 +const MAX_READ_BYTES = 16 * 1024 * 1024
 +
 +export interface ToolTimingsOptions {
@@ -1139,7 +1221,7 @@ index 0000000..cbdd039
 +  /** The journal's secret masker (structured-store maskSecrets), applied to every summary. */
 +  mask?: (text: string) => string
 +  /** The asynchronous file operations, replaceable so a test can hold one mid-flight. */
-+  io?: Partial<{ appendFile: typeof appendFile; writeFile: typeof writeFile; rename: typeof rename }>
++  io?: Partial<{ appendFile: typeof appendFile; writeFile: typeof writeFile; rename: typeof rename; open: typeof open }>
 +}
 +
 +interface OpenCall {
@@ -1178,7 +1260,7 @@ index 0000000..cbdd039
 +  /** Keys whose line is pending or on its way to the file, with their newest line: a rewrite leaves
 +   *  them to that append, and dispose() writes exactly these to the exit file. */
 +  private readonly unwritten = new Map<string, { count: number; line: string }>()
-+  private readonly io: { appendFile: typeof appendFile; writeFile: typeof writeFile; rename: typeof rename }
++  private readonly io: { appendFile: typeof appendFile; writeFile: typeof writeFile; rename: typeof rename; open: typeof open }
 +  private timer: NodeJS.Timeout | undefined
 +  private writes: Promise<void> = Promise.resolve()
 +  private fileLines = 0
@@ -1200,7 +1282,7 @@ index 0000000..cbdd039
 +    this.now = options.now ?? (() => performance.now())
 +    this.wallNow = options.wallNow ?? Date.now
 +    this.mask = options.mask ?? (text => text)
-+    this.io = { appendFile, writeFile, rename, ...options.io }
++    this.io = { appendFile, writeFile, rename, open, ...options.io }
 +  }
 +
 +  private get file(): string | undefined { return this.options.directory ? join(this.options.directory, FILE) : undefined }
@@ -1209,7 +1291,7 @@ index 0000000..cbdd039
 +  /** The newest `maxReadBytes` of a file, whole lines only; null when it does not exist. */
 +  private async readTail(path: string): Promise<{ text: string; truncated: boolean } | null> {
 +    let handle
-+    try { handle = await open(path, 'r') } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error }
++    try { handle = await this.io.open(path, 'r') } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error }
 +    try {
 +      const size = (await handle.stat()).size, length = Math.min(size, this.maxReadBytes)
 +      const buffer = Buffer.alloc(length)
@@ -1229,6 +1311,19 @@ index 0000000..cbdd039
 +    } finally { await handle.close() }
 +  }
 +
++  /** Takes the exit file over under a name of this load's own (a quit from now on writes a fresh
++   *  one), and lists every claimed file to read: those, oldest first, and the ones beyond the cap. */
++  private async claimExitFiles(exitFile: string): Promise<{ read: string[]; overflow: string[] }> {
++    const directory = this.options.directory!
++    const claimed = `tool-timings.exit.${String(this.wallNow()).padStart(13, '0')}-${process.pid}-${Math.random().toString(36).slice(2, 8)}.claimed.jsonl`
++    // Busy (a quit writing it on Windows) or missing: it stays where it is for the next load.
++    try { await this.io.rename(exitFile, join(directory, claimed)) } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') this.errors++ }
++    let names: string[] = []
++    try { names = (await readdir(directory)).filter(name => CLAIMED.test(name)).sort() } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
++    const paths = names.map(name => join(directory, name))
++    return { read: paths.slice(-MAX_CLAIMED), overflow: paths.slice(0, Math.max(0, paths.length - MAX_CLAIMED)) }
++  }
++
 +  /** Read what earlier processes recorded. Calls observed meanwhile are kept and win on a clash.
 +   *  Runs on the write queue, so no append lands on a torn last line before compaction heals it. */
 +  load(): Promise<void> {
@@ -1239,18 +1334,25 @@ index 0000000..cbdd039
 +
 +  private async loadTail(): Promise<void> {
 +    const file = this.file, exitFile = this.exitFile
-+    if (!file || !exitFile) return
++    // After a quit, nothing is loaded and nothing on disk is touched.
++    if (!file || !exitFile || this.disposed) return
 +    this.loadedBytes = 0
-+    let main: { text: string; truncated: boolean } | null, exit: { text: string; truncated: boolean } | null
++    let main: { text: string; truncated: boolean } | null, claims: { read: string[]; overflow: string[] }, exits: Array<{ text: string; truncated: boolean } | null>
 +    // Only the newest `maxReadBytes` of each file are ever read, however large it grew.
-+    try { [main, exit] = [await this.readTail(file), await this.readTail(exitFile)] } catch { this.errors++; return }
-+    if (!main && !exit) return
++    try {
++      claims = await this.claimExitFiles(exitFile)
++      main = await this.readTail(file)
++      exits = []
++      for (const path of claims.read) exits.push(await this.readTail(path))
++    } catch { this.errors++; return }
++    const exitText = exits.map(exit => exit?.text ?? '').join('\n')
++    if (!main && !claims.read.length) return
 +    // A last line without its newline was cut off by a crash mid-append.
 +    const torn = Boolean(main?.text && !main.text.endsWith('\n'))
 +    const cutoff = this.wallNow() - this.retentionMs, loaded = new Map<string, ToolTimingRecord>()
 +    let lines = 0
-+    // The exit file is read last: what a quit wrote there is newer than anything in the main file.
-+    for (const line of [...(main?.text ?? '').split('\n'), ...(exit?.text ?? '').split('\n')]) {
++    // Exit files are read last, oldest first: what a quit wrote is newer than the main file.
++    for (const line of [...(main?.text ?? '').split('\n'), ...exitText.split('\n')]) {
 +      if (!line.trim()) continue
 +      lines++
 +      const record = parseRecord(line)
@@ -1268,11 +1370,11 @@ index 0000000..cbdd039
 +    this.fileLines = lines
 +    // An oversized, torn or partly stale file, or one with a quit's lines beside it, is rewritten
 +    // from what was kept inside this queued step, so it is whole, merged and under the bound before
-+    // any queued append lands on it. The exit file goes only once that rewrite is durable.
-+    if (main?.truncated || torn || lines > keep.length || exit) {
++    // any queued append lands on it. Only this load's claimed files go, and only once that rewrite
++    // is durable: a rewrite skipped because the app is quitting deletes nothing.
++    if (main?.truncated || torn || lines > keep.length || claims.read.length || claims.overflow.length) {
 +      try {
-+        await this.rewrite()
-+        if (exit) await unlink(exitFile).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error })
++        if (await this.rewrite()) for (const path of [...claims.overflow, ...claims.read]) await unlink(path).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error })
 +      } catch { this.errors++; this.directoryReady = false }
 +    }
 +  }
@@ -1485,19 +1587,21 @@ index 0000000..cbdd039
 +
 +  private compact(): void {
 +    if (!this.file) return
-+    this.writes = this.writes.then(() => this.rewrite()).catch(() => { this.errors++; this.directoryReady = false })
++    this.writes = this.writes.then(async () => { await this.rewrite() }).catch(() => { this.errors++; this.directoryReady = false })
 +  }
 +
-+  /** The file rewritten from the kept records; a record whose line an append still owes is left to it. */
-+  private async rewrite(): Promise<void> {
++  /** The file rewritten from the kept records; a record whose line an append still owes is left to it.
++   *  True once the new file is in place; false when nothing was written (no file, or quitting). */
++  private async rewrite(): Promise<boolean> {
 +    const file = this.file
-+    if (!file || this.disposed) return
++    if (!file || this.disposed) return false
 +    const cutoff = this.wallNow() - this.retentionMs
 +    const lines = this.records.filter(record => Date.parse(record.endedAt) >= cutoff && !this.unwritten.has(record.key)).map(record => JSON.stringify({ v: 1, ...record }))
 +    if (!this.directoryReady) { await mkdir(this.options.directory!, { recursive: true }); this.directoryReady = true }
 +    await this.io.writeFile(file + '.tmp', lines.length ? lines.join('\n') + '\n' : '')
 +    await this.io.rename(file + '.tmp', file)
 +    this.fileLines = lines.length
++    return true
 +  }
 +
 +  report(query: ToolTimingsQuery = {}): ToolTimingsReport {
