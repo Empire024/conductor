@@ -91,6 +91,17 @@ export interface ToolTimingsQuery {
   origin?: ToolTimingOrigin
 }
 
+const ROW_CLOCK = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/
+
+/** The instant a transcript row's `timestamp` names, or null. Only an ISO-8601 time with an explicit
+ *  zone is read, the form the CLI writes (`2026-10-30T20:07:02.166Z`): a string without a zone would
+ *  be read in this machine's time zone, and a number, a date alone or a bare year is not a row time. */
+export function rowClockMs(value: unknown): number | null {
+  if (typeof value !== 'string' || !ROW_CLOCK.test(value)) return null
+  const at = Date.parse(value)
+  return Number.isFinite(at) ? at : null
+}
+
 /** One tool call paired from a cloud transcript by its exact tool_use_id (cloud/runs.ts
  *  parseTranscript). Stamps are the transcript rows' own ISO times, null when absent or invalid;
  *  a call with notes (a conflicting restatement, a result naming another row) is never timed.

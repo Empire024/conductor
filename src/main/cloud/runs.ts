@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameS
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import type { TranscriptToolCall } from '../../shared/tool-timings'
+import { rowClockMs, type TranscriptToolCall } from '../../shared/tool-timings'
 import { CLOUD_EFFORTS, CLOUD_MODELS, isCloudModel, MAX_CLOUD_PROMPT_CHARS, type CloudFetchResult, type CloudRunSummary, type CloudTranscriptEntry, type CloudUsage } from '../../shared/cloud'
 import { TerminalScreen } from './screen'
 
@@ -135,7 +135,8 @@ export function findResult(lines: string, hint: string | null, known: string[]):
 /** Tool calls kept from one transcript: the newest by their call time. */
 export const MAX_TRANSCRIPT_TOOLS = 2000
 const TELEPORT_NOTE = /^This session is being continued from another machine/
-const isoTime = (value: unknown): string | null => typeof value === 'string' && value.length <= 40 && Number.isFinite(Date.parse(value)) ? value : null
+/** A row's own `timestamp` as its label, only when it is a time on one known clock (rowClockMs). */
+const isoTime = (value: unknown): string | null => rowClockMs(value) === null ? null : value as string
 
 /** The transcript the CLI's teleport saved (one JSON record per line), as readable entries plus
  *  the token usage and model its assistant messages report, and its tool calls paired by their

@@ -4,7 +4,7 @@ import { appendFile, mkdir, open, readdir, rename, unlink, writeFile } from 'nod
 import { join } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import type { AgentEvent, ActivityStatus } from '../shared/structured-agent'
-import { aggregateToolTimings, summarizeToolArgs, summarizeToolError, toolCategory, TOOL_TIMING_LIMITS, type ToolTimingOutcome, type ToolTimingRecord, type ToolTimingsQuery, type ToolTimingsReport, type TranscriptToolCall } from '../shared/tool-timings'
+import { aggregateToolTimings, rowClockMs, summarizeToolArgs, summarizeToolError, toolCategory, TOOL_TIMING_LIMITS, type ToolTimingOutcome, type ToolTimingRecord, type ToolTimingsQuery, type ToolTimingsReport, type TranscriptToolCall } from '../shared/tool-timings'
 
 /**
  * The tool-call timing recorder (docs/perf-evidence/t3code-cloud-tool-timings.md). It sees every
@@ -418,6 +418,9 @@ export class ToolTimingRecorder {
         const key = `cloud-transcript\u0000${input.cloudSessionId}\u0000${call.toolUseId}`
         if (this.byKey.has(key)) { counts.known++; this.deduplicated++; continue }
         const record = this.transcriptRecord(key, input, call)
+        // A call whose rows carry no time of their own has no place on any clock but this host's,
+        // which is not the cloud's: it is not recorded, so no window or retention reads it as "now".
+        if (!record) { counts.skipped++; continue }
         // Beyond retention, or older than everything kept once the cloud allowance is full: a later
         // pull would only add what the next trim drops again.
         const ended = Date.parse(record.endedAt)
@@ -431,24 +434,25 @@ export class ToolTimingRecorder {
     return counts
   }
 
-  private transcriptRecord(key: string, input: { projectId: string; runId: string; cloudSessionId: string; model?: string }, call: TranscriptToolCall): ToolTimingRecord {
+  /** Null when neither row has a time the cloud wrote (rowClockMs). */
+  private transcriptRecord(key: string, input: { projectId: string; runId: string; cloudSessionId: string; model?: string }, call: TranscriptToolCall): ToolTimingRecord | null {
     const notes = [...call.notes]
-    const start = call.usedAt ? Date.parse(call.usedAt) : NaN, end = call.resultAt ? Date.parse(call.resultAt) : NaN
+    const start = rowClockMs(call.usedAt), end = rowClockMs(call.resultAt)
+    const endedMs = end ?? start
+    if (endedMs === null) return null
     let elapsedMs: number | null = null
     if (call.denied) notes.push('denied-or-interrupted-result')
     else if (call.notes.length) { /* the parser could not pair it on one clock: not timed */ }
-    else if (!Number.isFinite(start) || !Number.isFinite(end)) notes.push('missing-transcript-time')
+    else if (start === null || end === null) notes.push('missing-transcript-time')
     else if (end < start || end - start > MAX_PROVIDER_MS) notes.push('invalid-transcript-interval')
     else elapsedMs = end - start
-    const endedAt = Number.isFinite(end) ? new Date(end).toISOString() : Number.isFinite(start) ? new Date(start).toISOString() : null
-    if (!endedAt) notes.push('ended-at-import')
     const tool = (call.name || 'Tool').slice(0, TOOL_TIMING_LIMITS.tool)
     const outcome: ToolTimingOutcome = call.denied ? (/interrupt|cancel/i.test(call.denied) ? 'interrupted' : 'rejected') : call.isError ? 'failed' : 'completed'
     const record: ToolTimingRecord = {
       key, agentSessionId: input.runId, projectId: input.projectId, provider: 'claude-cloud', runtimeId: input.cloudSessionId, itemId: call.toolUseId,
       ...(input.model ? { model: input.model } : {}), origin: 'cloud-transcript',
       tool, category: toolCategory(tool), args: summarizeToolArgs(tool, call.input, this.mask),
-      startedAt: Number.isFinite(start) ? new Date(start).toISOString() : null, endedAt: endedAt ?? new Date(this.wallNow()).toISOString(),
+      startedAt: start !== null ? new Date(start).toISOString() : null, endedAt: new Date(endedMs).toISOString(),
       elapsedMs, elapsedSource: elapsedMs === null ? 'unavailable' : 'transcript-wall',
       waitMs: null, waitSource: 'unavailable', execMs: null, execSource: 'unavailable', prepareMs: null,
       outcome, concurrent: 0, ...(notes.length ? { notes } : {})
