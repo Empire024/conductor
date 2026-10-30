@@ -6,6 +6,7 @@ import { GENERAL_PROJECT_NAME, threadAge, threadStateLabel, type ThreadSummary, 
 import './ThreadList.css'
 import { sidebarThreadView } from './sidebar-thread-view'
 import { browserThreadListEnvironment, createThreadListRefresh, type ThreadListRefresh } from './thread-list-refresh'
+import { threadKeyboardRows, useThreadKeyboard } from './thread-keyboard'
 
 const COLLAPSED_KEY = 'conductor.threadsCollapsed'
 
@@ -15,6 +16,8 @@ interface ThreadListProps {
   activeAgentSessionId?: string | null
   /** Changes whenever a conversation's phase changes, so the list follows without waiting for main's push. */
   refreshKey: string
+  /** The sidebar is shown, not collapsed, and in workspace mode. Alt+1..9 and Alt+Shift+[ / ] select threads only while true. */
+  visible?: boolean
   onNewThread(): void
   onOpenThread(thread: ThreadSummary): void
   onContinueInProject(thread: ThreadSummary, projectId: string): void
@@ -92,6 +95,13 @@ export const ThreadList = memo(function ThreadList(props: ThreadListProps): Reac
   const { current, older } = sidebarThreadView(view, now.current)
   const total = current.length
   const groups = [{ bucket: 'current', label: '', threads: current }, ...(olderOpen ? [{ bucket: 'older', label: 'Older', threads: older }] : [])]
+  useThreadKeyboard({
+    rows: threadKeyboardRows({ current, older, olderOpen, collapsed }),
+    activeThreadId: props.activeAgentSessionId,
+    visible: props.visible === true,
+    menuOpen: menu !== null,
+    onOpenThread: props.onOpenThread
+  })
 
   return (
     <section className="sidebar-section threads-section" aria-label="Threads" data-thread-count={total}>
