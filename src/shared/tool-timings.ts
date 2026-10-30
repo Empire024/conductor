@@ -22,10 +22,12 @@ export type ToolCategory = 'shell' | 'file-read' | 'file-write' | 'search' | 'we
  *  stamps of the item's lifecycle, both on its clock (Codex startedAtMs → completedAtMs). That is
  *  lifecycle time, not execution, and is never mixed with a host stamp. */
 export type ElapsedSource = 'host-monotonic' | 'wall-clock' | 'provider' | 'transcript-wall' | 'unavailable'
-/** native: a structured tab this host observed live. cloud-transcript: a cloud coworker's call read
+/** native: a structured tab this host observed live. cli-transcript: a raw Claude CLI-view tab's
+ *  call read afterwards from the rows its CLI appended to the conversation's transcript while the
+ *  tab owned it (transcript-wall: that CLI's own row times on this machine). cloud-transcript: a cloud coworker's call read
  *  afterwards from its teleported transcript (transcript-wall elapsed: the cloud's own write times of
  *  the tool_use and its tool_result rows). Kept apart from the native report unless asked for. */
-export type ToolTimingOrigin = 'native' | 'cloud-transcript'
+export type ToolTimingOrigin = 'native' | 'cloud-transcript' | 'cli-transcript'
 /** provider-review: the provider's own auto-approval review time (Codex guardian), overlaps counted
  *  once. Kept apart from WaitSource, which is a human approval this host observed. */
 export type ReviewSource = 'provider-review'
@@ -58,7 +60,7 @@ export interface ToolTimingRecord {
   /** Time the call spent in `preparing` (the model still writing its arguments), when seen. */
   prepareMs: number | null
   /** Absent for a native call. */
-  origin?: 'cloud-transcript'
+  origin?: 'cloud-transcript' | 'cli-transcript'
   /** The provider's automatic approval review of this call (absent: none reported). Not part of waitMs. */
   reviewMs?: number
   reviewSource?: ReviewSource
@@ -160,7 +162,8 @@ export const TOOL_TIMING_GAPS: Readonly<Record<string, string>> = {
   claude: 'Claude: the stream reports no tool duration; exec is Conductor\'s observed running phase (includes stream transport latency). Auto-mode classifier time inside the CLI is not visible, so wait is unavailable unless a card was raised.',
   grok: 'Grok: no tool duration; exec is the observed running phase. Approval wait is observed when the ACP permission request arrives.',
   local: 'Local model: Conductor\'s own runtime measures each tool (exec = provider). There is no approval phase, so wait is unavailable.',
-  cli: 'CLI-view tabs (raw terminal) and conversations mirrored from another machine emit no structured tool events here: they are not covered.',
+  cli: 'Codex and Grok CLI-view tabs (raw terminal) and conversations mirrored from another machine emit no structured tool events here: they are not covered. Claude CLI-view tabs are read from their transcript when the tab returns to Chat (origin cli-transcript).',
+  'claude-cli': 'Claude CLI-view tabs (origin cli-transcript): read when the tab returns to Chat, from rows the CLI appended after the handoff (at most the newest 16 MiB), never live. Elapsed is the CLI\'s own row times from tool_use to its tool_result (transcript-wall), which includes permission, hooks and queueing: not execution, and no approval wait. Calls without a result, denied or interrupted results, and missing or reversed times are not timed.',
   'claude-cloud': 'Cloud coworkers (origin cloud-transcript): read from the teleported transcript after a pull, never live. Elapsed is the cloud\'s own row times from tool_use to its tool_result (transcript-wall), which includes permission, hooks and queueing: not execution, and no approval wait. Calls without a result yet, denied or interrupted results, and missing or reversed times are not timed.'
 }
 

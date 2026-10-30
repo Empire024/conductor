@@ -4,7 +4,7 @@ import { appendFile, mkdir, open, readdir, rename, unlink, writeFile } from 'nod
 import { join } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import type { AgentEvent, ActivityStatus } from '../shared/structured-agent'
-import { aggregateToolTimings, summarizeToolArgs, summarizeToolError, toolCategory, TOOL_TIMING_LIMITS, type ToolTimingOutcome, type ToolTimingRecord, type ToolTimingsQuery, type ToolTimingsReport, type TranscriptToolCall } from '../shared/tool-timings'
+import { aggregateToolTimings, summarizeToolArgs, summarizeToolError, toolCategory, TOOL_TIMING_LIMITS, type ToolTimingOutcome, type ToolTimingRecord, type ToolTimingsQuery, type ToolTimingsReport, type ToolTimingOrigin, type TranscriptToolCall } from '../shared/tool-timings'
 
 /**
  * The tool-call timing recorder (docs/perf-evidence/t3code-cloud-tool-timings.md). It sees every
@@ -27,6 +27,9 @@ const MAX_PROVIDER_MS = 7 * DAY_MS
 const FILE = 'tool-timings.jsonl'
 /** Transcript tool calls read in one import. */
 const MAX_IMPORT = 2000
+type TranscriptOrigin = Exclude<ToolTimingOrigin, 'native'>
+const TRANSCRIPT_ORIGINS: readonly TranscriptOrigin[] = ['cloud-transcript', 'cli-transcript']
+interface TranscriptSource { projectId: string; agentSessionId: string; session: string; provider: string; model?: string }
 /** Written only synchronously by dispose(): no async compaction ever renames over it, so what a quit
  *  writes there cannot be lost to a rewrite still in flight. A load never reads or deletes it in
  *  place: it first renames it to a claimed file of its own, so a quit during that load starts a fresh
@@ -46,6 +49,8 @@ export interface ToolTimingsOptions {
   maxOpen?: number
   /** Cloud-transcript records kept, within `capacity`; default 1000. */
   cloudCapacity?: number
+  /** Raw Claude CLI-view (cli-transcript) records kept, within `capacity`; default 1000. */
+  cliCapacity?: number
   flushMs?: number
   /** Most bytes load() reads, from the end of the file; default 16 MiB. */
   maxReadBytes?: number
@@ -79,7 +84,7 @@ export class ToolTimingRecorder {
   private readonly capacity: number
   private readonly retentionMs: number
   private readonly maxOpen: number
-  private readonly cloudCapacity: number
+  private readonly transcriptCapacity: Record<TranscriptOrigin, number>
   private readonly flushMs: number
   private readonly maxReadBytes: number
   private directoryReady = false
@@ -118,7 +123,7 @@ export class ToolTimingRecorder {
     this.capacity = options.capacity ?? 5000
     this.retentionMs = options.retentionMs ?? 14 * DAY_MS
     this.maxOpen = options.maxOpen ?? 2000
-    this.cloudCapacity = Math.max(0, Math.floor(options.cloudCapacity ?? 1000))
+    this.transcriptCapacity = { 'cloud-transcript': Math.max(0, Math.floor(options.cloudCapacity ?? 1000)), 'cli-transcript': Math.max(0, Math.floor(options.cliCapacity ?? 1000)) }
     this.flushMs = options.flushMs ?? 2000
     this.maxReadBytes = Math.max(1, Math.floor(options.maxReadBytes ?? MAX_READ_BYTES))
     this.now = options.now ?? (() => performance.now())
@@ -209,7 +214,7 @@ export class ToolTimingRecorder {
     this.droppedOnLoad += earlier.length - keep.length
     for (const record of keep) this.index(record)
     this.records = [...keep, ...this.records]
-    this.trimCloud(this.cloudCapacity)
+    for (const origin of TRANSCRIPT_ORIGINS) this.trimOrigin(origin, this.transcriptCapacity[origin])
     this.fileLines = lines
     // An oversized, torn or partly stale file, or one with a quit's lines beside it, is rewritten
     // from what was kept inside this queued step, so it is whole, merged and under the bound before
@@ -409,21 +414,36 @@ export class ToolTimingRecorder {
    * for an interrupted call are not timed. Wait and execution are never inferred from it.
    */
   importCloudTranscript(input: { projectId: string; runId: string; cloudSessionId: string; model?: string; calls: readonly TranscriptToolCall[] }): { added: number; known: number; skipped: number } {
+    return this.importTranscript('cloud-transcript', { projectId: input.projectId, agentSessionId: input.runId, session: input.cloudSessionId, provider: 'claude-cloud', model: input.model, calls: input.calls })
+  }
+
+  /**
+   * The tool calls a raw Claude CLI-view tab made, paired from the rows its CLI appended to the
+   * conversation's own transcript while the tab owned it (native-history.ts readClaudeCliToolCalls).
+   * Keyed by the native conversation id and tool_use_id, never the handoff's runtime; the same rules
+   * as a cloud transcript, on this machine's CLI row times. Kept apart as origin cli-transcript.
+   */
+  importCliTranscript(input: { projectId: string; agentSessionId: string; nativeSessionId: string; model?: string; calls: readonly TranscriptToolCall[] }): { added: number; known: number; skipped: number } {
+    return this.importTranscript('cli-transcript', { projectId: input.projectId, agentSessionId: input.agentSessionId, session: input.nativeSessionId, provider: 'claude-cli', model: input.model, calls: input.calls })
+  }
+
+  private importTranscript(origin: TranscriptOrigin, input: TranscriptSource & { calls: readonly TranscriptToolCall[] }): { added: number; known: number; skipped: number } {
     const counts = { added: 0, known: 0, skipped: 0 }
-    if (this.disposed || !input.cloudSessionId || !this.cloudCapacity) return counts
+    const capacity = this.transcriptCapacity[origin]
+    if (this.disposed || !input.session || !capacity) return counts
     const cutoff = this.wallNow() - this.retentionMs
-    let cloud = this.records.filter(record => record.origin === 'cloud-transcript').length
+    let held = this.records.filter(record => record.origin === origin).length
     for (const call of input.calls.slice(-MAX_IMPORT)) {
       try {
-        const key = `cloud-transcript\u0000${input.cloudSessionId}\u0000${call.toolUseId}`
+        const key = `${origin}\u0000${input.session}\u0000${call.toolUseId}`
         if (this.byKey.has(key)) { counts.known++; this.deduplicated++; continue }
-        const record = this.transcriptRecord(key, input, call)
-        // Beyond retention, or older than everything kept once the cloud allowance is full: a later
-        // pull would only add what the next trim drops again.
+        const record = this.transcriptRecord(key, origin, input, call)
+        // Beyond retention, or older than everything kept once this origin's allowance is full: a
+        // later read would only add what the next trim drops again.
         const ended = Date.parse(record.endedAt)
-        const oldest = cloud >= this.cloudCapacity ? this.records.find(entry => entry.origin === 'cloud-transcript') : undefined
+        const oldest = held >= capacity ? this.records.find(entry => entry.origin === origin) : undefined
         if (ended < cutoff || oldest && ended <= Date.parse(oldest.endedAt)) { counts.skipped++; continue }
-        if (cloud >= this.cloudCapacity) this.trimCloud(this.cloudCapacity - 1); else cloud++
+        if (held >= capacity) this.trimOrigin(origin, capacity - 1); else held++
         this.commit(record)
         counts.added++
       } catch { this.errors++ }
@@ -431,7 +451,7 @@ export class ToolTimingRecorder {
     return counts
   }
 
-  private transcriptRecord(key: string, input: { projectId: string; runId: string; cloudSessionId: string; model?: string }, call: TranscriptToolCall): ToolTimingRecord {
+  private transcriptRecord(key: string, origin: TranscriptOrigin, input: TranscriptSource, call: TranscriptToolCall): ToolTimingRecord {
     const notes = [...call.notes]
     const start = call.usedAt ? Date.parse(call.usedAt) : NaN, end = call.resultAt ? Date.parse(call.resultAt) : NaN
     let elapsedMs: number | null = null
@@ -445,8 +465,8 @@ export class ToolTimingRecorder {
     const tool = (call.name || 'Tool').slice(0, TOOL_TIMING_LIMITS.tool)
     const outcome: ToolTimingOutcome = call.denied ? (/interrupt|cancel/i.test(call.denied) ? 'interrupted' : 'rejected') : call.isError ? 'failed' : 'completed'
     const record: ToolTimingRecord = {
-      key, agentSessionId: input.runId, projectId: input.projectId, provider: 'claude-cloud', runtimeId: input.cloudSessionId, itemId: call.toolUseId,
-      ...(input.model ? { model: input.model } : {}), origin: 'cloud-transcript',
+      key, agentSessionId: input.agentSessionId, projectId: input.projectId, provider: input.provider, runtimeId: input.session, itemId: call.toolUseId,
+      ...(input.model ? { model: input.model } : {}), origin,
       tool, category: toolCategory(tool), args: summarizeToolArgs(tool, call.input, this.mask),
       startedAt: Number.isFinite(start) ? new Date(start).toISOString() : null, endedAt: endedAt ?? new Date(this.wallNow()).toISOString(),
       elapsedMs, elapsedSource: elapsedMs === null ? 'unavailable' : 'transcript-wall',
@@ -457,12 +477,12 @@ export class ToolTimingRecorder {
     return record
   }
 
-  /** Keeps at most `keep` cloud-transcript records, dropping the oldest; native records are never touched. */
-  private trimCloud(keep: number): void {
-    let excess = this.records.filter(record => record.origin === 'cloud-transcript').length - Math.max(0, keep)
+  /** Keeps at most `keep` records of one transcript origin, dropping the oldest; no other record is touched. */
+  private trimOrigin(origin: TranscriptOrigin, keep: number): void {
+    let excess = this.records.filter(record => record.origin === origin).length - Math.max(0, keep)
     if (excess <= 0) return
     this.records = this.records.filter(record => {
-      if (excess <= 0 || record.origin !== 'cloud-transcript') return true
+      if (excess <= 0 || record.origin !== origin) return true
       excess--
       if (this.byKey.get(record.key) === record) this.byKey.delete(record.key)
       return false
@@ -530,7 +550,7 @@ export class ToolTimingRecorder {
   report(query: ToolTimingsQuery = {}): ToolTimingsReport {
     const cutoff = this.wallNow() - this.retentionMs
     const live = this.records.filter(record => Date.parse(record.endedAt) >= cutoff)
-    const inFlight = query.origin === 'cloud-transcript' ? 0 : [...this.open.values()].filter(call => (!query.projectId || call.record.projectId === query.projectId) && (!query.agentSessionId || call.record.agentSessionId === query.agentSessionId) && (!query.provider || call.record.provider === query.provider)).length
+    const inFlight = query.origin && query.origin !== 'native' ? 0 : [...this.open.values()].filter(call => (!query.projectId || call.record.projectId === query.projectId) && (!query.agentSessionId || call.record.agentSessionId === query.agentSessionId) && (!query.provider || call.record.provider === query.provider)).length
     return aggregateToolTimings(live, query, {
       observedAt: new Date(this.wallNow()).toISOString(), inFlight,
       storage: { records: live.length, capacity: this.capacity, retentionDays: Math.round(this.retentionMs / DAY_MS), recordedSince: live[0]?.endedAt ?? null, deduplicated: this.deduplicated, droppedOnLoad: this.droppedOnLoad, parseErrors: this.parseErrors }
@@ -587,7 +607,7 @@ export function parseRecord(line: string): ToolTimingRecord | null {
   const strings = ['key', 'agentSessionId', 'projectId', 'provider', 'runtimeId', 'itemId', 'tool', 'category', 'args', 'endedAt'] as const
   if (strings.some(key => typeof value[key] !== 'string') || !Number.isFinite(Date.parse(value.endedAt as string))) return null
   if (!OUTCOMES.has(value.outcome as ToolTimingOutcome) || !nullableNumber(value.elapsedMs) || !nullableNumber(value.waitMs) || !nullableNumber(value.execMs) || !nullableNumber(value.prepareMs)) return null
-  if (value.origin !== undefined && value.origin !== 'cloud-transcript') return null
+  if (value.origin !== undefined && !(TRANSCRIPT_ORIGINS as readonly unknown[]).includes(value.origin)) return null
   if (value.reviewMs !== undefined && (typeof value.reviewMs !== 'number' || !Number.isFinite(value.reviewMs) || value.reviewMs < 0 || value.reviewSource !== 'provider-review')) return null
   const { v: _v, ...record } = value
   return { concurrent: 0, startedAt: null, ...record } as unknown as ToolTimingRecord
@@ -619,7 +639,7 @@ export function toolTimingsQuery(args: Record<string, unknown>): ToolTimingsQuer
     query.includeDetached = args.includeDetached
   }
   if (args.origin !== undefined) {
-    if (args.origin !== 'native' && args.origin !== 'cloud-transcript') throw new Error('origin must be "native" or "cloud-transcript"')
+    if (args.origin !== 'native' && args.origin !== 'cloud-transcript' && args.origin !== 'cli-transcript') throw new Error('origin must be "native", "cloud-transcript" or "cli-transcript"')
     query.origin = args.origin
   }
   return query

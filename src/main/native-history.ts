@@ -1,8 +1,11 @@
 import { createReadStream, existsSync, readdirSync } from 'node:fs'
+import { open, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { createInterface } from 'node:readline'
 import type { AdapterEvent, AgentEventData, Json } from '../shared/structured-agent'
+import type { TranscriptToolCall } from '../shared/tool-timings'
+import { TELEPORT_NOTE, TranscriptToolPairs } from './transcript-tool-pairs'
 export interface NativeHistoryItem { id: string; turnId?: string; data: AgentEventData }
 export function claudeHistoryPath(cwd: string, nativeId: string): string {
   if (!/^[a-zA-Z0-9_-]{1,160}$/.test(nativeId)) throw new Error('Invalid native conversation ID')
@@ -10,6 +13,61 @@ export function claudeHistoryPath(cwd: string, nativeId: string): string {
   return join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'projects', directory, nativeId + '.jsonl')
 }
 export function hasClaudeHistory(cwd: string, nativeId: string): boolean { return existsSync(claudeHistoryPath(cwd, nativeId)) }
+/** Most bytes of a CLI view's own rows read for its tool timings: the newest, from the handoff on. */
+export const MAX_CLI_TIMING_BYTES = 16 * 1024 * 1024
+/** The conversation transcript's size now: where a CLI view's own rows will start. 0 when it does
+ *  not exist yet (a fresh conversation); null when it cannot be read. */
+export async function claudeHistorySize(cwd: string, nativeId: string): Promise<number | null> {
+  try { return (await stat(claudeHistoryPath(cwd, nativeId))).size } catch (error) { return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 0 : null }
+}
+/**
+ * The tool calls a raw Claude CLI-view tab made: only rows its CLI appended to the conversation's
+ * transcript after `fromByte` (the size at the handoff, claudeHistorySize), at most the newest
+ * `maxBytes` of them, read asynchronously; never the whole file. Rows of another session, rows the
+ * CLI marks as copied from elsewhere (remoteSourced) and rows before a teleport's note (a cloud
+ * session's own rows, on its clock) are left out, as are calls the handoff already knew. Pairing is
+ * by exact tool_use_id (transcript-tool-pairs.ts). A file that shrank since is not read at all.
+ */
+export async function readClaudeCliToolCalls(cwd: string, nativeId: string, fromByte: number, options: { maxBytes?: number; known?: Iterable<string> } = {}): Promise<{ tools: TranscriptToolCall[]; unmatched: number; bytesRead: number; truncated: boolean; shrank: boolean }> {
+  const none = { tools: [], unmatched: 0, bytesRead: 0, truncated: false, shrank: false }
+  if (!Number.isSafeInteger(fromByte) || fromByte < 0) return none
+  let handle
+  try { handle = await open(claudeHistoryPath(cwd, nativeId), 'r') } catch { return none }
+  try {
+    const size = (await handle.stat()).size
+    if (size < fromByte) return { ...none, shrank: true }
+    const maxBytes = Math.max(1, Math.floor(options.maxBytes ?? MAX_CLI_TIMING_BYTES))
+    const start = Math.max(fromByte, size - maxBytes), length = size - start
+    const buffer = Buffer.alloc(length)
+    let read = 0
+    while (read < length) {
+      const { bytesRead } = await handle.read(buffer, read, length - read, start + read)
+      if (!bytesRead) break
+      read += bytesRead
+    }
+    let bytes = buffer.subarray(0, read)
+    const truncated = start > fromByte
+    // A window that starts mid-file starts mid-row: that partial row goes, cut at a newline byte.
+    if (truncated) { const newline = bytes.indexOf(0x0a); bytes = bytes.subarray(newline < 0 ? bytes.length : newline + 1) }
+    const rows: any[] = []
+    let teleported = -1
+    for (const line of bytes.toString('utf8').split('\n')) {
+      if (!line.trim()) continue
+      let row: any
+      try { row = JSON.parse(line) } catch { continue }
+      if (!row || typeof row !== 'object' || row.sessionId !== undefined && row.sessionId !== nativeId || row.remoteSourced === true) continue
+      const content = row.message?.content
+      const first = typeof content === 'string' ? content : Array.isArray(content) && typeof content[0]?.text === 'string' ? content[0].text : ''
+      if (row.type === 'user' && TELEPORT_NOTE.test(first)) teleported = rows.length
+      rows.push(row)
+    }
+    const known = new Set(options.known ?? [])
+    const pairs = new TranscriptToolPairs()
+    for (const row of rows.slice(teleported + 1)) pairs.add(row)
+    const paired = pairs.calls()
+    return { tools: paired.tools.filter(call => !known.has(call.toolUseId)), unmatched: paired.unmatched, bytesRead: read, truncated, shrank: false }
+  } finally { await handle.close() }
+}
 export async function readClaudeHistory(cwd: string, nativeId: string): Promise<NativeHistoryItem[]> {
   const path = claudeHistoryPath(cwd, nativeId)
   if (!existsSync(path)) return []

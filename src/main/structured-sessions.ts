@@ -1,7 +1,8 @@
 import { concreteModel } from '../shared/agent-model-selection'
 import { sessionCheckpoint } from './local-models/session-checkpoint'
 import { deriveConversationTitle } from '../shared/conversation-title'
-import { readClaudeHistory, hasClaudeHistory, readGrokHistory, hasGrokHistory, historyEvent } from './native-history'
+import { readClaudeHistory, hasClaudeHistory, readGrokHistory, hasGrokHistory, historyEvent, claudeHistorySize, readClaudeCliToolCalls } from './native-history'
+import type { TranscriptToolCall } from '../shared/tool-timings'
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -419,6 +420,8 @@ export class StructuredSessions {
       return 'failed'
     }
   }
+  /** Receives a raw Claude CLI view's own tool calls when its tab returns to Chat (AgentManager → tool timings). */
+  cliToolCalls?: (spec: AgentSpec, nativeSessionId: string, calls: TranscriptToolCall[]) => void
   private turnSettledListeners = new Set<(spec: AgentSpec) => void>()
   /** Called after every turn settles (a running phase gave way to an idle, finished or failed one). */
   onTurnSettled(listener: (spec: AgentSpec) => void): () => void {
@@ -661,7 +664,9 @@ export class StructuredSessions {
           this.emit(live, { data: { type: 'session', phase: state.phase, nativeSessionId } })
         }
         const history = live.spec.provider === 'claude' ? await readClaudeHistory(live.spec.cwd, nativeSessionId) : live.spec.provider === 'grok' ? await readGrokHistory(nativeSessionId) : await live.adapter?.history?.() ?? []
-        const handoff = { id: randomUUID(), known: history.map((item) => item.id) }
+        // Where the CLI's own rows will start in the transcript: its tool calls are read from there on.
+        const claudeBytes = live.spec.provider === 'claude' ? await claudeHistorySize(live.spec.cwd, nativeSessionId) : null
+        const handoff = { id: randomUUID(), known: history.map((item) => item.id), ...(claudeBytes !== null ? { claudeBytes } : {}) }
         // Persist ownership before releasing the structured process.
         this.database.setSetting('cliHandoff:' + id, JSON.stringify(handoff))
       }
@@ -697,7 +702,7 @@ export class StructuredSessions {
     if (active.has(this.database.structured.snapshot(id)!.phase)) { this.cancelCli(id); return }
     live.handoff = true
     try {
-      const handoff = JSON.parse(serialized) as { id: string; known: string[] }
+      const handoff = JSON.parse(serialized) as { id: string; known: string[]; claudeBytes?: number }
       // A previous switch may have timed out while stopping its process.
       if (live.adapter) {
         this.cancelNativeAcceptances(live, 'The runtime changed before native steering acceptance was confirmed. The pending input was retained; inspect the conversation before retrying.')
@@ -710,6 +715,14 @@ export class StructuredSessions {
       const known = new Set(handoff.known)
       // A failed/retried import reuses the handoff identity, so journal replay reconciles each item.
       for (const item of history) if (!known.has(item.id)) this.emit(live, historyEvent(item, handoff.id))
+      // A side record: a timing failure never keeps the conversation in the CLI view. A handoff
+      // persisted before its size was recorded has no boundary, so nothing is read for it.
+      if (live.spec.provider === 'claude' && typeof handoff.claudeBytes === 'number' && this.cliToolCalls) {
+        try {
+          const read = await readClaudeCliToolCalls(live.spec.cwd, state.nativeSessionId!, handoff.claudeBytes, { known })
+          if (read.tools.length) this.cliToolCalls(live.spec, state.nativeSessionId!, read.tools)
+        } catch { /* the recorder counts its own errors */ }
+      }
       this.database.removeSetting('cliHandoff:' + id)
       this.emit(live, { data: { type: 'session', phase: this.database.structured.snapshot(id)!.phase, view: 'visual' } })
     } finally { live.handoff = false }
