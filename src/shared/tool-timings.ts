@@ -110,6 +110,35 @@ export interface TranscriptToolCall {
   notes: string[]
 }
 
+/** Why a raw Claude CLI view's transcript read is (not) the whole of what its CLI appended. */
+export type CliCaptureReason =
+  | 'complete' | 'no-transcript'
+  | 'window-truncated' | 'call-limit'
+  | 'boundary-missing' | 'boundary-unverified' | 'boundary-malformed'
+  | 'file-missing' | 'file-shrank' | 'file-replaced' | 'file-changed' | 'file-unreadable'
+/**
+ * What one return to Chat read of the CLI view's own rows. `complete` only when the persisted
+ * boundary was verified against the file and every row after it was read; `partial` when rows
+ * after a verified boundary were not read (their calls are absent, never estimated); `unavailable`
+ * when no row could be trusted as the CLI's own (nothing was imported). Counts only; no content.
+ */
+export interface CliCaptureCoverage {
+  status: 'complete' | 'partial' | 'unavailable'
+  reason: CliCaptureReason
+  boundaryBytes: number | null
+  fileBytes: number | null
+  bytesRead: number
+  /** Appended bytes before the read window, never read. */
+  bytesSkipped: number
+  /** Calls with no result among the rows read. */
+  unmatchedCalls: number
+  /** Results whose call lies in unread rows: untimed, not estimated. */
+  unpairedResults: number
+  /** Paired calls or held entries the pairing bounds let go. */
+  droppedCalls: number
+}
+export interface CliCaptureNote extends CliCaptureCoverage { handoffId: string; agentSessionId: string; nativeSessionId: string }
+
 export interface DurationStats { measured: number; unavailable: number; p50: number | null; p95: number | null; max: number | null; totalMs: number }
 export interface ToolAggregate {
   tool: string
@@ -146,6 +175,8 @@ export interface ToolTimingsReport {
   offenders: ToolOffender[]
   recent: ToolTimingRecord[]
   storage: { records: number; capacity: number; retentionDays: number; recordedSince: string | null; deduplicated: number; droppedOnLoad: number; parseErrors: number }
+  /** Since this process started (not persisted): what each raw Claude CLI-view return could read. Absent until one returned. */
+  captureCoverage?: { cliTranscript: { returns: number; complete: number; partial: number; unavailable: number; recentIncomplete: CliCaptureNote[] } }
   gaps: string[]
 }
 
@@ -163,7 +194,7 @@ export const TOOL_TIMING_GAPS: Readonly<Record<string, string>> = {
   grok: 'Grok: no tool duration; exec is the observed running phase. Approval wait is observed when the ACP permission request arrives.',
   local: 'Local model: Conductor\'s own runtime measures each tool (exec = provider). There is no approval phase, so wait is unavailable.',
   cli: 'Codex and Grok CLI-view tabs (raw terminal) and conversations mirrored from another machine emit no structured tool events here: they are not covered. Claude CLI-view tabs are read from their transcript when the tab returns to Chat (origin cli-transcript).',
-  'claude-cli': 'Claude CLI-view tabs (origin cli-transcript): read when the tab returns to Chat, from rows the CLI appended after the handoff (at most the newest 16 MiB), never live. Elapsed is the CLI\'s own row times from tool_use to its tool_result (transcript-wall), which includes permission, hooks and queueing: not execution, and no approval wait. Calls without a result, denied or interrupted results, and missing or reversed times are not timed.',
+  'claude-cli': 'Claude CLI-view tabs (origin cli-transcript): read when the tab returns to Chat, from rows the CLI appended after the handoff (at most the newest 16 MiB), never live. Elapsed is the CLI\'s own row times from tool_use to its tool_result (transcript-wall), which includes permission, hooks and queueing: not execution, and no approval wait. Calls without a result, denied or interrupted results, and missing or reversed times are not timed. A return whose boundary cannot be verified against the file, or whose appended rows exceed the window, is reported in captureCoverage as partial or unavailable, never as complete.',
   'claude-cloud': 'Cloud coworkers (origin cloud-transcript): read from the teleported transcript after a pull, never live. Elapsed is the cloud\'s own row times from tool_use to its tool_result (transcript-wall), which includes permission, hooks and queueing: not execution, and no approval wait. Calls without a result yet, denied or interrupted results, and missing or reversed times are not timed.'
 }
 

@@ -312,7 +312,7 @@ export class AgentManager {
     controlBriefing?: (spec: AgentSpec) => string,
     private readonly mcp?: { configure(spec: AgentSpec): string; release(agentSessionId: string): void },
     /** Tool-call timing (src/main/tool-timings.ts): sees each staged event once; never throws. */
-    toolTimings?: { observe(event: import('../shared/structured-agent').AgentEvent, model?: string): void; importCliTranscript?(input: { projectId: string; agentSessionId: string; nativeSessionId: string; model?: string; calls: readonly import('../shared/tool-timings').TranscriptToolCall[] }): unknown }
+    toolTimings?: { observe(event: import('../shared/structured-agent').AgentEvent, model?: string): void; importCliTranscript?(input: { projectId: string; agentSessionId: string; nativeSessionId: string; model?: string; calls: readonly import('../shared/tool-timings').TranscriptToolCall[]; coverage?: import('../shared/tool-timings').CliCaptureCoverage & { handoffId: string } }): unknown }
   ) {
     // Everything static in the briefing is sent once per native runtime, a memory once per
     // runtime, the coworker log as a delta; see turn-briefing.ts for why and for the numbers.
@@ -337,9 +337,9 @@ export class AgentManager {
       },
       mcp)
     // A raw Claude CLI view's own tool calls, read from its transcript when the tab returns to Chat.
-    this.structured.cliToolCalls = (spec, nativeSessionId, calls) => {
+    this.structured.cliToolCalls = (spec, nativeSessionId, calls, coverage) => {
       if (anonymousConversations.has(spec.id)) return
-      toolTimings?.importCliTranscript?.({ projectId: spec.projectId, agentSessionId: spec.id, nativeSessionId, ...(spec.model ? { model: spec.model } : {}), calls })
+      toolTimings?.importCliTranscript?.({ projectId: spec.projectId, agentSessionId: spec.id, nativeSessionId, ...(spec.model ? { model: spec.model } : {}), calls, coverage })
     }
     this.nativeCli = new NativeCliManager(this.structured, database, (provider) => providers[provider].resolveExecutable(), broadcast)
   }

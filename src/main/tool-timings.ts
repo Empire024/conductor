@@ -4,7 +4,7 @@ import { appendFile, mkdir, open, readdir, rename, unlink, writeFile } from 'nod
 import { join } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import type { AgentEvent, ActivityStatus } from '../shared/structured-agent'
-import { aggregateToolTimings, summarizeToolArgs, summarizeToolError, toolCategory, TOOL_TIMING_LIMITS, type ToolTimingOutcome, type ToolTimingRecord, type ToolTimingsQuery, type ToolTimingsReport, type ToolTimingOrigin, type TranscriptToolCall } from '../shared/tool-timings'
+import { aggregateToolTimings, summarizeToolArgs, summarizeToolError, toolCategory, TOOL_TIMING_LIMITS, type ToolTimingOutcome, type ToolTimingRecord, type ToolTimingsQuery, type ToolTimingsReport, type ToolTimingOrigin, type TranscriptToolCall, type CliCaptureNote, type CliCaptureCoverage } from '../shared/tool-timings'
 
 /**
  * The tool-call timing recorder (docs/perf-evidence/t3code-cloud-tool-timings.md). It sees every
@@ -27,6 +27,8 @@ const MAX_PROVIDER_MS = 7 * DAY_MS
 const FILE = 'tool-timings.jsonl'
 /** Transcript tool calls read in one import. */
 const MAX_IMPORT = 2000
+/** Most per-handoff coverage notes kept in memory. */
+const MAX_CAPTURE_NOTES = 50
 type TranscriptOrigin = Exclude<ToolTimingOrigin, 'native'>
 const TRANSCRIPT_ORIGINS: readonly TranscriptOrigin[] = ['cloud-transcript', 'cli-transcript']
 interface TranscriptSource { projectId: string; agentSessionId: string; session: string; provider: string; model?: string }
@@ -111,6 +113,9 @@ export class ToolTimingRecorder {
   private writes: Promise<void> = Promise.resolve()
   private fileLines = 0
   private deduplicated = 0
+  /** What each raw Claude CLI-view return could read, by handoff: counts and reasons only, in memory (not persisted). */
+  private readonly cliCaptures = new Map<string, CliCaptureNote>()
+  private readonly cliCaptureTotals = { complete: 0, partial: 0, unavailable: 0 }
   private droppedOnLoad = 0
   private parseErrors = 0
   private disposed = false
@@ -423,8 +428,19 @@ export class ToolTimingRecorder {
    * Keyed by the native conversation id and tool_use_id, never the handoff's runtime; the same rules
    * as a cloud transcript, on this machine's CLI row times. Kept apart as origin cli-transcript.
    */
-  importCliTranscript(input: { projectId: string; agentSessionId: string; nativeSessionId: string; model?: string; calls: readonly TranscriptToolCall[] }): { added: number; known: number; skipped: number } {
+  importCliTranscript(input: { projectId: string; agentSessionId: string; nativeSessionId: string; model?: string; calls: readonly TranscriptToolCall[]; coverage?: CliCaptureCoverage & { handoffId: string } }): { added: number; known: number; skipped: number } {
+    if (input.coverage) this.noteCliCapture({ ...input.coverage, agentSessionId: input.agentSessionId, nativeSessionId: input.nativeSessionId })
     return this.importTranscript('cli-transcript', { projectId: input.projectId, agentSessionId: input.agentSessionId, session: input.nativeSessionId, provider: 'claude-cli', model: input.model, calls: input.calls })
+  }
+
+  /** One return's coverage, once per handoff: a retry or a repeat replaces its own note, never adds a return. */
+  private noteCliCapture(note: CliCaptureNote): void {
+    if (this.disposed || !note.handoffId) return
+    const prior = this.cliCaptures.get(note.handoffId)
+    if (prior) this.cliCaptureTotals[prior.status]--
+    else if (this.cliCaptures.size >= MAX_CAPTURE_NOTES) this.cliCaptures.delete(this.cliCaptures.keys().next().value!)
+    this.cliCaptures.set(note.handoffId, note)
+    this.cliCaptureTotals[note.status]++
   }
 
   private importTranscript(origin: TranscriptOrigin, input: TranscriptSource & { calls: readonly TranscriptToolCall[] }): { added: number; known: number; skipped: number } {
@@ -551,10 +567,15 @@ export class ToolTimingRecorder {
     const cutoff = this.wallNow() - this.retentionMs
     const live = this.records.filter(record => Date.parse(record.endedAt) >= cutoff)
     const inFlight = query.origin && query.origin !== 'native' ? 0 : [...this.open.values()].filter(call => (!query.projectId || call.record.projectId === query.projectId) && (!query.agentSessionId || call.record.agentSessionId === query.agentSessionId) && (!query.provider || call.record.provider === query.provider)).length
-    return aggregateToolTimings(live, query, {
+    const report = aggregateToolTimings(live, query, {
       observedAt: new Date(this.wallNow()).toISOString(), inFlight,
       storage: { records: live.length, capacity: this.capacity, retentionDays: Math.round(this.retentionMs / DAY_MS), recordedSince: live[0]?.endedAt ?? null, deduplicated: this.deduplicated, droppedOnLoad: this.droppedOnLoad, parseErrors: this.parseErrors }
     })
+    const { complete, partial, unavailable } = this.cliCaptureTotals, returns = complete + partial + unavailable
+    if (!returns) return report
+    return { ...report,
+      captureCoverage: { cliTranscript: { returns, complete, partial, unavailable, recentIncomplete: [...this.cliCaptures.values()].filter(note => note.status !== 'complete').slice(-10).reverse() } },
+      gaps: partial + unavailable ? [...report.gaps, `Claude CLI-view capture was incomplete for ${partial + unavailable} of ${returns} returns to Chat since this process started (${partial} partial, ${unavailable} unavailable); calls in the unread or unverified rows are not in this report and no duration is estimated for them (captureCoverage).`] : report.gaps }
   }
 
   /** On quit: calls still running are written as abandoned, so a runtime the host keeps running can

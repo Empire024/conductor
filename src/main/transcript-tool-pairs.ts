@@ -19,6 +19,8 @@ const toolId = (value: unknown): string | undefined => typeof value === 'string'
 export class TranscriptToolPairs {
   private readonly uses = new Map<string, { name: string; input: unknown; at: string | null; uuid: string | null; conflict: boolean }>()
   private readonly results = new Map<string, { at: string | null; isError: boolean; denied: string | null; source: string | null; result: string; conflict: boolean }>()
+  /** Held calls or results let go at the bound: coverage the caller must report, never hide. */
+  private evicted = 0
   constructor(private readonly maxIds = 8192) {}
 
   /** One transcript row (a parsed JSONL record). */
@@ -48,12 +50,14 @@ export class TranscriptToolPairs {
   }
 
   private hold<T>(map: Map<string, T>, id: string, value: T): void {
-    if (map.size >= this.maxIds) map.delete(map.keys().next().value!)
+    if (map.size >= this.maxIds) { map.delete(map.keys().next().value!); this.evicted++ }
     map.set(id, value)
   }
 
-  /** The paired calls, the same and in the same order however the rows were ordered, and how many calls have no result. */
-  calls(): { tools: TranscriptToolCall[]; unmatched: number } {
+  /** The paired calls, the same and in the same order however the rows were ordered, how many calls
+   *  have no result, how many results have no call among these rows (a partial read), and how many
+   *  held entries or paired calls the bounds let go. */
+  calls(): { tools: TranscriptToolCall[]; unmatched: number; orphans: number; dropped: number } {
     const tools: TranscriptToolCall[] = []
     for (const [toolUseId, result] of this.results) {
       const use = this.uses.get(toolUseId)
@@ -65,7 +69,8 @@ export class TranscriptToolPairs {
       tools.push({ toolUseId, name: use.name, input: use.input, usedAt: use.at, resultAt: result.at, isError: result.isError, denied: result.denied, result: result.result, notes })
     }
     const unmatched = [...this.uses.keys()].filter(id => !this.results.has(id)).length
+    const orphans = [...this.results.keys()].filter(id => !this.uses.has(id)).length
     tools.sort((a, b) => (a.usedAt ?? '').localeCompare(b.usedAt ?? '') || a.toolUseId.localeCompare(b.toolUseId))
-    return { tools: tools.slice(-MAX_TRANSCRIPT_TOOLS), unmatched }
+    return { tools: tools.slice(-MAX_TRANSCRIPT_TOOLS), unmatched, orphans, dropped: this.evicted + Math.max(0, tools.length - MAX_TRANSCRIPT_TOOLS) }
   }
 }
