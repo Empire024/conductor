@@ -35,6 +35,10 @@ provider, each once under its own name (`/approvals`, `/clear` and `/cost` find 
 puts a command that takes arguments (or one the runtime reported) into the draft so they can
 follow. A `$skill` always goes into the draft, because it prefixes a prompt.
 
+Skills are listed as `/skill:name` (Claude skills from `.claude/skills` and `~/.claude/skills`,
+Codex skills from `skills/list`); choosing one only drafts the runtime's own `/name ` or `$name `.
+Discovery, bounds, collisions and errors: `docs/skill-discovery.md`.
+
 ## Commands
 
 Arguments in brackets are optional.

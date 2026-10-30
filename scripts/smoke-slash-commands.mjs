@@ -1,5 +1,5 @@
 import { _electron as electron, expect } from '@playwright/test'
-import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -28,6 +28,11 @@ try {
   await page.waitForFunction(() => Boolean(window.conductor?.structured))
   await page.evaluate(async () => { await window.conductor.settings.setZoom(1); await window.conductor.settings.setThemeAuto(false); await window.conductor.settings.setThemeVariant('night') })
   const project = await page.evaluate(() => window.conductor.projects.create('Slash commands smoke'))
+  // A project skill for the /skill: list, and an agent-only one it must leave out (docs/skill-discovery.md).
+  for (const [name, frontmatter] of [['smoke-skill', 'description: Summarize the smoke project'], ['hidden-helper', 'description: Agent only\nuser-invocable: false']]) {
+    await mkdir(join(project.path, '.claude', 'skills', name), { recursive: true })
+    await writeFile(join(project.path, '.claude', 'skills', name, 'SKILL.md'), `---\n${frontmatter}\n---\nNever run by discovery.\n`)
+  }
   await page.evaluate(async projectId => {
     const [session] = await window.conductor.sessions.list(projectId)
     const layout = JSON.parse(JSON.stringify(session.layout))
@@ -160,6 +165,21 @@ try {
   await expect(claude.locator('.sa-command-notice')).toContainText('not a Claude Code or Conductor command')
   await shot(page, '8-claude-passthrough')
   results.checks.push('Claude /compact passes through to the CLI as typed; a name the CLI did not report answers inline')
+
+  await claudeComposer.fill('/skill:smoke')
+  const skillOption = claudeMenu.locator('[role="option"]', { hasText: '/skill:smoke-skill' })
+  await expect(skillOption).toHaveCount(1, { timeout: 20_000 })
+  await expect(skillOption).toContainText('Summarize the smoke project')
+  await expect(skillOption).toContainText('Project skill')
+  await shot(page, '9-claude-skill-menu')
+  const sentBefore = await userTexts(claude)
+  await claudeComposer.press('Enter')
+  await expect(claudeComposer).toHaveValue('/smoke-skill ')
+  assert.deepEqual(await userTexts(claude), sentBefore, 'choosing a skill sends nothing')
+  await claudeComposer.fill('/skill:hidden')
+  await expect(claude.locator('.sa-command-status')).toContainText('No skill matches')
+  await claudeComposer.fill('')
+  results.checks.push('Claude /skill: lists the project skill with its description and source, leaves out an agent-only one, and choosing it only drafts /smoke-skill')
 
   assert.deepEqual(errors, [])
 } catch (error) {

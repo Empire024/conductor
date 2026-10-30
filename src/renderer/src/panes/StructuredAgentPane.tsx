@@ -31,7 +31,8 @@ import { FileAttachmentInput } from '../components/FileAttachmentInput'
 import { composerEnterSends } from './composer-enter'
 import { composerChildKey, composerSendBlock, conversationModes, modelDisplayName, nextComposerSettings, resolvedComposerSettings } from './composer-settings'
 import { activateBrowserMention, CommandAutocomplete } from './CommandAutocomplete'
-import { composerCommands, matchingComposerCommands, nativeCommandNames, type ComposerCommand } from './composer-commands'
+import { composerCommandChoice, composerCommands, matchingComposerCommands, nativeCommandNames, type ComposerCommand } from './composer-commands'
+import { composerSkills, DISCOVERY_ERROR, invocableSkillNames } from './composer-skills'
 import { resolveSlashCommand, type ConductorSlashAction, type SlashHandling } from '../../../shared/slash-commands'
 import { conversationStatusText, lastAssistantText, matchConversationMode, matchEffort, matchModel } from './slash-command-actions'
 import { modelEfforts, supportedEffortChoices } from '../../../shared/model-effort'
@@ -272,9 +273,12 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const [commandDismissed, setCommandDismissed] = useState(false)
   const [commandIndex, setCommandIndex] = useState(0)
   const commandListId = useId()
-  const commands = matchingComposerCommands(draftView.commandQuery, composerCommands(projection.capabilities, commandDiscovery))
+  const skillState = composerSkills(structuredProvider, commandDiscovery, commandLoading)
+  const commands = matchingComposerCommands(draftView.commandQuery, composerCommands(projection.capabilities, commandDiscovery, skillState))
   const starterChoices = useMemo(() => composerStarterChoices(projection.capabilities, commandDiscovery), [projection.capabilities, commandDiscovery])
   const commandsOpen = !commandDismissed && !addFileOpen && !historical && commands.length > 0
+  // `/skill:` with nothing to list still opens the list, to say whether skills are loading, failed or absent.
+  const skillStatusOpen = !commandDismissed && !addFileOpen && !historical && !commands.length && draftView.commandQuery.toLowerCase().startsWith('/skill:')
   const [newOutput, setNewOutput] = useState(false)
   const newOutputRef = useRef(newOutput); newOutputRef.current = newOutput
   const [dockedQuestions, setDockedQuestions] = useState<ReadonlySet<string>>(() => new Set())
@@ -519,7 +523,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     // it, the runtime's protocol runs it, the runtime runs it as typed, or it answers inline why not.
     let nativeCommand = false, commandPrompt = false
     if (!oversized) {
-      const slash = resolveSlashCommand(provider, text, nativeCommandNames(commandDiscovery))
+      const slash = resolveSlashCommand(provider, text, nativeCommandNames(commandDiscovery), invocableSkillNames(provider, commandDiscovery))
       if (slash.kind === 'literal') text = slash.text
       else if (slash.kind === 'unknown') { setCommandNotice({ text: slash.reason, tone: 'unsupported' }); return }
       else if (slash.kind === 'command') {
@@ -527,6 +531,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
         if (handling.kind === 'unsupported') { setCommandNotice({ text: `/${invocation.name}: ${handling.reason}`, tone: 'unsupported' }); return }
         if (handling.kind === 'conductor' || handling.kind === 'protocol') { void runSlashCommand(invocation.name, invocation.args, handling).then(used => { if (used) clearSubmitted(draft.revision) }); return }
         if (handling.kind === 'prompt') { commandPrompt = true; text = handling.prompt + (invocation.args ? '\n\n' + invocation.args : '') }
+        else if (handling.kind === 'skill') text = handling.text + (invocation.args ? ' ' + invocation.args : '')
         else {
           nativeCommand = true
           if (handling.as) text = handling.as + (invocation.args ? ' ' + invocation.args : '')
@@ -674,12 +679,18 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const loadComposerDiscovery = (): void => {
     if (commandLoad.current === activeId || !ready || historical) return
     commandLoad.current = activeId; setCommandLoading(true)
-    void connect().then(() => window.conductor.structured.discover(activeId)).then(result => { if (activeIdRef.current === activeId) setCommandDiscovery(result) }).catch(() => { /* Local commands remain available if provider discovery fails. */ }).finally(() => { if (activeIdRef.current === activeId) setCommandLoading(false) })
+    void connect().then(() => window.conductor.structured.discover(activeId)).then(result => { if (activeIdRef.current === activeId) setCommandDiscovery(result) }).catch((reason: unknown) => {
+      // Local commands remain available if provider discovery fails; the list says skills did not
+      // load, and opening it again retries.
+      if (activeIdRef.current !== activeId) return
+      commandLoad.current = null
+      setCommandDiscovery({ [DISCOVERY_ERROR]: reason instanceof Error ? reason.message : String(reason) })
+    }).finally(() => { if (activeIdRef.current === activeId) setCommandLoading(false) })
   }
   useEffect(() => {
-    if (!commandsOpen) return
+    if (!commandsOpen && !skillStatusOpen) return
     loadComposerDiscovery()
-  }, [commandsOpen, activeId, ready, historical])
+  }, [commandsOpen, skillStatusOpen, activeId, ready, historical])
 
   const stop = (expediteSubmittedInput = false): void => { void window.conductor.structured.interrupt(activeId, expediteSubmittedInput).catch((reason: unknown) => setError(String(reason))) }
   const needsResume = !historical && Boolean(projection.nativeSessionId) && ['interrupted', 'disconnected'].includes(projection.phase)
@@ -1234,9 +1245,10 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
    *  that takes arguments in the draft so they can follow. A `$skill` always goes in the draft. */
   const chooseCommand = (command: ComposerCommand, complete = false): void => {
     setCommandDismissed(true); setCommandIndex(0)
-    if (command.name === 'browser' && command.trigger === '@') { setMessage(''); activateBrowserMention(); return }
-    if (command.insert?.startsWith('$') || complete && (command.insert || command.argumentHint)) { setMessage(command.insert ?? '/' + command.name + ' '); composer.current?.focus(); return }
-    setMessage('/' + command.name)
+    const choice = composerCommandChoice(command, complete)
+    if (choice.action === 'browser') { setMessage(''); activateBrowserMention(); return }
+    if (choice.action === 'draft') { setMessage(choice.text); composer.current?.focus(); return }
+    setMessage(choice.text)
     void submitRef.current()
   }
 
@@ -1329,7 +1341,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       {attachments.length > 0 && <div className="sa-context-chips">{attachments.map(attachment => <span key={attachment.id}><button type="button" title={canOpenPastedText(attachment) ? 'Open the pasted text as a file' : 'Inspect attached context'} onClick={() => { if (canOpenPastedText(attachment)) void openPastedText(props.project.id, attachment); else setInspectAttachment(attachment) }}>{attachment.kind === 'image' && <PromptImageThumbnail projectId={props.project.id} attachment={attachment} />}{attachment.name}{attachment.startLine ? ':' + attachment.startLine + (attachment.endLine ? '–' + attachment.endLine : '') : ''}</button>{isPastedText(attachment) && <button type="button" aria-label={'Put ' + attachment.name + ' back in the message as text'} title="Put back in the message as text" onClick={() => { const next = unfoldPastedText(draftRef.current.message, draftRef.current.attachments, attachment.id); setDraft(next.message, next.attachments) }}><Undo2 size={11} /></button>}<button type="button" aria-label={'Remove context ' + attachment.name} onClick={() => { if (isPastedText(attachment)) { const next = removePastedText(draftRef.current.message, draftRef.current.attachments, attachment.id); setDraft(next.message, next.attachments) } else setAttachments(current => current.filter(item => item.id !== attachment.id)) }}><X size={11} /></button></span>)}</div>}
       {promptChars > MAX_PROMPT_CHARS * 0.9 && <p className={'sa-prompt-limit' + (sendBlocked === 'oversized' ? ' sa-prompt-limit-over' : '')} role="status">{sendBlocked === 'oversized' ? `Too large to send: ${promptChars.toLocaleString()} of ${MAX_PROMPT_CHARS.toLocaleString()} characters including attachments. Remove or shorten an attachment, or trim the message.` : `${promptChars.toLocaleString()} / ${MAX_PROMPT_CHARS.toLocaleString()} characters`}</p>}
       {commandNotice && <div className="sa-command-notice" role="status" data-tone={commandNotice.tone}><span>{commandNotice.text}</span><button type="button" aria-label="Dismiss command message" onClick={() => setCommandNotice(null)}><X size={12} /></button></div>}
-      {commandsOpen && <CommandAutocomplete id={commandListId} commands={commands} selected={Math.min(commandIndex, commands.length - 1)} loading={commandLoading} onSelect={setCommandIndex} onChoose={chooseCommand} />}
+      {(commandsOpen || skillStatusOpen) && <CommandAutocomplete id={commandListId} commands={commands} selected={Math.min(commandIndex, commands.length - 1)} loading={commandLoading} skillStatus={draftView.commandQuery.toLowerCase().startsWith('/skill') ? skillState : undefined} onSelect={setCommandIndex} onChoose={chooseCommand} />}
       <ComposerTextarea projectId={props.project.id} sessionId={activeId} textareaRef={composer} aria-autocomplete="list" aria-controls={commandsOpen ? commandListId : undefined} aria-expanded={commandsOpen} aria-activedescendant={commandsOpen ? commandListId + '-' + Math.min(commandIndex, commands.length - 1) : undefined} aria-label={'Message ' + name} placeholder={sendBlocked !== 'empty' ? undefined : succession ? `Continued in ${succession.title}; send messages there` : cliOwned ? 'The native CLI has this conversation. Continue in Chat to send here.' : historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : steering ? (pendingSteering.some(input => input.status === 'sending' || input.status === 'accepted') ? 'Add another message (Ctrl+Enter sends)' : 'Message after the next tool use (Ctrl+Enter sends)') : turnRunning ? 'Queue a message after this turn (Ctrl+Enter sends)' : activePhases.has(projection.phase) ? 'Queue a message after this turn' : 'Message ' + name} disabled={(!ready && !arriving) || historical || resuming || projection.archived || cliOwned} rows={2} onFocus={() => { if (ready && !historical && !projection.nativeSessionId && !activePhases.has(projection.phase)) void connect().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }} onBlur={() => { setCommandDismissed(true); flushDraft() }} onChange={event => {
         // A long paste or drop folds into a "[Pasted text #N: L lines]" chip, as the Claude CLI does.
         // Only an event that could have inserted a long run pays for diffing the whole draft.

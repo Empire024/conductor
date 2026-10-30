@@ -25,10 +25,10 @@ describe('chat command discovery', () => {
     expect(commands.some(command => command.name === 'clear')).toBe(false)
     expect(commands.some(command => command.name === 'bad path' || command.name === 'not-a-command')).toBe(false)
   })
-  it('turns Codex skills into $ tokens', () => {
+  it('turns Codex skills into /skill:name entries that draft $ tokens', () => {
     const commands = composerCommands(undefined, { skills: { status: 'available', payload: { data: [{ skills: [{ name: 'research', enabled: true }, { name: 'disabled', enabled: false }] }] } } })
-    expect(commands.find(command => command.name === 'research')).toMatchObject({ insert: '$research ' })
-    expect(commands.some(command => command.name === 'disabled')).toBe(false)
+    expect(commands.find(command => command.name === 'skill:research')).toMatchObject({ insert: '$research ', kind: 'skill' })
+    expect(commands.some(command => command.name.endsWith('disabled'))).toBe(false)
   })
   it('reads the names a runtime reported, or nothing before discovery', () => {
     expect(nativeCommandNames(undefined)).toBeUndefined()

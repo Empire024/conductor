@@ -1,4 +1,5 @@
 import { readClaudeTaskOutput } from './claude-task-output'
+import { claudeSkillCatalog } from '../skill-discovery'
 import { execFile } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { open } from 'node:fs/promises'
@@ -818,7 +819,9 @@ export class ClaudeAdapter implements ProviderAdapter {
   }
 
   async discover(): Promise<Json> {
-    return structuredClone({ connection: 'local-cli', runtimeVersion: this.capabilities.runtimeVersion, initialize: this.initializedMetadata, configuration: this.configurationMetadata })
+    // The composer's /skill:name list (docs/skill-discovery.md): read from the skill folders, never run.
+    const skillCatalog = await claudeSkillCatalog({ cwd: this.options.cwd, environment: this.options.environment ?? process.env, isolated: Boolean(this.options.approvalReviewer) || this.options.profile === 'evaluation' })
+    return structuredClone({ connection: 'local-cli', runtimeVersion: this.capabilities.runtimeVersion, initialize: this.initializedMetadata, configuration: this.configurationMetadata, skillCatalog: skillCatalog as unknown as Json })
   }
 
   private emit(event: AdapterEvent): void {

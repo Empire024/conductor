@@ -376,6 +376,8 @@
 .sa-command-menu [role="option"] span { min-width: 0; color: var(--text-2); }
 .sa-command-menu > small { display: block; padding: 7px 7px 2px; color: var(--text-3); font-size: 10px; }
 .sa-command-hint { color: var(--text-3); font-style: normal; font-family: var(--font-mono, monospace); font-size: 10px; }
+.sa-command-menu [role="option"][data-kind="skill"] strong { width: auto; flex: 0 1 auto; max-width: 45%; overflow-wrap: anywhere; }
+.sa-command-status { margin: 0; padding: 0 7px 6px; color: var(--text-3); font-size: 11px; }
 .sa-command-notice { display: flex; align-items: flex-start; gap: 8px; margin: 0 0 6px; padding: 6px 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-1); color: var(--text-2); font-size: 11px; }
 .sa-command-notice[data-tone="unsupported"] { border-color: color-mix(in srgb, var(--warning, #d9a400) 45%, var(--border)); }
 .sa-command-notice > span { flex: 1; white-space: pre-wrap; overflow-wrap: anywhere; }

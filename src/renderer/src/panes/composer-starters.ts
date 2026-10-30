@@ -34,9 +34,10 @@ export const BUILT_IN_STARTERS: ComposerStarterChoice[] = [
 export function composerStarterChoices(capabilities?: ProviderCapabilities, discovery?: Json): ComposerStarterChoice[] {
   const configured = composerCommands(capabilities, discovery).flatMap(command => command.insert ? [{
     id: `configured:${command.insert.trim()}`,
-    label: `${command.insert.startsWith('$') ? '$' : command.trigger ?? '/'}${command.name}`,
+    // A skill is labelled with what it puts in the draft (`/review-pr`, `$research`), not `/skill:name`.
+    label: command.kind === 'skill' ? command.insert.trim() : `${command.insert.startsWith('$') ? '$' : command.trigger ?? '/'}${command.name}`,
     description: command.description,
-    kind: (command.insert.startsWith('$') ? 'configured-skill' : 'configured-command') as ComposerStarterKind,
+    kind: (command.kind === 'skill' || command.insert.startsWith('$') ? 'configured-skill' : 'configured-command') as ComposerStarterKind,
     draft: command.insert
   }] : [])
   return [...BUILT_IN_STARTERS, ...configured]

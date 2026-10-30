@@ -1,4 +1,5 @@
 import type { StructuredProvider } from './structured-agent'
+import { isSkillName, SKILL_COMMAND_PREFIX, skillSyntax } from './skill-catalog'
 
 /**
  * What a `/command` typed into a Chat conversation does, per provider (docs/slash-commands.md).
@@ -23,6 +24,8 @@ export type SlashHandling =
   | { kind: 'protocol'; command: NativeSlashCommand }
   /** The CLI's command is a canned prompt; Conductor sends the same request as a message. */
   | { kind: 'prompt'; prompt: string }
+  /** `/skill:name`: a message that names the skill in the runtime's own syntax (Codex `$name`); Claude's `/name` is native. */
+  | { kind: 'skill'; text: string }
   | { kind: 'unsupported'; reason: string }
 type Handler = SlashHandling | ((args: string) => SlashHandling)
 export interface SlashCommandSpec {
@@ -120,14 +123,17 @@ const runtimeName = (provider: StructuredProvider | undefined): string => provid
  * A Conductor mapping wins over a native one (the composer owns model, mode and the session), a
  * reported native command wins over an "unsupported" entry, and anything else is unknown.
  */
-export function resolveSlashCommand(provider: StructuredProvider | undefined, text: string, nativeCommands?: readonly string[]): SlashResolution {
+export function resolveSlashCommand(provider: StructuredProvider | undefined, text: string, nativeCommands?: readonly string[], skills?: readonly string[]): SlashResolution {
   const trimmed = text.trim()
   if (trimmed.startsWith('//')) return { kind: 'literal', text: trimmed.slice(1) }
   const invocation = parseSlashCommand(trimmed)
   if (!invocation) return { kind: 'message' }
+  // The name is lowercased for lookup; a skill keeps the case it was typed in (ASCII, same length).
+  if (invocation.name.startsWith(SKILL_COMMAND_PREFIX)) return resolveSkillCommand(provider, invocation, trimmed.slice(1 + SKILL_COMMAND_PREFIX.length, 1 + invocation.name.length), nativeCommands, skills)
   const spec = findSlashCommand(invocation.name)
   const handling = spec && slashHandling(spec, provider, invocation.args)
-  const reported = provider === 'claude' && Boolean(nativeCommands?.some(name => name.toLowerCase() === invocation.name))
+  // A listed skill typed as `/name` is the CLI's own command too, even one created after the CLI reported its list.
+  const reported = provider === 'claude' && [...nativeCommands ?? [], ...skills ?? []].some(name => name.toLowerCase() === invocation.name)
   if (handling && handling.kind !== 'unsupported' && handling.kind !== 'native') return { kind: 'command', invocation, spec, handling }
   if (reported) return { kind: 'command', invocation, spec, handling: handling?.kind === 'native' ? handling : native }
   if (handling?.kind === 'native') {
@@ -139,6 +145,33 @@ export function resolveSlashCommand(provider: StructuredProvider | undefined, te
   // Claude's custom commands and skills are only known from discovery; until it answers, let the CLI decide.
   if (provider === 'claude' && nativeCommands === undefined) return { kind: 'command', invocation, handling: native }
   return { kind: 'unknown', invocation, reason: `/${invocation.name} is not a ${runtimeName(provider)} or Conductor command. Type /help for the list, or start the message with // to send it as text.` }
+}
+
+/** Why a skill cannot be invoked as `/name`: the name is a command Conductor or the CLI already
+ *  answers, so Claude would run that command instead of the skill. */
+export function skillCommandCollision(name: string): string | undefined {
+  const spec = findSlashCommand(name)
+  if (!spec) return undefined
+  return `/${name} is ${spec.name === name.toLowerCase() ? 'a command' : 'another name for /' + spec.name} in Chat, so typing it runs that command, not the skill. Rename the skill’s folder to invoke it from here.`
+}
+/**
+ * `/skill:name [args]`: the skill in the runtime's own syntax. `skills` are the names discovery
+ * listed (undefined until it answers). A skill that is not listed is refused once discovery has
+ * answered, except a name the Claude CLI itself reported (its plugin skills); before that the
+ * runtime is the judge, as for any other Claude command.
+ */
+function resolveSkillCommand(provider: StructuredProvider | undefined, invocation: SlashInvocation, typed: string, nativeCommands: readonly string[] | undefined, skills: readonly string[] | undefined): SlashResolution {
+  const syntax = skillSyntax(provider)
+  if (!syntax) return { kind: 'unknown', invocation, reason: `${runtimeName(provider)[0]!.toUpperCase() + runtimeName(provider).slice(1)} has no skills Conductor can invoke.` }
+  if (!isSkillName(typed)) return { kind: 'unknown', invocation, reason: '/skill: needs a skill name, as in /skill:review-pr. Type /skill: to list this conversation’s skills.' }
+  const same = (name: string): boolean => name.toLowerCase() === typed.toLowerCase()
+  const name = skills?.find(same) ?? nativeCommands?.find(same) ?? typed
+  const missing = skills !== undefined && !skills.some(same) && !(syntax === '/' && nativeCommands?.some(same))
+  if (missing) return { kind: 'unknown', invocation, reason: `No skill named ${typed} was found for ${runtimeName(provider)} in this project. Type /skill: to list the skills it has.` }
+  if (syntax === '$') return { kind: 'command', invocation, handling: { kind: 'skill', text: '$' + name } }
+  const collision = skillCommandCollision(name)
+  if (collision) return { kind: 'unknown', invocation, reason: collision }
+  return { kind: 'command', invocation, handling: { kind: 'native', as: '/' + name } }
 }
 
 export interface SlashMenuEntry { name: string; description: string; argumentHint?: string; handling: SlashHandling }
