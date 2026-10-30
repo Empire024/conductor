@@ -1,9 +1,9 @@
 diff --git a/docs/skill-discovery.md b/docs/skill-discovery.md
 new file mode 100644
-index 0000000..89dfe57
+index 0000000..910de16
 --- /dev/null
 +++ b/docs/skill-discovery.md
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,92 @@
 +# Skills in the composer (`/skill:name`)
 +
 +Typing `/skill:` in a Chat conversation lists the skills that conversation's runtime can run, each
@@ -47,9 +47,14 @@ index 0000000..89dfe57
 +- Discovery reads names and frontmatter only. No script, prompt or file in a skill folder is run,
 +  imported or sent to a model; descriptions are untrusted display text (control and bidi characters
 +  removed, one line, at most 160 characters).
-+- Bounded I/O (`SKILL_LIMITS`, `src/shared/skill-catalog.ts`): 400 directory entries per root, 200
-+  skills, SKILL.md up to 64 KiB (a larger one is skipped unread), settings files up to 256 KiB.
-+  Names are sorted before reading, so a truncated list is the same on every run.
++- Bounded I/O (`SKILL_LIMITS`, `src/shared/skill-catalog.ts`): 400 directory entries enumerated
++  per root (hidden and invalid entries count too, so a root full of dot files is still bounded),
++  200 skills, SKILL.md up to 64 KiB (a larger one is skipped unread), settings files up to 256 KiB.
++- Determinism: a root within the entry bound is listed completely and sorted, so its result does
++  not depend on the order the file system lists it in. A root past the bound is marked
++  `truncated` (in `roots[]` and on the catalog, and the list says it is incomplete): which entries
++  were seen then follows the OS listing order and can differ between file systems or runs. The
++  200-skill cut is taken from the sorted names of what was seen.
 +- A skill folder or SKILL.md that is a symlink resolving outside its root is ignored, and a project
 +  `.claude/skills` that resolves outside the project is not read (`roots[].state: outside-project`).
 +  A user root may itself be a symlink (dotfiles), but entries must stay inside where it resolves.
@@ -174,15 +179,15 @@ index 43a2269..744671d 100644
    private emit(event: AdapterEvent): void {
 diff --git a/src/main/skill-discovery.test.ts b/src/main/skill-discovery.test.ts
 new file mode 100644
-index 0000000..ddf28b5
+index 0000000..8627a91
 --- /dev/null
 +++ b/src/main/skill-discovery.test.ts
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,156 @@
 +import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 +import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 +import { tmpdir } from 'node:os'
 +import { join } from 'node:path'
-+import { claudeSkillCatalog, discoverClaudeSkills, parseSkillFrontmatter } from './skill-discovery'
++import { boundedDirectoryNames, claudeSkillCatalog, discoverClaudeSkills, parseSkillFrontmatter } from './skill-discovery'
 +import { SKILL_LIMITS } from '../shared/skill-catalog'
 +
 +let base: string, project: string, home: string, outside: string
@@ -287,6 +292,29 @@ index 0000000..ddf28b5
 +    expect(catalog.skills.at(-1)!.name).toBe(`s${String(SKILL_LIMITS.skills - 1).padStart(3, '0')}`)
 +  })
 +
++  it('counts hidden entries toward the per-root bound, so a root of dot entries is still read a bounded amount', async () => {
++    // An endless directory of hidden names: enumeration must stop at the bound, not run forever.
++    let yielded = 0, closed = false
++    const endless = async () => ({
++      async *[Symbol.asyncIterator]() { for (;;) { yielded++; yield { name: `.hidden-${yielded}` } } },
++      async close() { closed = true }
++    })
++    expect(await boundedDirectoryNames('/unused', 5, endless)).toEqual({ names: [], truncated: true })
++    expect(yielded).toBe(6)
++    expect(closed).toBe(true)
++    // Exactly at the bound is complete, not truncated; visible names among the counted entries are kept.
++    const listing = (names: string[]) => async () => ({ async *[Symbol.asyncIterator]() { for (const name of names) yield { name } }, async close() {} })
++    expect(await boundedDirectoryNames('/unused', 3, listing(['.a', 'b', '.c']))).toEqual({ names: ['b'], truncated: false })
++    expect(await boundedDirectoryNames('/unused', 3, listing(['.a', '.b', '.c', 'late']))).toEqual({ names: [], truncated: true })
++
++    const root = join(project, '.claude', 'skills')
++    await Promise.all(Array.from({ length: SKILL_LIMITS.entriesPerRoot + 1 }, (_, index) => writeFile(join(root, `.dot-${index}`), '')))
++    const catalog = await discover()
++    expect(catalog.truncated).toBe(true)
++    expect(catalog.skills).toEqual([])
++    expect(catalog.roots?.[1]).toEqual({ source: 'project', location: '.claude/skills', state: 'read', truncated: true })
++  })
++
 +  it('cleans untrusted descriptions to one bounded line', async () => {
 +    await skill(join(project, '.claude', 'skills'), 'noisy', md(`description: >\n  First line\n  second‮ line\u0007 ${'y'.repeat(300)}`))
 +    const [entry] = (await discover()).skills
@@ -313,10 +341,10 @@ index 0000000..ddf28b5
 +})
 diff --git a/src/main/skill-discovery.ts b/src/main/skill-discovery.ts
 new file mode 100644
-index 0000000..cacf5f6
+index 0000000..e5271b1
 --- /dev/null
 +++ b/src/main/skill-discovery.ts
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,235 @@
 +import { homedir } from 'node:os'
 +import { isAbsolute, join, relative, resolve } from 'node:path'
 +import { open, opendir, realpath, stat } from 'node:fs/promises'
@@ -328,7 +356,8 @@ index 0000000..cacf5f6
 + * names, so descriptions and sources come from the files themselves.
 + *
 + * Only names and frontmatter are read. Nothing in a skill folder is executed, imported or sent to
-+ * a model, and every read is bounded: a fixed number of directory entries per root, SKILL.md files
++ * a model, and every read is bounded: a fixed number of directory entries per root (hidden ones
++ * count; past the bound which entries were seen follows the OS listing order), SKILL.md files
 + * up to SKILL_LIMITS.fileBytes (a larger one is skipped unread), a fixed number of skills. A skill
 + * folder or SKILL.md that is a symlink out of its root is ignored, and a project `.claude/skills`
 + * that resolves outside the project is not read.
@@ -451,6 +480,28 @@ index 0000000..cacf5f6
 +  return overrides
 +}
 +
++type DirectoryHandle = AsyncIterable<{ name: string }> & { close(): Promise<void> }
++/**
++ * The non-hidden names among the first `limit` entries the file system yields. Every entry counts
++ * toward the limit, hidden and invalid ones included, so a root full of dot entries is still read
++ * a bounded amount. Under the limit the names are complete and the caller's sort makes the result
++ * independent of listing order; past it (`truncated`) the subset is whatever the OS listed first,
++ * which can differ between file systems or runs, and the catalog says it is incomplete.
++ */
++export async function boundedDirectoryNames(path: string, limit: number, openDirectory: (path: string) => Promise<DirectoryHandle> = opendir): Promise<{ names: string[]; truncated: boolean }> {
++  const names: string[] = []
++  let seen = 0, truncated = false
++  const directory = await openDirectory(path)
++  try {
++    for await (const entry of directory) {
++      if (seen >= limit) { truncated = true; break }
++      seen++
++      if (!entry.name.startsWith('.')) names.push(entry.name)
++    }
++  } finally { await directory.close().catch(() => undefined) }
++  return { names, truncated }
++}
++
 +export function claudeConfigDirectory(environment: NodeJS.ProcessEnv, cwd: string, home = homedir()): string {
 +  const configured = environment.CLAUDE_CONFIG_DIR?.trim()
 +  return configured ? resolve(cwd, configured) : join(home, '.claude')
@@ -477,20 +528,11 @@ index 0000000..cacf5f6
 +      const project = await realOrUndefined(root.containedIn)
 +      if (!project || !inside(project, realRoot)) { reports.push({ source: root.source, location: root.location, state: 'outside-project' }); continue }
 +    }
-+    // Entries are collected up to the bound, then sorted, so the result does not depend on the
-+    // order the file system lists them in.
-+    const names: string[] = []
-+    try {
-+      const directory = await opendir(realRoot)
-+      try {
-+        for await (const entry of directory) {
-+          if (names.length >= SKILL_LIMITS.entriesPerRoot) { truncated = true; break }
-+          if (!entry.name.startsWith('.')) names.push(entry.name)
-+        }
-+      } finally { await directory.close().catch(() => undefined) }
-+    } catch { reports.push({ source: root.source, location: root.location, state: 'unreadable' }); continue }
-+    reports.push({ source: root.source, location: root.location, state: 'read' })
-+    for (const name of names.sort()) {
++    let listing: Awaited<ReturnType<typeof boundedDirectoryNames>>
++    try { listing = await boundedDirectoryNames(realRoot, SKILL_LIMITS.entriesPerRoot) } catch { reports.push({ source: root.source, location: root.location, state: 'unreadable' }); continue }
++    if (listing.truncated) truncated = true
++    reports.push({ source: root.source, location: root.location, state: 'read', ...(listing.truncated ? { truncated: true } : {}) })
++    for (const name of listing.names.sort()) {
 +      if (skills.size >= SKILL_LIMITS.skills) { truncated = true; break }
 +      // A symlinked folder or SKILL.md that leaves the root (or a dangling one) is not this root's skill.
 +      const folder = await realOrUndefined(join(realRoot, name))
@@ -1004,10 +1046,10 @@ index ae0ceaa..79035f5 100644
    return [...BUILT_IN_STARTERS, ...configured]
 diff --git a/src/shared/skill-catalog.ts b/src/shared/skill-catalog.ts
 new file mode 100644
-index 0000000..a03b4ee
+index 0000000..c0df022
 --- /dev/null
 +++ b/src/shared/skill-catalog.ts
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,82 @@
 +import type { StructuredProvider } from './structured-agent'
 +
 +/**
@@ -1040,6 +1082,8 @@ index 0000000..a03b4ee
 +  /** Display path of the root (`.claude/skills`, `~/.claude/skills`). */
 +  location: string
 +  state: 'read' | 'missing' | 'outside-project' | 'unreadable'
++  /** The root held more entries than SKILL_LIMITS.entriesPerRoot; only those the OS listed first were looked at. */
++  truncated?: boolean
 +}
 +export interface SkillCatalog {
 +  status: 'available' | 'unavailable'
@@ -1058,7 +1102,7 @@ index 0000000..a03b4ee
 +export const SKILL_LIMITS = {
 +  /** Skills kept per catalog. */
 +  skills: 200,
-+  /** Directory entries looked at per root; the rest are not read at all. */
++  /** Directory entries enumerated per root, hidden ones included; the rest are not read at all. */
 +  entriesPerRoot: 400,
 +  /** A SKILL.md larger than this is ignored, never read. */
 +  fileBytes: 64 * 1024,

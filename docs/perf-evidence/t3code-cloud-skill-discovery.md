@@ -10,8 +10,8 @@ integrate. Feature doc: `docs/skill-discovery.md`.
 | t3code source | `pingdotgg/t3code` at `dd148481531a0a090780a2ade20588566db099a2` (read-only, blob-less fetch into a scratch directory; nothing in it was run) |
 | t3 files studied | `apps/server/src/provider/Drivers/ClaudeSkills.ts`, `apps/web/src/components/chat/useComposerMenuItems.ts`, plus their helpers `packages/client-runtime/src/providerSkills.ts`, `apps/web/src/providerSkillSearch.ts`, `apps/server/src/provider/Drivers/ClaudeSkillDispatch.ts` |
 | Conductor BASE | `3f9534920f6950def7eb315e5d3f5706949ed88c` (`origin/main` when the session started; the owner's local main is ahead of it) |
-| Implementation commit | `436f58fea49417c3cf78e79c6c50566f4651c16b` on `claude/t3code-skill-discovery-9m3zlh` |
-| Integration patch | `docs/perf-evidence/t3code-cloud-skill-discovery-integration.patch` = `git diff --binary BASE implementation` (17 files, +908/−31, no binaries; sha256 `74d8c1bf9ec5c1a940682cba0bae2b878af91f5a2184043a12465c206ded68ed`). This evidence file and the patch are in a later commit, so they are not part of it. Checked: `git apply --index` on a clean BASE worktree reproduces the implementation tree exactly. Not checked: applying it to the owner's local main (not reachable from the cloud). |
+| Implementation commits | `436f58fea49417c3cf78e79c6c50566f4651c16b` (feature), `0eed14355e500fc84130495f143001dddbeda188` (review fix, final implementation) on `claude/t3code-skill-discovery-9m3zlh` |
+| Integration patch | `docs/perf-evidence/t3code-cloud-skill-discovery-integration.patch` = `git diff --binary 3f95349 0eed143 -- . ':(exclude)docs/perf-evidence/t3code-cloud-skill-discovery.md' ':(exclude)docs/perf-evidence/t3code-cloud-skill-discovery-integration.patch'` (17 files, +952/−31, no binaries; sha256 `79800257002fa62bc46b9ddc8cf8ac04c09d82f12cb05895ed3de7473de1ae44`). This evidence file and the patch itself are excluded. Checked: `git apply --index` on a clean BASE worktree reproduces `0eed143` (outside those two files) exactly. Not checked: applying it to the owner's local main (not reachable from the cloud). |
 
 ## What was taken from t3, and what was not
 
@@ -36,7 +36,8 @@ Not taken (deliberately, to stay bounded):
 - Fuzzy ranking: Conductor keeps its prefix matching (plus the bare skill name), which is
   deterministic and already bounded at 60 entries.
 
-Added beyond t3: bounded I/O (entry/skill/file/settings caps, sorted before the cut), symlink
+Added beyond t3: bounded I/O (entry/skill/file/settings caps; every enumerated entry counts, hidden
+ones included; deterministic only within the entry cap, honest `truncated` past it), symlink
 containment for entries and the project root, description sanitizing (control/bidi characters,
 one line, 160 chars), collision refusal against Conductor's command catalog, and explicit
 loading / error / unsupported / empty states in the list.
@@ -107,3 +108,22 @@ small: the hooks are in six existing files, the rest is new modules; the largest
   `SLASH_COMMANDS` could still shadow a same-named skill.
 - `~/.claude/skills` is read from the real home of the process; Windows paths are handled by
   `node:path`, but the scan was only exercised on Linux here.
+
+## Review fix (GPT integrator review of 8de49f5)
+
+- Finding: the per-root bound counted only visible names, so a root of arbitrarily many hidden
+  (dot) entries was enumerated without bound. Fix: `boundedDirectoryNames` counts every entry the
+  OS yields and stops at `SKILL_LIMITS.entriesPerRoot`; the root report and catalog carry
+  `truncated`. Regression in `src/main/skill-discovery.test.ts`: an endless all-hidden fake
+  iterator stops after `limit + 1` yields and is closed, and a real root of 401 dot files reports
+  `truncated` with no skills (the old code returned `truncated: false` after reading all of them).
+- Finding: "sorted before the cut" overstated determinism. Sorting happens after a capped,
+  OS-ordered prefix, so a truncated root's subset depends on enumeration order. The code comment,
+  `docs/skill-discovery.md` and this file now say so; within the cap the result is complete and
+  sorted.
+- No change to menu selection (drafts only, never sends), command precedence, collision refusal,
+  symlink/size/malformed guards or provider handling.
+- Verified: `tsc --noEmit` clean; focused files `skill-discovery`, `composer-skills`,
+  `slash-skill-commands`, `composer-commands`, `composer-starters`, `slash-commands`: 46 tests
+  passed. Full suite and smoke not rerun for this change (scanner-only fix; the smoke reads a root
+  of two skills).
