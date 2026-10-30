@@ -89,7 +89,7 @@ interface CliWindow {
 const parsesAsRow = (bytes: Buffer): boolean => { try { const row = JSON.parse(bytes.toString('utf8')); return Boolean(row) && typeof row === 'object' } catch { return false } }
 /** The rows after `fromByte` of an open transcript of `size` bytes: at most the newest `maxBytes`. */
 async function readCliWindow(handle: Pick<FileHandle, 'read'>, size: number, nativeId: string, fromByte: number, options: { maxBytes?: number; known?: Iterable<string> }): Promise<CliWindow> {
-  const maxBytes = Math.max(1, Math.floor(options.maxBytes ?? MAX_CLI_TIMING_BYTES))
+  const maxBytes = Math.min(MAX_CLI_TIMING_BYTES, Math.max(1, Math.floor(options.maxBytes ?? MAX_CLI_TIMING_BYTES)))
   const start = Math.max(fromByte, size - maxBytes), length = size - start
   const buffer = Buffer.alloc(length)
   let read = 0
@@ -171,17 +171,31 @@ function drift(before: FileStamp, after: FileStamp): 'none' | 'appended' | 'shra
   if (after.size > before.size) return 'appended'
   return before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs ? 'rewritten' : 'none'
 }
-/** Re-reads, once more and bounded to four fingerprint windows, the boundary's two ends and the read
- *  window's two ends: false when any of them is no longer what was verified or read. */
-async function endsUnchanged(handle: Pick<FileHandle, 'read'>, boundary: ClaudeHistoryBoundary, read: CliWindow): Promise<boolean> {
+/** Most bytes one re-verification read asks for: the window is compared piece by piece, never held a second time. */
+const VERIFY_CHUNK_BYTES = 64 * 1024
+/**
+ * Re-reads, once, everything the window read returned and compares it with those bytes, plus the
+ * boundary's two fingerprinted ends: the window's two ends first, then the middle in
+ * VERIFY_CHUNK_BYTES pieces. At most 2 * FINGERPRINT_BYTES + the window (itself at most
+ * MAX_CLI_TIMING_BYTES) is read, asynchronously, and never more than one piece is held beside the
+ * window. False at the first byte that differs or when the file ends early. The boundary's prefix
+ * between its two ends is not re-read: it is not part of the rows imported.
+ */
+async function windowUnchanged(handle: Pick<FileHandle, 'read'>, boundary: ClaudeHistoryBoundary, read: CliWindow): Promise<boolean> {
   if (boundary.bytes > 0) {
     const window = Math.min(boundary.bytes, FINGERPRINT_BYTES)
     if (await windowHash(handle, 0, window) !== boundary.head || await windowHash(handle, boundary.bytes - window, window) !== boundary.tail) return false
   }
-  const window = Math.min(read.raw.length, FINGERPRINT_BYTES)
-  if (!window) return true
-  const head = await readExactly(handle, read.start, window), tail = await readExactly(handle, read.start + read.raw.length - window, window)
-  return Boolean(head && tail) && head!.equals(read.raw.subarray(0, window)) && tail!.equals(read.raw.subarray(read.raw.length - window))
+  const raw = read.raw, ends = Math.min(raw.length, FINGERPRINT_BYTES)
+  if (!ends) return true
+  const head = await readExactly(handle, read.start, ends), tail = await readExactly(handle, read.start + raw.length - ends, ends)
+  if (!head || !tail || !head.equals(raw.subarray(0, ends)) || !tail.equals(raw.subarray(raw.length - ends))) return false
+  for (let at = ends; at < raw.length - ends; at += VERIFY_CHUNK_BYTES) {
+    const length = Math.min(VERIFY_CHUNK_BYTES, raw.length - ends - at)
+    const chunk = await readExactly(handle, read.start + at, length)
+    if (!chunk || !chunk.equals(raw.subarray(at, at + length))) return false
+  }
+  return true
 }
 
 /**
@@ -198,22 +212,26 @@ async function endsUnchanged(handle: Pick<FileHandle, 'read'>, boundary: ClaudeH
  *  - a short read (the file ended before the size read to), a smaller file, another file (the handle's
  *    identity, or the path now naming a different one), or a same-size file with a newer modification
  *    or change time imports nothing: unavailable (file-shrank, file-replaced, file-changed);
- *  - a file that only GREW is a bounded snapshot: the rows up to the size first seen are read and kept
- *    if the ends of the boundary and of the window are still the bytes read, and the status is
- *    `partial` (file-changed), with fileBytes the newest size seen, so the appended rows are visibly
- *    unread rather than silently missing. A later return to Chat does not re-read them;
+ *  - a file that only GREW is a bounded snapshot: the rows up to the size first seen are kept only if
+ *    every byte of the window (at most MAX_CLI_TIMING_BYTES) and both ends of the boundary are re-read
+ *    once and found equal to what was read, and the file then did not move again while that check
+ *    ran (no retry: any further growth, shrink or rewrite is unavailable). The status is `partial`
+ *    (file-changed), with fileBytes the newer size, so the appended rows are visibly unread rather
+ *    than silently missing. A later return to Chat does not re-read them;
  *  - a last row without its newline that does not parse (its writer was mid-write) is not used and
  *    makes the read `partial` (file-changed) rather than `complete`.
  * A window that did not reach back to the boundary is `partial` too. `file-changed` takes precedence
  * over `window-truncated` as the reason; bytesSkipped still shows the truncation.
  *
- * Limits that remain, by design (nothing here reads or hashes an unbounded prefix): only the first
- * and last FINGERPRINT_BYTES of the boundary prefix and of the window are compared, so a rewrite that
- * keeps the size, both ends, and the file's identity AND leaves its modification and change times as
- * they were (a clock too coarse to tell two writes apart, or timestamps set back) is not seen; and a
- * rewrite that happened before the capture started, strictly between the fingerprinted ends of the
- * boundary prefix, is not seen either. Only a rewrite during the capture that changes size,
- * identity or either time is.
+ * Limits that remain, by design (nothing here reads or hashes an unbounded prefix): the boundary
+ * prefix is compared only at its first and last FINGERPRINT_BYTES, so a rewrite that happened before
+ * the capture started, strictly between them, is not seen. Without growth the window is compared
+ * with itself by the size, identity and modification and change times only, so a rewrite that keeps
+ * all of them (a clock too coarse to tell two writes apart, or timestamps set back) is not seen; a
+ * rewrite that lands before the window is read is then part of what is read. With growth, the
+ * times move for the append too, so a rewrite made before or while the window is read cannot be told
+ * from it and is part of what is read; one made after the window was read, or while it is re-read,
+ * is seen by the full comparison and the movement check.
  */
 export async function captureClaudeCliToolCalls(cwd: string, nativeId: string, handoff: { claudeBoundary?: unknown; claudeBytes?: unknown }, options: { maxBytes?: number; known?: Iterable<string> } = {}, fs: CaptureFs = realFs): Promise<{ tools: TranscriptToolCall[]; coverage: CliCaptureCoverage }> {
   const coverage = (status: CliCaptureCoverage['status'], reason: CliCaptureReason, extra: Partial<CliCaptureCoverage> = {}): { tools: TranscriptToolCall[]; coverage: CliCaptureCoverage } =>
@@ -262,11 +280,15 @@ export async function captureClaudeCliToolCalls(cwd: string, nativeId: string, h
 
     let fileBytes = size
     if (moved === 'appended') {
-      // Rows were appended after the snapshot: kept up to the snapshot only if both of its ends are still the bytes read.
-      if (!await endsUnchanged(handle, boundary, read)) return unavailable('rewritten', afterRead.size)
+      // Rows were appended after the snapshot: kept up to the snapshot only if every byte of the window is still the byte read,
+      // and the file then did not move once more while that was checked. One pass, no retry: any movement is unavailable.
+      if (!await windowUnchanged(handle, boundary, read)) {
+        const now = await handle.stat({ bigint: true }), moved = drift(stampOf(afterRead), stampOf(now))
+        return unavailable(moved === 'shrank' || moved === 'replaced' ? moved : 'rewritten', now.size)
+      }
       const settled = await handle.stat({ bigint: true })
-      const afterAppend = drift(stampOf(afterRead), stampOf(settled))
-      if (afterAppend === 'shrank' || afterAppend === 'replaced' || afterAppend === 'rewritten') return unavailable(afterAppend, settled.size)
+      const duringCheck = drift(stampOf(afterRead), stampOf(settled))
+      if (duringCheck !== 'none') return unavailable(duringCheck, settled.size)
       fileBytes = Number(settled.size)
       if (!Number.isSafeInteger(fileBytes)) return coverage('unavailable', 'file-unreadable', { boundaryBytes: boundary.bytes })
     }
