@@ -141,6 +141,42 @@ describe('ToolTimingRecorder', () => {
     expect(third.records().map(record => [record.itemId, record.outcome])).toEqual([['done', 'completed'], ['long', 'completed']])
   })
 
+  it('times an abandoned call that ends later in this process on the provider clock, and keeps review apart', () => {
+    const { tool, session, advance, records } = harness()
+    tool('p', 'running', { name: 'Command', providerStartedAtMs: 1_000 }, { provider: 'codex' })
+    session('completed')
+    advance(50)
+    tool('p', 'completed', { name: 'Command', providerCompletedAtMs: 7_000, providerReviewMs: 250 }, { provider: 'codex' })
+    expect(records()[0]).toMatchObject({ outcome: 'completed', elapsedMs: 6_000, elapsedSource: 'provider', reviewMs: 250, reviewSource: 'provider-review', waitMs: null, notes: ['turn-ended-without-tool-end', 'ended-after-abandon'] })
+  })
+
+  it('rejects an invalid provider review and never folds review into wait', () => {
+    const { tool, advance, records } = harness()
+    tool('r', 'awaiting_approval', { name: 'Command' }, { provider: 'codex' })
+    advance(400)
+    tool('r', 'running', { name: 'Command' }, { provider: 'codex' })
+    tool('r', 'completed', { name: 'Command', providerReviewMs: -3 }, { provider: 'codex' })
+    const [record] = records()
+    expect(record).toMatchObject({ waitMs: 400, waitSource: 'observed-approval', notes: ['invalid-provider-review'] })
+    expect(record!.reviewMs).toBeUndefined()
+  })
+
+  it('persists provider elapsed and review across a restart, and refuses a malformed review on load', async () => {
+    const directory = tempDir()
+    const first = harness({ directory })
+    first.tool('c', 'running', { name: 'Command', providerStartedAtMs: 100 }, { provider: 'codex' })
+    first.tool('c', 'completed', { name: 'Command', providerCompletedAtMs: 900, providerReviewMs: 40 }, { provider: 'codex' })
+    first.recorder.dispose()
+    const second = harness({ directory, wall: first.clock.wall + 1000 })
+    await second.recorder.load()
+    expect(second.records()).toEqual([expect.objectContaining({ itemId: 'c', elapsedMs: 800, elapsedSource: 'provider', reviewMs: 40, reviewSource: 'provider-review' })])
+    second.recorder.dispose()
+    const line = JSON.stringify({ v: 1, ...second.records()[0] })
+    expect(parseRecord(line)).toMatchObject({ reviewMs: 40 })
+    expect(parseRecord(line.replace('"reviewMs":40', '"reviewMs":-1'))).toBeNull()
+    expect(parseRecord(line.replace('"reviewSource":"provider-review"', '"reviewSource":"observed-approval"'))).toBeNull()
+  })
+
   it('bounds memory and file: capacity, retention, corrupt lines', async () => {
     const directory = tempDir()
     const now = Date.parse('2026-10-29T10:00:00.000Z')

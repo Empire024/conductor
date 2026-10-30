@@ -184,7 +184,11 @@ export type AgentEventData =
   | { type: 'text'; role: 'user' | 'assistant' | 'status'; text: string; mode: 'delta' | 'snapshot'; attachments?: Omit<ContextAttachment, 'content'>[]; origin?: PromptOrigin }
   /** `detached` is true only for provider-confirmed background work that can outlive its parent
    * turn. It remains a tool/process, not a subagent, but terminal parent phases must not end it. */
-  | { type: 'tool'; name: string; description?: string; input?: Json; inputDelta?: string; status: ActivityStatus; detached?: boolean; output?: string; outputMode?: 'delta' | 'snapshot'; stderr?: string; exitCode?: number; durationMs?: number; outputArtifactId?: string }
+  | { type: 'tool'; name: string; description?: string; input?: Json; inputDelta?: string; status: ActivityStatus; detached?: boolean; output?: string; outputMode?: 'delta' | 'snapshot'; stderr?: string; exitCode?: number; durationMs?: number; outputArtifactId?: string
+      /** The provider's own Unix-ms stamps for this item's lifecycle (Codex item/started, item/completed), when it sent them. */
+      providerStartedAtMs?: number; providerCompletedAtMs?: number
+      /** Union of the provider's completed auto-approval reviews of this item, on its own clock (Codex guardian). Not human approval wait. */
+      providerReviewMs?: number }
   | { type: 'changes'; changes: FileChange[] }
   | { type: 'interaction'; interaction: PendingInteraction }
   | { type: 'plan'; steps: Array<{ text: string; status: 'pending' | 'in_progress' | 'completed' }>; explanation?: string }

@@ -9,14 +9,22 @@
  * event Conductor saw for the call; a call first seen already finished has no elapsed time. Wait
  * is the time spent in `awaiting_approval`, and only when that phase was seen. Execution is the
  * provider's own duration, or Conductor's observed `running` phase; never elapsed minus wait.
+ * Where a provider stamps an item's start and end on its own clock (Codex), elapsed is that
+ * provider interval instead, labelled `provider`; host and provider stamps are never subtracted
+ * from each other. A provider's automatic approval review is `reviewMs`, apart from wait.
  * A missing measurement is null and counted as unavailable, never as zero.
  */
 
 export type ToolTimingOutcome = 'completed' | 'failed' | 'rejected' | 'interrupted' | 'abandoned'
 export type ToolCategory = 'shell' | 'file-read' | 'file-write' | 'search' | 'web' | 'mcp' | 'agent' | 'other'
 /** host-monotonic: this process' monotonic clock; wall-clock: across a restart, where only wall
- *  time survives (bounded to a day, never negative). */
-export type ElapsedSource = 'host-monotonic' | 'wall-clock' | 'unavailable'
+ *  time survives (bounded to a day, never negative); provider: the provider's own start and end
+ *  stamps of the item's lifecycle, both on its clock (Codex startedAtMs → completedAtMs). That is
+ *  lifecycle time, not execution, and is never mixed with a host stamp. */
+export type ElapsedSource = 'host-monotonic' | 'wall-clock' | 'provider' | 'unavailable'
+/** provider-review: the provider's own auto-approval review time (Codex guardian), overlaps counted
+ *  once. Kept apart from WaitSource, which is a human approval this host observed. */
+export type ReviewSource = 'provider-review'
 export type WaitSource = 'observed-approval' | 'unavailable'
 export type ExecSource = 'provider' | 'host-phase' | 'unavailable'
 
@@ -45,6 +53,9 @@ export interface ToolTimingRecord {
   execSource: ExecSource
   /** Time the call spent in `preparing` (the model still writing its arguments), when seen. */
   prepareMs: number | null
+  /** The provider's automatic approval review of this call (absent: none reported). Not part of waitMs. */
+  reviewMs?: number
+  reviewSource?: ReviewSource
   outcome: ToolTimingOutcome
   exitCode?: number
   /** First meaningful line of a failure's output, masked and bounded. */
@@ -83,9 +94,10 @@ export interface ToolAggregate {
   wait: DurationStats
   exec: DurationStats
   prepare: DurationStats
+  review: DurationStats
 }
 export interface FailureGroup { tool: string; provider: string; count: number; calls: number; exitCodes: number[]; lastError: string | null; lastAt: string; example: string }
-export interface ProviderCoverage { provider: string; calls: number; elapsed: number; wait: number; exec: number; execFromProvider: number; abandoned: number }
+export interface ProviderCoverage { provider: string; calls: number; elapsed: number; elapsedFromProvider: number; wait: number; review: number; exec: number; execFromProvider: number; abandoned: number }
 export interface ToolOffender {
   kind: 'failure-rate' | 'approval-wait' | 'slow' | 'repeated' | 'argument-streaming' | 'abandoned' | 'coverage'
   tool: string
@@ -100,7 +112,7 @@ export interface ToolTimingsReport {
   filters: Omit<ToolTimingsQuery, 'limit' | 'recent'>
   window: { from: string | null; to: string | null }
   totals: { calls: number; failures: number; failureRate: number | null; abandoned: number; detached: number; inFlight: number }
-  coverage: { elapsed: number; wait: number; exec: number; providers: ProviderCoverage[] }
+  coverage: { elapsed: number; wait: number; review: number; exec: number; providers: ProviderCoverage[] }
   tools: ToolAggregate[]
   slowest: ToolTimingRecord[]
   failures: FailureGroup[]
@@ -119,7 +131,7 @@ export const TOOL_TIMING_LIMITS = { top: 10, maxTop: 50, maxRecent: 100, args: 1
 /** What each provider's events can and cannot say; repeated in every report so a missing number
  *  reads as a gap of that provider rather than a fast tool. */
 export const TOOL_TIMING_GAPS: Readonly<Record<string, string>> = {
-  codex: 'Codex: commandExecution, mcpToolCall and dynamicToolCall report their own durationMs (exec = provider). File changes and web search report none. Approval wait is observed when the app-server asks.',
+  codex: 'Codex: commandExecution, mcpToolCall and dynamicToolCall report their own durationMs (exec = provider). File changes and web search report none. Elapsed is the provider\'s item lifecycle (startedAtMs → completedAtMs) when both stamps arrived, else host-observed; an item seen only completing has none. Human approval wait is observed when the app-server asks; the automatic approval review is reported separately (review, provider clock; unstable protocol, reviews without a target item are not attributed).',
   claude: 'Claude: the stream reports no tool duration; exec is Conductor\'s observed running phase (includes stream transport latency). Auto-mode classifier time inside the CLI is not visible, so wait is unavailable unless a card was raised.',
   grok: 'Grok: no tool duration; exec is the observed running phase. Approval wait is observed when the ACP permission request arrives.',
   local: 'Local model: Conductor\'s own runtime measures each tool (exec = provider). There is no approval phase, so wait is unavailable.',
@@ -320,7 +332,8 @@ export function aggregateToolTimings(all: readonly ToolTimingRecord[], query: To
   for (const record of records) { const list = byTool.get(record.tool); if (list) list.push(record); else byTool.set(record.tool, [record]) }
   const tools: ToolAggregate[] = [...byTool.entries()].map(([tool, list]) => ({
     tool, category: list[0]!.category, providers: [...new Set(list.map(record => record.provider))].sort(), calls: list.length, failures: list.filter(isFailure).length,
-    elapsed: stats(list.map(record => record.elapsedMs)), wait: stats(list.map(record => record.waitMs)), exec: stats(list.map(record => record.execMs)), prepare: stats(list.map(record => record.prepareMs))
+    elapsed: stats(list.map(record => record.elapsedMs)), wait: stats(list.map(record => record.waitMs)), exec: stats(list.map(record => record.execMs)), prepare: stats(list.map(record => record.prepareMs)),
+    review: stats(list.map(record => record.reviewMs ?? null))
   })).sort((a, b) => (b.elapsed.totalMs || b.exec.totalMs) - (a.elapsed.totalMs || a.exec.totalMs) || b.calls - a.calls).slice(0, limit)
   const slowest = records.filter(record => spentMs(record) !== null).sort((a, b) => spentMs(b)! - spentMs(a)!).slice(0, limit)
   const failureGroups = new Map<string, FailureGroup>()
@@ -336,10 +349,12 @@ export function aggregateToolTimings(all: readonly ToolTimingRecord[], query: To
   }
   const providers = new Map<string, ProviderCoverage>()
   for (const record of records) {
-    const row = providers.get(record.provider) ?? { provider: record.provider, calls: 0, elapsed: 0, wait: 0, exec: 0, execFromProvider: 0, abandoned: 0 }
+    const row = providers.get(record.provider) ?? { provider: record.provider, calls: 0, elapsed: 0, elapsedFromProvider: 0, wait: 0, review: 0, exec: 0, execFromProvider: 0, abandoned: 0 }
     row.calls++
     if (record.elapsedMs !== null) row.elapsed++
+    if (record.elapsedSource === 'provider') row.elapsedFromProvider++
     if (record.waitMs !== null) row.wait++
+    if (record.reviewMs !== undefined) row.review++
     if (record.execMs !== null) row.exec++
     if (record.execSource === 'provider') row.execFromProvider++
     if (record.outcome === 'abandoned') row.abandoned++
@@ -354,7 +369,7 @@ export function aggregateToolTimings(all: readonly ToolTimingRecord[], query: To
     filters,
     window: { from: ended[0] ?? null, to: ended.at(-1) ?? null },
     totals: { calls: records.length, failures: failures.length, failureRate: records.length ? Math.round(failures.length / records.length * 1000) / 1000 : null, abandoned: records.filter(record => record.outcome === 'abandoned').length, detached: matched.filter(record => record.detached).length, inFlight: context.inFlight },
-    coverage: { elapsed: share(records.filter(record => record.elapsedMs !== null).length), wait: share(records.filter(record => record.waitMs !== null).length), exec: share(records.filter(record => record.execMs !== null).length), providers: [...providers.values()].sort((a, b) => b.calls - a.calls) },
+    coverage: { elapsed: share(records.filter(record => record.elapsedMs !== null).length), wait: share(records.filter(record => record.waitMs !== null).length), review: share(records.filter(record => record.reviewMs !== undefined).length), exec: share(records.filter(record => record.execMs !== null).length), providers: [...providers.values()].sort((a, b) => b.calls - a.calls) },
     tools,
     slowest,
     failures: [...failureGroups.values()].sort((a, b) => b.count - a.count || b.lastAt.localeCompare(a.lastAt)).slice(0, limit),

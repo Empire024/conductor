@@ -63,6 +63,10 @@ interface OpenCall {
   waitMs: number | null
   prepareMs: number | null
   runningMs: number | null
+  /** The provider's own start stamp (Unix ms, its clock), first one seen; null when it sent none. */
+  providerStartedAtMs: number | null
+  /** The provider's union of auto-approval reviews, when it reported one. Never host wait. */
+  reviewMs: number | null
 }
 
 type Observed = Pick<AgentEvent, 'id' | 'sessionId' | 'runtimeId' | 'provider' | 'projectId' | 'itemId' | 'turnId' | 'timestamp' | 'data'>
@@ -83,6 +87,8 @@ export class ToolTimingRecorder {
    *  its runtime incarnation (or this process) amends the record instead of adding a second one. */
   private readonly abandoned = new Map<string, ToolTimingRecord>()
   private readonly abandonedMono = new WeakMap<ToolTimingRecord, number>()
+  /** The provider start stamp of an abandoned call, so its later end can still be timed on the provider's clock. */
+  private readonly abandonedProviderStart = new WeakMap<ToolTimingRecord, number>()
   private readonly aliases = new WeakMap<ToolTimingRecord, string>()
   private readonly open = new Map<string, OpenCall>()
   private readonly inFlight = new Map<string, number>()
@@ -246,6 +252,8 @@ export class ToolTimingRecorder {
     if (data.name) call.record.tool = data.name.slice(0, TOOL_TIMING_LIMITS.tool)
     if (!call.record.args && data.input !== undefined) call.record.args = summarizeToolArgs(call.record.tool, data.input, this.mask)
     if (data.detached) call.record.detached = true
+    if (call.providerStartedAtMs === null && data.providerStartedAtMs !== undefined) call.providerStartedAtMs = data.providerStartedAtMs
+    if (data.providerReviewMs !== undefined) call.reviewMs = data.providerReviewMs
     if (event.turnId && !call.record.turnId) call.record.turnId = event.turnId
     if (data.status !== call.phase) {
       this.closePhase(call, mono)
@@ -262,6 +270,7 @@ export class ToolTimingRecorder {
       key, firstMono: mono, phase: data.status, phaseMono: mono,
       // A phase is only measured when Conductor saw the call enter it.
       waitMs: data.status === 'awaiting_approval' ? 0 : null, prepareMs: data.status === 'preparing' ? 0 : null, runningMs: data.status === 'running' ? 0 : null,
+      providerStartedAtMs: null, reviewMs: null,
       record: {
         key, agentSessionId: event.sessionId, projectId: event.projectId, provider: event.provider, runtimeId: event.runtimeId, itemId,
         ...(event.turnId ? { turnId: event.turnId } : {}), ...(model ? { model } : {}),
@@ -287,11 +296,15 @@ export class ToolTimingRecorder {
     const provider = providerDuration(data.durationMs)
     const notes: string[] = []
     if (data.durationMs !== undefined && provider === null) notes.push('invalid-provider-duration')
+    const lifecycle = providerInterval(call.providerStartedAtMs, data.providerCompletedAtMs, notes)
+    const review = providerReview(call.reviewMs, notes)
     const record: ToolTimingRecord = {
       ...call.record,
       endedAt: new Date(this.wallNow()).toISOString(),
-      elapsedMs: wasOpen ? Math.max(0, mono - call.firstMono) : null,
-      elapsedSource: wasOpen ? 'host-monotonic' : 'unavailable',
+      // The provider's own start-to-end on its own clock; otherwise what this host saw, never a mix.
+      ...(lifecycle !== null ? { elapsedMs: lifecycle, elapsedSource: 'provider' as const }
+        : { elapsedMs: wasOpen ? Math.max(0, mono - call.firstMono) : null, elapsedSource: wasOpen ? 'host-monotonic' as const : 'unavailable' as const }),
+      ...(review !== null ? { reviewMs: review, reviewSource: 'provider-review' as const } : {}),
       waitMs: call.waitMs, waitSource: call.waitMs === null ? 'unavailable' : 'observed-approval',
       execMs: provider ?? call.runningMs, execSource: provider !== null ? 'provider' : call.runningMs !== null ? 'host-phase' : 'unavailable',
       prepareMs: call.prepareMs,
@@ -313,12 +326,15 @@ export class ToolTimingRecorder {
     const wall = record.startedAt ? this.wallNow() - Date.parse(record.startedAt) : NaN
     const provider = providerDuration(data.durationMs)
     const notes = [...(record.notes ?? []).filter(note => note !== 'abandoned'), 'ended-after-abandon']
+    const lifecycle = providerInterval(this.abandonedProviderStart.get(record) ?? null, data.providerCompletedAtMs, notes)
+    const review = data.providerReviewMs !== undefined ? providerReview(data.providerReviewMs, notes) : null
     const amended: ToolTimingRecord = {
       ...record,
       ...(data.name ? { tool: data.name.slice(0, TOOL_TIMING_LIMITS.tool), category: toolCategory(data.name) } : {}),
       runtimeId: event.runtimeId,
       endedAt: new Date(this.wallNow()).toISOString(),
-      ...(firstMono !== undefined ? { elapsedMs: Math.max(0, mono - firstMono), elapsedSource: 'host-monotonic' as const }
+      ...(review !== null ? { reviewMs: review, reviewSource: 'provider-review' as const } : {}),
+      ...(lifecycle !== null ? { elapsedMs: lifecycle, elapsedSource: 'provider' as const } : firstMono !== undefined ? { elapsedMs: Math.max(0, mono - firstMono), elapsedSource: 'host-monotonic' as const }
         : Number.isFinite(wall) && wall >= 0 && wall <= DAY_MS ? { elapsedMs: wall, elapsedSource: 'wall-clock' as const } : { elapsedMs: null, elapsedSource: 'unavailable' as const }),
       ...(provider !== null ? { execMs: provider, execSource: 'provider' as const } : {}),
       outcome: data.status as ToolTimingOutcome,
@@ -363,6 +379,7 @@ export class ToolTimingRecorder {
       execMs: null, execSource: 'unavailable', prepareMs: call.prepareMs, outcome: 'abandoned', notes: ['abandoned', reason]
     }
     this.abandonedMono.set(record, call.firstMono)
+    if (call.providerStartedAtMs !== null) this.abandonedProviderStart.set(record, call.providerStartedAtMs)
     this.commit(record)
   }
 
@@ -468,6 +485,22 @@ function providerDuration(value: number | undefined): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= MAX_PROVIDER_MS ? value : null
 }
 
+/** End minus start, both the provider's own stamps on its own clock. Null when either was not sent;
+ *  a stamp that is negative, reversed or implausibly far apart is noted and not trusted. */
+function providerInterval(start: number | null, end: number | undefined, notes: string[]): number | null {
+  if (start === null || end === undefined) return null
+  const valid = [start, end].every(value => typeof value === 'number' && Number.isFinite(value) && value >= 0) && end >= start && end - start <= MAX_PROVIDER_MS
+  if (!valid) { notes.push('invalid-provider-interval'); return null }
+  return end - start
+}
+
+function providerReview(value: number | null | undefined, notes: string[]): number | null {
+  if (value === null || value === undefined) return null
+  const review = providerDuration(value)
+  if (review === null) notes.push('invalid-provider-review')
+  return review
+}
+
 const OUTCOMES = new Set<ToolTimingOutcome>(['completed', 'failed', 'rejected', 'interrupted', 'abandoned'])
 const nullableNumber = (value: unknown): value is number | null => value === null || (typeof value === 'number' && Number.isFinite(value) && value >= 0)
 /** A line the file holds, or null when it is not one this version wrote. */
@@ -478,6 +511,7 @@ export function parseRecord(line: string): ToolTimingRecord | null {
   const strings = ['key', 'agentSessionId', 'projectId', 'provider', 'runtimeId', 'itemId', 'tool', 'category', 'args', 'endedAt'] as const
   if (strings.some(key => typeof value[key] !== 'string') || !Number.isFinite(Date.parse(value.endedAt as string))) return null
   if (!OUTCOMES.has(value.outcome as ToolTimingOutcome) || !nullableNumber(value.elapsedMs) || !nullableNumber(value.waitMs) || !nullableNumber(value.execMs) || !nullableNumber(value.prepareMs)) return null
+  if (value.reviewMs !== undefined && (typeof value.reviewMs !== 'number' || !Number.isFinite(value.reviewMs) || value.reviewMs < 0 || value.reviewSource !== 'provider-review')) return null
   const { v: _v, ...record } = value
   return { concurrent: 0, startedAt: null, ...record } as unknown as ToolTimingRecord
 }

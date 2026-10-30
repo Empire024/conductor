@@ -32,6 +32,7 @@ export function ToolTimingsSetting(): React.JSX.Element {
       .then(setReport).catch(reason => setError(reason instanceof Error ? reason.message : String(reason)))
   }, [windowMs, provider])
   useEffect(load, [load])
+  const review = Boolean(report?.tools.some(tool => tool.review.measured > 0))
 
   return <section className="tool-timings-setting" aria-label="Tool timings">
     <div className="settings-section-title"><Timer size={14} /><div><strong>Tool timings</strong><span>Structured tool calls recorded from Claude, Codex, Grok and local-model tabs. p50 / p95; a time nobody measured shows as n/a.</span></div></div>
@@ -50,14 +51,15 @@ export function ToolTimingsSetting(): React.JSX.Element {
       <p className="tool-timings-summary" data-calls={report.totals.calls}>
         {report.totals.calls} calls · {report.totals.failures} failed{report.totals.failureRate !== null ? ` (${percent(report.totals.failureRate)})` : ''} · {report.totals.inFlight} running
         {report.totals.abandoned > 0 && ` · ${report.totals.abandoned} never ended`}
-        <br /><small>Measured: elapsed {percent(report.coverage.elapsed)}, approval wait {percent(report.coverage.wait)}, execution {percent(report.coverage.exec)} of calls</small>
+        <br /><small>Measured: elapsed {percent(report.coverage.elapsed)}, approval wait {percent(report.coverage.wait)}, execution {percent(report.coverage.exec)} of calls{report.coverage.review > 0 && `; provider auto-review ${percent(report.coverage.review)}, shown apart from approval wait`}</small>
       </p>
       {report.totals.calls === 0 && <p className="tool-timings-empty">No tool calls recorded in this window.</p>}
       {report.tools.length > 0 && <table className="tool-timings-table">
-        <thead><tr><th>Tool</th><th>Calls</th><th>Failed</th><th>Elapsed</th><th>Execution</th><th>Approval wait</th></tr></thead>
+        <thead><tr><th>Tool</th><th>Calls</th><th>Failed</th><th>Elapsed</th><th>Execution</th><th>Approval wait</th>{review && <th title="The provider's own automatic approval review, on its clock: not part of approval wait">Auto-review</th>}</tr></thead>
         <tbody>{report.tools.map(tool => <tr key={tool.tool} data-tool={tool.tool}>
           <td title={tool.providers.join(', ')}>{tool.tool}</td><td>{tool.calls}</td><td className={tool.failures ? 'failed' : ''}>{tool.failures}</td>
           <td><Stat stats={tool.elapsed} label="Elapsed" /></td><td><Stat stats={tool.exec} label="Execution" /></td><td><Stat stats={tool.wait} label="Approval wait" /></td>
+          {review && <td><Stat stats={tool.review} label="Provider auto-review" /></td>}
         </tr>)}</tbody>
       </table>}
       {report.offenders.length > 0 && <>
@@ -72,7 +74,7 @@ export function ToolTimingsSetting(): React.JSX.Element {
         <h4>Slowest calls</h4>
         <ul className="tool-timings-slowest">{report.slowest.slice(0, 5).map(record => <li key={record.key}>
           <span>{record.tool}</span><code title={record.args}>{record.args || '—'}</code>
-          <span title={record.elapsedMs !== null ? `elapsed (${record.elapsedSource})` : `execution (${record.execSource}); elapsed not measured`}>{formatToolMs(record.elapsedMs ?? record.execMs)} <small>{record.elapsedMs !== null ? 'elapsed' : `exec · ${record.execSource}`}</small></span>
+          <span title={record.elapsedMs !== null ? `elapsed (${record.elapsedSource})` : `execution (${record.execSource}); elapsed not measured`}>{formatToolMs(record.elapsedMs ?? record.execMs)} <small>{record.elapsedMs !== null ? record.elapsedSource === 'provider' ? 'elapsed · provider' : 'elapsed' : `exec · ${record.execSource}`}</small></span>
         </li>)}</ul>
       </>}
       <details className="tool-timings-gaps" open><summary>What each provider cannot report</summary><ul>{report.gaps.map(gap => <li key={gap}>{gap}</li>)}</ul>

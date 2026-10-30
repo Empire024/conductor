@@ -92,6 +92,31 @@ const requestKey = (id: string | number): string => `${typeof id}:${id}`
 const asyncQuestionId = (threadId: string, itemId: string): string => `codex-async:${threadId}:${itemId}`
 const textOutput = (value: unknown): string => typeof value === 'string' ? value : JSON.stringify(value, null, 2)
 const isId = (id: unknown): id is string | number => typeof id === 'string' || (typeof id === 'number' && Number.isFinite(id))
+/** A provider Unix-ms stamp as sent: any finite number. Whether it is plausible is the recorder's call. */
+const finiteMs = (value: unknown): number | undefined => typeof value === 'number' && Number.isFinite(value) ? value : undefined
+/** Auto-approval reviews kept per item and items with reviews kept at once (Codex guardian, unstable). */
+const MAX_REVIEWS_PER_ITEM = 16
+const MAX_REVIEWED_ITEMS = 512
+/** The time covered by intervals on one clock, overlaps counted once. */
+export function unionMs(intervals: Iterable<readonly [number, number]>): number {
+  let total = 0, end = -Infinity
+  for (const [start, stop] of [...intervals].sort((a, b) => a[0] - b[0])) {
+    if (stop <= end) continue
+    total += stop - Math.max(start, end)
+    end = stop
+  }
+  return total
+}
+/** A completed guardian review that names its target item, with a sane interval; anything else
+ *  (a network review, a reshaped payload) attributes no time to any tool. */
+function reviewInterval(params: unknown): { reviewId: string; targetItemId: string; interval: [number, number] } | undefined {
+  if (!record(params)) return undefined
+  const { reviewId, targetItemId, startedAtMs, completedAtMs } = params
+  if (typeof reviewId !== 'string' || !reviewId || reviewId.length > 256 || typeof targetItemId !== 'string' || !targetItemId || targetItemId.length > 256) return undefined
+  const start = finiteMs(startedAtMs), stop = finiteMs(completedAtMs)
+  if (start === undefined || stop === undefined || start < 0 || stop < start || stop - start > 7 * 24 * 60 * 60 * 1000) return undefined
+  return { reviewId, targetItemId, interval: [start, stop] }
+}
 const statusFor = (status: string, complete: boolean): ActivityStatus => status === 'failed' ? 'failed' : status === 'declined' ? 'rejected' : status === 'interrupted' ? 'interrupted' : complete ? 'completed' : status === 'inProgress' ? 'running' : 'preparing'
 /**
  * Codex's own `/permissions` presets, expressed in the modes the composer offers; the composer
@@ -561,6 +586,8 @@ export class CodexAdapter implements ProviderAdapter {
    * accepted request settings, but must re-emit the exact terminal phase rather than `running`. */
   private completedTurns = new Map<string, 'completed' | 'failed' | 'interrupted'>()
   private completedItems = new Set<string>()
+  /** Completed auto-approval review intervals by target item and reviewId, until that item completes. */
+  private reviews = new Map<string, Map<string, [number, number]>>()
   private defaults?: ThreadStartResponse
   private models: Model[] = []
   private experimental = false
@@ -1104,8 +1131,25 @@ export class CodexAdapter implements ProviderAdapter {
         return
       }
       case 'item/started': case 'item/completed':
-        this.item(params.item, context, method === 'item/completed', native)
+        // Each frame's own stamp only: a completion never implies when the item started.
+        this.item(params.item, context, method === 'item/completed', native, method === 'item/completed' ? { providerCompletedAtMs: finiteMs((params as { completedAtMs?: unknown }).completedAtMs) } : { providerStartedAtMs: finiteMs((params as { startedAtMs?: unknown }).startedAtMs) })
         return
+      case 'item/autoApprovalReview/completed': {
+        const review = reviewInterval(params)
+        if (review) {
+          const key = this.itemKey({ ...context, itemId: review.targetItemId })
+          let intervals = this.reviews.get(key)
+          if (!intervals && !this.completedItems.has(key)) {
+            if (this.reviews.size >= MAX_REVIEWED_ITEMS) this.reviews.delete(this.reviews.keys().next().value!)
+            this.reviews.set(key, intervals = new Map())
+          }
+          // A repeated reviewId replaces its own interval; beyond the cap a review is not counted.
+          if (intervals && (intervals.has(review.reviewId) || intervals.size < MAX_REVIEWS_PER_ITEM)) intervals.set(review.reviewId, review.interval)
+        }
+        // Still shown as before: the payload is unstable, and only its interval is used here.
+        this.unknown(method, params)
+        return
+      }
       case 'item/agentMessage/delta':
         if (typeof params.delta !== 'string') throw new Error('Invalid text delta')
         if (this.completedItems.has(this.itemKey(context))) return this.unknown(method, params, 'Late text after the authoritative item snapshot')
@@ -1192,7 +1236,7 @@ export class CodexAdapter implements ProviderAdapter {
     }
   }
 
-  private item(item: ThreadItem, context: Correlation, complete: boolean, native: AdapterEvent['native']): void {
+  private item(item: ThreadItem, context: Correlation, complete: boolean, native: AdapterEvent['native'], at: { providerStartedAtMs?: number; providerCompletedAtMs?: number } = {}): void {
     if (!record(item) || typeof item.id !== 'string' || typeof item.type !== 'string') throw new Error('Malformed Codex item')
     if (context.nativeSessionId === this.threadId && context.turnId === this.turnId) {
       if (item.type === 'enteredReviewMode') { this.turnKind = 'review'; this.emitPhase(true) }
@@ -1211,8 +1255,14 @@ export class CodexAdapter implements ProviderAdapter {
     const send = (data: AdapterEvent['data'], extra: Partial<AdapterEvent> = {}): void => this.emit({ ...correlation, data, native, ...extra })
     const tool = (name: string, data: Omit<Extract<AdapterEvent['data'], { type: 'tool' }>, 'type' | 'name'>): void => {
       if (this.items.size >= 2048) this.items.delete(this.items.keys().next().value!)
-      this.items.set(this.itemKey(correlation), { name, status: data.status, ...(item.type === 'fileChange' ? { paths: item.changes.map(change => change.path) } : {}) })
-      send({ type: 'tool', name, ...data })
+      const key = this.itemKey(correlation)
+      this.items.set(key, { name, status: data.status, ...(item.type === 'fileChange' ? { paths: item.changes.map(change => change.path) } : {}) })
+      const reviews = complete ? this.reviews.get(key) : undefined
+      if (complete) this.reviews.delete(key)
+      send({ type: 'tool', name, ...data,
+        ...(at.providerStartedAtMs !== undefined ? { providerStartedAtMs: at.providerStartedAtMs } : {}),
+        ...(at.providerCompletedAtMs !== undefined ? { providerCompletedAtMs: at.providerCompletedAtMs } : {}),
+        ...(reviews?.size ? { providerReviewMs: unionMs(reviews.values()) } : {}) })
     }
     switch (item.type) {
       case 'userMessage':
