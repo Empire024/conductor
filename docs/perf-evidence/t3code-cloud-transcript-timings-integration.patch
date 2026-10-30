@@ -1,0 +1,712 @@
+Exact increment: base 2736e20c25ff40b92881332841d05a39cce01418 (P3 export) -> implementation afd71210bee130ab22e303f9531845a6c703a91e
+Apply after the P3 patch: git apply --3way docs/perf-evidence/t3code-cloud-transcript-timings-integration.patch (see t3code-cloud-transcript-timings.md for shared hunks)
+
+diff --git a/scripts/fixtures/cloud-cli.cjs b/scripts/fixtures/cloud-cli.cjs
+index 4424be6..06201a8 100644
+--- a/scripts/fixtures/cloud-cli.cjs
++++ b/scripts/fixtures/cloud-cli.cjs
+@@ -31,8 +31,9 @@ if (args.includes('--teleport')) {
+   const usage = { input_tokens: 2, output_tokens: 120, cache_read_input_tokens: 1000, cache_creation_input_tokens: 500 }
+   const records = [
+     { type: 'user', timestamp: at, message: { role: 'user', content: 'Add a one-line note in NOTE.md on a branch and open a pull request.' } },
+-    { type: 'assistant', timestamp: at, message: { role: 'assistant', model: 'claude-opus-5-5', usage, content: [{ type: 'tool_use', name: 'Bash', input: { command: 'git push -u origin HEAD' } }] } },
+-    { type: 'user', timestamp: at, message: { role: 'user', content: [{ type: 'tool_result', content: 'To github.com:Empire024/conductor.git\n * [new branch] claude/fixture-note-x1' }] } },
++    // The cloud's own row times, ids and links, as the real teleport keeps them.
++    { type: 'assistant', uuid: 'fixture-assistant-1', timestamp: new Date(Date.parse(at) - 3000).toISOString(), message: { role: 'assistant', model: 'claude-opus-5-5', usage, content: [{ type: 'tool_use', id: 'toolu_fixture_push', name: 'Bash', input: { command: 'git push -u origin HEAD' } }] } },
++    { type: 'user', uuid: 'fixture-result-1', sourceToolAssistantUUID: 'fixture-assistant-1', timestamp: new Date(Date.parse(at) - 1500).toISOString(), toolUseResult: { stdout: '', stderr: '', interrupted: false, isImage: false, noOutputExpected: false }, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_fixture_push', content: 'To github.com:Empire024/conductor.git\n * [new branch] claude/fixture-note-x1' }] } },
+     { type: 'assistant', timestamp: at, message: { role: 'assistant', model: 'claude-opus-5-5', usage, content: [{ type: 'text', text: 'I added the note, pushed the branch and opened the pull request.' }] } },
+     { type: 'user', isMeta: false, timestamp: at, message: { role: 'user', content: 'This session is being continued from another machine. Application state may have changed.' } },
+     { type: 'cost-state', totalCostUSD: 0 }
+diff --git a/scripts/smoke-tool-timings.mjs b/scripts/smoke-tool-timings.mjs
+index e5ae591..b183ba6 100644
+--- a/scripts/smoke-tool-timings.mjs
++++ b/scripts/smoke-tool-timings.mjs
+@@ -57,7 +57,7 @@ try {
+   await expect(section.locator('tr[data-tool="PowerShell"] td').nth(3)).toHaveText('n/a')
+   // The headline claims recorded structured calls only, and says what is not recorded.
+   await expect(section.locator('.settings-section-title')).toContainText('Structured tool calls recorded')
+-  await expect(section.locator('.tool-timings-scope')).toContainText('Not recorded: raw CLI-view tabs, cloud coworkers')
++  await expect(section.locator('.tool-timings-scope')).toContainText('Not recorded: raw CLI-view tabs and conversations mirrored from another machine')
+   await expect(section.locator('.tool-timings-gaps')).toHaveAttribute('open', '')
+   await expect(section.locator('.tool-timings-slowest li').first()).toContainText('exec · provider')
+   await section.scrollIntoViewIfNeeded()
+diff --git a/src/main/agent-control.ts b/src/main/agent-control.ts
+index 931ce4b..c681c69 100644
+--- a/src/main/agent-control.ts
++++ b/src/main/agent-control.ts
+@@ -317,7 +317,7 @@ const toolSignatures = {
+   'local.stop': '({model?,pid?,force?,reason?,ownerApproval?}) — stop one running local model server this Conductor started, named by model or pid (both from local.servers), in one call. Refused while a turn is using it unless force:true, which asks the owner first (a wizard tab is the owner) and fails that turn; a server Conductor did not start is never stopped. A server another project started or protects is refused, naming that project and how to ask it (send_message({projectId})): a wizard tab of this project is not the owner there; only the owner credential, or ownerApproval:true with the owner approving the dialog, stops it. A server this project protected itself needs force:true and a reason. The next local turn starts its server again',
+   'local.protect': '({model?,pid?,reason,protect?}) — mark a local model server this project started as protected (protect:true, the default, with a reason another project is shown) or lift that (protect:false). Kept in the server\'s run record, so it survives a restart of Conductor and ends with the server. A protected server is never stopped to make room for another model, and local.stop from another project is refused naming this project and the reason. Only the project that started it may protect it (a server started before Conductor recorded that: a project with a conversation on it), only the protecting project lifts it, and the owner credential may do either',
+   'usage.weekly': '({provider?, weeks?}) — zero-turn weekly allowance report, so you can see before dispatching whether a provider’s weekly allowance is being used or left on the table: one row per provider window (split by the provider’s own reported reset, not calendar weeks; Claude seven_day and Fable weekly, Codex weekly), newest first, weeks (default 8, max 52) closed or current windows per bucket. Each row: status closed|current|no-data, startsAt/endsAt, peakPercent, finalPercent (last reading before the reset), usedUp and usedUpAt, unusedPercent, coverage complete|partial|none with notes (a stretch without readings is said to have none; nothing is interpolated), the current window’s projection at its pace so far, and tokens: processed/total tokens and cost Conductor recorded per model in that window (cost only where the provider reported one). Also recordedSince (earliest reading held) and unknown providers (Grok reports no allowance)',
+-  'tools.timings': '({projectId?,agentSessionId?,provider?,tool?,since?,until?,limit?,recent?,includeDetached?}) — zero-turn timing of the structured tool calls Conductor recorded in this project\'s Claude, Codex, Grok and local-model tabs (raw CLI-view tabs, cloud coworkers and conversations mirrored from another machine are not recorded; see gaps; docs/perf-evidence/t3code-cloud-tool-timings.md): totals and failure rate; coverage (the share of calls with a measured elapsed, approval wait and execution time, per provider); tools (per tool: calls, failures, and p50/p95/max/total for elapsed, wait, exec and argument streaming, each with measured and unavailable counts); slowest calls; failure groups with exit codes and a masked error line; offenders (failure rate, approval wait, slow, repeated, abandoned, coverage) each with its evidence and a suggested fix; recent (up to 100 raw records); storage (bounded records, retention, deduplicated restatements); gaps (what each provider cannot report). Arguments are a masked summary, never the full input. A time nobody measured is null and counted as unavailable, never zero; exec is the provider\'s own duration or the observed running phase, never elapsed minus wait. limit 1–50 (default 10); since/until ISO; detached background work is left out of latency unless includeDetached. projectId other than this project, or "*", is for the owner or a wizard tab only',
++  'tools.timings': '({projectId?,agentSessionId?,provider?,tool?,since?,until?,limit?,recent?,includeDetached?,origin?}) — zero-turn timing of the structured tool calls Conductor recorded in this project\'s Claude, Codex, Grok and local-model tabs (raw CLI-view tabs and conversations mirrored from another machine are not recorded; origin:"cloud-transcript" reports cloud coworkers\' calls read from their pulled transcripts instead, kept apart; see gaps; docs/perf-evidence/t3code-cloud-tool-timings.md): totals and failure rate; coverage (the share of calls with a measured elapsed, approval wait and execution time, per provider); tools (per tool: calls, failures, and p50/p95/max/total for elapsed, wait, exec and argument streaming, each with measured and unavailable counts); slowest calls; failure groups with exit codes and a masked error line; offenders (failure rate, approval wait, slow, repeated, abandoned, coverage) each with its evidence and a suggested fix; recent (up to 100 raw records); storage (bounded records, retention, deduplicated restatements); gaps (what each provider cannot report). Arguments are a masked summary, never the full input. A time nobody measured is null and counted as unavailable, never zero; exec is the provider\'s own duration or the observed running phase, never elapsed minus wait. limit 1–50 (default 10); since/until ISO; detached background work is left out of latency unless includeDetached. projectId other than this project, or "*", is for the owner or a wizard tab only',
+   'usage.limits': '({provider?}) — zero-turn read of the newest account allowance each provider reported: per provider and bucket (Claude five_hour, seven_day and model windows such as Fable weekly; Codex primary/secondary per limit bucket with its credits), usedPercent, resetsAt, windowMinutes, observedAt with its age and the conversation that reported it. A window whose resetsAt has passed says state "reset" (its current use is unknown until the provider reports again); a provider that reported nothing, or does not report an allowance at all (Grok), says status "unknown" and why. Figures are the provider’s own; nothing is estimated. Also carries localSavings: the conductor-local MCP tools\' (run_and_summarize, local_ask, summarize_file) measured frontier-token savings over the last 7 days — calls, modelCalls, localInputTokens/localOutputTokens and tokensSaved — or null where local assist is not wired',
+   'loops.list': '() — validated .conductor/loops/*.md definitions in this project, with version, triggers, inputs, budget and step count',
+   'loops.get': '({id}) — one validated logic loop including its instructions and exact model/effort/action steps',
+diff --git a/src/main/cloud/register.ts b/src/main/cloud/register.ts
+index f9c9534..e214ddd 100644
+--- a/src/main/cloud/register.ts
++++ b/src/main/cloud/register.ts
+@@ -4,6 +4,7 @@ import { BrowserWindow } from 'electron'
+ import * as pty from 'node-pty'
+ import { CLOUD_CHANNELS, type CloudRunSummary } from '../../shared/cloud'
+ import type { AgentControlUiRequest } from '../../shared/agent-control'
++import type { TranscriptToolCall } from '../../shared/tool-timings'
+ import type { PaneTab } from '../../shared/models'
+ import { registerCloudIpc } from './ipc'
+ import { CloudRuns, type CloudSpawn } from './runs'
+@@ -35,6 +36,8 @@ export function createCloud(options: {
+   /** The claude CLI, or null. */
+   claudeExecutable(): string | null
+   ui(request: AgentControlUiRequest): Promise<unknown>
++  /** The tool-timing recorder, once it exists: a pulled transcript's tool calls go there. */
++  toolTimings?(): { importCloudTranscript(input: { projectId: string; runId: string; cloudSessionId: string; model?: string; calls: readonly TranscriptToolCall[] }): unknown } | undefined
+ }): CloudRegistration {
+   const offline = process.env.CONDUCTOR_OFFLINE_TESTS === '1'
+   const runs = new CloudRuns({
+@@ -44,7 +47,8 @@ export function createCloud(options: {
+     ...(offline ? { prefixArgs: [join(process.cwd(), 'scripts/fixtures/cloud-cli.cjs')], env: { ELECTRON_RUN_AS_NODE: '1', CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR ?? join(options.userData, 'claude-config') } } : {}),
+     spawn: spawnPty,
+     onData: event => toWindows(CLOUD_CHANNELS.data, event),
+-    onChanged: summary => toWindows(CLOUD_CHANNELS.changed, summary)
++    onChanged: summary => toWindows(CLOUD_CHANNELS.changed, summary),
++    onToolCalls: (run, calls) => options.toolTimings?.()?.importCloudTranscript({ projectId: run.projectId, runId: run.id, cloudSessionId: run.sessionId!, model: run.confirmedModel ?? run.model, calls })
+   })
+   // The owner's own launcher choice opens in front, like any tab the owner opens.
+   const openTab = (run: CloudRunSummary): Promise<unknown> => {
+diff --git a/src/main/cloud/runs.test.ts b/src/main/cloud/runs.test.ts
+index fc35c55..2c2593b 100644
+--- a/src/main/cloud/runs.test.ts
++++ b/src/main/cloud/runs.test.ts
+@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
+ import { join } from 'node:path'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import { CLOUD_MODELS, isCloudModel, type CloudRunSummary } from '../../shared/cloud'
++import type { TranscriptToolCall } from '../../shared/tool-timings'
+ import { CloudRuns, clientEnv, cloudArgs, findResult, parseTranscript, readCreateLog, type CloudExec, type CloudGit, type CloudPty, type CloudSpawn } from './runs'
+ 
+ const fixture = join(process.cwd(), 'scripts/fixtures/cloud-cli.cjs')
+@@ -108,7 +109,8 @@ describe('cloud runs', () => {
+   it('creates the session, finds it has no live view, follows it on origin and pulls its transcript', async () => {
+     const origin = fakeOrigin()
+     const changes: CloudRunSummary[] = []
+-    const runs = make({ git: origin.git, onChanged: summary => changes.push(summary) })
++    const toolCalls: Array<{ run: CloudRunSummary; calls: TranscriptToolCall[] }> = []
++    const runs = make({ git: origin.git, onChanged: summary => changes.push(summary), onToolCalls: (pulled, calls) => toolCalls.push({ run: pulled, calls }) })
+     const run = start(runs, { model: 'claude-haiku-4-5-20251001', title: 'Note' })
+     expect(run).toMatchObject({ status: 'starting', attached: true, model: 'claude-haiku-4-5-20251001', title: 'Note', startedBy: 'agent_1', cwd: project })
+     await until(() => runs.get(run.id).liveView === false, 'the attach gate')
+@@ -130,6 +132,13 @@ describe('cloud runs', () => {
+     expect(origin.state.localBranches).toEqual([])
+     const entries = await runs.transcript(run.id)
+     expect(entries.map(entry => entry.role)).toEqual(['user', 'tool', 'result', 'assistant'])
++    // The tool call keeps its own id through the pull, paired with its result on the cloud's clock.
++    expect(entries.filter(entry => entry.toolUseId).map(entry => [entry.role, entry.toolUseId])).toEqual([['tool', 'toolu_fixture_push'], ['result', 'toolu_fixture_push']])
++    expect(toolCalls).toHaveLength(1)
++    expect(toolCalls[0]!.run).toMatchObject({ id: run.id, sessionId: created.sessionId })
++    const [call] = toolCalls[0]!.calls
++    expect(call).toMatchObject({ toolUseId: 'toolu_fixture_push', name: 'Bash', isError: false, denied: null, notes: [] })
++    expect(Date.parse(call!.resultAt!) - Date.parse(call!.usedAt!)).toBe(1500)
+     expect(runs.get(run.id)).toMatchObject({ confirmedModel: 'claude-opus-5-5', usage: { messages: 2, outputTokens: 240, cacheReadTokens: 2000 } })
+     expect(changes.some(change => change.status === 'running')).toBe(true)
+ 
+diff --git a/src/main/cloud/runs.ts b/src/main/cloud/runs.ts
+index a99b720..776603e 100644
+--- a/src/main/cloud/runs.ts
++++ b/src/main/cloud/runs.ts
+@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameS
+ import { homedir } from 'node:os'
+ import { join, resolve } from 'node:path'
+ import { randomUUID } from 'node:crypto'
++import type { TranscriptToolCall } from '../../shared/tool-timings'
+ import { CLOUD_EFFORTS, CLOUD_MODELS, isCloudModel, MAX_CLOUD_PROMPT_CHARS, type CloudFetchResult, type CloudRunSummary, type CloudTranscriptEntry, type CloudUsage } from '../../shared/cloud'
+ import { TerminalScreen } from './screen'
+ 
+@@ -32,6 +33,8 @@ export interface CloudRunsOptions {
+   env?: Record<string, string>
+   onData?(event: { id: string; data: string; sequence: number }): void
+   onChanged?(summary: CloudRunSummary): void
++  /** The tool calls a pulled transcript paired, for the timing recorder (cloud-transcript origin). */
++  onToolCalls?(run: CloudRunSummary, calls: TranscriptToolCall[]): void
+   now?(): number
+   /** How often the client's debug log is read while a client runs. */
+   pollMs?: number
+@@ -129,10 +132,25 @@ export function findResult(lines: string, hint: string | null, known: string[]):
+   return { branch: match.branch, head: match.sha, pr: pull ? Number(pull[1].split('/')[2]) : null, ambiguous: [] }
+ }
+ 
++/** Tool calls kept from one transcript: the newest by their call time. */
++export const MAX_TRANSCRIPT_TOOLS = 2000
++const TELEPORT_NOTE = /^This session is being continued from another machine/
++const isoTime = (value: unknown): string | null => typeof value === 'string' && value.length <= 40 && Number.isFinite(Date.parse(value)) ? value : null
++
+ /** The transcript the CLI's teleport saved (one JSON record per line), as readable entries plus
+- *  the token usage and model its assistant messages report. */
+-export function parseTranscript(jsonl: string): { entries: CloudTranscriptEntry[]; usage: CloudUsage; model: string | null } {
++ *  the token usage and model its assistant messages report, and its tool calls paired by their
++ *  exact tool_use_id (docs/perf-evidence/t3code-cloud-transcript-timings.md).
++ *
++ *  The teleport writes the cloud session's rows with their own `timestamp`, then its note that the
++ *  session continues on this machine, then rows of its own: only rows before that note are on the
++ *  cloud's clock, so only they are paired. A result row names the assistant row it answers
++ *  (sourceToolAssistantUUID); one that names another row is not paired. A statement repeated with
++ *  different times is not trusted. A call with no result yet is not a call to time. */
++export function parseTranscript(jsonl: string): { entries: CloudTranscriptEntry[]; usage: CloudUsage; model: string | null; tools: TranscriptToolCall[]; unmatched: number } {
+   const entries: CloudTranscriptEntry[] = []
++  const uses = new Map<string, { name: string; input: unknown; at: string | null; uuid: string | null; conflict: boolean }>()
++  const results = new Map<string, { at: string | null; isError: boolean; denied: string | null; source: string | null; result: string; conflict: boolean }>()
++  let local = false
+   const usage: CloudUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, messages: 0 }
+   let model: string | null = null
+   const clip = (value: string, max = 4000): string => value.length > max ? value.slice(0, max) + ' …' : value
+@@ -141,10 +159,13 @@ export function parseTranscript(jsonl: string): { entries: CloudTranscriptEntry[
+     let record: any
+     try { record = JSON.parse(line) } catch { continue }
+     if (record.type !== 'user' && record.type !== 'assistant') continue
++    const content = record.message?.content
++    const firstText = typeof content === 'string' ? content : Array.isArray(content) && typeof content[0]?.text === 'string' ? content[0].text : ''
++    // Everything from the teleport's note on was written on this machine, by its clock.
++    if (record.type === 'user' && TELEPORT_NOTE.test(firstText)) local = true
+     // The teleport's own note about continuing elsewhere is not part of the session.
+     if (record.isMeta) continue
+     const at = typeof record.timestamp === 'string' ? record.timestamp : null
+-    const content = record.message?.content
+     if (record.type === 'assistant') {
+       if (typeof record.message?.model === 'string' && !record.message.model.startsWith('<')) model = record.message.model
+       const u = record.message?.usage
+@@ -155,14 +176,44 @@ export function parseTranscript(jsonl: string): { entries: CloudTranscriptEntry[
+       if (part?.type === 'text' && String(part.text).trim()) {
+         if (record.type === 'user' && /^This session is being continued from another machine/.test(String(part.text))) continue
+         entries.push({ role: record.type, text: clip(String(part.text)), at })
+-      } else if (part?.type === 'tool_use') entries.push({ role: 'tool', text: clip(`${part.name} ${JSON.stringify(part.input ?? {})}`, 1500), at })
+-      else if (part?.type === 'tool_result') {
++      } else if (part?.type === 'tool_use') {
++        const toolUseId = typeof part.id === 'string' && part.id && part.id.length <= 256 ? part.id : undefined
++        entries.push({ role: 'tool', text: clip(`${part.name} ${JSON.stringify(part.input ?? {})}`, 1500), at, ...(toolUseId ? { toolUseId } : {}) })
++        if (toolUseId && record.type === 'assistant' && !local) {
++          const use = { name: typeof part.name === 'string' ? part.name.slice(0, 80) : 'Tool', input: part.input, at: isoTime(record.timestamp), uuid: typeof record.uuid === 'string' ? record.uuid : null, conflict: false }
++          const prior = uses.get(toolUseId)
++          if (prior) prior.conflict ||= prior.at !== use.at || prior.uuid !== use.uuid
++          else uses.set(toolUseId, use)
++        }
++      } else if (part?.type === 'tool_result') {
+         const body = Array.isArray(part.content) ? part.content.map((item: any) => item?.text ?? '').join('\n') : String(part.content ?? '')
+-        entries.push({ role: 'result', text: clip(body, 1500), at })
++        const toolUseId = typeof part.tool_use_id === 'string' && part.tool_use_id && part.tool_use_id.length <= 256 ? part.tool_use_id : undefined
++        entries.push({ role: 'result', text: clip(body, 1500), at, ...(toolUseId ? { toolUseId } : {}) })
++        if (toolUseId && record.type === 'user' && !local) {
++          const result = { at: isoTime(record.timestamp), isError: part.is_error === true, denied: typeof record.toolDenialKind === 'string' ? record.toolDenialKind.slice(0, 40) : null,
++            source: typeof record.sourceToolAssistantUUID === 'string' ? record.sourceToolAssistantUUID : null, result: body.slice(0, 4000), conflict: false }
++          const prior = results.get(toolUseId)
++          if (prior) prior.conflict ||= prior.at !== result.at || prior.isError !== result.isError
++          else results.set(toolUseId, result)
++        }
+       }
+     }
+   }
+-  return { entries, usage, model }
++  const tools: TranscriptToolCall[] = []
++  for (const [toolUseId, result] of results) {
++    const use = uses.get(toolUseId)
++    // A result whose call is not in this file (a partial pull) waits for a pull that has both.
++    if (!use) continue
++    const notes: string[] = []
++    if (use.conflict || result.conflict) notes.push('conflicting-restatement')
++    if (result.source && use.uuid && result.source !== use.uuid) notes.push('result-names-another-row')
++    // The first statements' times stay labels; a call with notes is never timed from them.
++    tools.push({ toolUseId, name: use.name, input: use.input, usedAt: use.at, resultAt: result.at, isError: result.isError, denied: result.denied, result: result.result, notes })
++  }
++  const unmatched = [...uses.keys()].filter(id => !results.has(id)).length
++  // The same calls in the same order however the file's rows were ordered.
++  tools.sort((a, b) => (a.usedAt ?? '').localeCompare(b.usedAt ?? '') || a.toolUseId.localeCompare(b.toolUseId))
++  return { entries, usage, model, tools: tools.slice(-MAX_TRANSCRIPT_TOOLS), unmatched }
+ }
+ 
+ /**
+@@ -413,6 +464,8 @@ export class CloudRuns {
+     await this.git(dir, ['checkout', '--detach']).catch(() => undefined)
+     if (checkedOut.startsWith('claude/') && !before.includes(checkedOut) && (await branches()).includes(checkedOut)) await this.git(run.cwd, ['branch', '-D', checkedOut]).catch(() => undefined)
+     const parsed = parseTranscript(readFileSync(file, 'utf8'))
++    // Timings are a side record: a failure there never fails the pull.
++    if (run.sessionId && parsed.tools.length) try { this.options.onToolCalls?.(run, parsed.tools) } catch { /* the recorder counts its own errors */ }
+     writeFileSync(this.transcriptFile(id), JSON.stringify(parsed.entries))
+     this.update(id, { transcriptAt: this.now(), transcriptEntries: parsed.entries.length, usage: parsed.usage, ...(parsed.model ? { confirmedModel: parsed.model } : {}) })
+     return parsed.entries
+diff --git a/src/main/cloud/transcript-timings.test.ts b/src/main/cloud/transcript-timings.test.ts
+new file mode 100644
+index 0000000..d1e0213
+--- /dev/null
++++ b/src/main/cloud/transcript-timings.test.ts
+@@ -0,0 +1,202 @@
++import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { afterEach, describe, expect, it } from 'vitest'
++import { maskSecrets } from '../structured-store'
++import { ToolTimingRecorder } from '../tool-timings'
++import { parseTranscript } from './runs'
++
++/**
++ * Cloud-coworker tool timings (docs/perf-evidence/t3code-cloud-transcript-timings.md): the real
++ * parser over teleported transcript rows shaped like Claude Code 2.1.312 writes them, into the
++ * recorder, out through its report. The host clock never takes part: wall and monotonic are pinned
++ * far from the rows' own times.
++ */
++const dirs: string[] = []
++afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }) })
++
++const HOST_WALL = Date.parse('2026-10-30T12:00:00.000Z')
++let rowSeq = 0
++const assistant = (uuid: string, at: string | undefined, tools: Array<{ id: string; name?: string; input?: unknown }>) => ({
++  type: 'assistant', uuid, parentUuid: null, isSidechain: false, sessionId: 'local-teleport-id', ...(at !== undefined ? { timestamp: at } : {}),
++  message: { id: `msg_${uuid}`, role: 'assistant', model: 'claude-opus-5-5', content: tools.map(tool => ({ type: 'tool_use', id: tool.id, name: tool.name ?? 'Bash', input: tool.input ?? { command: 'npm test' }, caller: { type: 'direct' } })) }
++})
++const result = (toolUseId: string, at: string | undefined, options: { source?: string; isError?: boolean; content?: string; denied?: string } = {}) => ({
++  type: 'user', uuid: `result-${++rowSeq}`, isSidechain: false, sessionId: 'local-teleport-id', ...(at !== undefined ? { timestamp: at } : {}),
++  ...(options.source ? { sourceToolAssistantUUID: options.source } : {}), ...(options.denied ? { toolDenialKind: options.denied } : {}),
++  permissionDecision: { decision: 'accept', source: 'config', reasonType: 'rule', ruleSource: 'cliArg' }, sandboxed: false,
++  toolUseResult: { stdout: options.content ?? 'ok', stderr: '', interrupted: false, isImage: false, noOutputExpected: false },
++  message: { role: 'user', content: [{ tool_use_id: toolUseId, type: 'tool_result', content: options.content ?? 'ok', is_error: options.isError ?? false }] }
++})
++const teleportNote = { type: 'user', isMeta: true, timestamp: '2026-10-30T11:59:00.000Z', message: { role: 'user', content: 'This session is being continued from another machine. Application state may have changed. The updated working directory is /w' } }
++const jsonl = (rows: unknown[]): string => rows.map(row => JSON.stringify(row)).join('\n') + '\n'
++
++function recorder(options: { directory?: string; cloudCapacity?: number; wall?: number } = {}) {
++  const clock = { wall: options.wall ?? HOST_WALL }
++  const rec = new ToolTimingRecorder({ directory: options.directory, cloudCapacity: options.cloudCapacity, flushMs: 60_000, now: () => 7_777_777, wallNow: () => clock.wall, mask: maskSecrets })
++  const pull = (text: string, cloudSessionId = 'session_01AAA', runId = 'cloud_run1') =>
++    rec.importCloudTranscript({ projectId: 'p1', runId, cloudSessionId, model: 'claude-opus-5-5', calls: parseTranscript(text).tools })
++  const cloud = (extra: Record<string, unknown> = {}) => rec.report({ origin: 'cloud-transcript', recent: 100, ...extra })
++  return { rec, clock, pull, cloud }
++}
++
++const basic = jsonl([
++  { type: 'user', timestamp: '2026-10-30T00:39:50.000Z', message: { role: 'user', content: 'Ship it' } },
++  assistant('a1', '2026-10-30T00:39:52.117Z', [{ id: 'toolu_013ecUXPwrWv6anEf6JfSbVU', input: { command: 'git fetch origin' } }]),
++  result('toolu_013ecUXPwrWv6anEf6JfSbVU', '2026-10-30T00:39:55.197Z', { source: 'a1' }),
++  teleportNote
++])
++
++describe('cloud transcript tool timings: parseTranscript → importCloudTranscript → report', () => {
++  it('times a paired call on the cloud rows\' own clock, apart from native timings', () => {
++    const { rec, pull, cloud } = recorder()
++    expect(pull(basic)).toEqual({ added: 1, known: 0, skipped: 0 })
++    const [record] = cloud().recent
++    expect(record).toMatchObject({
++      provider: 'claude-cloud', origin: 'cloud-transcript', agentSessionId: 'cloud_run1', runtimeId: 'session_01AAA', itemId: 'toolu_013ecUXPwrWv6anEf6JfSbVU', projectId: 'p1',
++      tool: 'Bash', args: 'git fetch origin', startedAt: '2026-10-30T00:39:52.117Z', endedAt: '2026-10-30T00:39:55.197Z',
++      elapsedMs: 3_080, elapsedSource: 'transcript-wall', waitMs: null, waitSource: 'unavailable', execMs: null, execSource: 'unavailable', prepareMs: null, outcome: 'completed'
++    })
++    // The default report is native tabs only; a cloud call never enters its totals.
++    expect(rec.report({}).totals.calls).toBe(0)
++    expect(rec.report({ provider: 'claude-cloud' }).totals.calls).toBe(0)
++    expect(cloud().gaps.some(gap => gap.startsWith('Cloud coworkers (origin cloud-transcript)'))).toBe(true)
++    expect(cloud().coverage).toMatchObject({ elapsed: 1, wait: 0, exec: 0 })
++  })
++
++  it('adds nothing twice: repeated pulls, a pull after a restart, and reordered rows', async () => {
++    const directory = mkdtempSync(join(tmpdir(), 'cloud-timings-')); dirs.push(directory)
++    const first = recorder({ directory })
++    first.pull(basic)
++    expect(first.pull(basic)).toEqual({ added: 0, known: 1, skipped: 0 })
++    first.rec.dispose()
++    const second = recorder({ directory })
++    await second.rec.load()
++    expect(second.cloud().totals.calls).toBe(1)
++    const lines = basic.trim().split('\n')
++    // The cloud's rows in another order; the teleport's own note always follows them.
++    const reordered = [lines[2], lines[0], lines[1], lines[3]].join('\n')
++    expect(parseTranscript(reordered).tools).toEqual(parseTranscript(basic).tools)
++    expect(parseTranscript(reordered).tools).toHaveLength(1)
++    expect(second.pull(reordered)).toEqual({ added: 0, known: 1, skipped: 0 })
++    expect(second.cloud().recent).toHaveLength(1)
++    expect(second.cloud().recent[0]).toMatchObject({ elapsedMs: 3_080 })
++    second.rec.dispose()
++    const persisted = readFileSync(join(directory, 'tool-timings.jsonl'), 'utf8') + (() => { try { return readFileSync(join(directory, 'tool-timings.exit.jsonl'), 'utf8') } catch { return '' } })()
++    expect(new Set(persisted.trim().split('\n').filter(Boolean).map(line => JSON.parse(line).key)).size).toBe(1)
++  })
++
++  it('waits for a partial pull\'s call to have its result, and ignores a result whose call is not in the file', () => {
++    const { pull, cloud } = recorder()
++    const partial = jsonl([assistant('a1', '2026-10-30T01:00:00.000Z', [{ id: 'toolu_running' }]), result('toolu_orphan', '2026-10-30T01:00:01.000Z')])
++    expect(parseTranscript(partial).unmatched).toBe(1)
++    expect(pull(partial)).toEqual({ added: 0, known: 0, skipped: 0 })
++    const full = jsonl([assistant('a1', '2026-10-30T01:00:00.000Z', [{ id: 'toolu_running' }]), result('toolu_running', '2026-10-30T01:00:04.500Z', { source: 'a1' }), teleportNote])
++    expect(pull(full)).toEqual({ added: 1, known: 0, skipped: 0 })
++    expect(cloud().recent.map(record => [record.itemId, record.elapsedMs])).toEqual([['toolu_running', 4_500]])
++  })
++
++  it('keeps the same tool_use_id in two cloud sessions apart', () => {
++    const { pull, cloud } = recorder()
++    pull(basic, 'session_01AAA', 'cloud_run1')
++    pull(basic, 'session_01BBB', 'cloud_run2')
++    pull(basic, 'session_01AAA', 'cloud_run1')
++    expect(cloud().recent.map(record => [record.runtimeId, record.agentSessionId]).sort()).toEqual([['session_01AAA', 'cloud_run1'], ['session_01BBB', 'cloud_run2']])
++    expect(cloud({ agentSessionId: 'cloud_run2' }).totals.calls).toBe(1)
++  })
++
++  it('times nothing it cannot pair on one clock: missing, reversed, conflicting, misattributed, denied and teleport-local rows', () => {
++    const { pull, cloud } = recorder()
++    const rows = jsonl([
++      assistant('a-missing', undefined, [{ id: 'toolu_missing' }]),
++      result('toolu_missing', '2026-10-30T02:00:01.000Z', { source: 'a-missing' }),
++      assistant('a-reversed', '2026-10-30T02:00:05.000Z', [{ id: 'toolu_reversed' }]),
++      result('toolu_reversed', '2026-10-30T02:00:04.000Z', { source: 'a-reversed' }),
++      assistant('a-conflict', '2026-10-30T02:00:06.000Z', [{ id: 'toolu_conflict' }]),
++      result('toolu_conflict', '2026-10-30T02:00:07.000Z', { source: 'a-conflict' }),
++      result('toolu_conflict', '2026-10-30T02:00:09.000Z', { source: 'a-conflict' }),
++      assistant('a-other', '2026-10-30T02:00:10.000Z', [{ id: 'toolu_other' }]),
++      result('toolu_other', '2026-10-30T02:00:11.000Z', { source: 'a-someone-else' }),
++      assistant('a-denied', '2026-10-30T02:00:12.000Z', [{ id: 'toolu_denied' }]),
++      result('toolu_denied', '2026-10-30T02:00:13.000Z', { source: 'a-denied', isError: true, denied: 'interrupted', content: 'Interrupted by user' }),
++      assistant('a-bad', 'not a time', [{ id: 'toolu_bad_time' }]),
++      result('toolu_bad_time', '2026-10-30T02:00:14.000Z', { source: 'a-bad' }),
++      // In flight when the teleport ran: its "result" is the resumed side's, on this machine's clock.
++      assistant('a-inflight', '2026-10-30T02:00:15.000Z', [{ id: 'toolu_inflight' }]),
++      teleportNote,
++      result('toolu_inflight', '2026-10-30T12:00:00.000Z', { source: 'a-inflight' }),
++      assistant('a-local', '2026-10-30T12:00:01.000Z', [{ id: 'toolu_local' }]),
++      result('toolu_local', '2026-10-30T12:00:02.000Z', { source: 'a-local' })
++    ])
++    expect(parseTranscript(rows).unmatched).toBe(1)
++    pull(rows)
++    const byId = Object.fromEntries(cloud().recent.map(record => [record.itemId, record]))
++    expect(Object.keys(byId).sort()).toEqual(['toolu_bad_time', 'toolu_conflict', 'toolu_denied', 'toolu_missing', 'toolu_other', 'toolu_reversed'])
++    for (const record of Object.values(byId)) expect(record).toMatchObject({ elapsedMs: null, elapsedSource: 'unavailable', waitMs: null, execMs: null })
++    expect(byId.toolu_missing!.notes).toEqual(['missing-transcript-time'])
++    expect(byId.toolu_bad_time!.notes).toEqual(['missing-transcript-time'])
++    expect(byId.toolu_reversed!.notes).toEqual(['invalid-transcript-interval'])
++    expect(byId.toolu_conflict!.notes).toEqual(['conflicting-restatement'])
++    // Its first statements' own times stay its labels; this host's clock is never one.
++    expect(byId.toolu_conflict).toMatchObject({ startedAt: '2026-10-30T02:00:06.000Z', endedAt: '2026-10-30T02:00:07.000Z' })
++    expect(Object.values(byId).every(record => !record.notes?.includes('ended-at-import'))).toBe(true)
++    expect(byId.toolu_other!.notes).toEqual(['result-names-another-row'])
++    expect(byId.toolu_denied).toMatchObject({ outcome: 'interrupted', notes: ['denied-or-interrupted-result'] })
++    // No record ever takes this host's time as a measurement.
++    expect(cloud().tools.every(tool => tool.elapsed.measured === 0)).toBe(true)
++  })
++
++  it('masks secrets in arguments and failures, and stores no output body', () => {
++    const { pull, cloud } = recorder()
++    const token = 'ghp_' + 'Z'.repeat(36)
++    const rows = jsonl([
++      assistant('a1', '2026-10-30T03:00:00.000Z', [{ id: 'toolu_secret', input: { command: `curl -H "Authorization: Bearer ${token}" https://x.example/?token=${token}` } }]),
++      result('toolu_secret', '2026-10-30T03:00:02.000Z', { source: 'a1', isError: true, content: `BODY-FIRST-LINE ${token}\nfatal: authentication failed for password=${token}\n` + 'q'.repeat(9_000) + '\nBODY-LAST-LINE' })
++    ])
++    pull(rows)
++    const [record] = cloud().recent
++    expect(record).toMatchObject({ outcome: 'failed', elapsedMs: 2_000 })
++    expect(record!.args.length).toBeLessThanOrEqual(161)
++    expect(record!.error!.length).toBeLessThanOrEqual(161)
++    const serialized = JSON.stringify(cloud())
++    expect(serialized).not.toContain(token)
++    // Only the failure's first line, masked and bounded: never the rest of the output.
++    expect(record!.error).toContain('[REDACTED]')
++    expect(record!.error).toMatch(/^fatal: authentication failed/)
++    expect(serialized).not.toContain('BODY-FIRST-LINE')
++    expect(serialized).not.toContain('BODY-LAST-LINE')
++    expect(serialized).not.toContain('q'.repeat(100))
++  })
++
++  it('bounds what it keeps: the cloud allowance, retention, and native records untouched', () => {
++    const { rec, pull, cloud } = recorder({ cloudCapacity: 3 })
++    rec.observe({ id: 'n1', sessionId: 's', runtimeId: 'r', provider: 'codex', projectId: 'p1', itemId: 'native-1', timestamp: '', data: { type: 'tool', name: 'Command', status: 'completed', durationMs: 5 } })
++    const rows = (from: number, count: number) => jsonl(Array.from({ length: count }, (_, i) => {
++      const at = (offset: number) => new Date(Date.parse('2026-10-30T04:00:00.000Z') + (from + i) * 60_000 + offset).toISOString()
++      return [assistant(`a${from + i}`, at(0), [{ id: `toolu_${from + i}` }]), result(`toolu_${from + i}`, at(100), { source: `a${from + i}` })]
++    }).flat())
++    expect(pull(rows(0, 5))).toEqual({ added: 5, known: 0, skipped: 0 })
++    expect(cloud().recent.map(record => record.itemId)).toEqual(['toolu_4', 'toolu_3', 'toolu_2'])
++    // A later pull of the same transcript does not re-add what the allowance already let go.
++    expect(pull(rows(0, 5))).toEqual({ added: 0, known: 3, skipped: 2 })
++    expect(cloud().totals.calls).toBe(3)
++    expect(rec.report({}).totals.calls).toBe(1)
++    // Beyond retention (14 days before this host's now): never added.
++    const old = jsonl([assistant('old', '2026-10-01T00:00:00.000Z', [{ id: 'toolu_old' }]), result('toolu_old', '2026-10-01T00:00:01.000Z', { source: 'old' })])
++    expect(pull(old, 'session_01OLD')).toEqual({ added: 0, known: 0, skipped: 1 })
++    // One transcript yields at most 2000 calls.
++    expect(parseTranscript(rows(100, 2_050)).tools).toHaveLength(2_000)
++  })
++
++  it('refuses a malformed origin on load and in a query', () => {
++    return import('../tool-timings').then(module => {
++      expect(() => module.toolTimingsQuery({ origin: 'mirror' })).toThrow(/origin/)
++      expect(module.toolTimingsQuery({ origin: 'cloud-transcript' })).toEqual({ origin: 'cloud-transcript' })
++      const { rec, pull } = recorder()
++      pull(basic)
++      const line = JSON.stringify({ v: 1, ...rec.report({ origin: 'cloud-transcript', recent: 1 }).recent[0] })
++      expect(module.parseRecord(line)).toMatchObject({ origin: 'cloud-transcript' })
++      expect(module.parseRecord(line.replace('"origin":"cloud-transcript"', '"origin":"elsewhere"'))).toBeNull()
++    })
++  })
++})
+diff --git a/src/main/index.ts b/src/main/index.ts
+index f70c2e8..7c76691 100644
+--- a/src/main/index.ts
++++ b/src/main/index.ts
+@@ -3140,7 +3140,7 @@ app.whenReady().then(async () => {
+     console.warn('Execution nodes are unavailable', error)
+   }
+   try {
+-    cloud = createCloud({ userData: app.getPath('userData'), claudeExecutable: () => agents.listProviders().find(provider => provider.id === 'claude')?.executable ?? null, ui: agentControlUi.request })
++    cloud = createCloud({ userData: app.getPath('userData'), claudeExecutable: () => agents.listProviders().find(provider => provider.id === 'claude')?.executable ?? null, ui: agentControlUi.request, toolTimings: () => toolTimings })
+     control.setCloud(cloud.runs)
+   } catch (error) {
+     console.warn('Cloud sessions are unavailable', error)
+diff --git a/src/main/tool-timings.ts b/src/main/tool-timings.ts
+index 7a7a325..ec4a2fa 100644
+--- a/src/main/tool-timings.ts
++++ b/src/main/tool-timings.ts
+@@ -4,7 +4,7 @@ import { appendFile, mkdir, open, readdir, rename, unlink, writeFile } from 'nod
+ import { join } from 'node:path'
+ import { performance } from 'node:perf_hooks'
+ import type { AgentEvent, ActivityStatus } from '../shared/structured-agent'
+-import { aggregateToolTimings, summarizeToolArgs, summarizeToolError, toolCategory, TOOL_TIMING_LIMITS, type ToolTimingOutcome, type ToolTimingRecord, type ToolTimingsQuery, type ToolTimingsReport } from '../shared/tool-timings'
++import { aggregateToolTimings, summarizeToolArgs, summarizeToolError, toolCategory, TOOL_TIMING_LIMITS, type ToolTimingOutcome, type ToolTimingRecord, type ToolTimingsQuery, type ToolTimingsReport, type TranscriptToolCall } from '../shared/tool-timings'
+ 
+ /**
+  * The tool-call timing recorder (docs/perf-evidence/t3code-cloud-tool-timings.md). It sees every
+@@ -25,6 +25,8 @@ const DAY_MS = 24 * 60 * 60 * 1000
+ /** A provider duration beyond this is a unit or clock error, not a measurement. */
+ const MAX_PROVIDER_MS = 7 * DAY_MS
+ const FILE = 'tool-timings.jsonl'
++/** Transcript tool calls read in one import. */
++const MAX_IMPORT = 2000
+ /** Written only synchronously by dispose(): no async compaction ever renames over it, so what a quit
+  *  writes there cannot be lost to a rewrite still in flight. A load never reads or deletes it in
+  *  place: it first renames it to a claimed file of its own, so a quit during that load starts a fresh
+@@ -42,6 +44,8 @@ export interface ToolTimingsOptions {
+   capacity?: number
+   retentionMs?: number
+   maxOpen?: number
++  /** Cloud-transcript records kept, within `capacity`; default 1000. */
++  cloudCapacity?: number
+   flushMs?: number
+   /** Most bytes load() reads, from the end of the file; default 16 MiB. */
+   maxReadBytes?: number
+@@ -75,6 +79,7 @@ export class ToolTimingRecorder {
+   private readonly capacity: number
+   private readonly retentionMs: number
+   private readonly maxOpen: number
++  private readonly cloudCapacity: number
+   private readonly flushMs: number
+   private readonly maxReadBytes: number
+   private directoryReady = false
+@@ -113,6 +118,7 @@ export class ToolTimingRecorder {
+     this.capacity = options.capacity ?? 5000
+     this.retentionMs = options.retentionMs ?? 14 * DAY_MS
+     this.maxOpen = options.maxOpen ?? 2000
++    this.cloudCapacity = Math.max(0, Math.floor(options.cloudCapacity ?? 1000))
+     this.flushMs = options.flushMs ?? 2000
+     this.maxReadBytes = Math.max(1, Math.floor(options.maxReadBytes ?? MAX_READ_BYTES))
+     this.now = options.now ?? (() => performance.now())
+@@ -203,6 +209,7 @@ export class ToolTimingRecorder {
+     this.droppedOnLoad += earlier.length - keep.length
+     for (const record of keep) this.index(record)
+     this.records = [...keep, ...this.records]
++    this.trimCloud(this.cloudCapacity)
+     this.fileLines = lines
+     // An oversized, torn or partly stale file, or one with a quit's lines beside it, is rewritten
+     // from what was kept inside this queued step, so it is whole, merged and under the bound before
+@@ -393,6 +400,75 @@ export class ToolTimingRecorder {
+     if (record.outcome === 'abandoned') this.abandoned.set(`${record.agentSessionId}\u0000${record.itemId}`, record)
+   }
+ 
++  /**
++   * A cloud coworker's tool calls, paired from its pulled transcript (cloud/runs.ts parseTranscript).
++   * Each is keyed by the cloud session and its tool_use_id, never by a runtime, so a repeated pull,
++   * a pull after a restart, or the same id in another session adds nothing twice; the first
++   * statement stands. Elapsed is the transcript rows' own times on the cloud's clock (transcript-wall),
++   * never this host's: a missing, reversed or implausible pair, a denial and a result the CLI wrote
++   * for an interrupted call are not timed. Wait and execution are never inferred from it.
++   */
++  importCloudTranscript(input: { projectId: string; runId: string; cloudSessionId: string; model?: string; calls: readonly TranscriptToolCall[] }): { added: number; known: number; skipped: number } {
++    const counts = { added: 0, known: 0, skipped: 0 }
++    if (this.disposed || !input.cloudSessionId || !this.cloudCapacity) return counts
++    const cutoff = this.wallNow() - this.retentionMs
++    let cloud = this.records.filter(record => record.origin === 'cloud-transcript').length
++    for (const call of input.calls.slice(-MAX_IMPORT)) {
++      try {
++        const key = `cloud-transcript\u0000${input.cloudSessionId}\u0000${call.toolUseId}`
++        if (this.byKey.has(key)) { counts.known++; this.deduplicated++; continue }
++        const record = this.transcriptRecord(key, input, call)
++        // Beyond retention, or older than everything kept once the cloud allowance is full: a later
++        // pull would only add what the next trim drops again.
++        const ended = Date.parse(record.endedAt)
++        const oldest = cloud >= this.cloudCapacity ? this.records.find(entry => entry.origin === 'cloud-transcript') : undefined
++        if (ended < cutoff || oldest && ended <= Date.parse(oldest.endedAt)) { counts.skipped++; continue }
++        if (cloud >= this.cloudCapacity) this.trimCloud(this.cloudCapacity - 1); else cloud++
++        this.commit(record)
++        counts.added++
++      } catch { this.errors++ }
++    }
++    return counts
++  }
++
++  private transcriptRecord(key: string, input: { projectId: string; runId: string; cloudSessionId: string; model?: string }, call: TranscriptToolCall): ToolTimingRecord {
++    const notes = [...call.notes]
++    const start = call.usedAt ? Date.parse(call.usedAt) : NaN, end = call.resultAt ? Date.parse(call.resultAt) : NaN
++    let elapsedMs: number | null = null
++    if (call.denied) notes.push('denied-or-interrupted-result')
++    else if (call.notes.length) { /* the parser could not pair it on one clock: not timed */ }
++    else if (!Number.isFinite(start) || !Number.isFinite(end)) notes.push('missing-transcript-time')
++    else if (end < start || end - start > MAX_PROVIDER_MS) notes.push('invalid-transcript-interval')
++    else elapsedMs = end - start
++    const endedAt = Number.isFinite(end) ? new Date(end).toISOString() : Number.isFinite(start) ? new Date(start).toISOString() : null
++    if (!endedAt) notes.push('ended-at-import')
++    const tool = (call.name || 'Tool').slice(0, TOOL_TIMING_LIMITS.tool)
++    const outcome: ToolTimingOutcome = call.denied ? (/interrupt|cancel/i.test(call.denied) ? 'interrupted' : 'rejected') : call.isError ? 'failed' : 'completed'
++    const record: ToolTimingRecord = {
++      key, agentSessionId: input.runId, projectId: input.projectId, provider: 'claude-cloud', runtimeId: input.cloudSessionId, itemId: call.toolUseId,
++      ...(input.model ? { model: input.model } : {}), origin: 'cloud-transcript',
++      tool, category: toolCategory(tool), args: summarizeToolArgs(tool, call.input, this.mask),
++      startedAt: Number.isFinite(start) ? new Date(start).toISOString() : null, endedAt: endedAt ?? new Date(this.wallNow()).toISOString(),
++      elapsedMs, elapsedSource: elapsedMs === null ? 'unavailable' : 'transcript-wall',
++      waitMs: null, waitSource: 'unavailable', execMs: null, execSource: 'unavailable', prepareMs: null,
++      outcome, concurrent: 0, ...(notes.length ? { notes } : {})
++    }
++    if (outcome === 'failed' || outcome === 'rejected') { const error = summarizeToolError(call.result.slice(0, 4000), undefined, this.mask); if (error) record.error = error }
++    return record
++  }
++
++  /** Keeps at most `keep` cloud-transcript records, dropping the oldest; native records are never touched. */
++  private trimCloud(keep: number): void {
++    let excess = this.records.filter(record => record.origin === 'cloud-transcript').length - Math.max(0, keep)
++    if (excess <= 0) return
++    this.records = this.records.filter(record => {
++      if (excess <= 0 || record.origin !== 'cloud-transcript') return true
++      excess--
++      if (this.byKey.get(record.key) === record) this.byKey.delete(record.key)
++      return false
++    })
++  }
++
+   private commit(record: ToolTimingRecord): void {
+     this.records.push(record)
+     this.index(record)
+@@ -454,7 +530,7 @@ export class ToolTimingRecorder {
+   report(query: ToolTimingsQuery = {}): ToolTimingsReport {
+     const cutoff = this.wallNow() - this.retentionMs
+     const live = this.records.filter(record => Date.parse(record.endedAt) >= cutoff)
+-    const inFlight = [...this.open.values()].filter(call => (!query.projectId || call.record.projectId === query.projectId) && (!query.agentSessionId || call.record.agentSessionId === query.agentSessionId) && (!query.provider || call.record.provider === query.provider)).length
++    const inFlight = query.origin === 'cloud-transcript' ? 0 : [...this.open.values()].filter(call => (!query.projectId || call.record.projectId === query.projectId) && (!query.agentSessionId || call.record.agentSessionId === query.agentSessionId) && (!query.provider || call.record.provider === query.provider)).length
+     return aggregateToolTimings(live, query, {
+       observedAt: new Date(this.wallNow()).toISOString(), inFlight,
+       storage: { records: live.length, capacity: this.capacity, retentionDays: Math.round(this.retentionMs / DAY_MS), recordedSince: live[0]?.endedAt ?? null, deduplicated: this.deduplicated, droppedOnLoad: this.droppedOnLoad, parseErrors: this.parseErrors }
+@@ -511,6 +587,7 @@ export function parseRecord(line: string): ToolTimingRecord | null {
+   const strings = ['key', 'agentSessionId', 'projectId', 'provider', 'runtimeId', 'itemId', 'tool', 'category', 'args', 'endedAt'] as const
+   if (strings.some(key => typeof value[key] !== 'string') || !Number.isFinite(Date.parse(value.endedAt as string))) return null
+   if (!OUTCOMES.has(value.outcome as ToolTimingOutcome) || !nullableNumber(value.elapsedMs) || !nullableNumber(value.waitMs) || !nullableNumber(value.execMs) || !nullableNumber(value.prepareMs)) return null
++  if (value.origin !== undefined && value.origin !== 'cloud-transcript') return null
+   if (value.reviewMs !== undefined && (typeof value.reviewMs !== 'number' || !Number.isFinite(value.reviewMs) || value.reviewMs < 0 || value.reviewSource !== 'provider-review')) return null
+   const { v: _v, ...record } = value
+   return { concurrent: 0, startedAt: null, ...record } as unknown as ToolTimingRecord
+@@ -541,6 +618,10 @@ export function toolTimingsQuery(args: Record<string, unknown>): ToolTimingsQuer
+     if (typeof args.includeDetached !== 'boolean') throw new Error('includeDetached must be a boolean')
+     query.includeDetached = args.includeDetached
+   }
++  if (args.origin !== undefined) {
++    if (args.origin !== 'native' && args.origin !== 'cloud-transcript') throw new Error('origin must be "native" or "cloud-transcript"')
++    query.origin = args.origin
++  }
+   return query
+ }
+ 
+diff --git a/src/renderer/src/components/ToolTimings.tsx b/src/renderer/src/components/ToolTimings.tsx
+index 524dd96..a8645e9 100644
+--- a/src/renderer/src/components/ToolTimings.tsx
++++ b/src/renderer/src/components/ToolTimings.tsx
+@@ -45,7 +45,7 @@ export function ToolTimingsSetting(): React.JSX.Element {
+       </select>
+       <button type="button" onClick={load} title="Refresh"><RefreshCw size={12} /> Refresh</button>
+     </div>
+-    <p className="tool-timings-scope">Not recorded: raw CLI-view tabs, cloud coworkers and conversations mirrored from another machine. Execution and approval wait are shown only where a provider or Conductor observed them.</p>
++    <p className="tool-timings-scope">Not recorded: raw CLI-view tabs and conversations mirrored from another machine. Cloud coworkers' calls read from their pulled transcripts are kept apart (tools.timings origin "cloud-transcript"). Execution and approval wait are shown only where a provider or Conductor observed them.</p>
+     {error && <p className="usage-cap-error">{error}</p>}
+     {report && <>
+       <p className="tool-timings-summary" data-calls={report.totals.calls}>
+diff --git a/src/shared/cloud.ts b/src/shared/cloud.ts
+index f937b68..9e77f26 100644
+--- a/src/shared/cloud.ts
++++ b/src/shared/cloud.ts
+@@ -22,6 +22,8 @@ export interface CloudTranscriptEntry {
+   role: 'user' | 'assistant' | 'tool' | 'result'
+   text: string
+   at: string | null
++  /** The provider's tool_use_id, on a tool call and on its result. */
++  toolUseId?: string
+ }
+ 
+ export interface CloudUsage { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; messages: number }
+diff --git a/src/shared/tool-timings.ts b/src/shared/tool-timings.ts
+index 6b2019f..66503b5 100644
+--- a/src/shared/tool-timings.ts
++++ b/src/shared/tool-timings.ts
+@@ -21,7 +21,11 @@ export type ToolCategory = 'shell' | 'file-read' | 'file-write' | 'search' | 'we
+  *  time survives (bounded to a day, never negative); provider: the provider's own start and end
+  *  stamps of the item's lifecycle, both on its clock (Codex startedAtMs → completedAtMs). That is
+  *  lifecycle time, not execution, and is never mixed with a host stamp. */
+-export type ElapsedSource = 'host-monotonic' | 'wall-clock' | 'provider' | 'unavailable'
++export type ElapsedSource = 'host-monotonic' | 'wall-clock' | 'provider' | 'transcript-wall' | 'unavailable'
++/** native: a structured tab this host observed live. cloud-transcript: a cloud coworker's call read
++ *  afterwards from its teleported transcript (transcript-wall elapsed: the cloud's own write times of
++ *  the tool_use and its tool_result rows). Kept apart from the native report unless asked for. */
++export type ToolTimingOrigin = 'native' | 'cloud-transcript'
+ /** provider-review: the provider's own auto-approval review time (Codex guardian), overlaps counted
+  *  once. Kept apart from WaitSource, which is a human approval this host observed. */
+ export type ReviewSource = 'provider-review'
+@@ -53,6 +57,8 @@ export interface ToolTimingRecord {
+   execSource: ExecSource
+   /** Time the call spent in `preparing` (the model still writing its arguments), when seen. */
+   prepareMs: number | null
++  /** Absent for a native call. */
++  origin?: 'cloud-transcript'
+   /** The provider's automatic approval review of this call (absent: none reported). Not part of waitMs. */
+   reviewMs?: number
+   reviewSource?: ReviewSource
+@@ -81,6 +87,25 @@ export interface ToolTimingsQuery {
+   /** Most recent raw records to include; default 0, at most 100. */
+   recent?: number
+   includeDetached?: boolean
++  /** Which records: native tabs (the default) or cloud-coworker transcripts, never both mixed. */
++  origin?: ToolTimingOrigin
++}
++
++/** One tool call paired from a cloud transcript by its exact tool_use_id (cloud/runs.ts
++ *  parseTranscript). Stamps are the transcript rows' own ISO times, null when absent or invalid;
++ *  a call with notes (a conflicting restatement, a result naming another row) is never timed.
++ *  `result` is bounded and only ever summarized as a failure's masked first line. */
++export interface TranscriptToolCall {
++  toolUseId: string
++  name: string
++  input: unknown
++  usedAt: string | null
++  resultAt: string | null
++  isError: boolean
++  /** The CLI's toolDenialKind on the result: a denial, or a result it wrote for an interrupted call. */
++  denied: string | null
++  result: string
++  notes: string[]
+ }
+ 
+ export interface DurationStats { measured: number; unavailable: number; p50: number | null; p95: number | null; max: number | null; totalMs: number }
+@@ -135,7 +160,8 @@ export const TOOL_TIMING_GAPS: Readonly<Record<string, string>> = {
+   claude: 'Claude: the stream reports no tool duration; exec is Conductor\'s observed running phase (includes stream transport latency). Auto-mode classifier time inside the CLI is not visible, so wait is unavailable unless a card was raised.',
+   grok: 'Grok: no tool duration; exec is the observed running phase. Approval wait is observed when the ACP permission request arrives.',
+   local: 'Local model: Conductor\'s own runtime measures each tool (exec = provider). There is no approval phase, so wait is unavailable.',
+-  cli: 'CLI-view tabs (raw terminal) and cloud coworkers mirrored from another machine emit no structured tool events here: they are not covered.'
++  cli: 'CLI-view tabs (raw terminal) and conversations mirrored from another machine emit no structured tool events here: they are not covered.',
++  'claude-cloud': 'Cloud coworkers (origin cloud-transcript): read from the teleported transcript after a pull, never live. Elapsed is the cloud\'s own row times from tool_use to its tool_result (transcript-wall), which includes permission, hooks and queueing: not execution, and no approval wait. Calls without a result yet, denied or interrupted results, and missing or reversed times are not timed.'
+ }
+ 
+ const SECRETISH_KEY = /(secret|token|password|passwd|api[_-]?key|auth|credential|cookie|private)/i
+@@ -233,7 +259,9 @@ const parseTime = (value: string | undefined): number | undefined => { if (!valu
+ 
+ export function filterToolTimings(records: readonly ToolTimingRecord[], query: ToolTimingsQuery): ToolTimingRecord[] {
+   const since = parseTime(query.since), until = parseTime(query.until), tool = query.tool?.toLowerCase()
++  const origin = query.origin ?? 'native'
+   return records.filter(record => {
++    if ((record.origin ?? 'native') !== origin) return false
+     if (query.projectId && record.projectId !== query.projectId) return false
+     if (query.agentSessionId && record.agentSessionId !== query.agentSessionId) return false
+     if (query.provider && record.provider !== query.provider) return false
