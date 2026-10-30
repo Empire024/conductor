@@ -10,7 +10,7 @@ Cloud-session delivery, 2026-10-30. Branch `claude/t3code-cloud-clock-proof-m8xf
 | **Patch** | `docs/perf-evidence/t3code-cloud-clock-proof-integration.patch` = `git diff 5a97c51 cd883f8` plus a two-line header. Applied to a pristine checkout of `5a97c51` it produces exactly the implementation tree (`dd7ec0ad35140e5315ff52c632c80b280fa4906a`). |
 | **Left unchanged** | `t3code-provider-clock-timings*` (P3) and `t3code-cloud-transcript-timings*` (P4) |
 
-Export commit SHA: see the last line of this note.
+Export commit SHA: the last line of this note (it cannot be written into the commit it names, so a note-only commit follows it).
 
 This is the P4 claim only. P5 capture safety belongs to the other Cloud sibling and is not touched.
 There is no handoff work, no rank-7 work and no provider-clock redesign.
@@ -235,3 +235,5 @@ for i in idx:
 with open(out, 'w') as f:
     for r in result: f.write(json.dumps(r, separators=(',', ':')) + '\n')
 ```
+
+Export commit SHA: `8acb91053ea206e3be407bb29f1909650df505c6`
