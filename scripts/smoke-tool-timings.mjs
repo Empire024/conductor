@@ -57,7 +57,7 @@ try {
   await expect(section.locator('tr[data-tool="PowerShell"] td').nth(3)).toHaveText('n/a')
   // The headline claims recorded structured calls only, and says what is not recorded.
   await expect(section.locator('.settings-section-title')).toContainText('Structured tool calls recorded')
-  await expect(section.locator('.tool-timings-scope')).toContainText('Not recorded: raw CLI-view tabs, cloud coworkers')
+  await expect(section.locator('.tool-timings-scope')).toContainText('Not recorded: raw CLI-view tabs and conversations mirrored from another machine')
   await expect(section.locator('.tool-timings-gaps')).toHaveAttribute('open', '')
   await expect(section.locator('.tool-timings-slowest li').first()).toContainText('exec · provider')
   await section.scrollIntoViewIfNeeded()

@@ -21,7 +21,11 @@ export type ToolCategory = 'shell' | 'file-read' | 'file-write' | 'search' | 'we
  *  time survives (bounded to a day, never negative); provider: the provider's own start and end
  *  stamps of the item's lifecycle, both on its clock (Codex startedAtMs → completedAtMs). That is
  *  lifecycle time, not execution, and is never mixed with a host stamp. */
-export type ElapsedSource = 'host-monotonic' | 'wall-clock' | 'provider' | 'unavailable'
+export type ElapsedSource = 'host-monotonic' | 'wall-clock' | 'provider' | 'transcript-wall' | 'unavailable'
+/** native: a structured tab this host observed live. cloud-transcript: a cloud coworker's call read
+ *  afterwards from its teleported transcript (transcript-wall elapsed: the cloud's own write times of
+ *  the tool_use and its tool_result rows). Kept apart from the native report unless asked for. */
+export type ToolTimingOrigin = 'native' | 'cloud-transcript'
 /** provider-review: the provider's own auto-approval review time (Codex guardian), overlaps counted
  *  once. Kept apart from WaitSource, which is a human approval this host observed. */
 export type ReviewSource = 'provider-review'
@@ -53,6 +57,8 @@ export interface ToolTimingRecord {
   execSource: ExecSource
   /** Time the call spent in `preparing` (the model still writing its arguments), when seen. */
   prepareMs: number | null
+  /** Absent for a native call. */
+  origin?: 'cloud-transcript'
   /** The provider's automatic approval review of this call (absent: none reported). Not part of waitMs. */
   reviewMs?: number
   reviewSource?: ReviewSource
@@ -81,6 +87,25 @@ export interface ToolTimingsQuery {
   /** Most recent raw records to include; default 0, at most 100. */
   recent?: number
   includeDetached?: boolean
+  /** Which records: native tabs (the default) or cloud-coworker transcripts, never both mixed. */
+  origin?: ToolTimingOrigin
+}
+
+/** One tool call paired from a cloud transcript by its exact tool_use_id (cloud/runs.ts
+ *  parseTranscript). Stamps are the transcript rows' own ISO times, null when absent or invalid;
+ *  a call with notes (a conflicting restatement, a result naming another row) is never timed.
+ *  `result` is bounded and only ever summarized as a failure's masked first line. */
+export interface TranscriptToolCall {
+  toolUseId: string
+  name: string
+  input: unknown
+  usedAt: string | null
+  resultAt: string | null
+  isError: boolean
+  /** The CLI's toolDenialKind on the result: a denial, or a result it wrote for an interrupted call. */
+  denied: string | null
+  result: string
+  notes: string[]
 }
 
 export interface DurationStats { measured: number; unavailable: number; p50: number | null; p95: number | null; max: number | null; totalMs: number }
@@ -135,7 +160,8 @@ export const TOOL_TIMING_GAPS: Readonly<Record<string, string>> = {
   claude: 'Claude: the stream reports no tool duration; exec is Conductor\'s observed running phase (includes stream transport latency). Auto-mode classifier time inside the CLI is not visible, so wait is unavailable unless a card was raised.',
   grok: 'Grok: no tool duration; exec is the observed running phase. Approval wait is observed when the ACP permission request arrives.',
   local: 'Local model: Conductor\'s own runtime measures each tool (exec = provider). There is no approval phase, so wait is unavailable.',
-  cli: 'CLI-view tabs (raw terminal) and cloud coworkers mirrored from another machine emit no structured tool events here: they are not covered.'
+  cli: 'CLI-view tabs (raw terminal) and conversations mirrored from another machine emit no structured tool events here: they are not covered.',
+  'claude-cloud': 'Cloud coworkers (origin cloud-transcript): read from the teleported transcript after a pull, never live. Elapsed is the cloud\'s own row times from tool_use to its tool_result (transcript-wall), which includes permission, hooks and queueing: not execution, and no approval wait. Calls without a result yet, denied or interrupted results, and missing or reversed times are not timed.'
 }
 
 const SECRETISH_KEY = /(secret|token|password|passwd|api[_-]?key|auth|credential|cookie|private)/i
@@ -233,7 +259,9 @@ const parseTime = (value: string | undefined): number | undefined => { if (!valu
 
 export function filterToolTimings(records: readonly ToolTimingRecord[], query: ToolTimingsQuery): ToolTimingRecord[] {
   const since = parseTime(query.since), until = parseTime(query.until), tool = query.tool?.toLowerCase()
+  const origin = query.origin ?? 'native'
   return records.filter(record => {
+    if ((record.origin ?? 'native') !== origin) return false
     if (query.projectId && record.projectId !== query.projectId) return false
     if (query.agentSessionId && record.agentSessionId !== query.agentSessionId) return false
     if (query.provider && record.provider !== query.provider) return false

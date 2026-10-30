@@ -4,6 +4,7 @@ import { BrowserWindow } from 'electron'
 import * as pty from 'node-pty'
 import { CLOUD_CHANNELS, type CloudRunSummary } from '../../shared/cloud'
 import type { AgentControlUiRequest } from '../../shared/agent-control'
+import type { TranscriptToolCall } from '../../shared/tool-timings'
 import type { PaneTab } from '../../shared/models'
 import { registerCloudIpc } from './ipc'
 import { CloudRuns, type CloudSpawn } from './runs'
@@ -35,6 +36,8 @@ export function createCloud(options: {
   /** The claude CLI, or null. */
   claudeExecutable(): string | null
   ui(request: AgentControlUiRequest): Promise<unknown>
+  /** The tool-timing recorder, once it exists: a pulled transcript's tool calls go there. */
+  toolTimings?(): { importCloudTranscript(input: { projectId: string; runId: string; cloudSessionId: string; model?: string; calls: readonly TranscriptToolCall[] }): unknown } | undefined
 }): CloudRegistration {
   const offline = process.env.CONDUCTOR_OFFLINE_TESTS === '1'
   const runs = new CloudRuns({
@@ -44,7 +47,8 @@ export function createCloud(options: {
     ...(offline ? { prefixArgs: [join(process.cwd(), 'scripts/fixtures/cloud-cli.cjs')], env: { ELECTRON_RUN_AS_NODE: '1', CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR ?? join(options.userData, 'claude-config') } } : {}),
     spawn: spawnPty,
     onData: event => toWindows(CLOUD_CHANNELS.data, event),
-    onChanged: summary => toWindows(CLOUD_CHANNELS.changed, summary)
+    onChanged: summary => toWindows(CLOUD_CHANNELS.changed, summary),
+    onToolCalls: (run, calls) => options.toolTimings?.()?.importCloudTranscript({ projectId: run.projectId, runId: run.id, cloudSessionId: run.sessionId!, model: run.confirmedModel ?? run.model, calls })
   })
   // The owner's own launcher choice opens in front, like any tab the owner opens.
   const openTab = (run: CloudRunSummary): Promise<unknown> => {

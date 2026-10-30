@@ -4,7 +4,7 @@ import { appendFile, mkdir, open, readdir, rename, unlink, writeFile } from 'nod
 import { join } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import type { AgentEvent, ActivityStatus } from '../shared/structured-agent'
-import { aggregateToolTimings, summarizeToolArgs, summarizeToolError, toolCategory, TOOL_TIMING_LIMITS, type ToolTimingOutcome, type ToolTimingRecord, type ToolTimingsQuery, type ToolTimingsReport } from '../shared/tool-timings'
+import { aggregateToolTimings, summarizeToolArgs, summarizeToolError, toolCategory, TOOL_TIMING_LIMITS, type ToolTimingOutcome, type ToolTimingRecord, type ToolTimingsQuery, type ToolTimingsReport, type TranscriptToolCall } from '../shared/tool-timings'
 
 /**
  * The tool-call timing recorder (docs/perf-evidence/t3code-cloud-tool-timings.md). It sees every
@@ -25,6 +25,8 @@ const DAY_MS = 24 * 60 * 60 * 1000
 /** A provider duration beyond this is a unit or clock error, not a measurement. */
 const MAX_PROVIDER_MS = 7 * DAY_MS
 const FILE = 'tool-timings.jsonl'
+/** Transcript tool calls read in one import. */
+const MAX_IMPORT = 2000
 /** Written only synchronously by dispose(): no async compaction ever renames over it, so what a quit
  *  writes there cannot be lost to a rewrite still in flight. A load never reads or deletes it in
  *  place: it first renames it to a claimed file of its own, so a quit during that load starts a fresh
@@ -42,6 +44,8 @@ export interface ToolTimingsOptions {
   capacity?: number
   retentionMs?: number
   maxOpen?: number
+  /** Cloud-transcript records kept, within `capacity`; default 1000. */
+  cloudCapacity?: number
   flushMs?: number
   /** Most bytes load() reads, from the end of the file; default 16 MiB. */
   maxReadBytes?: number
@@ -75,6 +79,7 @@ export class ToolTimingRecorder {
   private readonly capacity: number
   private readonly retentionMs: number
   private readonly maxOpen: number
+  private readonly cloudCapacity: number
   private readonly flushMs: number
   private readonly maxReadBytes: number
   private directoryReady = false
@@ -113,6 +118,7 @@ export class ToolTimingRecorder {
     this.capacity = options.capacity ?? 5000
     this.retentionMs = options.retentionMs ?? 14 * DAY_MS
     this.maxOpen = options.maxOpen ?? 2000
+    this.cloudCapacity = Math.max(0, Math.floor(options.cloudCapacity ?? 1000))
     this.flushMs = options.flushMs ?? 2000
     this.maxReadBytes = Math.max(1, Math.floor(options.maxReadBytes ?? MAX_READ_BYTES))
     this.now = options.now ?? (() => performance.now())
@@ -203,6 +209,7 @@ export class ToolTimingRecorder {
     this.droppedOnLoad += earlier.length - keep.length
     for (const record of keep) this.index(record)
     this.records = [...keep, ...this.records]
+    this.trimCloud(this.cloudCapacity)
     this.fileLines = lines
     // An oversized, torn or partly stale file, or one with a quit's lines beside it, is rewritten
     // from what was kept inside this queued step, so it is whole, merged and under the bound before
@@ -393,6 +400,75 @@ export class ToolTimingRecorder {
     if (record.outcome === 'abandoned') this.abandoned.set(`${record.agentSessionId}\u0000${record.itemId}`, record)
   }
 
+  /**
+   * A cloud coworker's tool calls, paired from its pulled transcript (cloud/runs.ts parseTranscript).
+   * Each is keyed by the cloud session and its tool_use_id, never by a runtime, so a repeated pull,
+   * a pull after a restart, or the same id in another session adds nothing twice; the first
+   * statement stands. Elapsed is the transcript rows' own times on the cloud's clock (transcript-wall),
+   * never this host's: a missing, reversed or implausible pair, a denial and a result the CLI wrote
+   * for an interrupted call are not timed. Wait and execution are never inferred from it.
+   */
+  importCloudTranscript(input: { projectId: string; runId: string; cloudSessionId: string; model?: string; calls: readonly TranscriptToolCall[] }): { added: number; known: number; skipped: number } {
+    const counts = { added: 0, known: 0, skipped: 0 }
+    if (this.disposed || !input.cloudSessionId || !this.cloudCapacity) return counts
+    const cutoff = this.wallNow() - this.retentionMs
+    let cloud = this.records.filter(record => record.origin === 'cloud-transcript').length
+    for (const call of input.calls.slice(-MAX_IMPORT)) {
+      try {
+        const key = `cloud-transcript\u0000${input.cloudSessionId}\u0000${call.toolUseId}`
+        if (this.byKey.has(key)) { counts.known++; this.deduplicated++; continue }
+        const record = this.transcriptRecord(key, input, call)
+        // Beyond retention, or older than everything kept once the cloud allowance is full: a later
+        // pull would only add what the next trim drops again.
+        const ended = Date.parse(record.endedAt)
+        const oldest = cloud >= this.cloudCapacity ? this.records.find(entry => entry.origin === 'cloud-transcript') : undefined
+        if (ended < cutoff || oldest && ended <= Date.parse(oldest.endedAt)) { counts.skipped++; continue }
+        if (cloud >= this.cloudCapacity) this.trimCloud(this.cloudCapacity - 1); else cloud++
+        this.commit(record)
+        counts.added++
+      } catch { this.errors++ }
+    }
+    return counts
+  }
+
+  private transcriptRecord(key: string, input: { projectId: string; runId: string; cloudSessionId: string; model?: string }, call: TranscriptToolCall): ToolTimingRecord {
+    const notes = [...call.notes]
+    const start = call.usedAt ? Date.parse(call.usedAt) : NaN, end = call.resultAt ? Date.parse(call.resultAt) : NaN
+    let elapsedMs: number | null = null
+    if (call.denied) notes.push('denied-or-interrupted-result')
+    else if (call.notes.length) { /* the parser could not pair it on one clock: not timed */ }
+    else if (!Number.isFinite(start) || !Number.isFinite(end)) notes.push('missing-transcript-time')
+    else if (end < start || end - start > MAX_PROVIDER_MS) notes.push('invalid-transcript-interval')
+    else elapsedMs = end - start
+    const endedAt = Number.isFinite(end) ? new Date(end).toISOString() : Number.isFinite(start) ? new Date(start).toISOString() : null
+    if (!endedAt) notes.push('ended-at-import')
+    const tool = (call.name || 'Tool').slice(0, TOOL_TIMING_LIMITS.tool)
+    const outcome: ToolTimingOutcome = call.denied ? (/interrupt|cancel/i.test(call.denied) ? 'interrupted' : 'rejected') : call.isError ? 'failed' : 'completed'
+    const record: ToolTimingRecord = {
+      key, agentSessionId: input.runId, projectId: input.projectId, provider: 'claude-cloud', runtimeId: input.cloudSessionId, itemId: call.toolUseId,
+      ...(input.model ? { model: input.model } : {}), origin: 'cloud-transcript',
+      tool, category: toolCategory(tool), args: summarizeToolArgs(tool, call.input, this.mask),
+      startedAt: Number.isFinite(start) ? new Date(start).toISOString() : null, endedAt: endedAt ?? new Date(this.wallNow()).toISOString(),
+      elapsedMs, elapsedSource: elapsedMs === null ? 'unavailable' : 'transcript-wall',
+      waitMs: null, waitSource: 'unavailable', execMs: null, execSource: 'unavailable', prepareMs: null,
+      outcome, concurrent: 0, ...(notes.length ? { notes } : {})
+    }
+    if (outcome === 'failed' || outcome === 'rejected') { const error = summarizeToolError(call.result.slice(0, 4000), undefined, this.mask); if (error) record.error = error }
+    return record
+  }
+
+  /** Keeps at most `keep` cloud-transcript records, dropping the oldest; native records are never touched. */
+  private trimCloud(keep: number): void {
+    let excess = this.records.filter(record => record.origin === 'cloud-transcript').length - Math.max(0, keep)
+    if (excess <= 0) return
+    this.records = this.records.filter(record => {
+      if (excess <= 0 || record.origin !== 'cloud-transcript') return true
+      excess--
+      if (this.byKey.get(record.key) === record) this.byKey.delete(record.key)
+      return false
+    })
+  }
+
   private commit(record: ToolTimingRecord): void {
     this.records.push(record)
     this.index(record)
@@ -454,7 +530,7 @@ export class ToolTimingRecorder {
   report(query: ToolTimingsQuery = {}): ToolTimingsReport {
     const cutoff = this.wallNow() - this.retentionMs
     const live = this.records.filter(record => Date.parse(record.endedAt) >= cutoff)
-    const inFlight = [...this.open.values()].filter(call => (!query.projectId || call.record.projectId === query.projectId) && (!query.agentSessionId || call.record.agentSessionId === query.agentSessionId) && (!query.provider || call.record.provider === query.provider)).length
+    const inFlight = query.origin === 'cloud-transcript' ? 0 : [...this.open.values()].filter(call => (!query.projectId || call.record.projectId === query.projectId) && (!query.agentSessionId || call.record.agentSessionId === query.agentSessionId) && (!query.provider || call.record.provider === query.provider)).length
     return aggregateToolTimings(live, query, {
       observedAt: new Date(this.wallNow()).toISOString(), inFlight,
       storage: { records: live.length, capacity: this.capacity, retentionDays: Math.round(this.retentionMs / DAY_MS), recordedSince: live[0]?.endedAt ?? null, deduplicated: this.deduplicated, droppedOnLoad: this.droppedOnLoad, parseErrors: this.parseErrors }
@@ -511,6 +587,7 @@ export function parseRecord(line: string): ToolTimingRecord | null {
   const strings = ['key', 'agentSessionId', 'projectId', 'provider', 'runtimeId', 'itemId', 'tool', 'category', 'args', 'endedAt'] as const
   if (strings.some(key => typeof value[key] !== 'string') || !Number.isFinite(Date.parse(value.endedAt as string))) return null
   if (!OUTCOMES.has(value.outcome as ToolTimingOutcome) || !nullableNumber(value.elapsedMs) || !nullableNumber(value.waitMs) || !nullableNumber(value.execMs) || !nullableNumber(value.prepareMs)) return null
+  if (value.origin !== undefined && value.origin !== 'cloud-transcript') return null
   if (value.reviewMs !== undefined && (typeof value.reviewMs !== 'number' || !Number.isFinite(value.reviewMs) || value.reviewMs < 0 || value.reviewSource !== 'provider-review')) return null
   const { v: _v, ...record } = value
   return { concurrent: 0, startedAt: null, ...record } as unknown as ToolTimingRecord
@@ -540,6 +617,10 @@ export function toolTimingsQuery(args: Record<string, unknown>): ToolTimingsQuer
   if (args.includeDetached !== undefined) {
     if (typeof args.includeDetached !== 'boolean') throw new Error('includeDetached must be a boolean')
     query.includeDetached = args.includeDetached
+  }
+  if (args.origin !== undefined) {
+    if (args.origin !== 'native' && args.origin !== 'cloud-transcript') throw new Error('origin must be "native" or "cloud-transcript"')
+    query.origin = args.origin
   }
   return query
 }

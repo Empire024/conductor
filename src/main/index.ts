@@ -3140,7 +3140,7 @@ app.whenReady().then(async () => {
     console.warn('Execution nodes are unavailable', error)
   }
   try {
-    cloud = createCloud({ userData: app.getPath('userData'), claudeExecutable: () => agents.listProviders().find(provider => provider.id === 'claude')?.executable ?? null, ui: agentControlUi.request })
+    cloud = createCloud({ userData: app.getPath('userData'), claudeExecutable: () => agents.listProviders().find(provider => provider.id === 'claude')?.executable ?? null, ui: agentControlUi.request, toolTimings: () => toolTimings })
     control.setCloud(cloud.runs)
   } catch (error) {
     console.warn('Cloud sessions are unavailable', error)

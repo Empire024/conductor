@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameS
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import type { TranscriptToolCall } from '../../shared/tool-timings'
 import { CLOUD_EFFORTS, CLOUD_MODELS, isCloudModel, MAX_CLOUD_PROMPT_CHARS, type CloudFetchResult, type CloudRunSummary, type CloudTranscriptEntry, type CloudUsage } from '../../shared/cloud'
 import { TerminalScreen } from './screen'
 
@@ -32,6 +33,8 @@ export interface CloudRunsOptions {
   env?: Record<string, string>
   onData?(event: { id: string; data: string; sequence: number }): void
   onChanged?(summary: CloudRunSummary): void
+  /** The tool calls a pulled transcript paired, for the timing recorder (cloud-transcript origin). */
+  onToolCalls?(run: CloudRunSummary, calls: TranscriptToolCall[]): void
   now?(): number
   /** How often the client's debug log is read while a client runs. */
   pollMs?: number
@@ -129,10 +132,25 @@ export function findResult(lines: string, hint: string | null, known: string[]):
   return { branch: match.branch, head: match.sha, pr: pull ? Number(pull[1].split('/')[2]) : null, ambiguous: [] }
 }
 
+/** Tool calls kept from one transcript: the newest by their call time. */
+export const MAX_TRANSCRIPT_TOOLS = 2000
+const TELEPORT_NOTE = /^This session is being continued from another machine/
+const isoTime = (value: unknown): string | null => typeof value === 'string' && value.length <= 40 && Number.isFinite(Date.parse(value)) ? value : null
+
 /** The transcript the CLI's teleport saved (one JSON record per line), as readable entries plus
- *  the token usage and model its assistant messages report. */
-export function parseTranscript(jsonl: string): { entries: CloudTranscriptEntry[]; usage: CloudUsage; model: string | null } {
+ *  the token usage and model its assistant messages report, and its tool calls paired by their
+ *  exact tool_use_id (docs/perf-evidence/t3code-cloud-transcript-timings.md).
+ *
+ *  The teleport writes the cloud session's rows with their own `timestamp`, then its note that the
+ *  session continues on this machine, then rows of its own: only rows before that note are on the
+ *  cloud's clock, so only they are paired. A result row names the assistant row it answers
+ *  (sourceToolAssistantUUID); one that names another row is not paired. A statement repeated with
+ *  different times is not trusted. A call with no result yet is not a call to time. */
+export function parseTranscript(jsonl: string): { entries: CloudTranscriptEntry[]; usage: CloudUsage; model: string | null; tools: TranscriptToolCall[]; unmatched: number } {
   const entries: CloudTranscriptEntry[] = []
+  const uses = new Map<string, { name: string; input: unknown; at: string | null; uuid: string | null; conflict: boolean }>()
+  const results = new Map<string, { at: string | null; isError: boolean; denied: string | null; source: string | null; result: string; conflict: boolean }>()
+  let local = false
   const usage: CloudUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, messages: 0 }
   let model: string | null = null
   const clip = (value: string, max = 4000): string => value.length > max ? value.slice(0, max) + ' …' : value
@@ -141,10 +159,13 @@ export function parseTranscript(jsonl: string): { entries: CloudTranscriptEntry[
     let record: any
     try { record = JSON.parse(line) } catch { continue }
     if (record.type !== 'user' && record.type !== 'assistant') continue
+    const content = record.message?.content
+    const firstText = typeof content === 'string' ? content : Array.isArray(content) && typeof content[0]?.text === 'string' ? content[0].text : ''
+    // Everything from the teleport's note on was written on this machine, by its clock.
+    if (record.type === 'user' && TELEPORT_NOTE.test(firstText)) local = true
     // The teleport's own note about continuing elsewhere is not part of the session.
     if (record.isMeta) continue
     const at = typeof record.timestamp === 'string' ? record.timestamp : null
-    const content = record.message?.content
     if (record.type === 'assistant') {
       if (typeof record.message?.model === 'string' && !record.message.model.startsWith('<')) model = record.message.model
       const u = record.message?.usage
@@ -155,14 +176,44 @@ export function parseTranscript(jsonl: string): { entries: CloudTranscriptEntry[
       if (part?.type === 'text' && String(part.text).trim()) {
         if (record.type === 'user' && /^This session is being continued from another machine/.test(String(part.text))) continue
         entries.push({ role: record.type, text: clip(String(part.text)), at })
-      } else if (part?.type === 'tool_use') entries.push({ role: 'tool', text: clip(`${part.name} ${JSON.stringify(part.input ?? {})}`, 1500), at })
-      else if (part?.type === 'tool_result') {
+      } else if (part?.type === 'tool_use') {
+        const toolUseId = typeof part.id === 'string' && part.id && part.id.length <= 256 ? part.id : undefined
+        entries.push({ role: 'tool', text: clip(`${part.name} ${JSON.stringify(part.input ?? {})}`, 1500), at, ...(toolUseId ? { toolUseId } : {}) })
+        if (toolUseId && record.type === 'assistant' && !local) {
+          const use = { name: typeof part.name === 'string' ? part.name.slice(0, 80) : 'Tool', input: part.input, at: isoTime(record.timestamp), uuid: typeof record.uuid === 'string' ? record.uuid : null, conflict: false }
+          const prior = uses.get(toolUseId)
+          if (prior) prior.conflict ||= prior.at !== use.at || prior.uuid !== use.uuid
+          else uses.set(toolUseId, use)
+        }
+      } else if (part?.type === 'tool_result') {
         const body = Array.isArray(part.content) ? part.content.map((item: any) => item?.text ?? '').join('\n') : String(part.content ?? '')
-        entries.push({ role: 'result', text: clip(body, 1500), at })
+        const toolUseId = typeof part.tool_use_id === 'string' && part.tool_use_id && part.tool_use_id.length <= 256 ? part.tool_use_id : undefined
+        entries.push({ role: 'result', text: clip(body, 1500), at, ...(toolUseId ? { toolUseId } : {}) })
+        if (toolUseId && record.type === 'user' && !local) {
+          const result = { at: isoTime(record.timestamp), isError: part.is_error === true, denied: typeof record.toolDenialKind === 'string' ? record.toolDenialKind.slice(0, 40) : null,
+            source: typeof record.sourceToolAssistantUUID === 'string' ? record.sourceToolAssistantUUID : null, result: body.slice(0, 4000), conflict: false }
+          const prior = results.get(toolUseId)
+          if (prior) prior.conflict ||= prior.at !== result.at || prior.isError !== result.isError
+          else results.set(toolUseId, result)
+        }
       }
     }
   }
-  return { entries, usage, model }
+  const tools: TranscriptToolCall[] = []
+  for (const [toolUseId, result] of results) {
+    const use = uses.get(toolUseId)
+    // A result whose call is not in this file (a partial pull) waits for a pull that has both.
+    if (!use) continue
+    const notes: string[] = []
+    if (use.conflict || result.conflict) notes.push('conflicting-restatement')
+    if (result.source && use.uuid && result.source !== use.uuid) notes.push('result-names-another-row')
+    // The first statements' times stay labels; a call with notes is never timed from them.
+    tools.push({ toolUseId, name: use.name, input: use.input, usedAt: use.at, resultAt: result.at, isError: result.isError, denied: result.denied, result: result.result, notes })
+  }
+  const unmatched = [...uses.keys()].filter(id => !results.has(id)).length
+  // The same calls in the same order however the file's rows were ordered.
+  tools.sort((a, b) => (a.usedAt ?? '').localeCompare(b.usedAt ?? '') || a.toolUseId.localeCompare(b.toolUseId))
+  return { entries, usage, model, tools: tools.slice(-MAX_TRANSCRIPT_TOOLS), unmatched }
 }
 
 /**
@@ -413,6 +464,8 @@ export class CloudRuns {
     await this.git(dir, ['checkout', '--detach']).catch(() => undefined)
     if (checkedOut.startsWith('claude/') && !before.includes(checkedOut) && (await branches()).includes(checkedOut)) await this.git(run.cwd, ['branch', '-D', checkedOut]).catch(() => undefined)
     const parsed = parseTranscript(readFileSync(file, 'utf8'))
+    // Timings are a side record: a failure there never fails the pull.
+    if (run.sessionId && parsed.tools.length) try { this.options.onToolCalls?.(run, parsed.tools) } catch { /* the recorder counts its own errors */ }
     writeFileSync(this.transcriptFile(id), JSON.stringify(parsed.entries))
     this.update(id, { transcriptAt: this.now(), transcriptEntries: parsed.entries.length, usage: parsed.usage, ...(parsed.model ? { confirmedModel: parsed.model } : {}) })
     return parsed.entries

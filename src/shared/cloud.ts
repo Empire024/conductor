@@ -22,6 +22,8 @@ export interface CloudTranscriptEntry {
   role: 'user' | 'assistant' | 'tool' | 'result'
   text: string
   at: string | null
+  /** The provider's tool_use_id, on a tool call and on its result. */
+  toolUseId?: string
 }
 
 export interface CloudUsage { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; messages: number }

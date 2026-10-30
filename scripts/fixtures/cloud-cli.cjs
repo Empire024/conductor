@@ -31,8 +31,9 @@ if (args.includes('--teleport')) {
   const usage = { input_tokens: 2, output_tokens: 120, cache_read_input_tokens: 1000, cache_creation_input_tokens: 500 }
   const records = [
     { type: 'user', timestamp: at, message: { role: 'user', content: 'Add a one-line note in NOTE.md on a branch and open a pull request.' } },
-    { type: 'assistant', timestamp: at, message: { role: 'assistant', model: 'claude-opus-5-5', usage, content: [{ type: 'tool_use', name: 'Bash', input: { command: 'git push -u origin HEAD' } }] } },
-    { type: 'user', timestamp: at, message: { role: 'user', content: [{ type: 'tool_result', content: 'To github.com:Empire024/conductor.git\n * [new branch] claude/fixture-note-x1' }] } },
+    // The cloud's own row times, ids and links, as the real teleport keeps them.
+    { type: 'assistant', uuid: 'fixture-assistant-1', timestamp: new Date(Date.parse(at) - 3000).toISOString(), message: { role: 'assistant', model: 'claude-opus-5-5', usage, content: [{ type: 'tool_use', id: 'toolu_fixture_push', name: 'Bash', input: { command: 'git push -u origin HEAD' } }] } },
+    { type: 'user', uuid: 'fixture-result-1', sourceToolAssistantUUID: 'fixture-assistant-1', timestamp: new Date(Date.parse(at) - 1500).toISOString(), toolUseResult: { stdout: '', stderr: '', interrupted: false, isImage: false, noOutputExpected: false }, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_fixture_push', content: 'To github.com:Empire024/conductor.git\n * [new branch] claude/fixture-note-x1' }] } },
     { type: 'assistant', timestamp: at, message: { role: 'assistant', model: 'claude-opus-5-5', usage, content: [{ type: 'text', text: 'I added the note, pushed the branch and opened the pull request.' }] } },
     { type: 'user', isMeta: false, timestamp: at, message: { role: 'user', content: 'This session is being continued from another machine. Application state may have changed.' } },
     { type: 'cost-state', totalCostUSD: 0 }

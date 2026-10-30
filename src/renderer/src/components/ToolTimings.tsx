@@ -45,7 +45,7 @@ export function ToolTimingsSetting(): React.JSX.Element {
       </select>
       <button type="button" onClick={load} title="Refresh"><RefreshCw size={12} /> Refresh</button>
     </div>
-    <p className="tool-timings-scope">Not recorded: raw CLI-view tabs, cloud coworkers and conversations mirrored from another machine. Execution and approval wait are shown only where a provider or Conductor observed them.</p>
+    <p className="tool-timings-scope">Not recorded: raw CLI-view tabs and conversations mirrored from another machine. Cloud coworkers' calls read from their pulled transcripts are kept apart (tools.timings origin "cloud-transcript"). Execution and approval wait are shown only where a provider or Conductor observed them.</p>
     {error && <p className="usage-cap-error">{error}</p>}
     {report && <>
       <p className="tool-timings-summary" data-calls={report.totals.calls}>

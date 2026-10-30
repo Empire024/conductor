@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CLOUD_MODELS, isCloudModel, type CloudRunSummary } from '../../shared/cloud'
+import type { TranscriptToolCall } from '../../shared/tool-timings'
 import { CloudRuns, clientEnv, cloudArgs, findResult, parseTranscript, readCreateLog, type CloudExec, type CloudGit, type CloudPty, type CloudSpawn } from './runs'
 
 const fixture = join(process.cwd(), 'scripts/fixtures/cloud-cli.cjs')
@@ -108,7 +109,8 @@ describe('cloud runs', () => {
   it('creates the session, finds it has no live view, follows it on origin and pulls its transcript', async () => {
     const origin = fakeOrigin()
     const changes: CloudRunSummary[] = []
-    const runs = make({ git: origin.git, onChanged: summary => changes.push(summary) })
+    const toolCalls: Array<{ run: CloudRunSummary; calls: TranscriptToolCall[] }> = []
+    const runs = make({ git: origin.git, onChanged: summary => changes.push(summary), onToolCalls: (pulled, calls) => toolCalls.push({ run: pulled, calls }) })
     const run = start(runs, { model: 'claude-haiku-4-5-20251001', title: 'Note' })
     expect(run).toMatchObject({ status: 'starting', attached: true, model: 'claude-haiku-4-5-20251001', title: 'Note', startedBy: 'agent_1', cwd: project })
     await until(() => runs.get(run.id).liveView === false, 'the attach gate')
@@ -130,6 +132,13 @@ describe('cloud runs', () => {
     expect(origin.state.localBranches).toEqual([])
     const entries = await runs.transcript(run.id)
     expect(entries.map(entry => entry.role)).toEqual(['user', 'tool', 'result', 'assistant'])
+    // The tool call keeps its own id through the pull, paired with its result on the cloud's clock.
+    expect(entries.filter(entry => entry.toolUseId).map(entry => [entry.role, entry.toolUseId])).toEqual([['tool', 'toolu_fixture_push'], ['result', 'toolu_fixture_push']])
+    expect(toolCalls).toHaveLength(1)
+    expect(toolCalls[0]!.run).toMatchObject({ id: run.id, sessionId: created.sessionId })
+    const [call] = toolCalls[0]!.calls
+    expect(call).toMatchObject({ toolUseId: 'toolu_fixture_push', name: 'Bash', isError: false, denied: null, notes: [] })
+    expect(Date.parse(call!.resultAt!) - Date.parse(call!.usedAt!)).toBe(1500)
     expect(runs.get(run.id)).toMatchObject({ confirmedModel: 'claude-opus-5-5', usage: { messages: 2, outputTokens: 240, cacheReadTokens: 2000 } })
     expect(changes.some(change => change.status === 'running')).toBe(true)
 
