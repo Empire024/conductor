@@ -1,19 +1,19 @@
-import { memo, useCallback, useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { ChevronDown, ChevronRight, FolderGit2, FolderInput, MessageSquareDashed, MoreHorizontal, Plus, WandSparkles } from 'lucide-react'
 import type { ProjectRecord } from '../../../shared/models'
 import { GENERAL_PROJECT_NAME, threadAge, threadStateLabel, type ThreadSummary, type ThreadView } from '../../../shared/threads'
 import './ThreadList.css'
 import { sidebarThreadView } from './sidebar-thread-view'
+import { browserThreadListEnvironment, createThreadListRefresh, type ThreadListRefresh } from './thread-list-refresh'
 
 const COLLAPSED_KEY = 'conductor.threadsCollapsed'
-const POLL_MS = 5000
 
 interface ThreadListProps {
   projects: ProjectRecord[]
   /** The conversation in the focused tab, highlighted in the list. */
   activeAgentSessionId?: string | null
-  /** Changes whenever a conversation's phase changes, so the list follows without waiting for the poll. */
+  /** Changes whenever a conversation's phase changes, so the list follows without waiting for main's push. */
   refreshKey: string
   onNewThread(): void
   onOpenThread(thread: ThreadSummary): void
@@ -38,16 +38,32 @@ export const ThreadList = memo(function ThreadList(props: ThreadListProps): Reac
   const [promoting, setPromoting] = useState<string | null>(null)
   const [note, setNote] = useState('')
   const now = useRef(Date.now())
-  const refresh = useCallback(() => {
-    void window.conductor.threads.list(query).then(next => { now.current = Date.parse(next.observedAt) || Date.now(); setView(next) }).catch(() => undefined)
-  }, [query])
-  useEffect(() => { if (!collapsed) refresh() }, [collapsed, refresh, props.refreshKey])
+  const [, setClock] = useState(0)
+  const refresher = useRef<ThreadListRefresh | null>(null)
+  const latest = useRef({ query, collapsed })
+  latest.current = { query, collapsed }
+  const lastRefreshKey = useRef(props.refreshKey)
+  // One lifecycle per mount (src/renderer/src/components/thread-list-refresh.ts): it subscribes to main's
+  // threads:changed before its first read, never overlaps reads, and drops a result for an old query.
   useEffect(() => {
-    if (collapsed) return
-    const timer = window.setInterval(() => { if (document.visibilityState === 'visible') refresh() }, POLL_MS)
-    window.addEventListener('focus', refresh)
-    return () => { window.clearInterval(timer); window.removeEventListener('focus', refresh) }
-  }, [collapsed, refresh])
+    const next = createThreadListRefresh({
+      environment: browserThreadListEnvironment(),
+      subscribe: listener => window.conductor.threads.onChanged(listener),
+      read: q => window.conductor.threads.list(q),
+      onView: view => { now.current = Date.parse(view.observedAt) || Date.now(); setView(view) },
+      onClock: tick => { now.current = tick; setClock(tick) },
+      ...latest.current
+    })
+    refresher.current = next
+    return () => { next.dispose(); refresher.current = null }
+  }, [])
+  useEffect(() => { refresher.current?.setQuery(query) }, [query])
+  useEffect(() => { refresher.current?.setCollapsed(collapsed) }, [collapsed])
+  useEffect(() => {
+    if (lastRefreshKey.current === props.refreshKey) return
+    lastRefreshKey.current = props.refreshKey
+    refresher.current?.invalidate()
+  }, [props.refreshKey])
   useEffect(() => {
     if (!menu) return
     const close = (event: Event): void => { if (event.target instanceof Element && event.target.closest('.thread-menu')) return; setMenu(null) }
@@ -68,7 +84,7 @@ export const ThreadList = memo(function ThreadList(props: ThreadListProps): Reac
     const name = promoting?.trim()
     setPromoting(null)
     if (!commit || !name) return
-    try { await props.onPromoteGeneral(name); setNote(''); refresh() } catch (error) { setNote(error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+': Error: /, '') : String(error)) }
+    try { await props.onPromoteGeneral(name); setNote(''); refresher.current?.refreshNow() } catch (error) { setNote(error instanceof Error ? error.message.replace(/^Error invoking remote method '[^']+': Error: /, '') : String(error)) }
   }
   // A project on another machine runs its threads there; continuing into one is a later slice.
   const targets = props.projects.filter(project => !project.general && !project.remote)

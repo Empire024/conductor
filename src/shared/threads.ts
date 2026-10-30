@@ -15,6 +15,8 @@ import type { AgentProviderId, ProjectRecord, SessionRecord } from './models'
 import type { PhoneSessionState, PhoneSessionSummary } from './phone-access'
 
 export const GENERAL_PROJECT_NAME = 'General'
+/** Main tells every window that the thread list may have changed (src/main/thread-invalidations.ts); no payload. */
+export const THREADS_CHANGED_CHANNEL = 'threads:changed'
 export const GENERAL_WORKSPACE_NAME = 'Threads'
 /** Where the anchor ({projectId, path}) is kept in the settings table. */
 export const GENERAL_ANCHOR_SETTING = 'generalThreadsAnchor'
@@ -207,4 +209,6 @@ export interface ThreadsBridge {
   handoff(agentSessionId: string, targetProjectId: string): Promise<{ text: string; provider: AgentProviderId; model?: string } | null>
   /** "Turn into a project": the General project keeps its folder and threads under the owner's name for it. */
   promote(name: string): Promise<ProjectRecord>
+  /** The thread list may have changed (carries no payload); the listener re-reads `list`. Returns the unsubscribe. */
+  onChanged(listener: () => void): () => void
 }
