@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { ChevronDown, ChevronRight, FolderGit2, FolderInput, MessageSquareDashed, MoreHorizontal, Plus, WandSparkles } from 'lucide-react'
 import type { ProjectRecord } from '../../../shared/models'
@@ -57,8 +57,8 @@ export const ThreadList = memo(function ThreadList(props: ThreadListProps): Reac
     refresher.current = next
     return () => { next.dispose(); refresher.current = null }
   }, [])
-  useEffect(() => { refresher.current?.setQuery(query) }, [query])
-  useEffect(() => { refresher.current?.setCollapsed(collapsed) }, [collapsed])
+  useLayoutEffect(() => { refresher.current?.setQuery(query) }, [query])
+  useLayoutEffect(() => { refresher.current?.setCollapsed(collapsed) }, [collapsed])
   useEffect(() => {
     if (lastRefreshKey.current === props.refreshKey) return
     lastRefreshKey.current = props.refreshKey
