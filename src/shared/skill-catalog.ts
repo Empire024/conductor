@@ -30,6 +30,8 @@ export interface SkillRootReport {
   /** Display path of the root (`.claude/skills`, `~/.claude/skills`). */
   location: string
   state: 'read' | 'missing' | 'outside-project' | 'unreadable'
+  /** The root held more entries than SKILL_LIMITS.entriesPerRoot; only those the OS listed first were looked at. */
+  truncated?: boolean
 }
 export interface SkillCatalog {
   status: 'available' | 'unavailable'
@@ -48,7 +50,7 @@ export interface SkillCatalog {
 export const SKILL_LIMITS = {
   /** Skills kept per catalog. */
   skills: 200,
-  /** Directory entries looked at per root; the rest are not read at all. */
+  /** Directory entries enumerated per root, hidden ones included; the rest are not read at all. */
   entriesPerRoot: 400,
   /** A SKILL.md larger than this is ignored, never read. */
   fileBytes: 64 * 1024,

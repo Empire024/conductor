@@ -9,7 +9,8 @@ import { cleanSkillDescription, isSkillName, SKILL_LIMITS, type DiscoveredSkill,
  * names, so descriptions and sources come from the files themselves.
  *
  * Only names and frontmatter are read. Nothing in a skill folder is executed, imported or sent to
- * a model, and every read is bounded: a fixed number of directory entries per root, SKILL.md files
+ * a model, and every read is bounded: a fixed number of directory entries per root (hidden ones
+ * count; past the bound which entries were seen follows the OS listing order), SKILL.md files
  * up to SKILL_LIMITS.fileBytes (a larger one is skipped unread), a fixed number of skills. A skill
  * folder or SKILL.md that is a symlink out of its root is ignored, and a project `.claude/skills`
  * that resolves outside the project is not read.
@@ -132,6 +133,28 @@ async function skillOverrides(configDir: string, cwd: string): Promise<Map<strin
   return overrides
 }
 
+type DirectoryHandle = AsyncIterable<{ name: string }> & { close(): Promise<void> }
+/**
+ * The non-hidden names among the first `limit` entries the file system yields. Every entry counts
+ * toward the limit, hidden and invalid ones included, so a root full of dot entries is still read
+ * a bounded amount. Under the limit the names are complete and the caller's sort makes the result
+ * independent of listing order; past it (`truncated`) the subset is whatever the OS listed first,
+ * which can differ between file systems or runs, and the catalog says it is incomplete.
+ */
+export async function boundedDirectoryNames(path: string, limit: number, openDirectory: (path: string) => Promise<DirectoryHandle> = opendir): Promise<{ names: string[]; truncated: boolean }> {
+  const names: string[] = []
+  let seen = 0, truncated = false
+  const directory = await openDirectory(path)
+  try {
+    for await (const entry of directory) {
+      if (seen >= limit) { truncated = true; break }
+      seen++
+      if (!entry.name.startsWith('.')) names.push(entry.name)
+    }
+  } finally { await directory.close().catch(() => undefined) }
+  return { names, truncated }
+}
+
 export function claudeConfigDirectory(environment: NodeJS.ProcessEnv, cwd: string, home = homedir()): string {
   const configured = environment.CLAUDE_CONFIG_DIR?.trim()
   return configured ? resolve(cwd, configured) : join(home, '.claude')
@@ -158,20 +181,11 @@ export async function discoverClaudeSkills(options: ClaudeSkillDiscoveryOptions)
       const project = await realOrUndefined(root.containedIn)
       if (!project || !inside(project, realRoot)) { reports.push({ source: root.source, location: root.location, state: 'outside-project' }); continue }
     }
-    // Entries are collected up to the bound, then sorted, so the result does not depend on the
-    // order the file system lists them in.
-    const names: string[] = []
-    try {
-      const directory = await opendir(realRoot)
-      try {
-        for await (const entry of directory) {
-          if (names.length >= SKILL_LIMITS.entriesPerRoot) { truncated = true; break }
-          if (!entry.name.startsWith('.')) names.push(entry.name)
-        }
-      } finally { await directory.close().catch(() => undefined) }
-    } catch { reports.push({ source: root.source, location: root.location, state: 'unreadable' }); continue }
-    reports.push({ source: root.source, location: root.location, state: 'read' })
-    for (const name of names.sort()) {
+    let listing: Awaited<ReturnType<typeof boundedDirectoryNames>>
+    try { listing = await boundedDirectoryNames(realRoot, SKILL_LIMITS.entriesPerRoot) } catch { reports.push({ source: root.source, location: root.location, state: 'unreadable' }); continue }
+    if (listing.truncated) truncated = true
+    reports.push({ source: root.source, location: root.location, state: 'read', ...(listing.truncated ? { truncated: true } : {}) })
+    for (const name of listing.names.sort()) {
       if (skills.size >= SKILL_LIMITS.skills) { truncated = true; break }
       // A symlinked folder or SKILL.md that leaves the root (or a dangling one) is not this root's skill.
       const folder = await realOrUndefined(join(realRoot, name))

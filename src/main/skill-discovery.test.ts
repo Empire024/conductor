@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { claudeSkillCatalog, discoverClaudeSkills, parseSkillFrontmatter } from './skill-discovery'
+import { boundedDirectoryNames, claudeSkillCatalog, discoverClaudeSkills, parseSkillFrontmatter } from './skill-discovery'
 import { SKILL_LIMITS } from '../shared/skill-catalog'
 
 let base: string, project: string, home: string, outside: string
@@ -105,6 +105,29 @@ describe('Claude skill discovery', () => {
     expect(catalog.skills).toHaveLength(SKILL_LIMITS.skills)
     expect(catalog.skills[0]!.name).toBe('s000')
     expect(catalog.skills.at(-1)!.name).toBe(`s${String(SKILL_LIMITS.skills - 1).padStart(3, '0')}`)
+  })
+
+  it('counts hidden entries toward the per-root bound, so a root of dot entries is still read a bounded amount', async () => {
+    // An endless directory of hidden names: enumeration must stop at the bound, not run forever.
+    let yielded = 0, closed = false
+    const endless = async () => ({
+      async *[Symbol.asyncIterator]() { for (;;) { yielded++; yield { name: `.hidden-${yielded}` } } },
+      async close() { closed = true }
+    })
+    expect(await boundedDirectoryNames('/unused', 5, endless)).toEqual({ names: [], truncated: true })
+    expect(yielded).toBe(6)
+    expect(closed).toBe(true)
+    // Exactly at the bound is complete, not truncated; visible names among the counted entries are kept.
+    const listing = (names: string[]) => async () => ({ async *[Symbol.asyncIterator]() { for (const name of names) yield { name } }, async close() {} })
+    expect(await boundedDirectoryNames('/unused', 3, listing(['.a', 'b', '.c']))).toEqual({ names: ['b'], truncated: false })
+    expect(await boundedDirectoryNames('/unused', 3, listing(['.a', '.b', '.c', 'late']))).toEqual({ names: [], truncated: true })
+
+    const root = join(project, '.claude', 'skills')
+    await Promise.all(Array.from({ length: SKILL_LIMITS.entriesPerRoot + 1 }, (_, index) => writeFile(join(root, `.dot-${index}`), '')))
+    const catalog = await discover()
+    expect(catalog.truncated).toBe(true)
+    expect(catalog.skills).toEqual([])
+    expect(catalog.roots?.[1]).toEqual({ source: 'project', location: '.claude/skills', state: 'read', truncated: true })
   })
 
   it('cleans untrusted descriptions to one bounded line', async () => {

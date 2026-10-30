@@ -41,9 +41,14 @@ Plugin skills (`plugin:skill`) are not scanned; the CLI reports them in its own 
 - Discovery reads names and frontmatter only. No script, prompt or file in a skill folder is run,
   imported or sent to a model; descriptions are untrusted display text (control and bidi characters
   removed, one line, at most 160 characters).
-- Bounded I/O (`SKILL_LIMITS`, `src/shared/skill-catalog.ts`): 400 directory entries per root, 200
-  skills, SKILL.md up to 64 KiB (a larger one is skipped unread), settings files up to 256 KiB.
-  Names are sorted before reading, so a truncated list is the same on every run.
+- Bounded I/O (`SKILL_LIMITS`, `src/shared/skill-catalog.ts`): 400 directory entries enumerated
+  per root (hidden and invalid entries count too, so a root full of dot files is still bounded),
+  200 skills, SKILL.md up to 64 KiB (a larger one is skipped unread), settings files up to 256 KiB.
+- Determinism: a root within the entry bound is listed completely and sorted, so its result does
+  not depend on the order the file system lists it in. A root past the bound is marked
+  `truncated` (in `roots[]` and on the catalog, and the list says it is incomplete): which entries
+  were seen then follows the OS listing order and can differ between file systems or runs. The
+  200-skill cut is taken from the sorted names of what was seen.
 - A skill folder or SKILL.md that is a symlink resolving outside its root is ignored, and a project
   `.claude/skills` that resolves outside the project is not read (`roots[].state: outside-project`).
   A user root may itself be a symlink (dotfiles), but entries must stay inside where it resolves.
