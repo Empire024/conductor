@@ -1,9 +1,10 @@
 import { memo, useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { ChevronDown, ChevronRight, FolderGit2, FolderInput, MessageSquareDashed, MoreHorizontal, Plus } from 'lucide-react'
+import { ChevronDown, ChevronRight, FolderGit2, FolderInput, MessageSquareDashed, MoreHorizontal, Plus, WandSparkles } from 'lucide-react'
 import type { ProjectRecord } from '../../../shared/models'
 import { GENERAL_PROJECT_NAME, threadAge, threadStateLabel, type ThreadSummary, type ThreadView } from '../../../shared/threads'
 import './ThreadList.css'
+import { sidebarThreadView } from './sidebar-thread-view'
 
 const COLLAPSED_KEY = 'conductor.threadsCollapsed'
 const POLL_MS = 5000
@@ -30,6 +31,7 @@ const readCollapsed = (): boolean => { try { return localStorage.getItem(COLLAPS
  */
 export const ThreadList = memo(function ThreadList(props: ThreadListProps): React.JSX.Element {
   const [view, setView] = useState<ThreadView | null>(null)
+  const [olderOpen, setOlderOpen] = useState(false)
   const [query, setQuery] = useState('')
   const [collapsed, setCollapsed] = useState(readCollapsed)
   const [menu, setMenu] = useState<{ thread: ThreadSummary | null; x: number; y: number } | null>(null)
@@ -71,7 +73,9 @@ export const ThreadList = memo(function ThreadList(props: ThreadListProps): Reac
   // A project on another machine runs its threads there; continuing into one is a later slice.
   const targets = props.projects.filter(project => !project.general && !project.remote)
   const hasGeneral = Boolean(view?.generalProjectId)
-  const total = view?.total ?? 0
+  const { current, older } = sidebarThreadView(view, now.current)
+  const total = current.length
+  const groups = [{ bucket: 'current', label: '', threads: current }, ...(olderOpen ? [{ bucket: 'older', label: 'Older', threads: older }] : [])]
 
   return (
     <section className="sidebar-section threads-section" aria-label="Threads" data-thread-count={total}>
@@ -79,7 +83,7 @@ export const ThreadList = memo(function ThreadList(props: ThreadListProps): Reac
         <button type="button" className="threads-toggle" onClick={toggle} aria-expanded={!collapsed}>
           {collapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
           <span>Threads</span>
-          {total > 0 && <small>{total}</small>}
+
         </button>
         <div className="heading-actions">
           <button type="button" className="threads-new" title="New thread, no project needed (Ctrl+Alt+N)" aria-label="New thread" onClick={props.onNewThread}><Plus size={14} /></button>
@@ -93,36 +97,37 @@ export const ThreadList = memo(function ThreadList(props: ThreadListProps): Reac
               onChange={event => setPromoting(event.target.value)} onBlur={() => void finishPromote(false)}
               onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); void finishPromote(true) } if (event.key === 'Escape') { event.preventDefault(); void finishPromote(false) } }} />
           )}
-          {(total > 6 || query) && (
+          {(olderOpen || query) && (
             <input className="threads-search" type="search" placeholder="Search threads" aria-label="Search threads" value={query} onChange={event => setQuery(event.target.value)} />
           )}
-          {view?.groups.map(group => (
+          {groups.map(group => (
             <div key={group.bucket} className={`thread-group thread-group-${group.bucket}`}>
-              <div className="thread-group-label">{group.label}</div>
+              {group.label && <div className="thread-group-label">{group.label}</div>}
               {group.threads.map(thread => {
                 const pill = threadStateLabel(thread)
                 return (
                   <button key={thread.id} type="button"
                     className={`thread-row${thread.id === props.activeAgentSessionId ? ' active' : ''}`}
                     data-thread-id={thread.id} data-thread-state={thread.state} data-thread-general={thread.general || undefined}
-                    title={`${thread.title}\n${thread.general ? `${GENERAL_PROJECT_NAME} (no project)` : thread.projectName} / ${thread.workspaceName} · ${thread.machineName}${thread.lastText ? `\n${thread.lastRole === 'user' ? 'You: ' : ''}${thread.lastText}` : ''}`}
+                    title={`${thread.title}\n${thread.general ? `${GENERAL_PROJECT_NAME} (no project)` : thread.projectName} / ${thread.workspaceName} · ${props.projects.find(project => project.id === thread.projectId)?.remote?.machineName ?? ''}${thread.lastText ? `\n${thread.lastRole === 'user' ? 'You: ' : ''}${thread.lastText}` : ''}`}
                     onClick={() => props.onOpenThread(thread)}
                     onContextMenu={event => openMenu(event, thread)}>
                     <span className={`thread-dot ${thread.state}`} aria-hidden="true" />
-                    <span className="thread-title ellipsis">{thread.wizard ? '✦ ' : ''}{thread.title}</span>
+                    <span className="thread-title ellipsis">{thread.wizard && <WandSparkles size={10} aria-label="Wizard" />}{thread.title}</span>
                     {pill ? <em className={`thread-pill ${thread.state}`}>{pill}</em> : <time dateTime={thread.updatedAt}>{threadAge(thread.updatedAt, now.current)}</time>}
                     <small className="thread-meta ellipsis">
                       {thread.general ? <><MessageSquareDashed size={10} aria-hidden="true" /> {GENERAL_PROJECT_NAME}</> : thread.projectName}
-                      {thread.coworkers ? ` · +${thread.coworkers} coworker${thread.coworkers === 1 ? '' : 's'}` : ''}
+                      {thread.wizard ? ' · Wizard' : thread.coworkers ? ' · Controller' : thread.controllerId ? ' · Coworker' : ''}
                     </small>
                   </button>
                 )
               })}
             </div>
           ))}
-          {view && view.hidden > 0 && <p className="threads-note">{view.hidden} more; search to find them.</p>}
-          {view && !total && (
-            <p className="threads-empty">{query ? 'No thread matches.' : <>No open threads. <button type="button" onClick={props.onNewThread}>Start one</button> — no project needed.</>}</p>
+          {(older.length > 0 || (view?.hidden ?? 0) > 0) && <button type="button" className="threads-older" aria-expanded={olderOpen} onClick={() => setOlderOpen(open => !open)}>{olderOpen ? 'Hide older' : 'Older'}</button>}
+          {olderOpen && view && view.hidden > 0 && <p className="threads-note">Search to find more threads.</p>}
+          {view && !total && !olderOpen && (
+            <p className="threads-empty">{query ? 'No thread matches.' : <>No active wizards. <button type="button" onClick={props.onNewThread}>Start one</button> — no project needed.</>}</p>
           )}
           {note && <p className="threads-note" role="status">{note}</p>}
         </div>
