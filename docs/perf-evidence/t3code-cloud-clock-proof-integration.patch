@@ -1,0 +1,399 @@
+Exact increment: base 5a97c51da8523b99be43412f094b0d82a426cef1 (P4 export) -> implementation cd883f86a71f91c1bbe13c881be8be88d8793957
+Apply after the P3 and P4 patches: git apply --3way docs/perf-evidence/t3code-cloud-clock-proof-integration.patch (see t3code-cloud-clock-proof.md for the shared hunks)
+
+diff --git a/src/main/cloud/fixtures/cloud-session-rows.cli-2.1.314.jsonl b/src/main/cloud/fixtures/cloud-session-rows.cli-2.1.314.jsonl
+new file mode 100644
+index 0000000..bfb5600
+--- /dev/null
++++ b/src/main/cloud/fixtures/cloud-session-rows.cli-2.1.314.jsonl
+@@ -0,0 +1,13 @@
++{"type":"agent-name","agentName":"[redacted]","sessionId":"00000000-0000-4000-8000-00000000cafe"}
++{"type":"queue-operation","operation":"enqueue","timestamp":"2026-10-30T20:06:39.158Z","sessionId":"00000000-0000-4000-8000-00000000cafe","content":"[redacted]"}
++{"parentUuid":null,"isSidechain":false,"promptId":"00000000-0000-4000-8000-000000000001","type":"user","message":{"role":"user","content":"[redacted]"},"uuid":"00000000-0000-4000-8000-000000000002","timestamp":"2026-10-30T20:06:39.487Z","permissionMode":"default","origin":{"kind":"human"},"promptSource":"sdk","turnOrigin":"human","turnPosition":{"promptIndex":1,"turnIndex":1},"clientPlatform":"claude_code_cli","turnAttributionKey":"00000000-0000-4000-8000-000000000002","userType":"external","entrypoint":"remote","cwd":"/redacted/cwd","sessionId":"00000000-0000-4000-8000-00000000cafe","version":"2.1.314","gitBranch":"redacted-branch"}
++{"parentUuid":"00000000-0000-4000-8000-000000000002","isSidechain":false,"type":"attachment","uuid":"00000000-0000-4000-8000-000000000003","timestamp":"2026-10-30T20:06:39.485Z","userType":"external","entrypoint":"remote","cwd":"/redacted/cwd","sessionId":"00000000-0000-4000-8000-00000000cafe","version":"2.1.314","gitBranch":"redacted-branch","attachment":{"type":"environment"}}
++{"parentUuid":"00000000-0000-4000-8000-000000000004","isSidechain":false,"message":{"model":"claude-sonnet-5-5","id":"msg_REDACTED0001","type":"message","role":"assistant","content":[{"type":"text","text":"[redacted]"}],"stop_reason":"tool_use"},"apiBlockIndex":1,"requestId":"req_REDACTED0001","requestedModel":"claude-sonnet-5-5","type":"assistant","uuid":"00000000-0000-4000-8000-000000000005","timestamp":"2026-10-30T20:07:01.766Z","advisorModel":"claude-opus-5-5","effort":"high","perTurnEffort":"high","userType":"external","entrypoint":"remote","cwd":"/redacted/cwd","sessionId":"00000000-0000-4000-8000-00000000cafe","version":"2.1.314","gitBranch":"redacted-branch"}
++{"parentUuid":"00000000-0000-4000-8000-000000000005","isSidechain":false,"message":{"model":"claude-sonnet-5-5","id":"msg_REDACTED0001","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_01RedactedFixture0000001","name":"Bash","input":{"command":"[redacted]"},"caller":{"type":"direct"}}],"stop_reason":"tool_use"},"apiBlockIndex":2,"requestId":"req_REDACTED0001","requestedModel":"claude-sonnet-5-5","type":"assistant","uuid":"00000000-0000-4000-8000-000000000006","timestamp":"2026-10-30T20:07:02.166Z","advisorModel":"claude-opus-5-5","effort":"high","perTurnEffort":"high","userType":"external","entrypoint":"remote","cwd":"/redacted/cwd","sessionId":"00000000-0000-4000-8000-00000000cafe","version":"2.1.314","gitBranch":"redacted-branch"}
++{"parentUuid":"00000000-0000-4000-8000-000000000006","isSidechain":false,"promptId":"00000000-0000-4000-8000-000000000001","type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01RedactedFixture0000001","type":"tool_result","content":"[redacted]","is_error":false}]},"uuid":"00000000-0000-4000-8000-000000000007","timestamp":"2026-10-30T20:07:02.446Z","toolUseResult":{"stdout":"[redacted]","stderr":"[redacted]","interrupted":false,"isImage":false,"noOutputExpected":false},"sandboxed":false,"sourceToolAssistantUUID":"00000000-0000-4000-8000-000000000006","permissionDecision":{"decision":"accept","source":"config","reasonType":"rule","ruleSource":"[redacted]"},"userType":"external","entrypoint":"remote","cwd":"/redacted/cwd","sessionId":"00000000-0000-4000-8000-00000000cafe","version":"2.1.314","gitBranch":"redacted-branch"}
++{"parentUuid":"00000000-0000-4000-8000-000000000007","isSidechain":false,"message":{"model":"claude-sonnet-5-5","id":"msg_REDACTED0001","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_01RedactedFixture0000002","name":"Bash","input":{"command":"[redacted]"},"caller":{"type":"direct"}}],"stop_reason":"tool_use"},"apiBlockIndex":3,"requestId":"req_REDACTED0001","requestedModel":"claude-sonnet-5-5","type":"assistant","uuid":"00000000-0000-4000-8000-000000000008","timestamp":"2026-10-30T20:07:02.992Z","advisorModel":"claude-opus-5-5","effort":"high","perTurnEffort":"high","userType":"external","entrypoint":"remote","cwd":"/redacted/cwd","sessionId":"00000000-0000-4000-8000-00000000cafe","version":"2.1.314","gitBranch":"redacted-branch"}
++{"parentUuid":"00000000-0000-4000-8000-000000000008","isSidechain":false,"promptId":"00000000-0000-4000-8000-000000000001","type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01RedactedFixture0000002","type":"tool_result","content":"[redacted]","is_error":false}]},"uuid":"00000000-0000-4000-8000-000000000009","timestamp":"2026-10-30T20:07:03.564Z","toolUseResult":{"stdout":"[redacted]","stderr":"[redacted]","interrupted":false,"isImage":false,"noOutputExpected":false},"sandboxed":false,"sourceToolAssistantUUID":"00000000-0000-4000-8000-000000000008","permissionDecision":{"decision":"accept","source":"config","reasonType":"rule","ruleSource":"[redacted]"},"userType":"external","entrypoint":"remote","cwd":"/redacted/cwd","sessionId":"00000000-0000-4000-8000-00000000cafe","version":"2.1.314","gitBranch":"redacted-branch"}
++{"parentUuid":"00000000-0000-4000-8000-000000000010","isSidechain":false,"message":{"model":"claude-sonnet-5-5","id":"msg_REDACTED0002","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_01RedactedFixture0000003","name":"Grep","input":{"pattern":"[redacted]","path":"[redacted]","output_mode":"[redacted]"},"caller":{"type":"direct"}}],"stop_reason":"tool_use"},"apiBlockIndex":3,"requestId":"req_REDACTED0002","requestedModel":"claude-sonnet-5-5","type":"assistant","uuid":"00000000-0000-4000-8000-000000000011","timestamp":"2026-10-30T20:07:08.766Z","advisorModel":"claude-opus-5-5","effort":"high","perTurnEffort":"high","userType":"external","entrypoint":"remote","cwd":"/redacted/cwd","sessionId":"00000000-0000-4000-8000-00000000cafe","version":"2.1.314","gitBranch":"redacted-branch"}
++{"parentUuid":"00000000-0000-4000-8000-000000000011","isSidechain":false,"promptId":"00000000-0000-4000-8000-000000000001","type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01RedactedFixture0000003","type":"tool_result","content":"[redacted]"}]},"uuid":"00000000-0000-4000-8000-000000000012","timestamp":"2026-10-30T20:07:09.079Z","toolUseResult":{"mode":"files_with_matches","filenames":["[redacted]","[redacted]","[redacted]","[redacted]","[redacted]","[redacted]","[redacted]","[redacted]","[redacted]","[redacted]","[redacted]","[redacted]","[redacted]"],"numFiles":13,"totalFiles":13},"sourceToolAssistantUUID":"00000000-0000-4000-8000-000000000011","permissionDecision":{"decision":"accept","source":"config","reasonType":"rule","ruleSource":"[redacted]"},"userType":"external","entrypoint":"remote","cwd":"/redacted/cwd","sessionId":"00000000-0000-4000-8000-00000000cafe","version":"2.1.314","gitBranch":"redacted-branch"}
++{"parentUuid":"00000000-0000-4000-8000-000000000013","isSidechain":false,"message":{"model":"claude-sonnet-5-5","id":"msg_REDACTED0003","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_01RedactedFixture0000004","name":"Read","input":{"file_path":"[redacted]"},"caller":{"type":"direct"}}],"stop_reason":"tool_use"},"apiBlockIndex":0,"requestId":"req_REDACTED0003","requestedModel":"claude-sonnet-5-5","type":"assistant","uuid":"00000000-0000-4000-8000-000000000014","timestamp":"2026-10-30T20:07:10.376Z","advisorModel":"claude-opus-5-5","effort":"high","perTurnEffort":"high","userType":"external","entrypoint":"remote","cwd":"/redacted/cwd","sessionId":"00000000-0000-4000-8000-00000000cafe","version":"2.1.314","gitBranch":"redacted-branch"}
++{"parentUuid":"00000000-0000-4000-8000-000000000014","isSidechain":false,"promptId":"00000000-0000-4000-8000-000000000001","type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01RedactedFixture0000004","type":"tool_result","content":"[redacted]"}]},"uuid":"00000000-0000-4000-8000-000000000015","timestamp":"2026-10-30T20:07:10.395Z","toolUseResult":{"type":"text","file":{"filePath":"[redacted]","content":"[redacted]","numLines":206,"startLine":1,"totalLines":206}},"sourceToolAssistantUUID":"00000000-0000-4000-8000-000000000014","permissionDecision":{"decision":"accept","source":"config","reasonType":"rule","ruleSource":"[redacted]"},"userType":"external","entrypoint":"remote","cwd":"/redacted/cwd","sessionId":"00000000-0000-4000-8000-00000000cafe","version":"2.1.314","gitBranch":"redacted-branch"}
+diff --git a/src/main/cloud/runs.ts b/src/main/cloud/runs.ts
+index 776603e..fbe84de 100644
+--- a/src/main/cloud/runs.ts
++++ b/src/main/cloud/runs.ts
+@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameS
+ import { homedir } from 'node:os'
+ import { join, resolve } from 'node:path'
+ import { randomUUID } from 'node:crypto'
+-import type { TranscriptToolCall } from '../../shared/tool-timings'
++import { rowClockMs, type TranscriptToolCall } from '../../shared/tool-timings'
+ import { CLOUD_EFFORTS, CLOUD_MODELS, isCloudModel, MAX_CLOUD_PROMPT_CHARS, type CloudFetchResult, type CloudRunSummary, type CloudTranscriptEntry, type CloudUsage } from '../../shared/cloud'
+ import { TerminalScreen } from './screen'
+ 
+@@ -135,7 +135,8 @@ export function findResult(lines: string, hint: string | null, known: string[]):
+ /** Tool calls kept from one transcript: the newest by their call time. */
+ export const MAX_TRANSCRIPT_TOOLS = 2000
+ const TELEPORT_NOTE = /^This session is being continued from another machine/
+-const isoTime = (value: unknown): string | null => typeof value === 'string' && value.length <= 40 && Number.isFinite(Date.parse(value)) ? value : null
++/** A row's own `timestamp` as its label, only when it is a time on one known clock (rowClockMs). */
++const isoTime = (value: unknown): string | null => rowClockMs(value) === null ? null : value as string
+ 
+ /** The transcript the CLI's teleport saved (one JSON record per line), as readable entries plus
+  *  the token usage and model its assistant messages report, and its tool calls paired by their
+diff --git a/src/main/cloud/transcript-clock-proof.test.ts b/src/main/cloud/transcript-clock-proof.test.ts
+new file mode 100644
+index 0000000..01bb123
+--- /dev/null
++++ b/src/main/cloud/transcript-clock-proof.test.ts
+@@ -0,0 +1,271 @@
++import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { afterEach, beforeEach, describe, expect, it } from 'vitest'
++import { maskSecrets } from '../structured-store'
++import { ToolTimingRecorder } from '../tool-timings'
++import { rowClockMs } from '../../shared/tool-timings'
++import { CloudRuns, parseTranscript, type CloudGit, type CloudPty, type CloudSpawn } from './runs'
++
++/**
++ * Do the cloud's own row times survive real ingestion? (docs/perf-evidence/t3code-cloud-clock-proof.md)
++ *
++ * REAL: ./fixtures/cloud-session-rows.cli-2.1.314.jsonl is a redacted slice of the transcript that
++ * Claude Code 2.1.314 itself wrote in the Claude Code cloud container that ran this work: structural
++ * keys, row `timestamp`s, ids' links and `message.id` sharing are as written; every text, command,
++ * output, path, branch and session id is replaced. The four tool pairs in it are the only production
++ * clock evidence here: Bash 280 ms, Bash 572 ms, Grep 313 ms, Read 19 ms between the call row and
++ * its result row.
++ *
++ * CONSTRUCTED: everything the teleport adds is built here from the CLI's documented write path
++ * (history keeps its rows and timestamps, `sessionId` becomes the local teleport id, then the
++ * "continued from another machine" note and rows of this machine, stamped by this machine). No
++ * teleport file was observed; those pieces say what the code does with such a file, not that the
++ * CLI writes it. The transport (the teleport client) and Electron are faked; no model or CLI runs.
++ */
++const FIXTURE = join(process.cwd(), 'src/main/cloud/fixtures/cloud-session-rows.cli-2.1.314.jsonl')
++const realRows = (): any[] => readFileSync(FIXTURE, 'utf8').trim().split('\n').map(line => JSON.parse(line))
++const jsonl = (rows: unknown[]): string => rows.map(row => JSON.stringify(row)).join('\n') + '\n'
++
++// This machine, a day later than the rows, and never close to them.
++const PULL_TIME = '2026-10-31T09:30:00.000Z'
++const HOST_WALL = Date.parse(PULL_TIME)
++const LOCAL_ID = '11111111-2222-4333-8444-555555555555'
++const CLOUD_SESSION = 'session_01CLOCKPROOF'
++
++const TOOLS = { bash1: 'toolu_01RedactedFixture0000001', bash2: 'toolu_01RedactedFixture0000002', grep: 'toolu_01RedactedFixture0000003', read: 'toolu_01RedactedFixture0000004' }
++const REAL_MS: Record<string, number> = { [TOOLS.bash1]: 280, [TOOLS.bash2]: 572, [TOOLS.grep]: 313, [TOOLS.read]: 19 }
++
++const note = (content: unknown = 'This session is being continued from another machine. Application state may have changed. The updated working directory is /redacted/cwd') =>
++  ({ type: 'user', isMeta: true, uuid: 'local-note', timestamp: PULL_TIME, sessionId: LOCAL_ID, message: { role: 'user', content } })
++/** What the CLI's writer does to a pulled history row: keeps it, sets the local session id. */
++const asHistory = (row: any) => ({ ...row, sessionId: LOCAL_ID, ...(row.type === 'user' || row.type === 'assistant' ? { remoteSourced: true } : {}) })
++const teleportShaped = (rows: any[] = realRows(), after: unknown[] = []): string => jsonl([...rows.map(asHistory), note(), ...after])
++/** Rows this machine wrote after the note: a call and its result 40 ms apart on THIS clock. */
++const localPair = [
++  { type: 'assistant', uuid: 'local-a', timestamp: PULL_TIME, sessionId: LOCAL_ID, message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_local', name: 'Bash', input: { command: 'ls' } }] } },
++  { type: 'user', uuid: 'local-r', sourceToolAssistantUUID: 'local-a', timestamp: '2026-10-31T09:30:00.040Z', sessionId: LOCAL_ID, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_local', content: 'ok' }] } }
++]
++
++const find = (rows: any[], predicate: (row: any) => boolean): any => rows.find(predicate)
++const useRow = (rows: any[], id: string): any => find(rows, row => row.type === 'assistant' && row.message.content.some((part: any) => part.id === id))
++const resultRow = (rows: any[], id: string): any => find(rows, row => row.type === 'user' && Array.isArray(row.message.content) && row.message.content.some((part: any) => part.tool_use_id === id))
++
++function recorder(options: { directory?: string; cloudCapacity?: number } = {}) {
++  const rec = new ToolTimingRecorder({ directory: options.directory, cloudCapacity: options.cloudCapacity, flushMs: 60_000, now: () => 7_777_777, wallNow: () => HOST_WALL, mask: maskSecrets })
++  const pull = (text: string, cloudSessionId = CLOUD_SESSION, runId = 'cloud_run1') =>
++    rec.importCloudTranscript({ projectId: 'p1', runId, cloudSessionId, model: 'claude-opus-5-5', calls: parseTranscript(text).tools })
++  const cloud = (extra: Record<string, unknown> = {}) => rec.report({ origin: 'cloud-transcript', recent: 100, ...extra })
++  const byId = () => Object.fromEntries(cloud().recent.map(record => [record.itemId, record]))
++  return { rec, pull, cloud, byId }
++}
++
++describe('the real provider rows (redacted slice of a Claude Code 2.1.314 cloud transcript)', () => {
++  it('carry a per-row ISO time, exact id links, and one clock per content block rather than per message', () => {
++    const rows = realRows()
++    const messages = rows.filter(row => row.type === 'user' || row.type === 'assistant')
++    for (const row of messages) expect(row.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/)
++    expect(new Set(rows.map(row => row.version).filter(Boolean))).toEqual(new Set(['2.1.314']))
++    for (const id of Object.values(TOOLS)) expect(resultRow(rows, id).sourceToolAssistantUUID).toBe(useRow(rows, id).uuid)
++    // Two tool_use blocks of ONE API message are two rows with their own times: a row time is when
++    // the CLI wrote that block, not the message's creation or receipt, and parallel calls do not share a start.
++    const [one, two] = [useRow(rows, TOOLS.bash1), useRow(rows, TOOLS.bash2)]
++    expect(one.message.id).toBe(two.message.id)
++    expect(one.requestId).toBe(two.requestId)
++    expect(Date.parse(two.timestamp) - Date.parse(one.timestamp)).toBe(826)
++    // The file's order is not the clock's order: a row written 2 ms "earlier" follows the prompt.
++    const stamps = rows.filter(row => row.timestamp).map(row => row.timestamp as string)
++    expect(stamps).not.toEqual([...stamps].sort())
++    // Nothing identifying survives, and the permission record has no time to read a wait from.
++    expect(readFileSync(FIXTURE, 'utf8')).not.toMatch(/conductor|empire|github|\/home\/|@|Bearer|sk-|7c8e3784/i)
++    expect(Object.keys(resultRow(rows, TOOLS.bash1).permissionDecision).sort()).toEqual(['decision', 'reasonType', 'ruleSource', 'source'])
++  })
++})
++
++describe('real rows → parseTranscript → recorder → report', () => {
++  it('keeps the rows\' own clock for every real pair and nothing else', () => {
++    const { rec, pull, cloud, byId } = recorder()
++    const text = teleportShaped(realRows(), localPair)
++    expect(parseTranscript(text).unmatched).toBe(0)
++    expect(pull(text)).toEqual({ added: 4, known: 0, skipped: 0 })
++    const records = byId()
++    for (const [id, ms] of Object.entries(REAL_MS)) expect(records[id], id).toMatchObject({ elapsedMs: ms, elapsedSource: 'transcript-wall', waitMs: null, waitSource: 'unavailable', execMs: null, execSource: 'unavailable', outcome: 'completed' })
++    // The labels are the rows' strings exactly, from the cloud, not this host.
++    const rows = realRows()
++    expect(records[TOOLS.read]).toMatchObject({ startedAt: useRow(rows, TOOLS.read).timestamp, endedAt: resultRow(rows, TOOLS.read).timestamp, tool: 'Read', provider: 'claude-cloud', origin: 'cloud-transcript', runtimeId: CLOUD_SESSION, agentSessionId: 'cloud_run1' })
++    expect(records[TOOLS.grep]).toMatchObject({ tool: 'Grep', startedAt: '2026-10-30T20:07:08.766Z', endedAt: '2026-10-30T20:07:09.079Z' })
++    // The call rows of one message start 826 ms apart, each on its own row time.
++    expect(records[TOOLS.bash1]!.startedAt).toBe('2026-10-30T20:07:02.166Z')
++    expect(records[TOOLS.bash2]!.startedAt).toBe('2026-10-30T20:07:02.992Z')
++    // This machine's own rows, written after the note on its clock, are never a call to time.
++    expect(records['toolu_local']).toBeUndefined()
++    // Nothing is stamped by the pull time, and the default (native) report holds none of it.
++    expect(cloud().recent.every(record => Date.parse(record.endedAt) < Date.parse('2026-10-31T00:00:00.000Z'))).toBe(true)
++    expect(rec.report({}).totals.calls).toBe(0)
++    // Coverage is a share: every cloud call has an elapsed, none a wait or an execution.
++    expect(cloud().coverage).toMatchObject({ elapsed: 1, wait: 0, exec: 0 })
++  })
++
++  it('does so through CloudRuns.transcript with a faked teleport, adds nothing twice across pulls, copies and a restart', async () => {
++    const dirs = { root: mkdtempSync(join(tmpdir(), 'clock-root-')), project: mkdtempSync(join(tmpdir(), 'clock-project-')), config: mkdtempSync(join(tmpdir(), 'clock-config-')), timings: mkdtempSync(join(tmpdir(), 'clock-timings-')) }
++    try {
++      const runId = 'cloud_proof1'
++      const base = { projectId: 'p1', workspaceId: 'w', title: 't', prompt: 'p', model: 'claude-opus-5-5', effort: null, ref: null, cwd: dirs.project, liveView: false, confirmedModel: null, branchHint: null, branch: null, headCommit: null, prUrl: null, transcriptAt: null, transcriptEntries: 0, usage: null, worktreePath: null, fetchedCommit: null, startedBy: 'owner', createdAt: HOST_WALL, updatedAt: HOST_WALL, endedAt: null, exitCode: null, error: null }
++      writeFileSync(join(dirs.root, 'runs.json'), JSON.stringify([{ ...base, id: runId, status: 'stopped', attached: false, sessionId: CLOUD_SESSION, sessionUrl: `https://claude.ai/code/${CLOUD_SESSION}` }]))
++      const git: CloudGit = async (cwd, args) => { if (args[0] === 'worktree' && args[1] === 'add') mkdirSync(args[3]!, { recursive: true }); return '' }
++      let teleported = teleportShaped(realRows(), localPair)
++      // The transport: a client that saves the conversation file where the CLI would and names it on Ctrl+C.
++      const spawn: CloudSpawn = (_file, _args, options) => {
++        const folder = join(options.env.CLAUDE_CONFIG_DIR!, 'projects', realpathSync(options.cwd).replace(/[^A-Za-z0-9-]/g, '-'))
++        mkdirSync(folder, { recursive: true })
++        writeFileSync(join(folder, `${LOCAL_ID}.jsonl`), teleported)
++        let exit: (event: { exitCode: number }) => void = () => undefined
++        const pty: CloudPty = { onData: () => undefined, onExit: listener => { exit = listener }, write: data => { if (data === '\x03') setTimeout(() => exit({ exitCode: 0 }), 5) }, resize: () => undefined, kill: () => undefined }
++        return pty
++      }
++      const counts: Array<{ added: number; known: number; skipped: number }> = []
++      const open = async () => {
++        const rec = new ToolTimingRecorder({ directory: dirs.timings, flushMs: 60_000, now: () => 7_777_777, wallNow: () => HOST_WALL, mask: maskSecrets })
++        await rec.load()
++        // register.ts's onToolCalls, one line: the run's ids and the cloud session id.
++        const runs = new CloudRuns({ root: dirs.root, executable: () => 'claude', spawn, git, env: { CLAUDE_CONFIG_DIR: dirs.config },
++          onToolCalls: (run, calls) => { counts.push(rec.importCloudTranscript({ projectId: run.projectId, runId: run.id, cloudSessionId: run.sessionId!, model: run.confirmedModel ?? run.model, calls })) } })
++        return { rec, runs }
++      }
++      const first = await open()
++      const entries = await first.runs.transcript(runId, true)
++      // The stored transcript keeps each call's id (this machine's own rows follow, as they always did);
++      // the note is not in it. Only the cloud's rows are timed, below.
++      expect(entries.filter(entry => entry.toolUseId).map(entry => `${entry.role}:${entry.toolUseId}`)).toEqual([...Object.values(TOOLS), 'toolu_local'].flatMap(id => [`tool:${id}`, `result:${id}`]))
++      expect(entries.some(entry => /continued from another machine/.test(entry.text))).toBe(false)
++      await first.runs.transcript(runId, true)
++      expect(counts).toEqual([{ added: 4, known: 0, skipped: 0 }, { added: 0, known: 4, skipped: 0 }])
++      expect(first.rec.report({ origin: 'cloud-transcript', recent: 10 }).recent.map(record => record.elapsedMs).sort((a, b) => a! - b!)).toEqual([19, 280, 313, 572])
++      expect(first.rec.report({}).totals.calls).toBe(0)
++      first.runs.dispose(); first.rec.dispose()
++
++      // A restart, and a file whose cloud rows were copied twice and reordered: still the same four calls.
++      const lines = realRows().map(asHistory)
++      teleported = jsonl([...lines.slice().reverse(), ...lines, note(), ...localPair])
++      const second = await open()
++      expect(second.rec.report({ origin: 'cloud-transcript' }).totals.calls).toBe(4)
++      await second.runs.transcript(runId, true)
++      expect(counts.at(-1)).toEqual({ added: 0, known: 4, skipped: 0 })
++      expect(second.rec.report({ origin: 'cloud-transcript', recent: 10 }).recent.map(record => record.elapsedMs).sort((a, b) => a! - b!)).toEqual([19, 280, 313, 572])
++      second.runs.dispose(); second.rec.dispose()
++      const persisted = readdirSync(dirs.timings).map(name => readFileSync(join(dirs.timings, name), 'utf8')).join('\n')
++      expect(new Set(persisted.trim().split('\n').filter(Boolean).map(line => JSON.parse(line).key)).size).toBe(4)
++    } finally { for (const dir of Object.values(dirs)) rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }) }
++  }, 30_000)
++
++  it('keeps another cloud session\'s identical rows apart, and never mixes origins', () => {
++    const { rec, pull, cloud } = recorder()
++    rec.observe({ id: 'n1', sessionId: 's', runtimeId: 'r', provider: 'codex', projectId: 'p1', itemId: 'native-1', timestamp: '', data: { type: 'tool', name: 'Command', status: 'completed', durationMs: 5 } })
++    const text = teleportShaped()
++    pull(text, 'session_01AAA', 'cloud_run1'); pull(text, 'session_01BBB', 'cloud_run2'); pull(text, 'session_01AAA', 'cloud_run1')
++    expect(cloud().totals.calls).toBe(8)
++    expect(cloud({ agentSessionId: 'cloud_run2' }).totals.calls).toBe(4)
++    expect(new Set(cloud().recent.map(record => record.runtimeId))).toEqual(new Set(['session_01AAA', 'session_01BBB']))
++    expect(rec.report({}).totals.calls).toBe(1)
++    expect(rec.report({ provider: 'claude-cloud' }).totals.calls).toBe(0)
++  })
++})
++
++describe('what the row clock may and may not be', () => {
++  it('reads an ISO-8601 instant with an explicit zone and nothing else', () => {
++    expect(rowClockMs('2026-10-30T20:07:02.166Z')).toBe(Date.parse('2026-10-30T20:07:02.166Z'))
++    expect(rowClockMs('2026-10-30T22:07:02.166+02:00')).toBe(Date.parse('2026-10-30T20:07:02.166Z'))
++    for (const bad of ['2026-10-30T20:07:02.166', '2026-10-30 20:07:02Z', '2026-10-30', '2026', '5', 'Oct 30 2026 20:07 UTC', 1_761_854_822_166, '', null, undefined, {}, '2026-13-45T25:61:61Z']) expect(rowClockMs(bad), String(bad)).toBeNull()
++  })
++
++  it('does not time a pair whose stamp depends on the reader\'s time zone or is not a time', () => {
++    const previous = process.env.TZ
++    process.env.TZ = 'America/Los_Angeles'
++    try {
++      const make = (usedAt: unknown, resultAt: unknown) => {
++        const rows = realRows()
++        useRow(rows, TOOLS.bash1).timestamp = usedAt
++        resultRow(rows, TOOLS.bash1).timestamp = resultAt
++        return teleportShaped(rows)
++      }
++      for (const [label, resultAt] of [['no zone', '2026-10-30T20:07:02.446'], ['epoch number', 1_761_854_822_446], ['date only', '2026-10-30'], ['digits', '5']] as const) {
++        const { pull, byId } = recorder()
++        pull(make('2026-10-30T20:07:02.166Z', resultAt))
++        expect(byId()[TOOLS.bash1], label).toMatchObject({ elapsedMs: null, elapsedSource: 'unavailable', notes: expect.arrayContaining(['missing-transcript-time']), startedAt: '2026-10-30T20:07:02.166Z' })
++        // The label that is left is the call row's own time, not this machine's and not a guess.
++        expect(byId()[TOOLS.bash1]!.endedAt, label).toBe('2026-10-30T20:07:02.166Z')
++      }
++      // The same two rows, both with an explicit zone, in any offset, are timed.
++      const { pull, byId } = recorder()
++      pull(make('2026-10-30T13:07:02.166-07:00', '2026-10-30T22:07:02.446+02:00'))
++      expect(byId()[TOOLS.bash1]).toMatchObject({ elapsedMs: 280 })
++    } finally { if (previous === undefined) delete process.env.TZ; else process.env.TZ = previous }
++  })
++
++  it('does not date a call by this host when neither of its rows has a usable time', () => {
++    const { rec, pull, cloud } = recorder()
++    const rows = realRows()
++    for (const id of [TOOLS.bash1, TOOLS.grep]) { delete useRow(rows, id).timestamp; resultRow(rows, id).timestamp = 'garbage' }
++    // The two remaining calls keep their own times; the two undated ones are not recorded at all.
++    expect(pull(teleportShaped(rows))).toEqual({ added: 2, known: 0, skipped: 2 })
++    expect(cloud().recent.map(record => record.itemId).sort()).toEqual([TOOLS.bash2, TOOLS.read].sort())
++    expect(cloud().recent.some(record => record.endedAt.startsWith('2026-10-31'))).toBe(false)
++    expect(cloud().recent.some(record => record.notes?.includes('ended-at-import'))).toBe(false)
++    // Asking for "the last hour" of this host's time never finds a call the cloud did not date.
++    expect(rec.report({ origin: 'cloud-transcript', since: new Date(HOST_WALL - 3_600_000).toISOString() }).totals.calls).toBe(0)
++    expect(pull(teleportShaped(rows))).toEqual({ added: 0, known: 2, skipped: 2 })
++  })
++
++  it('stops at the teleport\'s note, whatever form it takes, and never times what this machine wrote', () => {
++    const { pull, cloud } = recorder()
++    const rows = realRows()
++    // The note as the CLI could also write it: an array of text parts; and a second note from a later teleport.
++    const arrayNote = note([{ type: 'text', text: 'This session is being continued from another machine. Application state may have changed.' }])
++    const text = jsonl([...rows.map(asHistory), arrayNote, ...localPair, note(), { ...useRow(rows, TOOLS.read), uuid: 'again', timestamp: PULL_TIME }])
++    expect(parseTranscript(text).tools.map(tool => tool.toolUseId).sort()).toEqual(Object.values(TOOLS).sort())
++    // A call written before the note whose result this machine wrote after it is not a pair.
++    const split = realRows()
++    const result = asHistory(resultRow(split, TOOLS.read))
++    const head = split.filter(row => row !== resultRow(split, TOOLS.read)).map(asHistory)
++    const lateResult = { ...result, timestamp: PULL_TIME }
++    const parsed = parseTranscript(jsonl([...head, note(), lateResult]))
++    expect(parsed.tools.map(tool => tool.toolUseId)).not.toContain(TOOLS.read)
++    expect(parsed.unmatched).toBe(1)
++    expect(pull(text)).toEqual({ added: 4, known: 0, skipped: 0 })
++    expect(cloud().recent).toHaveLength(4)
++  })
++
++  it('does not time a result the CLI synthesised for an interrupted call, wherever its clock came from', () => {
++    const { pull, byId } = recorder()
++    const rows = realRows()
++    const synthetic = resultRow(rows, TOOLS.read)
++    // The CLI writes these with toolDenialKind; here one carries the time of a machine a day after the rows.
++    Object.assign(synthetic, { timestamp: PULL_TIME, toolDenialKind: 'interrupted', toolUseResult: "[Tool call interrupted: the session ended before this call's result was recorded, so its outcome is unknown.]" })
++    synthetic.message.content[0].is_error = true
++    pull(teleportShaped(rows))
++    expect(byId()[TOOLS.read]).toMatchObject({ elapsedMs: null, outcome: 'interrupted', notes: expect.arrayContaining(['denied-or-interrupted-result']) })
++    expect(byId()[TOOLS.bash1]).toMatchObject({ elapsedMs: 280 })
++  })
++
++  it('does not time reversed, conflicting or re-identified copies, and times exact copies once', () => {
++    const { pull, byId } = recorder()
++    const rows = realRows()
++    // Reversed: the Grep result is written "before" its call.
++    const grepUse = useRow(rows, TOOLS.grep), grepResult = resultRow(rows, TOOLS.grep)
++    ;[grepUse.timestamp, grepResult.timestamp] = [grepResult.timestamp, grepUse.timestamp]
++    // Conflicting: the Bash 2 result is restated 60 s later.
++    const again = { ...resultRow(rows, TOOLS.bash2), uuid: 'copy-b2', timestamp: '2026-10-30T20:08:03.564Z' }
++    // A copy that was given a new uuid for the Read call, same time: not the same statement.
++    const reidentified = { ...useRow(rows, TOOLS.read), uuid: 'copy-read' }
++    // An exact copy of the first Bash pair, as a resume might leave it.
++    const exact = [useRow(rows, TOOLS.bash1), resultRow(rows, TOOLS.bash1)]
++    pull(teleportShaped([...rows, again, reidentified, ...exact]))
++    const records = byId()
++    expect(records[TOOLS.grep]).toMatchObject({ elapsedMs: null, notes: expect.arrayContaining(['invalid-transcript-interval']) })
++    expect(records[TOOLS.bash2]).toMatchObject({ elapsedMs: null, notes: expect.arrayContaining(['conflicting-restatement']) })
++    expect(records[TOOLS.read]).toMatchObject({ elapsedMs: null, notes: expect.arrayContaining(['conflicting-restatement']) })
++    expect(records[TOOLS.bash1]).toMatchObject({ elapsedMs: 280 })
++    // The first statement's times stay as the labels.
++    expect(records[TOOLS.bash2]).toMatchObject({ startedAt: '2026-10-30T20:07:02.992Z', endedAt: '2026-10-30T20:07:03.564Z' })
++  })
++})
+diff --git a/src/main/tool-timings.ts b/src/main/tool-timings.ts
+index ec4a2fa..6080947 100644
+--- a/src/main/tool-timings.ts
++++ b/src/main/tool-timings.ts
+@@ -4,7 +4,7 @@ import { appendFile, mkdir, open, readdir, rename, unlink, writeFile } from 'nod
+ import { join } from 'node:path'
+ import { performance } from 'node:perf_hooks'
+ import type { AgentEvent, ActivityStatus } from '../shared/structured-agent'
+-import { aggregateToolTimings, summarizeToolArgs, summarizeToolError, toolCategory, TOOL_TIMING_LIMITS, type ToolTimingOutcome, type ToolTimingRecord, type ToolTimingsQuery, type ToolTimingsReport, type TranscriptToolCall } from '../shared/tool-timings'
++import { aggregateToolTimings, rowClockMs, summarizeToolArgs, summarizeToolError, toolCategory, TOOL_TIMING_LIMITS, type ToolTimingOutcome, type ToolTimingRecord, type ToolTimingsQuery, type ToolTimingsReport, type TranscriptToolCall } from '../shared/tool-timings'
+ 
+ /**
+  * The tool-call timing recorder (docs/perf-evidence/t3code-cloud-tool-timings.md). It sees every
+@@ -418,6 +418,9 @@ export class ToolTimingRecorder {
+         const key = `cloud-transcript\u0000${input.cloudSessionId}\u0000${call.toolUseId}`
+         if (this.byKey.has(key)) { counts.known++; this.deduplicated++; continue }
+         const record = this.transcriptRecord(key, input, call)
++        // A call whose rows carry no time of their own has no place on any clock but this host's,
++        // which is not the cloud's: it is not recorded, so no window or retention reads it as "now".
++        if (!record) { counts.skipped++; continue }
+         // Beyond retention, or older than everything kept once the cloud allowance is full: a later
+         // pull would only add what the next trim drops again.
+         const ended = Date.parse(record.endedAt)
+@@ -431,24 +434,25 @@ export class ToolTimingRecorder {
+     return counts
+   }
+ 
+-  private transcriptRecord(key: string, input: { projectId: string; runId: string; cloudSessionId: string; model?: string }, call: TranscriptToolCall): ToolTimingRecord {
++  /** Null when neither row has a time the cloud wrote (rowClockMs). */
++  private transcriptRecord(key: string, input: { projectId: string; runId: string; cloudSessionId: string; model?: string }, call: TranscriptToolCall): ToolTimingRecord | null {
+     const notes = [...call.notes]
+-    const start = call.usedAt ? Date.parse(call.usedAt) : NaN, end = call.resultAt ? Date.parse(call.resultAt) : NaN
++    const start = rowClockMs(call.usedAt), end = rowClockMs(call.resultAt)
++    const endedMs = end ?? start
++    if (endedMs === null) return null
+     let elapsedMs: number | null = null
+     if (call.denied) notes.push('denied-or-interrupted-result')
+     else if (call.notes.length) { /* the parser could not pair it on one clock: not timed */ }
+-    else if (!Number.isFinite(start) || !Number.isFinite(end)) notes.push('missing-transcript-time')
++    else if (start === null || end === null) notes.push('missing-transcript-time')
+     else if (end < start || end - start > MAX_PROVIDER_MS) notes.push('invalid-transcript-interval')
+     else elapsedMs = end - start
+-    const endedAt = Number.isFinite(end) ? new Date(end).toISOString() : Number.isFinite(start) ? new Date(start).toISOString() : null
+-    if (!endedAt) notes.push('ended-at-import')
+     const tool = (call.name || 'Tool').slice(0, TOOL_TIMING_LIMITS.tool)
+     const outcome: ToolTimingOutcome = call.denied ? (/interrupt|cancel/i.test(call.denied) ? 'interrupted' : 'rejected') : call.isError ? 'failed' : 'completed'
+     const record: ToolTimingRecord = {
+       key, agentSessionId: input.runId, projectId: input.projectId, provider: 'claude-cloud', runtimeId: input.cloudSessionId, itemId: call.toolUseId,
+       ...(input.model ? { model: input.model } : {}), origin: 'cloud-transcript',
+       tool, category: toolCategory(tool), args: summarizeToolArgs(tool, call.input, this.mask),
+-      startedAt: Number.isFinite(start) ? new Date(start).toISOString() : null, endedAt: endedAt ?? new Date(this.wallNow()).toISOString(),
++      startedAt: start !== null ? new Date(start).toISOString() : null, endedAt: new Date(endedMs).toISOString(),
+       elapsedMs, elapsedSource: elapsedMs === null ? 'unavailable' : 'transcript-wall',
+       waitMs: null, waitSource: 'unavailable', execMs: null, execSource: 'unavailable', prepareMs: null,
+       outcome, concurrent: 0, ...(notes.length ? { notes } : {})
+diff --git a/src/shared/tool-timings.ts b/src/shared/tool-timings.ts
+index 66503b5..40713ea 100644
+--- a/src/shared/tool-timings.ts
++++ b/src/shared/tool-timings.ts
+@@ -91,6 +91,17 @@ export interface ToolTimingsQuery {
+   origin?: ToolTimingOrigin
+ }
+ 
++const ROW_CLOCK = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/
++
++/** The instant a transcript row's `timestamp` names, or null. Only an ISO-8601 time with an explicit
++ *  zone is read, the form the CLI writes (`2026-10-30T20:07:02.166Z`): a string without a zone would
++ *  be read in this machine's time zone, and a number, a date alone or a bare year is not a row time. */
++export function rowClockMs(value: unknown): number | null {
++  if (typeof value !== 'string' || !ROW_CLOCK.test(value)) return null
++  const at = Date.parse(value)
++  return Number.isFinite(at) ? at : null
++}
++
+ /** One tool call paired from a cloud transcript by its exact tool_use_id (cloud/runs.ts
+  *  parseTranscript). Stamps are the transcript rows' own ISO times, null when absent or invalid;
+  *  a call with notes (a conflicting restatement, a result naming another row) is never timed.
