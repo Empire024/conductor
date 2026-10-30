@@ -98,13 +98,37 @@ non-finite, or more than 7 days is dropped and the record is noted `invalid-prov
   (note `app-exit`). It then synchronously writes every line that is not yet durable to
   `tool-timings.exit.jsonl`: lines still pending, and lines held by an append that is queued or in
   flight. It never writes to the main file, because a compaction may be renaming over it. Queued
-  steps that have not started become no-ops. The next `load()` runs on the same write queue. It reads
-  the main file and then the exit file, merges them by key with the exit file winning, and rewrites
-  the main file. It deletes the exit file only once that rewrite is durable. A line that is both in
-  the exit file and appended by a step already in flight is read as one record. Two regressions hold
-  this in place: a quit while a compaction `rename` is held, and a quit while an `appendFile` is
-  held. Both reopen and assert that every record appears exactly once, and both fail against the
-  earlier synchronous append to the main file.
+  steps that have not started become no-ops. A line that is both in the exit file and appended by a
+  step already in flight is read as one record.
+
+  **Load ownership.** The next `load()` runs on the same write queue and does nothing once disposed.
+  It never reads or deletes `tool-timings.exit.jsonl` in place:
+  - It first renames the exit file to a claimed file of its own,
+    `tool-timings.exit.<13-digit ms>-<pid>-<random>.claimed.jsonl`. A quit during that load
+    therefore writes a fresh exit file, which this load never touches. The quit is synchronous on
+    the main thread, so it cannot interleave with the rename callback and the read that follows it.
+  - It reads the main file, then every claimed file, oldest first. That includes claimed files left
+    behind by earlier loads that never finished. It merges them by key, with later lines winning,
+    and rewrites the main file.
+  - It deletes only the claimed files it read, and only when `rewrite()` reports that the new main
+    file is in place. A rewrite skipped because the app is quitting deletes nothing, and those
+    claimed files are read again by the next load.
+
+  Leftover claimed files are bounded: the newest 8 are read. Older ones exist only after more than 8
+  loads in a row each failed to reach a durable rewrite; they are deleted after the next durable
+  rewrite, and their rows are dropped. If renaming a busy exit file fails (Windows, while a quit
+  writes it), the file stays where it is for the next load.
+
+  Four regressions hold this in place. Each reopens with a fresh recorder and asserts that every
+  record appears exactly once:
+  - a quit while a compaction `rename` is held;
+  - a quit while an `appendFile` is held;
+  - a quit while a load's rewrite `rename` is held, with an earlier exit file present (the
+    earlier quit's row, the new quit's rows and the main row all survive);
+  - a quit while the load is still reading the exit file. The skipped rewrite deletes nothing, and
+    the claimed file and the new exit file both remain until the next load.
+
+  Each fails against the code it replaces.
 - **Resuming an abandoned call.** If the runtime host kept the provider running, the next process amends that same
   record when the terminal event arrives, even under a new runtime id. Elapsed is then wall-clock
   (bounded to 24 h, never negative) and labelled `wall-clock`. The record keeps its key, so the
@@ -257,19 +281,23 @@ The screenshot from the smoke is `artifacts/tool-timings/settings-usage.png`, wh
 
 - `npx tsc --noEmit` passes with no errors.
 - `npx vitest run src/shared/tool-timings.test.ts src/main/tool-timings.test.ts src/main/tool-timings.pipeline.test.ts`
-  runs 34 tests, all passing. These include:
+  runs 36 tests, all passing. These include:
   - the bounded-load regressions;
-  - the two quit-mid-write regressions;
+  - the four quit-mid-write and load-ownership regressions;
   - the redaction cases with synthetic dummy secrets, through the persisted JSONL and the report;
   - the masker's bounded-cost check.
 
   The bounded-load and quit-mid-write regressions were each confirmed to fail against the code they
-  replace: 4 of 4 bounded-load tests fail against the original whole-file `readFile`, and 2 of 2
-  quit tests fail against the earlier synchronous append to the main file.
+  replace:
+  - 4 of 4 bounded-load tests fail against the original whole-file `readFile`.
+  - 2 of 2 quit tests fail against the earlier synchronous append to the main file.
+  - Both load-ownership tests fail against `5f08f38`. The held-rewrite case fails by assertion. The
+    held-read case fails by assertion against `5f08f38` with only an `io.open` hook added, since
+    that version had no way to hold a read.
 - `npx vitest run src/main/agent-control.test.ts -t tools.timings` passes. It covers project scoping,
   the owner/wizard `"*"`, argument validation, the read-lane class, `tools.list` advertising, and the
   not-wired message.
-- Full `npx vitest run` in this Linux container, on the final implementation: 6,347 passed,
+- Full `npx vitest run` in this Linux container, on the final implementation: 6,349 passed,
   **15 failed**, 78 skipped. The 15 are, by name, exactly the 15 that fail on the untouched base
   `3f95349` in this container (checked in a clean worktree). They depend on the host:
   where.exe/PATHEXT lookup, icacls ACL repair, IPv6 relay, Python and pip path policy,
@@ -287,8 +315,8 @@ The screenshot from the smoke is `artifacts/tool-timings/settings-usage.png`, wh
   - Settings → Usage shows "9 calls", with elapsed "n/a" and "exec · provider";
   - the headline claims only recorded structured calls, the not-recorded line is visible, and the
     gaps list is open;
-  - after a quit and relaunch, the same 9 records load exactly once, the exit file is merged into
-    the main file and removed, and the main file holds 9 unique keys.
+  - after a quit and relaunch, the same 9 records load exactly once; the exit file is claimed and
+    merged into the main file; no exit or claimed file remains; and the main file holds 9 unique keys.
 
   `ELECTRON_DISABLE_SANDBOX` is set only because this Linux container runs as root.
 - On the owner's machine, run `npm run build && node scripts/smoke-tool-timings.mjs`. The window is
@@ -343,7 +371,8 @@ The new files have no conflicts. Each shared-file hunk below is minimal and anch
     application code)
 - Every file in the hunk table above.
 
-At runtime the recorder writes `<userData>/tool-timings/tool-timings.jsonl`, plus
-`tool-timings.exit.jsonl` between a quit and the next load.
+At runtime the recorder writes `<userData>/tool-timings/tool-timings.jsonl`. Between a quit and
+the next load's durable rewrite there is also `tool-timings.exit.jsonl`, and possibly
+`tool-timings.exit.*.claimed.jsonl` files.
 
 If `app.update` smokes are requested for acceptance, add `smoke-tool-timings`.

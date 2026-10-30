@@ -1,5 +1,5 @@
 import { _electron as electron, expect } from '@playwright/test'
-import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
@@ -74,11 +74,12 @@ try {
   assert.equal(new Set(written).size, 9)
   ;({ app, page } = await launch())
   await expect.poll(() => page.evaluate(() => window.conductor.toolTimings.report({}).then(report => report.totals.calls))).toBe(9)
-  await expect.poll(async () => (await keysIn('tool-timings.exit.jsonl')).length).toBe(0)
+  // The relaunch claimed the quit's exit file and deleted its claim once the rewrite was durable.
+  await expect.poll(async () => (await readdir(directory)).filter(name => name.includes('.exit.'))).toEqual([])
   const merged = await keysIn('tool-timings.jsonl')
   assert.equal(merged.length, 9)
   assert.equal(new Set(merged).size, 9)
-  results.checks.push('Records survive a restart exactly once: the exit file is merged into the main file and removed')
+  results.checks.push('Records survive a restart exactly once: the exit file is claimed, merged into the main file, and no exit or claimed file remains')
 } catch (error) {
   results.failures.push(error.stack ?? String(error))
   await page.screenshot({ path: join(output, 'failed.png'), fullPage: true }).catch(() => {})

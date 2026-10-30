@@ -1,5 +1,5 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { appendFile, rename } from 'node:fs/promises'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFile, open, rename } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -286,6 +286,52 @@ describe('ToolTimingRecorder', () => {
       expect(existsSync(join(directory, 'tool-timings.exit.jsonl'))).toBe(false)
       const durable = readFileSync(join(directory, 'tool-timings.jsonl'), 'utf8').split('\n').filter(Boolean).map(text => parseRecord(text)!.itemId)
       expect(durable.sort()).toEqual(['c3', 'c4', 'c5', 'c6', 'c7', 'c8', 'live'])
+    })
+
+    const row = (itemId: string): string => JSON.stringify({ v: 1, key: `s\u0000r\u0000${itemId}`, agentSessionId: 's', projectId: 'p', provider: 'codex', runtimeId: 'r', itemId, tool: 'Bash', category: 'shell', args: '', startedAt: null, endedAt: new Date().toISOString(), elapsedMs: null, elapsedSource: 'unavailable', waitMs: null, waitSource: 'unavailable', execMs: 4, execSource: 'provider', prepareMs: null, outcome: 'completed', concurrent: 0 }) + '\n'
+    const exitFiles = (directory: string): string[] => readdirSync(directory).filter(name => name.includes('.exit.')).sort()
+
+    it('keeps an earlier quit\'s rows and a new quit\'s rows when the new quit lands while the load\'s rewrite is held', async () => {
+      const directory = tempDir(), main = join(directory, 'tool-timings.jsonl')
+      writeFileSync(main, row('m'))
+      writeFileSync(join(directory, 'tool-timings.exit.jsonl'), row('old'))
+      const held = gate()
+      const recorder = new ToolTimingRecorder({ directory, flushMs: 60_000, now: () => 0, io: { rename: (async (from: string, to: string) => { if (to === main) await held.hold(); return rename(from, to) }) as typeof rename } })
+      const tool = (itemId: string, status: 'running' | 'completed') => recorder.observe({ id: itemId, sessionId: 's', runtimeId: 'r', provider: 'codex', projectId: 'p', itemId, timestamp: '', data: { type: 'tool', name: 'Bash', status } })
+      const loading = recorder.load()
+      await held.reached
+      tool('n', 'completed'); tool('live', 'running')
+      recorder.dispose()
+      held.release()
+      await loading
+
+      const next = new ToolTimingRecorder({ directory })
+      await next.load()
+      expect(keysOf(next.report({ recent: 100 }))).toEqual(['live:abandoned', 'm:completed', 'n:completed', 'old:completed'])
+      expect(exitFiles(directory)).toEqual([])
+      const durable = readFileSync(main, 'utf8').split('\n').filter(Boolean).map(text => parseRecord(text)!.itemId)
+      expect(durable.sort()).toEqual(['live', 'm', 'n', 'old'])
+    })
+
+    it('deletes no exit rows when a quit lands while the load is still reading them, and the next load keeps old and new once', async () => {
+      const directory = tempDir()
+      writeFileSync(join(directory, 'tool-timings.jsonl'), row('m'))
+      writeFileSync(join(directory, 'tool-timings.exit.jsonl'), row('old'))
+      const held = gate()
+      const recorder = new ToolTimingRecorder({ directory, flushMs: 60_000, now: () => 0, io: { open: (async (...args: Parameters<typeof open>) => { if (String(args[0]).includes('.exit.')) await held.hold(); return open(...args) }) as typeof open } })
+      const loading = recorder.load()
+      await held.reached
+      recorder.observe({ id: 'n2', sessionId: 's', runtimeId: 'r', provider: 'codex', projectId: 'p', itemId: 'n2', timestamp: '', data: { type: 'tool', name: 'Bash', status: 'running' } })
+      recorder.dispose()
+      held.release()
+      await loading
+      // The skipped rewrite deleted nothing: the claimed earlier file and the new quit's file remain.
+      expect(exitFiles(directory)).toEqual([expect.stringMatching(/^tool-timings\.exit\.\d{13}-\d+-[0-9a-z]+\.claimed\.jsonl$/), 'tool-timings.exit.jsonl'])
+
+      const next = new ToolTimingRecorder({ directory })
+      await next.load()
+      expect(keysOf(next.report({ recent: 100 }))).toEqual(['m:completed', 'n2:abandoned', 'old:completed'])
+      expect(exitFiles(directory)).toEqual([])
     })
 
     it('keeps every record exactly once when the quit lands while an append is held, and skips steps not yet started', async () => {

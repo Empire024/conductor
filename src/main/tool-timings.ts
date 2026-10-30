@@ -1,6 +1,6 @@
 import type { IpcMain, IpcMainInvokeEvent } from 'electron'
 import { appendFileSync, mkdirSync } from 'node:fs'
-import { appendFile, mkdir, open, rename, unlink, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, open, readdir, rename, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import type { AgentEvent, ActivityStatus } from '../shared/structured-agent'
@@ -25,9 +25,15 @@ const DAY_MS = 24 * 60 * 60 * 1000
 /** A provider duration beyond this is a unit or clock error, not a measurement. */
 const MAX_PROVIDER_MS = 7 * DAY_MS
 const FILE = 'tool-timings.jsonl'
-/** Written only synchronously by dispose() and merged by the next load(): no async compaction ever
- *  renames over it, so what a quit writes there cannot be lost to a rewrite still in flight. */
+/** Written only synchronously by dispose(): no async compaction ever renames over it, so what a quit
+ *  writes there cannot be lost to a rewrite still in flight. A load never reads or deletes it in
+ *  place: it first renames it to a claimed file of its own, so a quit during that load starts a fresh
+ *  exit file the load cannot touch. A claimed file is deleted only once a rewrite holding its lines
+ *  is durable; otherwise the next load reads it again. */
 const EXIT_FILE = 'tool-timings.exit.jsonl'
+const CLAIMED = /^tool-timings\.exit\.\d{13}-\d+-[0-9a-z]+\.claimed\.jsonl$/
+/** Claimed files left by loads that never reached a durable rewrite; beyond this many, the oldest go. */
+const MAX_CLAIMED = 8
 const MAX_READ_BYTES = 16 * 1024 * 1024
 
 export interface ToolTimingsOptions {
@@ -45,7 +51,7 @@ export interface ToolTimingsOptions {
   /** The journal's secret masker (structured-store maskSecrets), applied to every summary. */
   mask?: (text: string) => string
   /** The asynchronous file operations, replaceable so a test can hold one mid-flight. */
-  io?: Partial<{ appendFile: typeof appendFile; writeFile: typeof writeFile; rename: typeof rename }>
+  io?: Partial<{ appendFile: typeof appendFile; writeFile: typeof writeFile; rename: typeof rename; open: typeof open }>
 }
 
 interface OpenCall {
@@ -84,7 +90,7 @@ export class ToolTimingRecorder {
   /** Keys whose line is pending or on its way to the file, with their newest line: a rewrite leaves
    *  them to that append, and dispose() writes exactly these to the exit file. */
   private readonly unwritten = new Map<string, { count: number; line: string }>()
-  private readonly io: { appendFile: typeof appendFile; writeFile: typeof writeFile; rename: typeof rename }
+  private readonly io: { appendFile: typeof appendFile; writeFile: typeof writeFile; rename: typeof rename; open: typeof open }
   private timer: NodeJS.Timeout | undefined
   private writes: Promise<void> = Promise.resolve()
   private fileLines = 0
@@ -106,7 +112,7 @@ export class ToolTimingRecorder {
     this.now = options.now ?? (() => performance.now())
     this.wallNow = options.wallNow ?? Date.now
     this.mask = options.mask ?? (text => text)
-    this.io = { appendFile, writeFile, rename, ...options.io }
+    this.io = { appendFile, writeFile, rename, open, ...options.io }
   }
 
   private get file(): string | undefined { return this.options.directory ? join(this.options.directory, FILE) : undefined }
@@ -115,7 +121,7 @@ export class ToolTimingRecorder {
   /** The newest `maxReadBytes` of a file, whole lines only; null when it does not exist. */
   private async readTail(path: string): Promise<{ text: string; truncated: boolean } | null> {
     let handle
-    try { handle = await open(path, 'r') } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error }
+    try { handle = await this.io.open(path, 'r') } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error }
     try {
       const size = (await handle.stat()).size, length = Math.min(size, this.maxReadBytes)
       const buffer = Buffer.alloc(length)
@@ -135,6 +141,19 @@ export class ToolTimingRecorder {
     } finally { await handle.close() }
   }
 
+  /** Takes the exit file over under a name of this load's own (a quit from now on writes a fresh
+   *  one), and lists every claimed file to read: those, oldest first, and the ones beyond the cap. */
+  private async claimExitFiles(exitFile: string): Promise<{ read: string[]; overflow: string[] }> {
+    const directory = this.options.directory!
+    const claimed = `tool-timings.exit.${String(this.wallNow()).padStart(13, '0')}-${process.pid}-${Math.random().toString(36).slice(2, 8)}.claimed.jsonl`
+    // Busy (a quit writing it on Windows) or missing: it stays where it is for the next load.
+    try { await this.io.rename(exitFile, join(directory, claimed)) } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') this.errors++ }
+    let names: string[] = []
+    try { names = (await readdir(directory)).filter(name => CLAIMED.test(name)).sort() } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+    const paths = names.map(name => join(directory, name))
+    return { read: paths.slice(-MAX_CLAIMED), overflow: paths.slice(0, Math.max(0, paths.length - MAX_CLAIMED)) }
+  }
+
   /** Read what earlier processes recorded. Calls observed meanwhile are kept and win on a clash.
    *  Runs on the write queue, so no append lands on a torn last line before compaction heals it. */
   load(): Promise<void> {
@@ -145,18 +164,25 @@ export class ToolTimingRecorder {
 
   private async loadTail(): Promise<void> {
     const file = this.file, exitFile = this.exitFile
-    if (!file || !exitFile) return
+    // After a quit, nothing is loaded and nothing on disk is touched.
+    if (!file || !exitFile || this.disposed) return
     this.loadedBytes = 0
-    let main: { text: string; truncated: boolean } | null, exit: { text: string; truncated: boolean } | null
+    let main: { text: string; truncated: boolean } | null, claims: { read: string[]; overflow: string[] }, exits: Array<{ text: string; truncated: boolean } | null>
     // Only the newest `maxReadBytes` of each file are ever read, however large it grew.
-    try { [main, exit] = [await this.readTail(file), await this.readTail(exitFile)] } catch { this.errors++; return }
-    if (!main && !exit) return
+    try {
+      claims = await this.claimExitFiles(exitFile)
+      main = await this.readTail(file)
+      exits = []
+      for (const path of claims.read) exits.push(await this.readTail(path))
+    } catch { this.errors++; return }
+    const exitText = exits.map(exit => exit?.text ?? '').join('\n')
+    if (!main && !claims.read.length) return
     // A last line without its newline was cut off by a crash mid-append.
     const torn = Boolean(main?.text && !main.text.endsWith('\n'))
     const cutoff = this.wallNow() - this.retentionMs, loaded = new Map<string, ToolTimingRecord>()
     let lines = 0
-    // The exit file is read last: what a quit wrote there is newer than anything in the main file.
-    for (const line of [...(main?.text ?? '').split('\n'), ...(exit?.text ?? '').split('\n')]) {
+    // Exit files are read last, oldest first: what a quit wrote is newer than the main file.
+    for (const line of [...(main?.text ?? '').split('\n'), ...exitText.split('\n')]) {
       if (!line.trim()) continue
       lines++
       const record = parseRecord(line)
@@ -174,11 +200,11 @@ export class ToolTimingRecorder {
     this.fileLines = lines
     // An oversized, torn or partly stale file, or one with a quit's lines beside it, is rewritten
     // from what was kept inside this queued step, so it is whole, merged and under the bound before
-    // any queued append lands on it. The exit file goes only once that rewrite is durable.
-    if (main?.truncated || torn || lines > keep.length || exit) {
+    // any queued append lands on it. Only this load's claimed files go, and only once that rewrite
+    // is durable: a rewrite skipped because the app is quitting deletes nothing.
+    if (main?.truncated || torn || lines > keep.length || claims.read.length || claims.overflow.length) {
       try {
-        await this.rewrite()
-        if (exit) await unlink(exitFile).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error })
+        if (await this.rewrite()) for (const path of [...claims.overflow, ...claims.read]) await unlink(path).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error })
       } catch { this.errors++; this.directoryReady = false }
     }
   }
@@ -391,19 +417,21 @@ export class ToolTimingRecorder {
 
   private compact(): void {
     if (!this.file) return
-    this.writes = this.writes.then(() => this.rewrite()).catch(() => { this.errors++; this.directoryReady = false })
+    this.writes = this.writes.then(async () => { await this.rewrite() }).catch(() => { this.errors++; this.directoryReady = false })
   }
 
-  /** The file rewritten from the kept records; a record whose line an append still owes is left to it. */
-  private async rewrite(): Promise<void> {
+  /** The file rewritten from the kept records; a record whose line an append still owes is left to it.
+   *  True once the new file is in place; false when nothing was written (no file, or quitting). */
+  private async rewrite(): Promise<boolean> {
     const file = this.file
-    if (!file || this.disposed) return
+    if (!file || this.disposed) return false
     const cutoff = this.wallNow() - this.retentionMs
     const lines = this.records.filter(record => Date.parse(record.endedAt) >= cutoff && !this.unwritten.has(record.key)).map(record => JSON.stringify({ v: 1, ...record }))
     if (!this.directoryReady) { await mkdir(this.options.directory!, { recursive: true }); this.directoryReady = true }
     await this.io.writeFile(file + '.tmp', lines.length ? lines.join('\n') + '\n' : '')
     await this.io.rename(file + '.tmp', file)
     this.fileLines = lines.length
+    return true
   }
 
   report(query: ToolTimingsQuery = {}): ToolTimingsReport {
