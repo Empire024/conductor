@@ -1,0 +1,521 @@
+diff --git a/src/main/native-history-read-stability.test.ts b/src/main/native-history-read-stability.test.ts
+new file mode 100644
+index 0000000..fd5e5d7
+--- /dev/null
++++ b/src/main/native-history-read-stability.test.ts
+@@ -0,0 +1,273 @@
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import { appendFileSync, closeSync, mkdtempSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, truncateSync, utimesSync, writeFileSync, writeSync, type BigIntStats } from 'node:fs'
++import { open, stat, type FileHandle } from 'node:fs/promises'
++import { tmpdir } from 'node:os'
++import { dirname, join } from 'node:path'
++import { captureClaudeCliToolCalls, claudeHistoryBoundary, claudeHistoryPath, type CaptureFs, type ClaudeHistoryBoundary } from './native-history'
++
++/**
++ * captureClaudeCliToolCalls against a transcript that changes WHILE it is being read
++ * (docs/perf-evidence/t3code-cli-read-stability.md). An open handle does not lock a file: another
++ * process can truncate or rewrite the same inode at any moment. Real files in a temp directory, with
++ * async handles wrapped so that a write, a truncation or a short read lands at a chosen read or stat
++ * of the capture, which is sequential and so deterministic. No CLI, model, Electron or timer.
++ */
++const T0 = Date.parse('2026-10-30T10:00:00.000Z')
++const stamp = (offsetMs: number) => new Date(T0 + offsetMs).toISOString()
++const SECRET = 'SECRET-ROW-TEXT-4711'
++const roots: string[] = []
++afterEach(() => {
++  vi.unstubAllEnvs()
++  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 5 })
++})
++
++const NATIVE = 'native-conversation'
++const callRows = (tag: string, at: number, ms: number, options: { sessionId?: string; command?: string; remoteSourced?: boolean } = {}) => [
++  JSON.stringify({ type: 'assistant', uuid: 'a-' + tag, sessionId: options.sessionId ?? NATIVE, ...(options.remoteSourced ? { remoteSourced: true } : {}), timestamp: stamp(at), message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_' + tag, name: 'Bash', input: { command: options.command ?? 'npm test' } }] } }),
++  JSON.stringify({ type: 'user', uuid: 'r-' + tag, sessionId: options.sessionId ?? NATIVE, ...(options.remoteSourced ? { remoteSourced: true } : {}), timestamp: stamp(at + ms), sourceToolAssistantUUID: 'a-' + tag, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_' + tag, content: 'ok', is_error: false }] } })
++]
++const call = (tag: string, at: number, ms: number, options?: Parameters<typeof callRows>[3]) => callRows(tag, at, ms, options).join('\n') + '\n'
++const filler = (bytes: number) => { const line = JSON.stringify({ type: 'summary', sessionId: NATIVE, summary: 'f'.repeat(900) }) + '\n'; return line.repeat(Math.ceil(bytes / line.length)) }
++
++/** A transcript holding the handoff's rows (longer than a fingerprint window, so its two ends differ), its boundary, and the CLI's own rows appended after. */
++async function transcript(cli: string) {
++  const root = mkdtempSync(join(tmpdir(), 'conductor-read-stability-')); roots.push(root)
++  vi.stubEnv('CLAUDE_CONFIG_DIR', join(root, 'profile'))
++  const cwd = join(root, 'workspace')
++  const path = claudeHistoryPath(cwd, NATIVE)
++  mkdirSync(dirname(path), { recursive: true })
++  writeFileSync(path, call('chat', 0, 2_000, { command: 'echo ' + SECRET }) + filler(9_000))
++  const boundary = (await claudeHistoryBoundary(cwd, NATIVE))!
++  expect(boundary.bytes).toBe(statSync(path).size)
++  appendFileSync(path, cli)
++  return { cwd, path, boundary, handoff: { claudeBoundary: boundary as ClaudeHistoryBoundary } }
++}
++
++interface Hooks {
++  /** Runs before the nth read of the capture's handle. For a boundary of bytes > 0: 0 = head hash, 1 = tail hash, 2 = the window. */
++  beforeRead?(n: number, position: number, length: number): void
++  afterRead?(n: number, position: number, length: number): void
++  /** The most bytes the nth read may return (0 = the file ends there); the file itself is untouched. */
++  serve?(n: number, position: number, length: number): number
++  /** Runs after the nth fstat of the handle (0 = first, 1 = after the fingerprints, 2 = after the window read, 3 = after an append was seen) and may replace what it reports. */
++  afterStat?(n: number, info: BigIntStats): BigIntStats | void
++}
++function instrumented(hooks: Hooks = {}) {
++  const requested: Array<{ position: number; length: number }> = []
++  let opened = 0
++  const fs: CaptureFs = {
++    open: async path => {
++      opened++
++      const real = await open(path, 'r')
++      let reads = 0, stats = 0
++      return {
++        stat: (async (options?: { bigint?: boolean }) => { const info = await real.stat({ bigint: true, ...options }) as BigIntStats; return hooks.afterStat?.(stats++, info) ?? info }) as FileHandle['stat'],
++        read: (async (buffer: Buffer, offset: number, length: number, position: number) => {
++          const n = reads++
++          requested.push({ position, length })
++          hooks.beforeRead?.(n, position, length)
++          const cap = hooks.serve?.(n, position, length) ?? length
++          const result = cap <= 0 ? { bytesRead: 0, buffer } : await real.read(buffer, offset, Math.min(length, cap), position)
++          hooks.afterRead?.(n, position, length)
++          return result
++        }) as FileHandle['read'],
++        close: () => real.close()
++      }
++    },
++    stat: path => stat(path, { bigint: true })
++  }
++  return { fs, requested, get opened() { return opened } }
++}
++/** Pushes the modification time well away from the original, so a same-size rewrite is distinguishable on a coarse-clock file system. */
++const touch = (path: string) => utimesSync(path, new Date(), new Date(Date.now() + 60_000))
++/** Same length, different bytes, at `position`: a rewrite in place that no size check can see. */
++function rewriteInPlace(path: string, position: number, bytes: string) {
++  const fd = openSync(path, 'r+'); try { writeSync(fd, bytes, position) } finally { closeSync(fd) }
++  touch(path)
++}
++const ids = (tools: Array<{ toolUseId: string }>) => tools.map(tool => tool.toolUseId).sort()
++
++describe('Claude CLI-view capture stays true when the transcript changes while it is read', () => {
++  const own = () => call('cli', 60_000, 1_250, { command: 'git status' })
++
++  it('control: an unchanged transcript is complete, exact, bounded by the boundary and says nothing of the rows\' text', async () => {
++    const t = await transcript(own() + call('other', 70_000, 500, { sessionId: 'another-conversation' }) + call('copied', 71_000, 500, { remoteSourced: true }))
++    const io = instrumented()
++    const { tools, coverage } = await captureClaudeCliToolCalls(t.cwd, NATIVE, t.handoff, {}, io.fs)
++    expect(ids(tools)).toEqual(['toolu_cli'])
++    expect(tools[0]).toMatchObject({ usedAt: stamp(60_000), resultAt: stamp(61_250) })
++    const size = statSync(t.path).size
++    expect(coverage).toEqual({ status: 'complete', reason: 'complete', boundaryBytes: t.boundary.bytes, fileBytes: size, bytesRead: size - t.boundary.bytes, bytesSkipped: 0, unmatchedCalls: 0, unpairedResults: 0, droppedCalls: 0 })
++    expect(JSON.stringify(coverage)).not.toContain(SECRET)
++    expect(JSON.stringify(t.boundary)).not.toContain(SECRET)
++    // Only the two fingerprint windows and the appended rows were read: the handoff's prefix is not.
++    expect(io.requested.reduce((sum, read) => sum + read.length, 0)).toBe(2 * 4096 + (size - t.boundary.bytes))
++  })
++
++  it('a read served in short pieces that still reach the end is the whole read, not a short one', async () => {
++    const t = await transcript(own())
++    const { tools, coverage } = await captureClaudeCliToolCalls(t.cwd, NATIVE, t.handoff, {}, instrumented({ serve: (n, _p, length) => n >= 2 ? Math.min(length, 7) : length }).fs)
++    expect(ids(tools)).toEqual(['toolu_cli'])
++    expect(coverage).toMatchObject({ status: 'complete', reason: 'complete' })
++  })
++
++  it('imports nothing when the file is truncated after the boundary was verified and before its rows are read', async () => {
++    const t = await transcript(own())
++    // The file ends 40 bytes into the CLI's rows: the window read comes back short of the size it was told.
++    const io = instrumented({ beforeRead: n => { if (n === 2) truncateSync(t.path, t.boundary.bytes + 40) } })
++    const { tools, coverage } = await captureClaudeCliToolCalls(t.cwd, NATIVE, t.handoff, {}, io.fs)
++    expect(tools).toEqual([])
++    expect(coverage).toMatchObject({ status: 'unavailable', reason: 'file-shrank', boundaryBytes: t.boundary.bytes, fileBytes: t.boundary.bytes + 40, unmatchedCalls: 0, unpairedResults: 0 })
++  })
++
++  it('imports nothing when the file ends before the size it was told, even though nothing wrote to it', async () => {
++    const t = await transcript(own())
++    const io = instrumented({ serve: (n, _p, length) => n === 2 ? Math.floor(length / 2) : n > 2 ? 0 : length })
++    const { tools, coverage } = await captureClaudeCliToolCalls(t.cwd, NATIVE, t.handoff, {}, io.fs)
++    expect(tools).toEqual([])
++    expect(coverage).toMatchObject({ status: 'unavailable', reason: 'file-shrank' })
++  })
++
++  it('imports nothing when the file is truncated and then rewritten to the same size after verification', async () => {
++    const t = await transcript(own())
++    const forged = call('cli', 60_000, 99_000, { command: 'git status' })
++    expect(forged.length).toBe(own().length)
++    // Truncated back to the boundary and refilled with different rows of exactly the original length.
++    const io = instrumented({ beforeRead: n => { if (n === 2) { truncateSync(t.path, t.boundary.bytes); appendFileSync(t.path, forged); touch(t.path) } } })
++    const { tools, coverage } = await captureClaudeCliToolCalls(t.cwd, NATIVE, t.handoff, {}, io.fs)
++    expect(tools).toEqual([])
++    expect(coverage).toMatchObject({ status: 'unavailable', reason: 'file-changed', fileBytes: statSync(t.path).size })
++  })
++
++  it('imports nothing when the file is rewritten in place while the window is being read', async () => {
++    const t = await transcript(own())
++    const io = instrumented({ afterRead: n => { if (n === 2) rewriteInPlace(t.path, t.boundary.bytes + 10, 'X'.repeat(30)) } })
++    const { tools, coverage } = await captureClaudeCliToolCalls(t.cwd, NATIVE, t.handoff, {}, io.fs)
++    expect(tools).toEqual([])
++    expect(coverage).toMatchObject({ status: 'unavailable', reason: 'file-changed' })
++  })
++
++  it('imports nothing when the file changes while the boundary\'s fingerprints are being read', async () => {
++    for (const mutate of [
++      { name: 'appended', run: (t: { path: string }) => appendFileSync(t.path, call('late', 80_000, 100)), reason: 'file-changed' },
++      { name: 'rewritten', run: (t: { path: string; boundary: ClaudeHistoryBoundary }) => rewriteInPlace(t.path, t.boundary.bytes + 5, 'Y'.repeat(20)), reason: 'file-changed' },
++      { name: 'truncated into the boundary', run: (t: { path: string; boundary: ClaudeHistoryBoundary }) => truncateSync(t.path, t.boundary.bytes - 100), reason: 'file-shrank' }
++    ]) {
++      const t = await transcript(own())
++      // After the tail hash has been read (read 1), so the hashes themselves still match what was persisted.
++      const io = instrumented({ afterRead: n => { if (n === 1) mutate.run(t) } })
++      const { tools, coverage } = await captureClaudeCliToolCalls(t.cwd, NATIVE, t.handoff, {}, io.fs)
++      expect({ name: mutate.name, tools, status: coverage.status, reason: coverage.reason }).toEqual({ name: mutate.name, tools: [], status: 'unavailable', reason: mutate.reason })
++    }
++  })
++
++  it('reports a file truncated inside the boundary between its stat and its fingerprint reads as shrunk', async () => {
++    const t = await transcript(own())
++    const io = instrumented({ beforeRead: n => { if (n === 1) truncateSync(t.path, 1000) } })
++    const { tools, coverage } = await captureClaudeCliToolCalls(t.cwd, NATIVE, t.handoff, {}, io.fs)
++    expect(tools).toEqual([])
++    expect(coverage).toMatchObject({ status: 'unavailable', reason: 'file-shrank', fileBytes: 1000 })
++  })
++
++  it('imports nothing when the handle reports another file, or the path is renamed over or deleted during the read', async () => {
++    const swapped = await transcript(own())
++    const other = await captureClaudeCliToolCalls(swapped.cwd, NATIVE, swapped.handoff, {}, instrumented({ afterStat: (n, info) => n === 2 ? { ...info, ino: info.ino + 1n } as BigIntStats : undefined }).fs)
++    expect(other.tools).toEqual([])
++    expect(other.coverage).toMatchObject({ status: 'unavailable', reason: 'file-replaced' })
++
++    const renamed = await transcript(own())
++    const replacement = join(dirname(renamed.path), 'replacement.jsonl')
++    writeFileSync(replacement, readFileSync(renamed.path))
++    const over = await captureClaudeCliToolCalls(renamed.cwd, NATIVE, renamed.handoff, {}, instrumented({ afterRead: n => { if (n === 2) renameSync(replacement, renamed.path) } }).fs)
++    expect(over.tools).toEqual([])
++    expect(over.coverage).toMatchObject({ status: 'unavailable', reason: 'file-replaced' })
++
++    const deleted = await transcript(own())
++    const gone = await captureClaudeCliToolCalls(deleted.cwd, NATIVE, deleted.handoff, {}, instrumented({ afterRead: n => { if (n === 2) rmSync(deleted.path) } }).fs)
++    expect(gone.tools).toEqual([])
++    expect(gone.coverage).toMatchObject({ status: 'unavailable', reason: 'file-replaced' })
++  })
++
++  describe('rows appended while the capture runs: an explicit bounded snapshot, never a silent whole capture', () => {
++    it('keeps the calls up to the size first seen, says partial, shows the unread appended bytes, and drops nothing for the next return', async () => {
++      const t = await transcript(own())
++      const snapshot = statSync(t.path).size
++      const late = call('late', 80_000, 100)
++      const io = instrumented({ afterRead: n => { if (n === 2) appendFileSync(t.path, late) } })
++      const first = await captureClaudeCliToolCalls(t.cwd, NATIVE, t.handoff, {}, io.fs)
++      expect(ids(first.tools)).toEqual(['toolu_cli'])
++      expect(first.coverage).toEqual({ status: 'partial', reason: 'file-changed', boundaryBytes: t.boundary.bytes, fileBytes: snapshot + late.length, bytesRead: snapshot - t.boundary.bytes, bytesSkipped: 0, unmatchedCalls: 0, unpairedResults: 0, droppedCalls: 0 })
++      // The appended rows were counted as unread, not consumed: the same boundary reads them whole next time, once.
++      const next = await captureClaudeCliToolCalls(t.cwd, NATIVE, t.handoff, { known: first.tools.map(tool => tool.toolUseId) }, instrumented().fs)
++      expect(ids(next.tools)).toEqual(['toolu_late'])
++      expect(next.coverage).toMatchObject({ status: 'complete', reason: 'complete', fileBytes: snapshot + late.length })
++    })
++
++    it('imports nothing when the append also rewrote an end of the window, or of the boundary prefix', async () => {
++      for (const where of ['window-start', 'window-end', 'boundary-head', 'boundary-tail'] as const) {
++        const t = await transcript(own())
++        const position = { 'window-start': t.boundary.bytes + 2, 'window-end': statSync(t.path).size - 12, 'boundary-head': 3, 'boundary-tail': t.boundary.bytes - 5 }[where]
++        const io = instrumented({ afterRead: n => { if (n === 2) { rewriteInPlace(t.path, position, 'Z'.repeat(4)); appendFileSync(t.path, call('late', 80_000, 100)) } } })
++        const { tools, coverage } = await captureClaudeCliToolCalls(t.cwd, NATIVE, t.handoff, {}, io.fs)
++        expect({ where, tools, status: coverage.status, reason: coverage.reason }).toEqual({ where, tools: [], status: 'unavailable', reason: 'file-changed' })
++      }
++    })
++
++    it('imports nothing when the file is truncated after the append was seen', async () => {
++      const t = await transcript(own())
++      // Read 2 is the window, 3 to 6 the re-check of the four ends; the file is cut after the last of them.
++      const io = instrumented({ afterRead: n => { if (n === 2) appendFileSync(t.path, call('late', 80_000, 100)); if (n === 6) truncateSync(t.path, t.boundary.bytes + 20) } })
++      const { tools, coverage } = await captureClaudeCliToolCalls(t.cwd, NATIVE, t.handoff, {}, io.fs)
++      expect(tools).toEqual([])
++      expect(coverage).toMatchObject({ status: 'unavailable', reason: 'file-shrank' })
++    })
++  })
++
++  describe('a last row its writer had not finished', () => {
++    it('is not dropped under complete: the read is partial, the cut-off bytes are unread, and nothing is timed from it', async () => {
++      const [use, result] = callRows('cli', 60_000, 1_250, { command: 'git status' })
++      const cut = result!.slice(0, 120)
++      const t = await transcript(use + '\n' + cut)
++      const size = statSync(t.path).size
++      const { tools, coverage } = await captureClaudeCliToolCalls(t.cwd, NATIVE, t.handoff, {}, instrumented().fs)
++      expect(tools).toEqual([])
++      expect(coverage).toEqual({ status: 'partial', reason: 'file-changed', boundaryBytes: t.boundary.bytes, fileBytes: size, bytesRead: size - t.boundary.bytes - cut.length, bytesSkipped: 0, unmatchedCalls: 1, unpairedResults: 0, droppedCalls: 0 })
++    })
++
++    it('is used when it is a whole row that merely lacks its newline', async () => {
++      const [use, result] = callRows('cli', 60_000, 1_250, { command: 'git status' })
++      const t = await transcript(use + '\n' + result)
++      const { tools, coverage } = await captureClaudeCliToolCalls(t.cwd, NATIVE, t.handoff, {}, instrumented().fs)
++      expect(ids(tools)).toEqual(['toolu_cli'])
++      expect(coverage).toMatchObject({ status: 'complete', reason: 'complete', bytesRead: statSync(t.path).size - t.boundary.bytes })
++    })
++
++    it('does not turn skipped, malformed or foreign rows into durations: a newline-terminated bad row is skipped as it always was', async () => {
++      const [use] = callRows('cli', 60_000, 1_250, { command: 'git status' })
++      const [foreignUse, foreignResult] = callRows('foreign', 61_000, 3_000, { sessionId: 'another-conversation' })
++      const t = await transcript(use + '\n' + '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_cli" BROKEN\n' + foreignUse + '\n' + foreignResult + '\n')
++      const { tools, coverage } = await captureClaudeCliToolCalls(t.cwd, NATIVE, t.handoff, {}, instrumented().fs)
++      expect(tools).toEqual([])
++      expect(coverage).toMatchObject({ status: 'complete', reason: 'complete', unmatchedCalls: 1, unpairedResults: 0 })
++    })
++  })
++
++  it('stays bounded: a window smaller than the appended rows reads at most maxBytes of them, partial, and never the prefix', async () => {
++    const t = await transcript(own() + filler(20_000))
++    const size = statSync(t.path).size
++    const io = instrumented()
++    const { coverage } = await captureClaudeCliToolCalls(t.cwd, NATIVE, t.handoff, { maxBytes: 5_000 }, io.fs)
++    expect(coverage).toMatchObject({ status: 'partial', reason: 'window-truncated', fileBytes: size, bytesRead: 5_000, bytesSkipped: size - t.boundary.bytes - 5_000 })
++    expect(Math.max(...io.requested.map(read => read.length))).toBe(5_000)
++    expect(io.requested.reduce((sum, read) => sum + read.length, 0)).toBe(2 * 4096 + 5_000)
++  })
++
++  it('opens nothing for a legacy size-only, malformed or missing boundary', async () => {
++    const t = await transcript(own())
++    for (const handoff of [{ claudeBytes: t.boundary.bytes }, { claudeBytes: -1 }, {}, { claudeBoundary: { bytes: t.boundary.bytes } }, { claudeBoundary: null }]) {
++      const io = instrumented()
++      const { tools, coverage } = await captureClaudeCliToolCalls(t.cwd, NATIVE, handoff, {}, io.fs)
++      expect({ tools, status: coverage.status, opened: io.opened }).toEqual({ tools: [], status: 'unavailable', opened: 0 })
++    }
++  })
++})
+diff --git a/src/main/native-history.ts b/src/main/native-history.ts
+index 3d67b6d..32ad338 100644
+--- a/src/main/native-history.ts
++++ b/src/main/native-history.ts
+@@ -1,4 +1,4 @@
+-import { createReadStream, existsSync, readdirSync } from 'node:fs'
++import { createReadStream, existsSync, readdirSync, type BigIntStats } from 'node:fs'
+ import { open, stat, type FileHandle } from 'node:fs/promises'
+ import { createHash } from 'node:crypto'
+ import { join } from 'node:path'
+@@ -28,13 +28,15 @@ export async function claudeHistorySize(cwd: string, nativeId: string): Promise<
+  * last FINGERPRINT_BYTES bytes up to that size. Hashes only, never content. A transcript is only
+  * appended to, so a file that is smaller, another file, or has different bytes at either end is
+  * not the file the boundary was taken from; a rewrite that leaves both ends and the size alone is
+- * the one thing it cannot see.
++ * the one thing it cannot see. (The capture additionally compares the file's size, identity and
++ * modification and change times around its reads, so such a rewrite is seen when it happens while
++ * the capture runs, not when it happened earlier.)
+  */
+ export interface ClaudeHistoryBoundary { bytes: number; id?: string; head?: string; tail?: string }
+ const FINGERPRINT_BYTES = 4096
+ const HASH = /^[0-9a-f]{64}$/
+ 
+-async function readExactly(handle: FileHandle, position: number, length: number): Promise<Buffer | null> {
++async function readExactly(handle: Pick<FileHandle, 'read'>, position: number, length: number): Promise<Buffer | null> {
+   const buffer = Buffer.alloc(length)
+   let read = 0
+   while (read < length) {
+@@ -44,7 +46,7 @@ async function readExactly(handle: FileHandle, position: number, length: number)
+   }
+   return buffer
+ }
+-async function windowHash(handle: FileHandle, position: number, length: number): Promise<string | null> {
++async function windowHash(handle: Pick<FileHandle, 'read'>, position: number, length: number): Promise<string | null> {
+   const bytes = await readExactly(handle, position, length)
+   return bytes ? createHash('sha256').update(bytes).digest('hex') : null
+ }
+@@ -75,9 +77,18 @@ function parseBoundary(value: unknown): ClaudeHistoryBoundary | null {
+   return { bytes: boundary.bytes!, ...(boundary.id ? { id: boundary.id } : {}), head: boundary.head, tail: boundary.tail }
+ }
+ 
+-interface CliWindow { tools: TranscriptToolCall[]; unmatched: number; orphans: number; dropped: number; bytesRead: number; bytesSkipped: number; truncated: boolean }
++interface CliWindow {
++  tools: TranscriptToolCall[]; unmatched: number; orphans: number; dropped: number; bytesRead: number; bytesSkipped: number; truncated: boolean
++  /** The file ended before the size the window was read to: it was truncated while being read. Nothing was parsed. */
++  short: boolean
++  /** The newest bytes were a row cut off mid-write: not parsed, not counted in bytesRead. */
++  partialTail: boolean
++  /** The bytes read and where they start, to re-check the window's two ends against the file afterwards. */
++  raw: Buffer; start: number
++}
++const parsesAsRow = (bytes: Buffer): boolean => { try { const row = JSON.parse(bytes.toString('utf8')); return Boolean(row) && typeof row === 'object' } catch { return false } }
+ /** The rows after `fromByte` of an open transcript of `size` bytes: at most the newest `maxBytes`. */
+-async function readCliWindow(handle: FileHandle, size: number, nativeId: string, fromByte: number, options: { maxBytes?: number; known?: Iterable<string> }): Promise<CliWindow> {
++async function readCliWindow(handle: Pick<FileHandle, 'read'>, size: number, nativeId: string, fromByte: number, options: { maxBytes?: number; known?: Iterable<string> }): Promise<CliWindow> {
+   const maxBytes = Math.max(1, Math.floor(options.maxBytes ?? MAX_CLI_TIMING_BYTES))
+   const start = Math.max(fromByte, size - maxBytes), length = size - start
+   const buffer = Buffer.alloc(length)
+@@ -87,10 +98,18 @@ async function readCliWindow(handle: FileHandle, size: number, nativeId: string,
+     if (!bytesRead) break
+     read += bytesRead
+   }
+-  let bytes = buffer.subarray(0, read)
+   const truncated = start > fromByte
++  // The file ended before the size it was read to: the rows read are not the rows of that size. None are used.
++  if (read < length) return { tools: [], unmatched: 0, orphans: 0, dropped: 0, bytesRead: read, bytesSkipped: start - fromByte, truncated, short: true, partialTail: false, raw: buffer.subarray(0, read), start }
++  let bytes = buffer
+   // A window that starts mid-file starts mid-row: that partial row goes, cut at a newline byte.
+   if (truncated) { const newline = bytes.indexOf(0x0a); bytes = bytes.subarray(newline < 0 ? bytes.length : newline + 1) }
++  // A last row without its newline is either a whole row or one its writer had not finished: only a
++  // row that parses is kept, and a cut-off one is reported, never dropped under a complete read.
++  let partialTail = false
++  const lastNewline = bytes.lastIndexOf(0x0a)
++  const tail = bytes.subarray(lastNewline + 1)
++  if (tail.length && tail.toString('utf8').trim() && !parsesAsRow(tail)) { partialTail = true; bytes = bytes.subarray(0, lastNewline + 1) }
+   const rows: any[] = []
+   let teleported = -1
+   for (const line of bytes.toString('utf8').split('\n')) {
+@@ -107,7 +126,7 @@ async function readCliWindow(handle: FileHandle, size: number, nativeId: string,
+   const pairs = new TranscriptToolPairs()
+   for (const row of rows.slice(teleported + 1)) pairs.add(row)
+   const paired = pairs.calls()
+-  return { tools: paired.tools.filter(call => !known.has(call.toolUseId)), unmatched: paired.unmatched, orphans: paired.orphans, dropped: paired.dropped, bytesRead: read, bytesSkipped: start - fromByte, truncated }
++  return { tools: paired.tools.filter(call => !known.has(call.toolUseId)), unmatched: paired.unmatched, orphans: paired.orphans, dropped: paired.dropped, bytesRead: partialTail ? read - tail.length : read, bytesSkipped: start - fromByte, truncated, short: false, partialTail, raw: buffer, start }
+ }
+ 
+ /**
+@@ -116,8 +135,9 @@ async function readCliWindow(handle: FileHandle, size: number, nativeId: string,
+  * `maxBytes` of them, read asynchronously; never the whole file. Rows of another session, rows the
+  * CLI marks as copied from elsewhere (remoteSourced) and rows before a teleport's note (a cloud
+  * session's own rows, on its clock) are left out, as are calls the handoff already knew. Pairing is
+- * by exact tool_use_id (transcript-tool-pairs.ts). A file that shrank since is not read at all.
+- * It trusts `fromByte`; captureClaudeCliToolCalls is the read that verifies a persisted boundary.
++ * by exact tool_use_id (transcript-tool-pairs.ts). A file that shrank since, or that ends before the
++ * size it was read to, is not used. It trusts `fromByte`; captureClaudeCliToolCalls is the read that
++ * verifies a persisted boundary.
+  */
+ export async function readClaudeCliToolCalls(cwd: string, nativeId: string, fromByte: number, options: { maxBytes?: number; known?: Iterable<string> } = {}): Promise<{ tools: TranscriptToolCall[]; unmatched: number; bytesRead: number; truncated: boolean; shrank: boolean }> {
+   const none = { tools: [], unmatched: 0, bytesRead: 0, truncated: false, shrank: false }
+@@ -128,30 +148,88 @@ export async function readClaudeCliToolCalls(cwd: string, nativeId: string, from
+     const size = (await handle.stat()).size
+     if (size < fromByte) return { ...none, shrank: true }
+     const window = await readCliWindow(handle, size, nativeId, fromByte, options)
++    if (window.short) return { ...none, shrank: true }
+     return { tools: window.tools, unmatched: window.unmatched, bytesRead: window.bytesRead, truncated: window.truncated, shrank: false }
+   } finally { await handle.close() }
+ }
+ 
++/** The file operations a capture makes; a test hands in handles that misbehave at chosen moments. */
++export interface CaptureFs {
++  open(path: string): Promise<Pick<FileHandle, 'stat' | 'read' | 'close'>>
++  stat(path: string): Promise<Pick<BigIntStats, 'dev' | 'ino'>>
++}
++const realFs: CaptureFs = { open: path => open(path, 'r'), stat: path => stat(path, { bigint: true }) }
++
++/** What a handle reports about the file at one moment: compared before and after reads, never kept as content. */
++type FileStamp = Pick<BigIntStats, 'size' | 'dev' | 'ino' | 'mtimeNs' | 'ctimeNs'>
++const stampOf = (info: FileStamp): FileStamp => ({ size: info.size, dev: info.dev, ino: info.ino, mtimeNs: info.mtimeNs, ctimeNs: info.ctimeNs })
++/** How the file moved between two stamps: appended (larger, same file), or else gone smaller, another
++ *  file, or rewritten in place (same size, newer modification or change time), or not at all. */
++function drift(before: FileStamp, after: FileStamp): 'none' | 'appended' | 'shrank' | 'replaced' | 'rewritten' {
++  if (before.dev !== after.dev || before.ino !== after.ino) return 'replaced'
++  if (after.size < before.size) return 'shrank'
++  if (after.size > before.size) return 'appended'
++  return before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs ? 'rewritten' : 'none'
++}
++/** Re-reads, once more and bounded to four fingerprint windows, the boundary's two ends and the read
++ *  window's two ends: false when any of them is no longer what was verified or read. */
++async function endsUnchanged(handle: Pick<FileHandle, 'read'>, boundary: ClaudeHistoryBoundary, read: CliWindow): Promise<boolean> {
++  if (boundary.bytes > 0) {
++    const window = Math.min(boundary.bytes, FINGERPRINT_BYTES)
++    if (await windowHash(handle, 0, window) !== boundary.head || await windowHash(handle, boundary.bytes - window, window) !== boundary.tail) return false
++  }
++  const window = Math.min(read.raw.length, FINGERPRINT_BYTES)
++  if (!window) return true
++  const head = await readExactly(handle, read.start, window), tail = await readExactly(handle, read.start + read.raw.length - window, window)
++  return Boolean(head && tail) && head!.equals(read.raw.subarray(0, window)) && tail!.equals(read.raw.subarray(read.raw.length - window))
++}
++
+ /**
+- * The same read, but of a handoff's persisted boundary, verified against the file on one open
+- * handle (so nothing can change between the check and the read), with an explicit account of what
+- * was and was not read. A missing, malformed or size-only (legacy) boundary, or a file that is
+- * gone, shorter, another file or different at either end, imports nothing and says why: rows
+- * cannot then be told from the ones before the handoff, and no bounded continuation can find the
+- * boundary again. A window that did not reach back to the boundary is `partial`, never `complete`.
++ * The same read, but of a handoff's persisted boundary, verified against the file, with an explicit
++ * account of what was and was not read. A missing, malformed or size-only (legacy) boundary, or a
++ * file that is gone, shorter, another file or different at either end, imports nothing and says why:
++ * rows cannot then be told from the ones before the handoff, and no bounded continuation can find
++ * the boundary again.
++ *
++ * An open handle does not lock the contents: another process can truncate or rewrite the same inode
++ * at any moment. So the capture takes a snapshot of the file (its size, identity and modification
++ * and change times) from the handle, reads the boundary's fingerprints and the window up to exactly
++ * that size, and takes the snapshot again after each stage:
++ *  - a short read (the file ended before the size read to), a smaller file, another file (the handle's
++ *    identity, or the path now naming a different one), or a same-size file with a newer modification
++ *    or change time imports nothing: unavailable (file-shrank, file-replaced, file-changed);
++ *  - a file that only GREW is a bounded snapshot: the rows up to the size first seen are read and kept
++ *    if the ends of the boundary and of the window are still the bytes read, and the status is
++ *    `partial` (file-changed), with fileBytes the newest size seen, so the appended rows are visibly
++ *    unread rather than silently missing. A later return to Chat does not re-read them;
++ *  - a last row without its newline that does not parse (its writer was mid-write) is not used and
++ *    makes the read `partial` (file-changed) rather than `complete`.
++ * A window that did not reach back to the boundary is `partial` too. `file-changed` takes precedence
++ * over `window-truncated` as the reason; bytesSkipped still shows the truncation.
++ *
++ * Limits that remain, by design (nothing here reads or hashes an unbounded prefix): only the first
++ * and last FINGERPRINT_BYTES of the boundary prefix and of the window are compared, so a rewrite that
++ * keeps the size, both ends, and the file's identity AND leaves its modification and change times as
++ * they were (a clock too coarse to tell two writes apart, or timestamps set back) is not seen; and a
++ * rewrite that happened before the capture started, strictly between the fingerprinted ends of the
++ * boundary prefix, is not seen either. Only a rewrite during the capture that changes size,
++ * identity or either time is.
+  */
+-export async function captureClaudeCliToolCalls(cwd: string, nativeId: string, handoff: { claudeBoundary?: unknown; claudeBytes?: unknown }, options: { maxBytes?: number; known?: Iterable<string> } = {}): Promise<{ tools: TranscriptToolCall[]; coverage: CliCaptureCoverage }> {
++export async function captureClaudeCliToolCalls(cwd: string, nativeId: string, handoff: { claudeBoundary?: unknown; claudeBytes?: unknown }, options: { maxBytes?: number; known?: Iterable<string> } = {}, fs: CaptureFs = realFs): Promise<{ tools: TranscriptToolCall[]; coverage: CliCaptureCoverage }> {
+   const coverage = (status: CliCaptureCoverage['status'], reason: CliCaptureReason, extra: Partial<CliCaptureCoverage> = {}): { tools: TranscriptToolCall[]; coverage: CliCaptureCoverage } =>
+     ({ tools: [], coverage: { status, reason, boundaryBytes: null, fileBytes: null, bytesRead: 0, bytesSkipped: 0, unmatchedCalls: 0, unpairedResults: 0, droppedCalls: 0, ...extra } })
+   if (handoff.claudeBoundary === undefined) return coverage('unavailable', handoff.claudeBytes === undefined ? 'boundary-missing' : typeof handoff.claudeBytes === 'number' && Number.isSafeInteger(handoff.claudeBytes) && handoff.claudeBytes >= 0 ? 'boundary-unverified' : 'boundary-malformed', typeof handoff.claudeBytes === 'number' && Number.isSafeInteger(handoff.claudeBytes) ? { boundaryBytes: handoff.claudeBytes } : {})
+   const boundary = parseBoundary(handoff.claudeBoundary)
+   if (!boundary) return coverage('unavailable', 'boundary-malformed')
+-  let handle: FileHandle
+-  try { handle = await open(claudeHistoryPath(cwd, nativeId), 'r') } catch (error) {
++  const path = claudeHistoryPath(cwd, nativeId)
++  let handle: Awaited<ReturnType<CaptureFs['open']>>
++  try { handle = await fs.open(path) } catch (error) {
+     // A conversation whose CLI view wrote nothing has no transcript, and had none at the handoff.
+     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return boundary.bytes === 0 ? coverage('complete', 'no-transcript', { boundaryBytes: 0, fileBytes: 0 }) : coverage('unavailable', 'file-missing', { boundaryBytes: boundary.bytes })
+     return coverage('unavailable', 'file-unreadable', { boundaryBytes: boundary.bytes })
+   }
++  const unavailable = (moved: ReturnType<typeof drift>, fileBytes: bigint): ReturnType<typeof coverage> =>
++    coverage('unavailable', moved === 'shrank' ? 'file-shrank' : moved === 'replaced' ? 'file-replaced' : 'file-changed', { boundaryBytes: boundary.bytes, fileBytes: Number.isSafeInteger(Number(fileBytes)) ? Number(fileBytes) : null })
+   try {
+     const info = await handle.stat({ bigint: true }), size = Number(info.size)
+     const known = { boundaryBytes: boundary.bytes, fileBytes: size }
+@@ -159,13 +237,41 @@ export async function captureClaudeCliToolCalls(cwd: string, nativeId: string, h
+     if (size < boundary.bytes) return coverage('unavailable', 'file-shrank', known)
+     const id = fileId(info)
+     if (boundary.id && id && boundary.id !== id) return coverage('unavailable', 'file-replaced', known)
++    const snapshot = stampOf(info)
+     if (boundary.bytes > 0) {
+       const window = Math.min(boundary.bytes, FINGERPRINT_BYTES)
+-      if (await windowHash(handle, 0, window) !== boundary.head || await windowHash(handle, boundary.bytes - window, window) !== boundary.tail) return coverage('unavailable', 'file-changed', known)
++      const head = await windowHash(handle, 0, window), tail = await windowHash(handle, boundary.bytes - window, window)
++      // The file ended inside bytes its size promised: it was truncated since the size was taken.
++      if (!head || !tail) return unavailable('shrank', (await handle.stat({ bigint: true })).size)
++      if (head !== boundary.head || tail !== boundary.tail) return coverage('unavailable', 'file-changed', known)
+     }
++    const verified = await handle.stat({ bigint: true })
++    const duringFingerprints = drift(snapshot, stampOf(verified))
++    // Fingerprints read while the file moved say nothing about the bytes the snapshot is of; growth included.
++    if (duringFingerprints !== 'none') return unavailable(duringFingerprints, verified.size)
++
+     const read = await readCliWindow(handle, size, nativeId, boundary.bytes, options)
+-    const reason: CliCaptureReason = read.truncated ? 'window-truncated' : read.dropped ? 'call-limit' : 'complete'
+-    return { tools: read.tools, coverage: { status: reason === 'complete' ? 'complete' : 'partial', reason, ...known, bytesRead: read.bytesRead, bytesSkipped: read.bytesSkipped, unmatchedCalls: read.unmatched, unpairedResults: read.orphans, droppedCalls: read.dropped } }
++    const afterRead = await handle.stat({ bigint: true })
++    if (read.short) return unavailable('shrank', afterRead.size)
++    // The path may now name another file (renamed over, or deleted): the handle still holds the old one.
++    let named: Awaited<ReturnType<CaptureFs['stat']>>
++    try { named = await fs.stat(path) } catch (error) { return (error as NodeJS.ErrnoException).code === 'ENOENT' ? unavailable('replaced', afterRead.size) : coverage('unavailable', 'file-unreadable', { boundaryBytes: boundary.bytes }) }
++    if (named.ino !== afterRead.ino || named.dev !== afterRead.dev) return unavailable('replaced', afterRead.size)
++    const moved = drift(snapshot, stampOf(afterRead))
++    if (moved === 'shrank' || moved === 'replaced' || moved === 'rewritten') return unavailable(moved, afterRead.size)
++
++    let fileBytes = size
++    if (moved === 'appended') {
++      // Rows were appended after the snapshot: kept up to the snapshot only if both of its ends are still the bytes read.
++      if (!await endsUnchanged(handle, boundary, read)) return unavailable('rewritten', afterRead.size)
++      const settled = await handle.stat({ bigint: true })
++      const afterAppend = drift(stampOf(afterRead), stampOf(settled))
++      if (afterAppend === 'shrank' || afterAppend === 'replaced' || afterAppend === 'rewritten') return unavailable(afterAppend, settled.size)
++      fileBytes = Number(settled.size)
++      if (!Number.isSafeInteger(fileBytes)) return coverage('unavailable', 'file-unreadable', { boundaryBytes: boundary.bytes })
++    }
++    const reason: CliCaptureReason = moved === 'appended' || read.partialTail ? 'file-changed' : read.truncated ? 'window-truncated' : read.dropped ? 'call-limit' : 'complete'
++    return { tools: read.tools, coverage: { status: reason === 'complete' ? 'complete' : 'partial', reason, boundaryBytes: boundary.bytes, fileBytes, bytesRead: read.bytesRead, bytesSkipped: read.bytesSkipped, unmatchedCalls: read.unmatched, unpairedResults: read.orphans, droppedCalls: read.dropped } }
+   } catch { return coverage('unavailable', 'file-unreadable', { boundaryBytes: boundary.bytes }) } finally { await handle.close().catch(() => undefined) }
+ }
+ export async function readClaudeHistory(cwd: string, nativeId: string): Promise<NativeHistoryItem[]> {
