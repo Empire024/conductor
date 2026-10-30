@@ -1,0 +1,79 @@
+rank9 thread-invalidations: src/main/index.ts WIRING (snippets only; apply with compare-save).
+Anchors are from the stale f3e3dcb index.ts; line numbers will differ locally, match by the quoted text.
+Nothing here is applied by the cloud cycle.
+
+1) Import, next to `import { registerThreadsIpc } from './threads-ipc'` (~l.177)
+   import { createThreadInvalidations, type ThreadInvalidations } from './thread-invalidations'
+
+2) Module-level, next to `let disposeThreadsIpc: (() => void) | undefined` (~l.221)
+   let threadInvalidations: ThreadInvalidations | undefined
+   let disposeThreadInvalidationBroadcast: (() => void) | undefined
+
+3) Shutdown list, right after ['threads IPC', () => disposeThreadsIpc?.()], (~l.787)
+   ['thread invalidations', () => { disposeThreadInvalidationBroadcast?.(); disposeThreadInvalidationBroadcast = undefined; threadInvalidations?.dispose(); threadInvalidations = undefined }],
+
+4) Create it immediately BEFORE `disposeThreadsIpc = registerThreadsIpc({` (~l.1923).
+   agent-manager's broadcast() sends to windows AND to onBroadcast listeners, so this one listener
+   covers structured:events (structured-sessions drainOutbox) and agent:status (flush).
+   threadInvalidations = createThreadInvalidations({ windows: () => BrowserWindow.getAllWindows() })
+   disposeThreadInvalidationBroadcast = onBroadcast((channel, payload) => { threadInvalidations?.observe(channel, payload) })
+
+5) projectsChanged in the registerThreadsIpc deps (~l.1930). That function sends 'projects:changed'
+   straight to the windows (not via onBroadcast or publish), so it needs its own call:
+     projectsChanged: () => {
+       const projects = generalThreads!.mark(database.listDeskProjects())
+       for (const window of BrowserWindow.getAllWindows()) ... window.webContents.send('projects:changed', projects)
+   +   threadInvalidations?.observe('projects:changed')
+       phoneAccess?.refresh()
+     }
+
+6) publish() (~l.2952), directly after `phoneObserve(channel, payload)`.
+   publish() does NOT go through onBroadcast. It carries structured:events from the remote-session
+   mirror, remote:changed, and sessions:restored from the task dispatcher.
+   +   threadInvalidations?.observe(channel, payload)
+
+7) broadcastSessionArchive (~l.1333), after the for-loop:
+   +   threadInvalidations?.observe('session-archive:changed')
+
+8) sessions:restore handler (~l.2171). The main window gets no 'sessions:restored' when it is the
+   sender, so notify unconditionally when a workspace was restored:
+     const restored = database.restoreSession(sessionId)
+     if (restored) {
+   +   threadInvalidations?.notify()
+
+9) Structural handlers that broadcast NOTHING today (verified by grep on the stale base). Add
+   `threadInvalidations?.notify()` as the last statement (after the awaited work) of:
+     projects:remove     (after database.removeProject(projectId))
+     projects:rename     (after renameLocalProject / remote rename resolves)
+     sessions:create     (wrap: const created = database.createSession(...); threadInvalidations?.notify(); return created)
+     sessions:delete     (after database.closeSession(sessionId))
+     sessions:rename     (workspaceName is shown in thread rows)
+     sessions:move-tabs  (after moveTabsBetweenWorkspaces resolves)
+   agents.killProject / killSession normally end in agent:status 'exited', which is already covered;
+   not verified here.
+
+Coverage map (what changes a row -> how it reaches the invalidator)
+   message text / lastText / title (structured:rename) / archived flag -> structured:events (all are session events)
+   phase, needs-you, working, exited                                    -> agent:status
+   project added / renamed / General promoted                           -> projects:changed (step 5)
+   paired machine online / projects adopted                             -> remote:changed (step 6)
+   workspace archive / restore                                          -> session-archive:changed, sessions:restored
+   NOT used: phone:changed is the desktop's phone-access settings/status, not conversation state.
+
+Per-token IPC storm: the module sends nothing per event. It arms one 200 ms timer on the first
+invalidation and sends one payload-free 'threads:changed' per live window when it fires; events during
+the interval add nothing. Streaming at any rate gives at most 5 notices/s/window from main, and the
+renderer reads at most once per 400 ms on top of that (and never concurrently). 200/400 ms are unmeasured choices.
+
+Read path (unchanged, not edited): threads:list is `trusted(event)` + `await deps.sessions()` ->
+phoneStateAsync({history:false}). The notice carries no data, so no new payload to validate.
+phoneState() on the stale base recomputes from the database on each call (it is not the cached
+`latest` map behind the 400 ms phone refresh), and flush() persists status/events before it
+broadcasts, so a read triggered by the notice sees the change. phoneStateAsync does not exist on the
+stale base; confirm locally that it is also a live recompute.
+
+Local follow-ups that are NOT cloud-editable here
+   - src/renderer/src/components/sidebar-thread-view.ts is absent from the stale base; the supplied
+     ThreadList.tsx imports it. Local has it, so no action beyond compare-save.
+   - Existing tests untouched. ThreadList.test.ts renders ThreadList with renderToStaticMarkup, where
+     effects do not run, so it does not exercise the new lifecycle.
